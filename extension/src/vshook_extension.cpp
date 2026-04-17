@@ -3,20 +3,17 @@
 #include <windows.h>
 
 #include <fstream>
-#include <sstream>
 #include <string>
 
 namespace vshook {
 
 using plugin_register_t = int (*)(const char*, void*);
-using ShowConsoleMsg_t = void (*)(const char*);
 using GetResourcePath_t = const char* (*)();
 using Main_OnCommand_t = void (*)(int, int);
 using AddExtensionsMainMenu_t = bool (*)();
 using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
 
 static plugin_register_t plugin_register_ptr = nullptr;
-static ShowConsoleMsg_t ShowConsoleMsg_ptr = nullptr;
 static GetResourcePath_t GetResourcePath_ptr = nullptr;
 static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
 static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
@@ -41,44 +38,43 @@ static custom_action_register_t g_runAction {
   nullptr
 };
 
-static void logLine(const std::string& text)
-{
-  if(ShowConsoleMsg_ptr) {
-    ShowConsoleMsg_ptr((text + "\n").c_str());
-  }
-}
-
 static bool fileExists(const std::string& path)
 {
   std::ifstream f(path, std::ios::binary);
   return f.good();
 }
 
+static std::string normalizeSlashes(std::string path)
+{
+  for(char& c : path) {
+    if(c == '\\') c = '/';
+  }
+  return path;
+}
+
 static std::string buildDefaultScriptPath()
 {
   const char* resource = GetResourcePath_ptr ? GetResourcePath_ptr() : "";
-  std::string base = resource ? resource : "";
-  for(char& c : base) if(c == '\\') c = '/';
+  std::string base = normalizeSlashes(resource ? resource : "");
   return base + "/Scripts/VS Hook APP/VS Hook.lua";
 }
 
 static bool ensureScriptRegistered()
 {
   if(!AddRemoveReaScript_ptr) return false;
+
   g_state.scriptPath = buildDefaultScriptPath();
 
   if(!fileExists(g_state.scriptPath)) {
-    logLine("[VS Hook APP] Script nao encontrado em: " + g_state.scriptPath);
     return false;
   }
 
-  g_state.scriptCommandId = AddRemoveReaScript_ptr(true, 0, g_state.scriptPath.c_str(), true);
-  if(g_state.scriptCommandId == 0) {
-    logLine("[VS Hook APP] Falha ao registrar o script no Action List.");
+  const int commandId = AddRemoveReaScript_ptr(true, 0, g_state.scriptPath.c_str(), true);
+  if(commandId == 0) {
     return false;
   }
 
-  logLine("[VS Hook APP] Script registrado: " + g_state.scriptPath);
+  g_state.scriptCommandId = commandId;
   return true;
 }
 
@@ -86,10 +82,12 @@ static void runScript()
 {
   if(g_state.scriptCommandId == 0) {
     if(!ensureScriptRegistered()) {
-      MessageBoxA(nullptr,
-                  ("VS Hook APP nao encontrou o script:\n\n" + buildDefaultScriptPath()).c_str(),
-                  "VS Hook APP",
-                  MB_OK | MB_ICONERROR);
+      MessageBoxA(
+        nullptr,
+        ("VS Hook APP nao encontrou o script em:\n\n" + buildDefaultScriptPath()).c_str(),
+        "VS Hook APP",
+        MB_OK | MB_ICONERROR
+      );
       return;
     }
   }
@@ -101,7 +99,11 @@ static void runScript()
 
 static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, int relmode, HWND hwnd)
 {
-  (void)sec; (void)val; (void)val2; (void)relmode; (void)hwnd;
+  (void)sec;
+  (void)val;
+  (void)val2;
+  (void)relmode;
+  (void)hwnd;
 
   if(command == g_state.customRunCommandId) {
     runScript();
@@ -125,7 +127,6 @@ static bool loadApi(reaper_plugin_info_t* rec)
   if(!rec || !rec->GetFunc) return false;
 
   plugin_register_ptr = reinterpret_cast<plugin_register_t>(rec->GetFunc("plugin_register"));
-  ShowConsoleMsg_ptr = reinterpret_cast<ShowConsoleMsg_t>(rec->GetFunc("ShowConsoleMsg"));
   GetResourcePath_ptr = reinterpret_cast<GetResourcePath_t>(rec->GetFunc("GetResourcePath"));
   Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
   AddExtensionsMainMenu_ptr = reinterpret_cast<AddExtensionsMainMenu_t>(rec->GetFunc("AddExtensionsMainMenu"));
@@ -155,10 +156,6 @@ static void initialize()
   }
 
   ensureScriptRegistered();
-
-  logLine("[VS Hook APP] Loader carregado.");
-  logLine("[VS Hook APP] Resource path: " + g_state.resourcePath);
-  logLine("[VS Hook APP] Script path: " + buildDefaultScriptPath());
 
   g_state.initialized = true;
 }
