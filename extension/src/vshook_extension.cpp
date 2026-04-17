@@ -53,13 +53,13 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   if(g_state.commandId == 0) return;
 
   if(std::strcmp(menustr, "Main extensions") == 0) {
-    MENUITEMINFO mi{};
-    mi.cbSize = sizeof(MENUITEMINFO);
-    mi.fMask = MIIM_TYPE | MIIM_ID;
-    mi.fType = MFT_STRING;
-    mi.dwTypeData = const_cast<char*>("VS Hook Test");
-    mi.wID = g_state.commandId;
-    InsertMenuItem(hMenu, GetMenuItemCount(hMenu), TRUE, &mi);
+    InsertMenu(
+      hMenu,
+      GetMenuItemCount(hMenu),
+      MF_BYPOSITION | MF_STRING,
+      g_state.commandId,
+      "VS Hook Test"
+    );
   }
 }
 
