@@ -78,7 +78,7 @@ jobs:
           echo "Binary: $BIN"
           file "$BIN"
           lipo -info "$BIN" || true
-          nm -gU "$BIN" | grep "_REAPER_PLUGIN_ENTRYPOINT"
+          nm -gU "$BIN" | grep "_ReaperPluginEntry"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
