@@ -1,0 +1,65 @@
+name: Build VS Hook APP Loader
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'extension/**'
+      - '.github/workflows/build-vshook-loader.yml'
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            artifact_name: vshook-loader-windows
+            configure_cmd: cmake -S extension -B extension/build -A x64
+            build_cmd: cmake --build extension/build --config Release
+            shell: pwsh
+          - name: macOS
+            os: macos-latest
+            artifact_name: vshook-loader-macos
+            configure_cmd: cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release
+            build_cmd: cmake --build extension/build --config Release
+            shell: bash
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check SDK headers
+        shell: bash
+        run: |
+          test -f extension/sdk/reaper_plugin.h
+          test -f extension/sdk/reaper_plugin_functions.h
+          echo "SDK headers found."
+
+      - name: Configure
+        shell: ${{ matrix.shell }}
+        run: ${{ matrix.configure_cmd }}
+
+      - name: Build
+        shell: ${{ matrix.shell }}
+        run: ${{ matrix.build_cmd }}
+
+      - name: Show build outputs
+        shell: bash
+        run: |
+          echo "=== extension/build ==="
+          find extension/build -maxdepth 4 -type f | sort
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+          path: |
+            extension/build/**/reaper_vshook.dll
+            extension/build/**/reaper_vshook.dylib
+            extension/build/**/libreaper_vshook.dylib

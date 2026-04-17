@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.20)
+project(reaper_vshook_loader LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_library(reaper_vshook SHARED
+  src/vshook_extension.cpp
+)
+
+target_include_directories(reaper_vshook PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/sdk
+)
+
+target_compile_definitions(reaper_vshook PRIVATE
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
+)
+
+set_target_properties(reaper_vshook PROPERTIES
+  OUTPUT_NAME "reaper_vshook"
+)
