@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 if(APPLE AND NOT DEFINED CMAKE_OSX_ARCHITECTURES)
-  set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS universal build" FORCE)
+  set(CMAKE_OSX_ARCHITECTURES "x86_64" CACHE STRING "macOS Intel build" FORCE)
 endif()
 
 project(reaper_vshook_loader LANGUAGES CXX)
@@ -27,5 +27,9 @@ set_target_properties(reaper_vshook PROPERTIES
 )
 
 if(APPLE)
+  set_target_properties(reaper_vshook PROPERTIES
+    PREFIX ""
+    SUFFIX ".dylib"
+  )
   target_link_options(reaper_vshook PRIVATE "-undefined" "dynamic_lookup")
 endif()

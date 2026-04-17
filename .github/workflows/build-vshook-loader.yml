@@ -39,9 +39,9 @@ jobs:
           path: |
             extension/build/**/reaper_vshook.dll
 
-  build-macos:
-    name: macOS Universal
-    runs-on: macos-latest
+  build-macos-intel:
+    name: macOS Intel
+    runs-on: macos-15-intel
 
     steps:
       - name: Checkout
@@ -55,12 +55,16 @@ jobs:
           test -f extension/WDL/swell/swell.h
           echo "SDK headers found."
 
+      - name: Clean build dir
+        shell: bash
+        run: rm -rf extension/build
+
       - name: Configure
         shell: bash
         run: >
           cmake -S extension -B extension/build
           -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+          -DCMAKE_OSX_ARCHITECTURES="x86_64"
 
       - name: Build
         shell: bash
@@ -73,13 +77,14 @@ jobs:
           BIN="$(find extension/build -type f \( -name 'reaper_vshook.dylib' -o -name 'libreaper_vshook.dylib' \) | head -n 1)"
           if [ -n "$BIN" ]; then
             echo "Binary: $BIN"
+            file "$BIN" || true
             lipo -info "$BIN" || true
           fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vshook-loader-macos-universal
+          name: vshook-loader-macos-intel
           if-no-files-found: error
           path: |
             extension/build/**/reaper_vshook.dylib
