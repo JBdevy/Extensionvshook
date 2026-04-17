@@ -36,6 +36,13 @@ struct State {
   bool actionHookRegistered = false;
 } g_state;
 
+static custom_action_register_t g_runAction {
+  0,
+  const_cast<char*>("VSHookRun"),
+  const_cast<char*>("VS Hook"),
+  nullptr
+};
+
 static void logMessage(const std::string& text)
 {
   const std::string line = "[VS Hook] " + text + "\n";
@@ -97,7 +104,7 @@ static bool ensureScriptRegistered()
   }
 
   if(!AddRemoveReaScript_ptr) {
-    logMessage("API AddRemoveReaScript nao disponivel. A extensao vai abrir o menu, mas nao consegue registrar o Lua automaticamente.");
+    logMessage("API AddRemoveReaScript nao disponivel. A extensao carregou, mas nao conseguiu registrar o Lua automaticamente.");
     return false;
   }
 
@@ -175,9 +182,12 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 
 static bool loadApi(reaper_plugin_info_t* rec)
 {
-  if(!rec || !rec->GetFunc) return false;
+  if(!rec || !rec->GetFunc || !rec->Register) {
+    return false;
+  }
 
-  plugin_register_ptr = reinterpret_cast<plugin_register_t>(rec->GetFunc("plugin_register"));
+  plugin_register_ptr = rec->Register;
+
   GetResourcePath_ptr = reinterpret_cast<GetResourcePath_t>(rec->GetFunc("GetResourcePath"));
   Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
   AddExtensionsMainMenu_ptr = reinterpret_cast<AddExtensionsMainMenu_t>(rec->GetFunc("AddExtensionsMainMenu"));
@@ -198,25 +208,27 @@ static void initialize()
   const char* resource = GetResourcePath_ptr ? GetResourcePath_ptr() : "";
   g_state.resourcePath = resource ? resource : "";
 
-  if(AddExtensionsMainMenu_ptr) {
-    AddExtensionsMainMenu_ptr();
-  }
-
-  g_state.customRunCommandId = plugin_register_ptr("command_id", reinterpret_cast<void*>(const_cast<char*>("_VSHOOK_RUN")));
+  g_state.customRunCommandId = plugin_register_ptr("custom_action", &g_runAction);
   if(g_state.customRunCommandId != 0) {
     plugin_register_ptr("hookcommand2", reinterpret_cast<void*>(&hookCommand2));
     g_state.actionHookRegistered = true;
-    logMessage("Command ID registrado: " + std::to_string(g_state.customRunCommandId));
+    logMessage("Custom action registrada. Command ID: " + std::to_string(g_state.customRunCommandId));
   } else {
-    logMessage("Falha ao registrar command_id da extensao.");
+    logMessage("Falha ao registrar custom_action da extensao.");
   }
 
   plugin_register_ptr("hookcustommenu", reinterpret_cast<void*>(&menuHook));
   g_state.menuHookRegistered = true;
+  logMessage("Menu hook registrado.");
+
+  if(AddExtensionsMainMenu_ptr) {
+    AddExtensionsMainMenu_ptr();
+  }
 
   ensureScriptRegistered();
 
   g_state.initialized = true;
+  logMessage("Extensao inicializada.");
 }
 
 static void shutdown()
