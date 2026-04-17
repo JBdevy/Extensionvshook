@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
+
+if(APPLE AND NOT DEFINED CMAKE_OSX_ARCHITECTURES)
+  set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS universal build" FORCE)
+endif()
+
 project(reaper_vshook_loader LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)

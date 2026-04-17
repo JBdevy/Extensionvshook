@@ -8,19 +8,9 @@ on:
       - '.github/workflows/build-vshook-loader.yml'
 
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Windows
-            os: windows-latest
-            artifact_name: vshook-loader-windows
-          - name: macOS
-            os: macos-latest
-            artifact_name: vshook-loader-macos
+  build-windows:
+    name: Windows
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -33,38 +23,64 @@ jobs:
           test -f extension/sdk/reaper_plugin_functions.h
           echo "SDK headers found."
 
-      - name: Configure (Windows)
-        if: runner.os == 'Windows'
+      - name: Configure
         shell: pwsh
         run: cmake -S extension -B extension/build -A x64
 
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
+      - name: Build
         shell: pwsh
         run: cmake --build extension/build --config Release
-
-      - name: Configure (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: cmake --build extension/build --config Release
-
-      - name: Show build outputs
-        shell: bash
-        run: |
-          echo "=== extension/build ==="
-          find extension/build -maxdepth 4 -type f | sort || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: vshook-loader-windows
           if-no-files-found: error
           path: |
             extension/build/**/reaper_vshook.dll
+
+  build-macos:
+    name: macOS Universal
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check SDK headers
+        shell: bash
+        run: |
+          test -f extension/sdk/reaper_plugin.h
+          test -f extension/sdk/reaper_plugin_functions.h
+          test -f extension/WDL/swell/swell.h
+          echo "SDK headers found."
+
+      - name: Configure
+        shell: bash
+        run: >
+          cmake -S extension -B extension/build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+
+      - name: Build
+        shell: bash
+        run: cmake --build extension/build --config Release
+
+      - name: Show binary info
+        shell: bash
+        run: |
+          find extension/build -maxdepth 4 -type f | sort || true
+          BIN="$(find extension/build -type f \( -name 'reaper_vshook.dylib' -o -name 'libreaper_vshook.dylib' \) | head -n 1)"
+          if [ -n "$BIN" ]; then
+            echo "Binary: $BIN"
+            lipo -info "$BIN" || true
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vshook-loader-macos-universal
+          if-no-files-found: error
+          path: |
             extension/build/**/reaper_vshook.dylib
             extension/build/**/libreaper_vshook.dylib
