@@ -36,6 +36,6 @@ if(APPLE)
 
   target_link_options(reaper_vshook PRIVATE
     "-undefined" "dynamic_lookup"
-    "-Wl,-exported_symbol,_REAPER_PLUGIN_ENTRYPOINT"
+    "-Wl,-exported_symbol,_ReaperPluginEntry"
   )
 endif()
