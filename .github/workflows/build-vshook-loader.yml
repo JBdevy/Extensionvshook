@@ -70,16 +70,15 @@ jobs:
         shell: bash
         run: cmake --build extension/build --config Release
 
-      - name: Show binary info
+      - name: Verify exported entrypoint
         shell: bash
         run: |
-          find extension/build -maxdepth 4 -type f | sort || true
           BIN="$(find extension/build -type f \( -name 'reaper_vshook.dylib' -o -name 'libreaper_vshook.dylib' \) | head -n 1)"
-          if [ -n "$BIN" ]; then
-            echo "Binary: $BIN"
-            file "$BIN" || true
-            lipo -info "$BIN" || true
-          fi
+          test -n "$BIN"
+          echo "Binary: $BIN"
+          file "$BIN"
+          lipo -info "$BIN" || true
+          nm -gU "$BIN" | grep "_REAPER_PLUGIN_ENTRYPOINT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

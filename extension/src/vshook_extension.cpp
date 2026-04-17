@@ -1,4 +1,11 @@
 #include "reaper_plugin.h"
+#include <cstring>
+
+#if defined(__APPLE__)
+  #define VSHOOK_EXPORT __attribute__((visibility("default")))
+#else
+  #define VSHOOK_EXPORT
+#endif
 
 namespace vshook {
 
@@ -45,7 +52,7 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   if(flag != 0 || !menustr || !hMenu) return;
   if(g_state.commandId == 0) return;
 
-  if(strcmp(menustr, "Main extensions") == 0) {
+  if(std::strcmp(menustr, "Main extensions") == 0) {
     MENUITEMINFO mi{};
     mi.cbSize = sizeof(MENUITEMINFO);
     mi.fMask = MIIM_TYPE | MIIM_ID;
@@ -117,7 +124,7 @@ static void shutdown()
 
 } // namespace vshook
 
-extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
+extern "C" VSHOOK_EXPORT REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   REAPER_PLUGIN_HINSTANCE instance,
   reaper_plugin_info_t* rec)
 {
