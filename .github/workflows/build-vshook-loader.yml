@@ -1,4 +1,4 @@
-name: Build VS Hook APP Loader
+name: Build VS Hook APP loader
 
 on:
   workflow_dispatch:
@@ -10,6 +10,7 @@ on:
 jobs:
   build:
     name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -17,17 +18,9 @@ jobs:
           - name: Windows
             os: windows-latest
             artifact_name: vshook-loader-windows
-            configure_cmd: cmake -S extension -B extension/build -A x64
-            build_cmd: cmake --build extension/build --config Release
-            shell: pwsh
           - name: macOS
             os: macos-latest
             artifact_name: vshook-loader-macos
-            configure_cmd: cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release
-            build_cmd: cmake --build extension/build --config Release
-            shell: bash
-
-    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
@@ -40,19 +33,31 @@ jobs:
           test -f extension/sdk/reaper_plugin_functions.h
           echo "SDK headers found."
 
-      - name: Configure
-        shell: ${{ matrix.shell }}
-        run: ${{ matrix.configure_cmd }}
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake -S extension -B extension/build -A x64
 
-      - name: Build
-        shell: ${{ matrix.shell }}
-        run: ${{ matrix.build_cmd }}
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build extension/build --config Release
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: cmake -S extension -B extension/build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: cmake --build extension/build --config Release
 
       - name: Show build outputs
         shell: bash
         run: |
           echo "=== extension/build ==="
-          find extension/build -maxdepth 4 -type f | sort
+          find extension/build -maxdepth 4 -type f | sort || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
