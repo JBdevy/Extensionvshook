@@ -20,3 +20,7 @@ target_compile_definitions(reaper_vshook PRIVATE
 set_target_properties(reaper_vshook PROPERTIES
   OUTPUT_NAME "reaper_vshook"
 )
+
+if(APPLE)
+  target_link_options(reaper_vshook PRIVATE "-undefined" "dynamic_lookup")
+endif()
