@@ -122,7 +122,13 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   if(flag != 0 || !menustr || !hMenu) return;
 
   if(std::string(menustr) == "Main extensions") {
-    AppendMenu(hMenu, MF_STRING, static_cast<UINT_PTR>(g_state.customRunCommandId), "VS Hook APP");
+    MENUITEMINFO mi{};
+    mi.cbSize = sizeof(MENUITEMINFO);
+    mi.fMask = MIIM_TYPE | MIIM_ID;
+    mi.fType = MFT_STRING;
+    mi.dwTypeData = const_cast<char*>("VS Hook APP");
+    mi.wID = g_state.customRunCommandId;
+    InsertMenuItem(hMenu, GetMenuItemCount(hMenu), TRUE, &mi);
   }
 }
 
