@@ -1,6 +1,8 @@
 #include "reaper_plugin.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <fstream>
 #include <string>
@@ -19,7 +21,7 @@ static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
 static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
 
-static HINSTANCE g_hInstance = nullptr;
+static REAPER_PLUGIN_HINSTANCE g_hInstance = nullptr;
 
 struct State {
   std::string resourcePath;
@@ -82,12 +84,14 @@ static void runScript()
 {
   if(g_state.scriptCommandId == 0) {
     if(!ensureScriptRegistered()) {
+#ifdef _WIN32
       MessageBoxA(
         nullptr,
         ("VS Hook APP nao encontrou o script em:\n\n" + buildDefaultScriptPath()).c_str(),
         "VS Hook APP",
         MB_OK | MB_ICONERROR
       );
+#endif
       return;
     }
   }
