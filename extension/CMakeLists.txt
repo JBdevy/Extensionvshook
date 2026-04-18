@@ -20,6 +20,7 @@ target_include_directories(reaper_vshook PRIVATE
 )
 
 target_compile_definitions(reaper_vshook PRIVATE
+  SWELL_PROVIDED_BY_APP
   WIN32_LEAN_AND_MEAN
   NOMINMAX
 )
