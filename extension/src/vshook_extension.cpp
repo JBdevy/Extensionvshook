@@ -1,44 +1,63 @@
+#define SWELL_PROVIDED_BY_APP
 #include "reaper_plugin.h"
-#include <cstring>
-#include <cctype>
-#include <string>
-#include <sstream>
 #include <fstream>
+#include <string>
+#include <vector>
 
 namespace vshook {
 
 using plugin_register_t = int (*)(const char*, void*);
 using GetResourcePath_t = const char* (*)();
-using AddExtensionsMainMenu_t = bool (*)();
+using Main_OnCommand_t = void (*)(int, int);
+using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
 using ShowConsoleMsg_t = void (*)(const char*);
 
 static plugin_register_t plugin_register_ptr = nullptr;
 static GetResourcePath_t GetResourcePath_ptr = nullptr;
-static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
+static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
+static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
 static ShowConsoleMsg_t ShowConsoleMsg_ptr = nullptr;
 
 static custom_action_register_t g_action = {
   0,
-  "VSHOOKDIAG",
-  "VS Hook Diagnostic",
+  "VSHOOKRUN",
+  "VS Hook",
   nullptr
 };
 
 struct State {
+  std::string resourcePath;
+  std::string scriptPath;
+  std::string logPath;
+  int scriptCommandId = 0;
   int commandId = 0;
   bool initialized = false;
-  bool menuHookRegistered = false;
   bool commandHookRegistered = false;
-  std::string resourcePath;
-  std::string logPath;
 } g_state;
 
-static std::string toLowerCopy(std::string s)
+static void appendFileLog(const std::string& line)
 {
-  for (char& c : s) {
-    c = (char)std::tolower((unsigned char)c);
+  const std::string path = g_state.logPath.empty() ? "/tmp/vshook_nomenu_log.txt" : g_state.logPath;
+  std::ofstream f(path, std::ios::app | std::ios::binary);
+  if (f.good()) {
+    f << line << "\n";
   }
-  return s;
+}
+
+static void logMessage(const std::string& text)
+{
+  const std::string line = "[VS Hook NO MENU] " + text;
+  appendFileLog(line);
+
+  if (ShowConsoleMsg_ptr) {
+    ShowConsoleMsg_ptr((line + "\n").c_str());
+  }
+}
+
+static bool fileExists(const std::string& path)
+{
+  std::ifstream f(path, std::ios::binary);
+  return f.good();
 }
 
 static std::string normalizeSlashes(std::string path)
@@ -49,22 +68,75 @@ static std::string normalizeSlashes(std::string path)
   return path;
 }
 
-static void appendFileLog(const std::string& line)
+static std::vector<std::string> buildScriptCandidates()
 {
-  std::string path = g_state.logPath.empty() ? "/tmp/vshook_diag_log.txt" : g_state.logPath;
-  std::ofstream f(path, std::ios::app | std::ios::binary);
-  if (f.good()) {
-    f << line << "\n";
-  }
+  const char* resource = GetResourcePath_ptr ? GetResourcePath_ptr() : "";
+  const std::string base = normalizeSlashes(resource ? resource : "");
+
+  return {
+    base + "/Scripts/VS Hook APP/VS Hook.lua",
+    base + "/Scripts/VS Hook/VS Hook.lua",
+    base + "/Scripts/VS Hook Server/VS Hook.lua"
+  };
 }
 
-static void logMessage(const std::string& text)
+static bool resolveScriptPath()
 {
-  const std::string line = "[VS Hook DIAG] " + text;
-  appendFileLog(line);
+  const auto candidates = buildScriptCandidates();
 
-  if (ShowConsoleMsg_ptr) {
-    ShowConsoleMsg_ptr((line + "\n").c_str());
+  for (const auto& candidate : candidates) {
+    if (fileExists(candidate)) {
+      g_state.scriptPath = candidate;
+      logMessage("Script encontrado em: " + candidate);
+      return true;
+    }
+  }
+
+  g_state.scriptPath.clear();
+  logMessage("VS Hook.lua nao foi encontrado.");
+  for (const auto& candidate : candidates) {
+    logMessage("Tentado: " + candidate);
+  }
+  return false;
+}
+
+static bool ensureScriptRegistered()
+{
+  if (g_state.scriptCommandId != 0) {
+    return true;
+  }
+
+  if (!AddRemoveReaScript_ptr) {
+    logMessage("API AddRemoveReaScript indisponivel.");
+    return false;
+  }
+
+  if (!resolveScriptPath()) {
+    return false;
+  }
+
+  const int commandId = AddRemoveReaScript_ptr(true, 0, g_state.scriptPath.c_str(), true);
+  if (commandId == 0) {
+    logMessage("Falha ao registrar o script: " + g_state.scriptPath);
+    return false;
+  }
+
+  g_state.scriptCommandId = commandId;
+  logMessage("Script registrado com command ID: " + std::to_string(commandId));
+  return true;
+}
+
+static void runScript()
+{
+  if (!ensureScriptRegistered()) {
+    return;
+  }
+
+  if (Main_OnCommand_ptr && g_state.scriptCommandId != 0) {
+    logMessage("Executando VS Hook.lua");
+    Main_OnCommand_ptr(g_state.scriptCommandId, 0);
+  } else {
+    logMessage("Main_OnCommand indisponivel.");
   }
 }
 
@@ -77,54 +149,12 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   (void)hwnd;
 
   if (command == g_state.commandId) {
-    logMessage("hookCommand2: VS Hook Diagnostic acionado com sucesso.");
+    logMessage("hookCommand2 recebeu o commandId da extensao.");
+    runScript();
     return true;
   }
 
   return false;
-}
-
-static void tryInsertMenuItem(HMENU hMenu, const char* label)
-{
-  if (!hMenu || g_state.commandId == 0) return;
-
-  InsertMenu(
-    hMenu,
-    0,
-    MF_BYPOSITION | MF_STRING,
-    g_state.commandId,
-    label
-  );
-}
-
-static void menuHook(const char* menustr, HMENU hMenu, int flag)
-{
-  std::ostringstream oss;
-  oss << "menuHook: flag=" << flag
-      << " commandId=" << g_state.commandId
-      << " menustr=" << (menustr ? menustr : "(null)");
-  logMessage(oss.str());
-
-  if (!menustr || !hMenu) return;
-  if (flag != 0) return;
-  if (g_state.commandId == 0) {
-    logMessage("menuHook: commandId == 0, nao foi possivel inserir menu.");
-    return;
-  }
-
-  const std::string ms = toLowerCopy(menustr);
-
-  if (ms == "main extensions") {
-    tryInsertMenuItem(hMenu, "VS Hook DIAG EXACT");
-    logMessage("menuHook: inserido por match exato em 'Main extensions'.");
-    return;
-  }
-
-  if (ms.find("extensions") != std::string::npos) {
-    tryInsertMenuItem(hMenu, "VS Hook DIAG FUZZY");
-    logMessage("menuHook: inserido por match parcial contendo 'extensions'.");
-    return;
-  }
 }
 
 static bool loadApi(reaper_plugin_info_t* rec)
@@ -133,7 +163,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
 
   plugin_register_ptr = rec->Register;
   GetResourcePath_ptr = reinterpret_cast<GetResourcePath_t>(rec->GetFunc("GetResourcePath"));
-  AddExtensionsMainMenu_ptr = reinterpret_cast<AddExtensionsMainMenu_t>(rec->GetFunc("AddExtensionsMainMenu"));
+  Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
+  AddRemoveReaScript_ptr = reinterpret_cast<AddRemoveReaScript_t>(rec->GetFunc("AddRemoveReaScript"));
   ShowConsoleMsg_ptr = reinterpret_cast<ShowConsoleMsg_t>(rec->GetFunc("ShowConsoleMsg"));
 
   return plugin_register_ptr != nullptr;
@@ -147,33 +178,23 @@ static void initialize()
     const char* rp = GetResourcePath_ptr();
     g_state.resourcePath = normalizeSlashes(rp ? rp : "");
     if (!g_state.resourcePath.empty()) {
-      g_state.logPath = g_state.resourcePath + "/vshook_diag_log.txt";
+      g_state.logPath = g_state.resourcePath + "/vshook_nomenu_log.txt";
     }
   }
 
-  appendFileLog("========== VS Hook DIAG START ==========");
+  appendFileLog("========== VS Hook NO MENU START ==========");
   logMessage("resourcePath=" + (g_state.resourcePath.empty() ? std::string("(vazio)") : g_state.resourcePath));
-  logMessage("logPath=" + (g_state.logPath.empty() ? std::string("/tmp/vshook_diag_log.txt") : g_state.logPath));
+  logMessage("logPath=" + (g_state.logPath.empty() ? std::string("/tmp/vshook_nomenu_log.txt") : g_state.logPath));
 
   g_state.commandId = plugin_register_ptr("custom_action", (void*)&g_action);
   if (g_state.commandId != 0) {
     logMessage("custom_action registrado: " + std::to_string(g_state.commandId));
+
     plugin_register_ptr("hookcommand2", reinterpret_cast<void*>(&hookCommand2));
     g_state.commandHookRegistered = true;
     logMessage("hookcommand2 registrado.");
   } else {
     logMessage("Falha ao registrar custom_action.");
-  }
-
-  plugin_register_ptr("hookcustommenu", reinterpret_cast<void*>(&menuHook));
-  g_state.menuHookRegistered = true;
-  logMessage("hookcustommenu registrado.");
-
-  if (AddExtensionsMainMenu_ptr) {
-    const bool ok = AddExtensionsMainMenu_ptr();
-    logMessage(std::string("AddExtensionsMainMenu retornou: ") + (ok ? "true" : "false"));
-  } else {
-    logMessage("AddExtensionsMainMenu indisponivel.");
   }
 
   g_state.initialized = true;
@@ -186,11 +207,6 @@ static void shutdown()
 
   if (!plugin_register_ptr) return;
 
-  if (g_state.menuHookRegistered) {
-    plugin_register_ptr("-hookcustommenu", reinterpret_cast<void*>(&menuHook));
-    g_state.menuHookRegistered = false;
-  }
-
   if (g_state.commandHookRegistered) {
     plugin_register_ptr("-hookcommand2", reinterpret_cast<void*>(&hookCommand2));
     g_state.commandHookRegistered = false;
@@ -202,7 +218,7 @@ static void shutdown()
   }
 
   g_state.initialized = false;
-  appendFileLog("========== VS Hook DIAG END ==========");
+  appendFileLog("========== VS Hook NO MENU END ==========");
 }
 
 } // namespace vshook
