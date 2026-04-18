@@ -88,13 +88,7 @@ static void tryInsertMenuItem(HMENU hMenu, const char* label)
 {
   if (!hMenu || g_state.commandId == 0) return;
 
-  MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
-  mi.fMask = MIIM_TYPE | MIIM_ID;
-  mi.fType = MFT_STRING;
-  mi.dwTypeData = (char*)label;
-  mi.wID = g_state.commandId;
-
-  InsertMenuItem(hMenu, GetMenuItemCount(hMenu), true, &mi);
+  AppendMenu(hMenu, MF_STRING, g_state.commandId, label);
 }
 
 static void menuHook(const char* menustr, HMENU hMenu, int flag)
