@@ -3,14 +3,17 @@
 #include <cctype>
 #include <string>
 #include <sstream>
+#include <fstream>
 
 namespace vshook {
 
 using plugin_register_t = int (*)(const char*, void*);
+using GetResourcePath_t = const char* (*)();
 using AddExtensionsMainMenu_t = bool (*)();
 using ShowConsoleMsg_t = void (*)(const char*);
 
 static plugin_register_t plugin_register_ptr = nullptr;
+static GetResourcePath_t GetResourcePath_ptr = nullptr;
 static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static ShowConsoleMsg_t ShowConsoleMsg_ptr = nullptr;
 
@@ -26,15 +29,9 @@ struct State {
   bool initialized = false;
   bool menuHookRegistered = false;
   bool commandHookRegistered = false;
+  std::string resourcePath;
+  std::string logPath;
 } g_state;
-
-static void logMessage(const std::string& text)
-{
-  if (ShowConsoleMsg_ptr) {
-    const std::string line = "[VS Hook DIAG] " + text + "\n";
-    ShowConsoleMsg_ptr(line.c_str());
-  }
-}
 
 static std::string toLowerCopy(std::string s)
 {
@@ -42,6 +39,33 @@ static std::string toLowerCopy(std::string s)
     c = (char)std::tolower((unsigned char)c);
   }
   return s;
+}
+
+static std::string normalizeSlashes(std::string path)
+{
+  for (char& c : path) {
+    if (c == '\\') c = '/';
+  }
+  return path;
+}
+
+static void appendFileLog(const std::string& line)
+{
+  std::string path = g_state.logPath.empty() ? "/tmp/vshook_diag_log.txt" : g_state.logPath;
+  std::ofstream f(path, std::ios::app | std::ios::binary);
+  if (f.good()) {
+    f << line << "\n";
+  }
+}
+
+static void logMessage(const std::string& text)
+{
+  const std::string line = "[VS Hook DIAG] " + text;
+  appendFileLog(line);
+
+  if (ShowConsoleMsg_ptr) {
+    ShowConsoleMsg_ptr((line + "\n").c_str());
+  }
 }
 
 static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, int relmode, HWND hwnd)
@@ -108,6 +132,7 @@ static bool loadApi(reaper_plugin_info_t* rec)
   if (!rec || !rec->Register || !rec->GetFunc) return false;
 
   plugin_register_ptr = rec->Register;
+  GetResourcePath_ptr = reinterpret_cast<GetResourcePath_t>(rec->GetFunc("GetResourcePath"));
   AddExtensionsMainMenu_ptr = reinterpret_cast<AddExtensionsMainMenu_t>(rec->GetFunc("AddExtensionsMainMenu"));
   ShowConsoleMsg_ptr = reinterpret_cast<ShowConsoleMsg_t>(rec->GetFunc("ShowConsoleMsg"));
 
@@ -117,6 +142,18 @@ static bool loadApi(reaper_plugin_info_t* rec)
 static void initialize()
 {
   if (g_state.initialized) return;
+
+  if (GetResourcePath_ptr) {
+    const char* rp = GetResourcePath_ptr();
+    g_state.resourcePath = normalizeSlashes(rp ? rp : "");
+    if (!g_state.resourcePath.empty()) {
+      g_state.logPath = g_state.resourcePath + "/vshook_diag_log.txt";
+    }
+  }
+
+  appendFileLog("========== VS Hook DIAG START ==========");
+  logMessage("resourcePath=" + (g_state.resourcePath.empty() ? std::string("(vazio)") : g_state.resourcePath));
+  logMessage("logPath=" + (g_state.logPath.empty() ? std::string("/tmp/vshook_diag_log.txt") : g_state.logPath));
 
   g_state.commandId = plugin_register_ptr("custom_action", (void*)&g_action);
   if (g_state.commandId != 0) {
@@ -145,6 +182,8 @@ static void initialize()
 
 static void shutdown()
 {
+  logMessage("shutdown iniciado.");
+
   if (!plugin_register_ptr) return;
 
   if (g_state.menuHookRegistered) {
@@ -163,6 +202,7 @@ static void shutdown()
   }
 
   g_state.initialized = false;
+  appendFileLog("========== VS Hook DIAG END ==========");
 }
 
 } // namespace vshook
