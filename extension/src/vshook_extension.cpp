@@ -20,6 +20,13 @@ static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
 static ShowConsoleMsg_t ShowConsoleMsg_ptr = nullptr;
 
+static custom_action_register_t g_action = {
+  0,
+  "VSHOOKRUN",
+  "VS Hook",
+  nullptr
+};
+
 struct State {
   std::string resourcePath;
   std::string scriptPath;
@@ -142,16 +149,24 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
 
 static void menuHook(const char* menustr, HMENU hMenu, int flag)
 {
-  if (flag != 0 || !menustr || !hMenu) return;
-  if (g_state.commandId == 0) return;
+  if (!menustr || !hMenu) return;
 
-  if (std::strcmp(menustr, "Main extensions") == 0) {
-    MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
-    mi.fMask = MIIM_TYPE | MIIM_ID;
-    mi.fType = MFT_STRING;
-    mi.dwTypeData = (char*)"VS Hook";
-    mi.wID = g_state.commandId;
-    InsertMenuItem(hMenu, GetMenuItemCount(hMenu), true, &mi);
+  if (flag == 0) {
+    if (std::strcmp(menustr, "Main extensions") == 0) {
+      if (g_state.commandId == 0) {
+        logMessage("menuHook: commandId == 0, nao foi possivel inserir o menu.");
+        return;
+      }
+
+      MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
+      mi.fMask = MIIM_TYPE | MIIM_ID;
+      mi.fType = MFT_STRING;
+      mi.dwTypeData = (char*)"VS Hook";
+      mi.wID = g_state.commandId;
+
+      InsertMenuItem(hMenu, GetMenuItemCount(hMenu), true, &mi);
+      logMessage("menuHook: item VS Hook inserido em Main extensions.");
+    }
   }
 }
 
@@ -181,29 +196,27 @@ static void initialize()
     logMessage("GetResourcePath indisponivel.");
   }
 
-  if (AddExtensionsMainMenu_ptr) {
-    AddExtensionsMainMenu_ptr();
-    logMessage("AddExtensionsMainMenu OK.");
-  } else {
-    logMessage("AddExtensionsMainMenu indisponivel.");
-  }
-
-  g_state.commandId = plugin_register_ptr(
-    "command_id",
-    reinterpret_cast<void*>(const_cast<char*>("_VSHOOK_RUN"))
-  );
-
+  g_state.commandId = plugin_register_ptr("custom_action", (void*)&g_action);
   if (g_state.commandId != 0) {
+    logMessage("custom_action registrado: " + std::to_string(g_state.commandId));
+
     plugin_register_ptr("hookcommand2", reinterpret_cast<void*>(&hookCommand2));
     g_state.commandHookRegistered = true;
-    logMessage("command_id registrado: " + std::to_string(g_state.commandId));
+    logMessage("hookcommand2 registrado.");
   } else {
-    logMessage("Falha ao registrar command_id.");
+    logMessage("Falha ao registrar custom_action.");
   }
 
   plugin_register_ptr("hookcustommenu", reinterpret_cast<void*>(&menuHook));
   g_state.menuHookRegistered = true;
   logMessage("hookcustommenu registrado.");
+
+  if (AddExtensionsMainMenu_ptr) {
+    const bool ok = AddExtensionsMainMenu_ptr();
+    logMessage(std::string("AddExtensionsMainMenu: ") + (ok ? "OK" : "falhou"));
+  } else {
+    logMessage("AddExtensionsMainMenu indisponivel.");
+  }
 
   g_state.initialized = true;
 }
@@ -220,6 +233,11 @@ static void shutdown()
   if (g_state.commandHookRegistered) {
     plugin_register_ptr("-hookcommand2", reinterpret_cast<void*>(&hookCommand2));
     g_state.commandHookRegistered = false;
+  }
+
+  if (g_state.commandId != 0) {
+    plugin_register_ptr("-custom_action", (void*)&g_action);
+    g_state.commandId = 0;
   }
 
   g_state.initialized = false;
