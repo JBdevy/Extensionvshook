@@ -1,4 +1,4 @@
-name: Build VS Hook APP loader
+name: Build VS Hook Loader
 
 on:
   workflow_dispatch:
@@ -39,9 +39,9 @@ jobs:
           path: |
             extension/build/**/reaper_vshook.dll
 
-  build-macos-intel:
-    name: macOS Intel
-    runs-on: macos-15-intel
+  build-macos-universal:
+    name: macOS Universal
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
@@ -64,7 +64,7 @@ jobs:
         run: >
           cmake -S extension -B extension/build
           -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_OSX_ARCHITECTURES="x86_64"
+          -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
 
       - name: Build
         shell: bash
@@ -83,7 +83,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vshook-loader-macos-intel
+          name: vshook-loader-macos-universal
           if-no-files-found: error
           path: |
             extension/build/**/reaper_vshook.dylib

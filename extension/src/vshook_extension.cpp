@@ -1,33 +1,126 @@
 #include "reaper_plugin.h"
 #include <cstring>
-
-#if defined(__APPLE__)
-  #define VSHOOK_EXPORT __attribute__((visibility("default")))
-#else
-  #define VSHOOK_EXPORT
-#endif
+#include <fstream>
+#include <string>
+#include <vector>
 
 namespace vshook {
 
 using plugin_register_t = int (*)(const char*, void*);
+using GetResourcePath_t = const char* (*)();
+using Main_OnCommand_t = void (*)(int, int);
 using AddExtensionsMainMenu_t = bool (*)();
+using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
 using ShowConsoleMsg_t = void (*)(const char*);
 
 static plugin_register_t plugin_register_ptr = nullptr;
+static GetResourcePath_t GetResourcePath_ptr = nullptr;
+static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
 static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
+static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
 static ShowConsoleMsg_t ShowConsoleMsg_ptr = nullptr;
 
 struct State {
+  std::string resourcePath;
+  std::string scriptPath;
+  int scriptCommandId = 0;
   int commandId = 0;
   bool initialized = false;
   bool menuHookRegistered = false;
   bool commandHookRegistered = false;
 } g_state;
 
-static void logMessage(const char* text)
+static void logMessage(const std::string& text)
 {
-  if(ShowConsoleMsg_ptr) {
-    ShowConsoleMsg_ptr(text);
+  if (ShowConsoleMsg_ptr) {
+    const std::string line = "[VS Hook] " + text + "\n";
+    ShowConsoleMsg_ptr(line.c_str());
+  }
+}
+
+static bool fileExists(const std::string& path)
+{
+  std::ifstream f(path, std::ios::binary);
+  return f.good();
+}
+
+static std::string normalizeSlashes(std::string path)
+{
+  for (char& c : path) {
+    if (c == '\\') c = '/';
+  }
+  return path;
+}
+
+static std::vector<std::string> buildScriptCandidates()
+{
+  const char* resource = GetResourcePath_ptr ? GetResourcePath_ptr() : "";
+  const std::string base = normalizeSlashes(resource ? resource : "");
+
+  return {
+    base + "/Scripts/VS Hook APP/VS Hook.lua",
+    base + "/Scripts/VS Hook/VS Hook.lua",
+    base + "/Scripts/VS Hook Server/VS Hook.lua"
+  };
+}
+
+static bool resolveScriptPath()
+{
+  const auto candidates = buildScriptCandidates();
+
+  for (const auto& candidate : candidates) {
+    if (fileExists(candidate)) {
+      g_state.scriptPath = candidate;
+      logMessage("Script encontrado em: " + candidate);
+      return true;
+    }
+  }
+
+  g_state.scriptPath.clear();
+  logMessage("VS Hook.lua nao foi encontrado.");
+  for (const auto& candidate : candidates) {
+    logMessage("Tentado: " + candidate);
+  }
+  return false;
+}
+
+static bool ensureScriptRegistered()
+{
+  if (g_state.scriptCommandId != 0) {
+    return true;
+  }
+
+  if (!AddRemoveReaScript_ptr) {
+    logMessage("API AddRemoveReaScript indisponivel.");
+    return false;
+  }
+
+  if (!resolveScriptPath()) {
+    return false;
+  }
+
+  const int commandId = AddRemoveReaScript_ptr(true, 0, g_state.scriptPath.c_str(), true);
+  if (commandId == 0) {
+    logMessage("Falha ao registrar o script: " + g_state.scriptPath);
+    return false;
+  }
+
+  g_state.scriptCommandId = commandId;
+  logMessage("Script registrado com command ID: " + std::to_string(commandId));
+  return true;
+}
+
+static void runScript()
+{
+  if (!ensureScriptRegistered()) {
+    return;
+  }
+
+  if (Main_OnCommand_ptr && g_state.scriptCommandId != 0) {
+    logMessage("Executando VS Hook.lua");
+    Main_OnCommand_ptr(g_state.scriptCommandId, 0);
+  } else {
+    logMessage("Main_OnCommand indisponivel.");
   }
 }
 
@@ -39,8 +132,8 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   (void)relmode;
   (void)hwnd;
 
-  if(command == g_state.commandId) {
-    logMessage("[VS Hook Test] menu clicado com sucesso.\n");
+  if (command == g_state.commandId) {
+    runScript();
     return true;
   }
 
@@ -49,26 +142,28 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
 
 static void menuHook(const char* menustr, HMENU hMenu, int flag)
 {
-  if(flag != 0 || !menustr || !hMenu) return;
-  if(g_state.commandId == 0) return;
+  if (flag != 0 || !menustr || !hMenu) return;
+  if (g_state.commandId == 0) return;
 
-  if(std::strcmp(menustr, "Main extensions") == 0) {
-    InsertMenu(
-      hMenu,
-      GetMenuItemCount(hMenu),
-      MF_BYPOSITION | MF_STRING,
-      g_state.commandId,
-      "VS Hook Test"
-    );
+  if (std::strcmp(menustr, "Main extensions") == 0) {
+    MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
+    mi.fMask = MIIM_TYPE | MIIM_ID;
+    mi.fType = MFT_STRING;
+    mi.dwTypeData = (char*)"VS Hook";
+    mi.wID = g_state.commandId;
+    InsertMenuItem(hMenu, GetMenuItemCount(hMenu), true, &mi);
   }
 }
 
 static bool loadApi(reaper_plugin_info_t* rec)
 {
-  if(!rec || !rec->Register || !rec->GetFunc) return false;
+  if (!rec || !rec->Register || !rec->GetFunc) return false;
 
   plugin_register_ptr = rec->Register;
+  GetResourcePath_ptr = reinterpret_cast<GetResourcePath_t>(rec->GetFunc("GetResourcePath"));
+  Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
   AddExtensionsMainMenu_ptr = reinterpret_cast<AddExtensionsMainMenu_t>(rec->GetFunc("AddExtensionsMainMenu"));
+  AddRemoveReaScript_ptr = reinterpret_cast<AddRemoveReaScript_t>(rec->GetFunc("AddRemoveReaScript"));
   ShowConsoleMsg_ptr = reinterpret_cast<ShowConsoleMsg_t>(rec->GetFunc("ShowConsoleMsg"));
 
   return plugin_register_ptr != nullptr;
@@ -76,45 +171,53 @@ static bool loadApi(reaper_plugin_info_t* rec)
 
 static void initialize()
 {
-  if(g_state.initialized) return;
+  if (g_state.initialized) return;
 
-  if(AddExtensionsMainMenu_ptr) {
-    AddExtensionsMainMenu_ptr();
-    logMessage("[VS Hook Test] AddExtensionsMainMenu OK.\n");
+  if (GetResourcePath_ptr) {
+    const char* resource = GetResourcePath_ptr();
+    g_state.resourcePath = resource ? resource : "";
+    logMessage("Resource path: " + g_state.resourcePath);
   } else {
-    logMessage("[VS Hook Test] AddExtensionsMainMenu indisponivel.\n");
+    logMessage("GetResourcePath indisponivel.");
+  }
+
+  if (AddExtensionsMainMenu_ptr) {
+    AddExtensionsMainMenu_ptr();
+    logMessage("AddExtensionsMainMenu OK.");
+  } else {
+    logMessage("AddExtensionsMainMenu indisponivel.");
   }
 
   g_state.commandId = plugin_register_ptr(
     "command_id",
-    reinterpret_cast<void*>(const_cast<char*>("_VSHOOK_TEST_COMMAND"))
+    reinterpret_cast<void*>(const_cast<char*>("_VSHOOK_RUN"))
   );
 
-  if(g_state.commandId != 0) {
+  if (g_state.commandId != 0) {
     plugin_register_ptr("hookcommand2", reinterpret_cast<void*>(&hookCommand2));
     g_state.commandHookRegistered = true;
-    logMessage("[VS Hook Test] command_id registrado.\n");
+    logMessage("command_id registrado: " + std::to_string(g_state.commandId));
   } else {
-    logMessage("[VS Hook Test] falha ao registrar command_id.\n");
+    logMessage("Falha ao registrar command_id.");
   }
 
   plugin_register_ptr("hookcustommenu", reinterpret_cast<void*>(&menuHook));
   g_state.menuHookRegistered = true;
-  logMessage("[VS Hook Test] hookcustommenu registrado.\n");
+  logMessage("hookcustommenu registrado.");
 
   g_state.initialized = true;
 }
 
 static void shutdown()
 {
-  if(!g_state.initialized || !plugin_register_ptr) return;
+  if (!plugin_register_ptr) return;
 
-  if(g_state.menuHookRegistered) {
+  if (g_state.menuHookRegistered) {
     plugin_register_ptr("-hookcustommenu", reinterpret_cast<void*>(&menuHook));
     g_state.menuHookRegistered = false;
   }
 
-  if(g_state.commandHookRegistered) {
+  if (g_state.commandHookRegistered) {
     plugin_register_ptr("-hookcommand2", reinterpret_cast<void*>(&hookCommand2));
     g_state.commandHookRegistered = false;
   }
@@ -124,19 +227,19 @@ static void shutdown()
 
 } // namespace vshook
 
-extern "C" VSHOOK_EXPORT REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
+extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   REAPER_PLUGIN_HINSTANCE instance,
   reaper_plugin_info_t* rec)
 {
   (void)instance;
 
-  if(!rec) {
+  if (!rec) {
     vshook::shutdown();
     return 0;
   }
 
-  if(rec->caller_version != REAPER_PLUGIN_VERSION) return 0;
-  if(!vshook::loadApi(rec)) return 0;
+  if (rec->caller_version != REAPER_PLUGIN_VERSION) return 0;
+  if (!vshook::loadApi(rec)) return 0;
 
   vshook::initialize();
   return 1;
