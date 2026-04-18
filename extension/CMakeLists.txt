@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(reaper_vshook_loader LANGUAGES CXX)
+project(reaper_vshook_loader LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,6 +17,8 @@ add_library(reaper_vshook SHARED
 
 target_include_directories(reaper_vshook PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/sdk
+  ${CMAKE_CURRENT_SOURCE_DIR}/WDL
+  ${CMAKE_CURRENT_SOURCE_DIR}/WDL/swell
 )
 
 target_compile_definitions(reaper_vshook PRIVATE
@@ -33,6 +35,15 @@ if(APPLE)
   set_target_properties(reaper_vshook PROPERTIES
     PREFIX ""
     SUFFIX ".dylib"
+  )
+
+  target_sources(reaper_vshook PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/WDL/swell/swell-modstub.mm
+  )
+
+  target_link_libraries(reaper_vshook PRIVATE
+    "-framework AppKit"
+    "-framework CoreFoundation"
   )
 
   target_link_options(reaper_vshook PRIVATE
