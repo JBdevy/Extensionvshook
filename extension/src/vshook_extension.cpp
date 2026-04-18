@@ -1,5 +1,6 @@
 #define SWELL_PROVIDED_BY_APP
 #include "reaper_plugin.h"
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -23,7 +24,7 @@ static ShowConsoleMsg_t ShowConsoleMsg_ptr = nullptr;
 static custom_action_register_t g_action = {
   0,
   "VSHOOKRUN",
-  "VS Hook",
+  "VS Hook APP",
   nullptr
 };
 
@@ -149,12 +150,19 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
 
 static void menuHook(const char* menustr, HMENU hMenu, int flag)
 {
-  (void)hMenu;
+  if (!menustr || !hMenu) return;
+  if (flag != 0) return;
+  if (g_state.commandId == 0) return;
 
-  if (!menustr) return;
+  if (std::strcmp(menustr, "Main extensions") == 0) {
+    MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
+    mi.fMask = MIIM_TYPE | MIIM_ID;
+    mi.fType = MFT_STRING;
+    mi.dwTypeData = (char*)"VS Hook APP";
+    mi.wID = g_state.commandId;
 
-  if (flag == 0 && std::string(menustr) == "Main extensions") {
-    logMessage("hookcustommenu recebeu Main extensions.");
+    InsertMenuItem(hMenu, 0, true, &mi);
+    logMessage("VS Hook APP inserido no menu Extensions.");
   }
 }
 
