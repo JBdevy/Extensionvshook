@@ -5,6 +5,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+  #include <windows.h>
+#endif
+
 namespace vshook {
 
 using plugin_register_t = int (*)(const char*, void*);
@@ -35,10 +39,47 @@ struct State {
   bool menuHookRegistered = false;
 } g_state;
 
+#ifdef _WIN32
+static std::wstring utf8ToWide(const std::string& text)
+{
+  if (text.empty()) return std::wstring();
+
+  int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                 text.c_str(), -1, nullptr, 0);
+
+  // Fallback: if the incoming text is not valid UTF-8, use the current
+  // Windows codepage instead of failing. This keeps the loader tolerant of
+  // paths returned by older Windows/REAPER setups.
+  UINT codepage = CP_UTF8;
+  DWORD flags = MB_ERR_INVALID_CHARS;
+  if (size <= 0) {
+    codepage = CP_ACP;
+    flags = 0;
+    size = MultiByteToWideChar(codepage, flags, text.c_str(), -1, nullptr, 0);
+  }
+
+  if (size <= 0) return std::wstring();
+
+  std::wstring wide(static_cast<size_t>(size), L'\0');
+  MultiByteToWideChar(codepage, flags, text.c_str(), -1, wide.data(), size);
+
+  if (!wide.empty() && wide.back() == L'\0') wide.pop_back();
+  return wide;
+}
+#endif
+
 static bool fileExists(const std::string& path)
 {
+#ifdef _WIN32
+  const std::wstring widePath = utf8ToWide(path);
+  if (widePath.empty()) return false;
+
+  const DWORD attrs = GetFileAttributesW(widePath.c_str());
+  return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
   std::ifstream f(path, std::ios::binary);
   return f.good();
+#endif
 }
 
 static std::string normalizeSlashes(std::string path)

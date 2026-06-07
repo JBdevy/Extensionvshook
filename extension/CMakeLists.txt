@@ -1,11 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(reaper_vshook_loader LANGUAGES CXX OBJCXX)
+project(reaper_vshook_loader LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
+
+if(APPLE)
+  enable_language(OBJCXX)
+endif()
 
 if(APPLE AND NOT DEFINED CMAKE_OSX_ARCHITECTURES)
   set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS universal build" FORCE)
