@@ -92,14 +92,20 @@ static std::string normalizeSlashes(std::string path)
 
 static std::vector<std::string> buildScriptCandidates()
 {
+#ifdef _WIN32
+  // Windows: usa somente o caminho fixo do instalador, fora da pasta do usuario.
+  // Isso evita falhas quando o perfil do Windows tem acentos, ex: Produção.
+  return {
+    "C:/Program Files/VS Hook APP/VS Hook.lua"
+  };
+#else
   const char* resource = GetResourcePath_ptr ? GetResourcePath_ptr() : "";
   const std::string base = normalizeSlashes(resource ? resource : "");
 
   return {
-    base + "/Scripts/VS Hook APP/VS Hook.lua",
-    base + "/Scripts/VS Hook/VS Hook.lua",
-    base + "/Scripts/VS Hook Server/VS Hook.lua"
+    base + "/Scripts/VS Hook APP/VS Hook.lua"
   };
+#endif
 }
 
 static bool resolveScriptPath()
