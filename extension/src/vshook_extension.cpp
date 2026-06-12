@@ -93,10 +93,10 @@ static std::string normalizeSlashes(std::string path)
 static std::vector<std::string> buildScriptCandidates()
 {
 #ifdef _WIN32
-  // Windows: usa somente o caminho fixo do instalador, fora da pasta do usuario.
+  // Windows: usa o caminho publico do instalador, sem depender do perfil do usuario.
   // Isso evita falhas quando o perfil do Windows tem acentos, ex: Produção.
   return {
-    "C:/Program Files/VS Hook APP/VS Hook.lua"
+    "C:/Users/Public/VS Hook APP/VS Hook.lua"
   };
 #else
   const char* resource = GetResourcePath_ptr ? GetResourcePath_ptr() : "";
@@ -257,7 +257,8 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
     return 0;
   }
 
-  if (rec->caller_version != REAPER_PLUGIN_VERSION) return 0;
+  // Nao bloqueia por caller_version: alguns REAPERs reportam versao diferente
+  // e isso fazia a extensao retornar 0 silenciosamente, sem criar o menu Extensions.
   if (!vshook::loadApi(rec)) return 0;
 
   vshook::initialize();
