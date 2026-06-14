@@ -23,19 +23,32 @@ static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
 static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
 
-static custom_action_register_t g_action = {
-  0,
-  "VSHOOKRUN",
-  "VS Hook APP",
-  nullptr
-};
-
-struct State {
+struct ScriptEntry {
+  custom_action_register_t action;
+  const char* displayName;
+  const char* fileName;
   std::string scriptPath;
   int scriptCommandId = 0;
   int commandId = 0;
+};
+
+static ScriptEntry g_scripts[] = {
+  {
+    { 0, "VSHOOKRUN", "VS Hook APP", nullptr },
+    "VS Hook APP",
+    "VS Hook.lua"
+  },
+  {
+    { 0, "VSHOOKLYRICS", "Hook Lyrics", nullptr },
+    "Hook Lyrics",
+    "Hook lyrics.lua"
+  }
+};
+
+struct State {
   bool initialized = false;
   bool commandHookRegistered = false;
+  bool commandHook2Registered = false;
   bool menuHookRegistered = false;
 } g_state;
 
@@ -90,42 +103,42 @@ static std::string normalizeSlashes(std::string path)
   return path;
 }
 
-static std::vector<std::string> buildScriptCandidates()
+static std::vector<std::string> buildScriptCandidates(const char* fileName)
 {
 #ifdef _WIN32
   // Windows: usa o caminho publico do instalador, sem depender do perfil do usuario.
   // Isso evita falhas quando o perfil do Windows tem acentos, ex: Produção.
   return {
-    "C:/Users/Public/VS Hook APP/VS Hook.lua"
+    std::string("C:/Users/Public/VS Hook APP/") + fileName
   };
 #else
   const char* resource = GetResourcePath_ptr ? GetResourcePath_ptr() : "";
   const std::string base = normalizeSlashes(resource ? resource : "");
 
   return {
-    base + "/Scripts/VS Hook APP/VS Hook.lua"
+    base + "/Scripts/VS Hook APP/" + fileName
   };
 #endif
 }
 
-static bool resolveScriptPath()
+static bool resolveScriptPath(ScriptEntry& script)
 {
-  const auto candidates = buildScriptCandidates();
+  const auto candidates = buildScriptCandidates(script.fileName);
 
   for (const auto& candidate : candidates) {
     if (fileExists(candidate)) {
-      g_state.scriptPath = candidate;
+      script.scriptPath = candidate;
       return true;
     }
   }
 
-  g_state.scriptPath.clear();
+  script.scriptPath.clear();
   return false;
 }
 
-static bool ensureScriptRegistered()
+static bool ensureScriptRegistered(ScriptEntry& script)
 {
-  if (g_state.scriptCommandId != 0) {
+  if (script.scriptCommandId != 0) {
     return true;
   }
 
@@ -133,30 +146,55 @@ static bool ensureScriptRegistered()
     return false;
   }
 
-  if (!resolveScriptPath()) {
+  if (!resolveScriptPath(script)) {
     return false;
   }
 
-  const int commandId = AddRemoveReaScript_ptr(true, 0, g_state.scriptPath.c_str(), true);
+  const int commandId = AddRemoveReaScript_ptr(true, 0, script.scriptPath.c_str(), true);
   if (commandId == 0) {
     return false;
   }
 
-  g_state.scriptCommandId = commandId;
+  script.scriptCommandId = commandId;
   return true;
 }
 
-static void runScript()
+static void runScript(ScriptEntry& script)
 {
-  if (!ensureScriptRegistered()) {
+  if (!ensureScriptRegistered(script)) {
     return;
   }
 
-  if (Main_OnCommand_ptr && g_state.scriptCommandId != 0) {
-    Main_OnCommand_ptr(g_state.scriptCommandId, 0);
+  if (Main_OnCommand_ptr && script.scriptCommandId != 0) {
+    Main_OnCommand_ptr(script.scriptCommandId, 0);
   }
 }
 
+static ScriptEntry* findScriptByCommand(int command)
+{
+  for (ScriptEntry& script : g_scripts) {
+    if (script.commandId != 0 && command == script.commandId) {
+      return &script;
+    }
+  }
+  return nullptr;
+}
+
+// Necessario para cliques vindos do menu Extensions e tambem chamadas normais da action list.
+static bool hookCommand(int command, int flag)
+{
+  (void)flag;
+
+  ScriptEntry* script = findScriptByCommand(command);
+  if (script) {
+    runScript(*script);
+    return true;
+  }
+
+  return false;
+}
+
+// Necessario para atalhos, MIDI e alguns disparos internos do REAPER.
 static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, int relmode, HWND hwnd)
 {
   (void)sec;
@@ -165,8 +203,9 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   (void)relmode;
   (void)hwnd;
 
-  if (command == g_state.commandId) {
-    runScript();
+  ScriptEntry* script = findScriptByCommand(command);
+  if (script) {
+    runScript(*script);
     return true;
   }
 
@@ -177,15 +216,19 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 {
   if (!menustr || !hMenu) return;
   if (flag != 0) return;
-  if (g_state.commandId == 0) return;
 
   if (std::strcmp(menustr, "Main extensions") == 0) {
-    MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
-    mi.fMask = MIIM_TYPE | MIIM_ID;
-    mi.fType = MFT_STRING;
-    mi.dwTypeData = (char*)"VS Hook APP";
-    mi.wID = g_state.commandId;
-    InsertMenuItem(hMenu, 0, true, &mi);
+    // Insere de tras para frente porque cada item entra na posicao 0.
+    for (int i = static_cast<int>(sizeof(g_scripts) / sizeof(g_scripts[0])) - 1; i >= 0; --i) {
+      if (g_scripts[i].commandId == 0) continue;
+
+      MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
+      mi.fMask = MIIM_TYPE | MIIM_ID;
+      mi.fType = MFT_STRING;
+      mi.dwTypeData = (char*)g_scripts[i].displayName;
+      mi.wID = g_scripts[i].commandId;
+      InsertMenuItem(hMenu, 0, true, &mi);
+    }
   }
 }
 
@@ -206,10 +249,20 @@ static void initialize()
 {
   if (g_state.initialized) return;
 
-  g_state.commandId = plugin_register_ptr("custom_action", (void*)&g_action);
-  if (g_state.commandId != 0) {
-    plugin_register_ptr("hookcommand2", reinterpret_cast<void*>(&hookCommand2));
+  bool hasRegisteredAction = false;
+  for (ScriptEntry& script : g_scripts) {
+    script.commandId = plugin_register_ptr("custom_action", (void*)&script.action);
+    if (script.commandId != 0) {
+      hasRegisteredAction = true;
+    }
+  }
+
+  if (hasRegisteredAction) {
+    plugin_register_ptr("hookcommand", reinterpret_cast<void*>(&hookCommand));
     g_state.commandHookRegistered = true;
+
+    plugin_register_ptr("hookcommand2", reinterpret_cast<void*>(&hookCommand2));
+    g_state.commandHook2Registered = true;
   }
 
   plugin_register_ptr("hookcustommenu", reinterpret_cast<void*>(&menuHook));
@@ -231,14 +284,21 @@ static void shutdown()
     g_state.menuHookRegistered = false;
   }
 
-  if (g_state.commandHookRegistered) {
+  if (g_state.commandHook2Registered) {
     plugin_register_ptr("-hookcommand2", reinterpret_cast<void*>(&hookCommand2));
+    g_state.commandHook2Registered = false;
+  }
+
+  if (g_state.commandHookRegistered) {
+    plugin_register_ptr("-hookcommand", reinterpret_cast<void*>(&hookCommand));
     g_state.commandHookRegistered = false;
   }
 
-  if (g_state.commandId != 0) {
-    plugin_register_ptr("-custom_action", (void*)&g_action);
-    g_state.commandId = 0;
+  for (ScriptEntry& script : g_scripts) {
+    if (script.commandId != 0) {
+      plugin_register_ptr("-custom_action", (void*)&script.action);
+      script.commandId = 0;
+    }
   }
 
   g_state.initialized = false;
