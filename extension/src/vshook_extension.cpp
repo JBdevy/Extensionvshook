@@ -1,7 +1,9 @@
 #define SWELL_PROVIDED_BY_APP
 #include "reaper_plugin.h"
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -12,12 +14,16 @@
 namespace vshook {
 
 using plugin_register_t = int (*)(const char*, void*);
+using plugin_getapi_t = void* (*)(const char*);
+using ShowMessageBox_t = int (*)(const char*, const char*, int);
 using GetResourcePath_t = const char* (*)();
 using Main_OnCommand_t = void (*)(int, int);
 using AddExtensionsMainMenu_t = bool (*)();
 using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
 
 static plugin_register_t plugin_register_ptr = nullptr;
+static plugin_getapi_t plugin_getapi_ptr = nullptr;
+static ShowMessageBox_t ShowMessageBox_ptr = nullptr;
 static GetResourcePath_t GetResourcePath_ptr = nullptr;
 static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
 static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
@@ -81,6 +87,21 @@ static std::wstring utf8ToWide(const std::string& text)
 }
 #endif
 
+static std::string joinPath(const std::string& base, const std::string& child)
+{
+  if (base.empty()) return child;
+  const char last = base.back();
+  if (last == '/' || last == '\\') return base + child;
+  return base + "/" + child;
+}
+
+static void showDiagnostic(const std::string& text)
+{
+  if (ShowMessageBox_ptr) {
+    ShowMessageBox_ptr(text.c_str(), "VS Hook Loader", 0);
+  }
+}
+
 static bool fileExists(const std::string& path)
 {
 #ifdef _WIN32
@@ -105,20 +126,26 @@ static std::string normalizeSlashes(std::string path)
 
 static std::vector<std::string> buildScriptCandidates(const char* fileName)
 {
+  std::vector<std::string> candidates;
+
 #ifdef _WIN32
-  // Windows: usa o caminho publico do instalador, sem depender do perfil do usuario.
-  // Isso evita falhas quando o perfil do Windows tem acentos, ex: Produção.
-  return {
-    std::string("C:/Users/Public/VS Hook APP/") + fileName
-  };
+  candidates.push_back(std::string("C:/Users/Public/VS Hook APP/") + fileName);
+
+  char* publicDir = nullptr;
+  size_t publicLen = 0;
+  if (_dupenv_s(&publicDir, &publicLen, "PUBLIC") == 0 && publicDir && publicDir[0]) {
+    candidates.push_back(joinPath(normalizeSlashes(publicDir), std::string("VS Hook APP/") + fileName));
+  }
+  if (publicDir) free(publicDir);
 #else
   const char* resource = GetResourcePath_ptr ? GetResourcePath_ptr() : "";
   const std::string base = normalizeSlashes(resource ? resource : "");
-
-  return {
-    base + "/Scripts/VS Hook APP/" + fileName
-  };
+  candidates.push_back(base + "/Scripts/VS Hook APP/" + fileName);
+  candidates.push_back(base + "/Scripts/" + fileName);
+  candidates.push_back(base + "/VS Hook APP/" + fileName);
 #endif
+
+  return candidates;
 }
 
 static bool resolveScriptPath(ScriptEntry& script)
@@ -143,15 +170,23 @@ static bool ensureScriptRegistered(ScriptEntry& script)
   }
 
   if (!AddRemoveReaScript_ptr) {
+    showDiagnostic("REAPER nao entregou a API AddRemoveReaScript para o VS Hook Loader.");
     return false;
   }
 
   if (!resolveScriptPath(script)) {
+    std::ostringstream oss;
+    oss << "Nao encontrei o script: " << script.fileName << "\n\nCaminhos verificados:";
+    for (const auto& candidate : buildScriptCandidates(script.fileName)) {
+      oss << "\n- " << candidate;
+    }
+    showDiagnostic(oss.str());
     return false;
   }
 
   const int commandId = AddRemoveReaScript_ptr(true, 0, script.scriptPath.c_str(), true);
   if (commandId == 0) {
+    showDiagnostic(std::string("REAPER nao conseguiu registrar o script:\n") + script.scriptPath);
     return false;
   }
 
@@ -234,15 +269,29 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 
 static bool loadApi(reaper_plugin_info_t* rec)
 {
-  if (!rec || !rec->Register || !rec->GetFunc) return false;
+  if (!rec || !rec->GetFunc) return false;
 
-  plugin_register_ptr = rec->Register;
+  // Mesmo padrao da SWS: pega plugin_register via GetFunc primeiro.
+  // Em algumas combinacoes de REAPER/SDK, depender somente de rec->Register
+  // pode fazer a extensao retornar 0 e nem aparecer no menu Extensions.
+  plugin_register_ptr = reinterpret_cast<plugin_register_t>(rec->GetFunc("plugin_register"));
+  if (!plugin_register_ptr) {
+    plugin_register_ptr = rec->Register;
+  }
+
+  plugin_getapi_ptr = reinterpret_cast<plugin_getapi_t>(rec->GetFunc("plugin_getapi"));
+  ShowMessageBox_ptr = reinterpret_cast<ShowMessageBox_t>(rec->GetFunc("ShowMessageBox"));
   GetResourcePath_ptr = reinterpret_cast<GetResourcePath_t>(rec->GetFunc("GetResourcePath"));
   Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
   AddExtensionsMainMenu_ptr = reinterpret_cast<AddExtensionsMainMenu_t>(rec->GetFunc("AddExtensionsMainMenu"));
   AddRemoveReaScript_ptr = reinterpret_cast<AddRemoveReaScript_t>(rec->GetFunc("AddRemoveReaScript"));
 
-  return plugin_register_ptr != nullptr;
+  if (!plugin_register_ptr) {
+    showDiagnostic("VS Hook Loader nao carregou: plugin_register indisponivel.");
+    return false;
+  }
+
+  return true;
 }
 
 static void initialize()
@@ -258,15 +307,20 @@ static void initialize()
   }
 
   if (hasRegisteredAction) {
-    plugin_register_ptr("hookcommand", reinterpret_cast<void*>(&hookCommand));
-    g_state.commandHookRegistered = true;
+    if (plugin_register_ptr("hookcommand", reinterpret_cast<void*>(&hookCommand))) {
+      g_state.commandHookRegistered = true;
+    }
 
-    plugin_register_ptr("hookcommand2", reinterpret_cast<void*>(&hookCommand2));
-    g_state.commandHook2Registered = true;
+    if (plugin_register_ptr("hookcommand2", reinterpret_cast<void*>(&hookCommand2))) {
+      g_state.commandHook2Registered = true;
+    }
+  } else {
+    showDiagnostic("VS Hook Loader carregou, mas nao conseguiu registrar as actions no REAPER.");
   }
 
-  plugin_register_ptr("hookcustommenu", reinterpret_cast<void*>(&menuHook));
-  g_state.menuHookRegistered = true;
+  if (plugin_register_ptr("hookcustommenu", reinterpret_cast<void*>(&menuHook))) {
+    g_state.menuHookRegistered = true;
+  }
 
   if (AddExtensionsMainMenu_ptr) {
     AddExtensionsMainMenu_ptr();
