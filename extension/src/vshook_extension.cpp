@@ -20,6 +20,8 @@ using GetResourcePath_t = const char* (*)();
 using Main_OnCommand_t = void (*)(int, int);
 using AddExtensionsMainMenu_t = bool (*)();
 using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
+using GetExtState_t = const char* (*)(const char*, const char*);
+using SetExtState_t = void (*)(const char*, const char*, const char*, bool);
 
 static plugin_register_t plugin_register_ptr = nullptr;
 static plugin_getapi_t plugin_getapi_ptr = nullptr;
@@ -28,6 +30,11 @@ static GetResourcePath_t GetResourcePath_ptr = nullptr;
 static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
 static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
+static GetExtState_t GetExtState_ptr = nullptr;
+static SetExtState_t SetExtState_ptr = nullptr;
+
+static const char* kExtStateSection = "VS_HOOK_LOADER";
+static const char* kAutoOpenKey = "AUTO_OPEN_VSHOOK";
 
 struct ScriptEntry {
   custom_action_register_t action;
@@ -56,7 +63,12 @@ struct State {
   bool commandHookRegistered = false;
   bool commandHook2Registered = false;
   bool menuHookRegistered = false;
+  bool timerRegistered = false;
+  int startupTimerTicks = 0;
 } g_state;
+
+static custom_action_register_t g_toggleAutoOpenAction = { 0, "VSHOOKAUTOOPEN", "Abrir VS Hook junto com o REAPER", nullptr };
+static int g_toggleAutoOpenCommandId = 0;
 
 #ifdef _WIN32
 static std::wstring utf8ToWide(const std::string& text)
@@ -205,6 +217,35 @@ static void runScript(ScriptEntry& script)
   }
 }
 
+
+static bool getAutoOpenEnabled()
+{
+  if (!GetExtState_ptr) return false;
+
+  const char* value = GetExtState_ptr(kExtStateSection, kAutoOpenKey);
+  return value && std::strcmp(value, "1") == 0;
+}
+
+static void setAutoOpenEnabled(bool enabled)
+{
+  if (!SetExtState_ptr) {
+    showDiagnostic("REAPER nao entregou a API SetExtState para salvar essa configuracao.");
+    return;
+  }
+
+  SetExtState_ptr(kExtStateSection, kAutoOpenKey, enabled ? "1" : "0", true);
+}
+
+static void toggleAutoOpen()
+{
+  const bool enabled = !getAutoOpenEnabled();
+  setAutoOpenEnabled(enabled);
+
+  showDiagnostic(enabled
+    ? "VS Hook configurado para abrir junto com o REAPER."
+    : "VS Hook nao vai mais abrir junto com o REAPER.");
+}
+
 static ScriptEntry* findScriptByCommand(int command)
 {
   for (ScriptEntry& script : g_scripts) {
@@ -219,6 +260,11 @@ static ScriptEntry* findScriptByCommand(int command)
 static bool hookCommand(int command, int flag)
 {
   (void)flag;
+
+  if (g_toggleAutoOpenCommandId != 0 && command == g_toggleAutoOpenCommandId) {
+    toggleAutoOpen();
+    return true;
+  }
 
   ScriptEntry* script = findScriptByCommand(command);
   if (script) {
@@ -238,6 +284,11 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   (void)relmode;
   (void)hwnd;
 
+  if (g_toggleAutoOpenCommandId != 0 && command == g_toggleAutoOpenCommandId) {
+    toggleAutoOpen();
+    return true;
+  }
+
   ScriptEntry* script = findScriptByCommand(command);
   if (script) {
     runScript(*script);
@@ -254,6 +305,21 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 
   if (std::strcmp(menustr, "Main extensions") == 0) {
     // Insere de tras para frente porque cada item entra na posicao 0.
+    if (g_toggleAutoOpenCommandId != 0) {
+      MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
+      mi.fMask = MIIM_TYPE | MIIM_ID | MIIM_STATE;
+      mi.fType = MFT_STRING;
+      mi.fState = getAutoOpenEnabled() ? MFS_CHECKED : MFS_UNCHECKED;
+      mi.dwTypeData = (char*)"Abrir junto com o REAPER";
+      mi.wID = g_toggleAutoOpenCommandId;
+      InsertMenuItem(hMenu, 0, true, &mi);
+
+      MENUITEMINFO sep = { sizeof(MENUITEMINFO), };
+      sep.fMask = MIIM_TYPE;
+      sep.fType = MFT_SEPARATOR;
+      InsertMenuItem(hMenu, 0, true, &sep);
+    }
+
     for (int i = static_cast<int>(sizeof(g_scripts) / sizeof(g_scripts[0])) - 1; i >= 0; --i) {
       if (g_scripts[i].commandId == 0) continue;
 
@@ -264,6 +330,24 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
       mi.wID = g_scripts[i].commandId;
       InsertMenuItem(hMenu, 0, true, &mi);
     }
+  }
+}
+
+
+static void startupTimer()
+{
+  ++g_state.startupTimerTicks;
+
+  // Espera alguns ciclos para o REAPER terminar de montar a interface.
+  if (g_state.startupTimerTicks < 30) return;
+
+  if (g_state.timerRegistered && plugin_register_ptr) {
+    plugin_register_ptr("-timer", reinterpret_cast<void*>(&startupTimer));
+    g_state.timerRegistered = false;
+  }
+
+  if (getAutoOpenEnabled()) {
+    runScript(g_scripts[0]);
   }
 }
 
@@ -285,6 +369,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
   Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
   AddExtensionsMainMenu_ptr = reinterpret_cast<AddExtensionsMainMenu_t>(rec->GetFunc("AddExtensionsMainMenu"));
   AddRemoveReaScript_ptr = reinterpret_cast<AddRemoveReaScript_t>(rec->GetFunc("AddRemoveReaScript"));
+  GetExtState_ptr = reinterpret_cast<GetExtState_t>(rec->GetFunc("GetExtState"));
+  SetExtState_ptr = reinterpret_cast<SetExtState_t>(rec->GetFunc("SetExtState"));
 
   if (!plugin_register_ptr) {
     showDiagnostic("VS Hook Loader nao carregou: plugin_register indisponivel.");
@@ -298,7 +384,9 @@ static void initialize()
 {
   if (g_state.initialized) return;
 
-  bool hasRegisteredAction = false;
+  g_toggleAutoOpenCommandId = plugin_register_ptr("custom_action", (void*)&g_toggleAutoOpenAction);
+
+  bool hasRegisteredAction = g_toggleAutoOpenCommandId != 0;
   for (ScriptEntry& script : g_scripts) {
     script.commandId = plugin_register_ptr("custom_action", (void*)&script.action);
     if (script.commandId != 0) {
@@ -326,12 +414,26 @@ static void initialize()
     AddExtensionsMainMenu_ptr();
   }
 
+  if (getAutoOpenEnabled()) {
+    g_state.startupTimerTicks = 0;
+    if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
+      g_state.timerRegistered = true;
+    } else {
+      runScript(g_scripts[0]);
+    }
+  }
+
   g_state.initialized = true;
 }
 
 static void shutdown()
 {
   if (!plugin_register_ptr) return;
+
+  if (g_state.timerRegistered) {
+    plugin_register_ptr("-timer", reinterpret_cast<void*>(&startupTimer));
+    g_state.timerRegistered = false;
+  }
 
   if (g_state.menuHookRegistered) {
     plugin_register_ptr("-hookcustommenu", reinterpret_cast<void*>(&menuHook));
@@ -353,6 +455,11 @@ static void shutdown()
       plugin_register_ptr("-custom_action", (void*)&script.action);
       script.commandId = 0;
     }
+  }
+
+  if (g_toggleAutoOpenCommandId != 0) {
+    plugin_register_ptr("-custom_action", (void*)&g_toggleAutoOpenAction);
+    g_toggleAutoOpenCommandId = 0;
   }
 
   g_state.initialized = false;

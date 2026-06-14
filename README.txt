@@ -37,3 +37,8 @@ PASSO A PASSO DO ZERO
    - tambem tenta:
      Scripts/VS Hook/VS Hook.lua
      Scripts/VS Hook Server/VS Hook.lua
+
+Alteracao desta versao:
+- Adicionada opcao no menu Extensions > Abrir junto com o REAPER.
+- A opcao fica marcada/desmarcada e salva no ExtState persistente do REAPER.
+- Quando ativa, o loader espera alguns ciclos de inicializacao e abre o VS Hook automaticamente.
