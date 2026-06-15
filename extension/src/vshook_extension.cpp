@@ -347,7 +347,9 @@ static void startupTimer()
   }
 
   if (getAutoOpenEnabled()) {
-    runScript(g_scripts[0]);
+    for (ScriptEntry& script : g_scripts) {
+      runScript(script);
+    }
   }
 }
 
