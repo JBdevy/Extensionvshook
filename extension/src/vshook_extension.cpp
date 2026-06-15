@@ -47,14 +47,9 @@ struct ScriptEntry {
 
 static ScriptEntry g_scripts[] = {
   {
-    { 0, "VSHOOKRUN", "VS Hook APP", nullptr },
-    "VS Hook APP",
+    { 0, "VSHOOKRUN", "VS Hook", nullptr },
+    "VS Hook",
     "VS Hook.lua"
-  },
-  {
-    { 0, "VSHOOKLYRICS", "Hook Lyrics", nullptr },
-    "Hook Lyrics",
-    "Hook lyrics.lua"
   }
 };
 
