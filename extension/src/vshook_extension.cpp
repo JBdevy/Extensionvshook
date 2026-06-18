@@ -2,13 +2,14 @@
 #include "reaper_plugin.h"
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #ifdef _WIN32
   #include <windows.h>
+#else
+  #include <sys/stat.h>
 #endif
 
 namespace vshook {
@@ -47,9 +48,14 @@ struct ScriptEntry {
 
 static ScriptEntry g_scripts[] = {
   {
-    { 0, "VSHOOKRUN", "VS Hook", nullptr },
-    "VS Hook",
+    { 0, "VSHOOKRUN", "VS Hook APP", nullptr },
+    "VS Hook APP",
     "VS Hook.lua"
+  },
+  {
+    { 0, "VSHOOKLYRICS", "Hook Lyrics", nullptr },
+    "Hook Lyrics",
+    "Hook lyrics.lua"
   }
 };
 
@@ -118,8 +124,8 @@ static bool fileExists(const std::string& path)
   const DWORD attrs = GetFileAttributesW(widePath.c_str());
   return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 #else
-  std::ifstream f(path, std::ios::binary);
-  return f.good();
+  struct stat st;
+  return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 #endif
 }
 

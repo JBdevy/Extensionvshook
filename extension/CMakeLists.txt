@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 
+if(APPLE)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
+  set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS universal build" FORCE)
+endif()
+
 project(reaper_vshook_loader LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -11,9 +16,6 @@ if(APPLE)
   enable_language(OBJCXX)
 endif()
 
-if(APPLE AND NOT DEFINED CMAKE_OSX_ARCHITECTURES)
-  set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS universal build" FORCE)
-endif()
 
 add_library(reaper_vshook SHARED
   src/vshook_extension.cpp

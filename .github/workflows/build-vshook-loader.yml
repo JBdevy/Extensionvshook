@@ -61,10 +61,13 @@ jobs:
 
       - name: Configure
         shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: >
           cmake -S extension -B extension/build
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
 
       - name: Build
         shell: bash
@@ -78,6 +81,7 @@ jobs:
           echo "Binary: $BIN"
           file "$BIN"
           lipo -info "$BIN" || true
+          otool -l "$BIN" | grep -A3 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX" || true
           nm -gU "$BIN" | grep "_ReaperPluginEntry"
 
       - name: Upload artifact

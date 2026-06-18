@@ -32,18 +32,13 @@ PASSO A PASSO DO ZERO
 
 5) Esse cpp:
    - cria o menu VS Hook em Extensions
-   - registra/carrega apenas o script VS Hook.lua
-   - no Windows procura em:
-     C:/Users/Public/VS Hook APP/VS Hook.lua
-     %PUBLIC%/VS Hook APP/VS Hook.lua
-   - no macOS procura em:
+   - quando clicar, procura primeiro:
      Scripts/VS Hook APP/VS Hook.lua
-     Scripts/VS Hook.lua
-     VS Hook APP/VS Hook.lua
+   - tambem tenta:
+     Scripts/VS Hook/VS Hook.lua
+     Scripts/VS Hook Server/VS Hook.lua
 
 Alteracao desta versao:
-- Removido o carregamento/registro do Hook Lyrics pelo loader.
-- O loader agora registra/carrega somente VS Hook.lua.
-- Mantida a opcao no menu Extensions > Abrir junto com o REAPER.
+- Adicionada opcao no menu Extensions > Abrir junto com o REAPER.
 - A opcao fica marcada/desmarcada e salva no ExtState persistente do REAPER.
-- Quando ativa, o loader espera alguns ciclos de inicializacao e abre somente o VS Hook automaticamente.
+- Quando ativa, o loader espera alguns ciclos de inicializacao e abre o VS Hook automaticamente.
