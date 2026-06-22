@@ -41,6 +41,8 @@ struct ScriptEntry {
   custom_action_register_t action;
   const char* displayName;
   const char* fileName;
+  bool showInExtensionsMenu = false;
+  bool runOnStartup = false;
   std::string scriptPath;
   int scriptCommandId = 0;
   int commandId = 0;
@@ -48,14 +50,11 @@ struct ScriptEntry {
 
 static ScriptEntry g_scripts[] = {
   {
-    { 0, "VSHOOKRUN", "VS Hook APP", nullptr },
-    "VS Hook APP",
-    "VS Hook.lua"
-  },
-  {
-    { 0, "VSHOOKLYRICS", "Hook Lyrics", nullptr },
-    "Hook Lyrics",
-    "Hook lyrics.lua"
+    { 0, "VSHOOKRUN", "VS Hook", nullptr },
+    "VS Hook",
+    "VS Hook.lua",
+    true,
+    true
   }
 };
 
@@ -306,22 +305,9 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 
   if (std::strcmp(menustr, "Main extensions") == 0) {
     // Insere de tras para frente porque cada item entra na posicao 0.
-    if (g_toggleAutoOpenCommandId != 0) {
-      MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
-      mi.fMask = MIIM_TYPE | MIIM_ID | MIIM_STATE;
-      mi.fType = MFT_STRING;
-      mi.fState = getAutoOpenEnabled() ? MFS_CHECKED : MFS_UNCHECKED;
-      mi.dwTypeData = (char*)"Abrir junto com o REAPER";
-      mi.wID = g_toggleAutoOpenCommandId;
-      InsertMenuItem(hMenu, 0, true, &mi);
-
-      MENUITEMINFO sep = { sizeof(MENUITEMINFO), };
-      sep.fMask = MIIM_TYPE;
-      sep.fType = MFT_SEPARATOR;
-      InsertMenuItem(hMenu, 0, true, &sep);
-    }
-
+    // O menu Extensions deve ficar limpo para o usuario final: apenas "VS Hook".
     for (int i = static_cast<int>(sizeof(g_scripts) / sizeof(g_scripts[0])) - 1; i >= 0; --i) {
+      if (!g_scripts[i].showInExtensionsMenu) continue;
       if (g_scripts[i].commandId == 0) continue;
 
       MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
@@ -349,7 +335,9 @@ static void startupTimer()
 
   if (getAutoOpenEnabled()) {
     for (ScriptEntry& script : g_scripts) {
-      runScript(script);
+      if (script.runOnStartup) {
+        runScript(script);
+      }
     }
   }
 }
@@ -422,7 +410,11 @@ static void initialize()
     if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
       g_state.timerRegistered = true;
     } else {
-      runScript(g_scripts[0]);
+      for (ScriptEntry& script : g_scripts) {
+        if (script.runOnStartup) {
+          runScript(script);
+        }
+      }
     }
   }
 

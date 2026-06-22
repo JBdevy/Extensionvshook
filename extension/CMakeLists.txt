@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
+if(POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW)
+endif()
+
 if(APPLE)
   set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
   set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS universal build" FORCE)
@@ -32,6 +36,19 @@ target_compile_definitions(reaper_vshook PRIVATE
   WIN32_LEAN_AND_MEAN
   NOMINMAX
 )
+
+if(MSVC)
+  # Igual ao padrao da SWS: runtime C/C++ estatico.
+  # Evita clientes Windows sem VC++ Redistributable ficarem sem carregar a DLL,
+  # o que faz o menu Extensions nem aparecer.
+  set_property(TARGET reaper_vshook PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+  )
+  target_compile_options(reaper_vshook PRIVATE
+    /utf-8
+    /Zc:threadSafeInit-
+  )
+endif()
 
 set_target_properties(reaper_vshook PROPERTIES
   OUTPUT_NAME "reaper_vshook"

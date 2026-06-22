@@ -31,7 +31,8 @@ PASSO A PASSO DO ZERO
      xattr -dr com.apple.quarantine /caminho/para/reaper_vshook.dylib
 
 5) Esse cpp:
-   - cria o menu VS Hook em Extensions
+   - cria somente a entrada Extensions > VS Hook
+   - nao registra nem carrega Hook Lyrics
    - quando clicar, procura primeiro:
      Scripts/VS Hook APP/VS Hook.lua
    - tambem tenta:
@@ -39,6 +40,7 @@ PASSO A PASSO DO ZERO
      Scripts/VS Hook Server/VS Hook.lua
 
 Alteracao desta versao:
-- Adicionada opcao no menu Extensions > Abrir junto com o REAPER.
-- A opcao fica marcada/desmarcada e salva no ExtState persistente do REAPER.
-- Quando ativa, o loader espera alguns ciclos de inicializacao e abre o VS Hook automaticamente.
+- Menu Extensions limpo: apenas VS Hook.
+- Hook Lyrics nao e mais registrado nem carregado pela extensao. Se ele existir na pasta, fica apenas como arquivo separado.
+- Auto-open, quando ja estiver ativo no ExtState, abre somente o VS Hook principal.
+- Windows agora compila com runtime C/C++ estatico, igual ao padrao da SWS, para evitar DLL nao carregar em maquinas sem VC++ Redistributable.
