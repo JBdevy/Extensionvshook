@@ -31,16 +31,27 @@ PASSO A PASSO DO ZERO
      xattr -dr com.apple.quarantine /caminho/para/reaper_vshook.dylib
 
 5) Esse cpp:
-   - cria somente a entrada Extensions > VS Hook
+   - cria as entradas Extensions > VS Hook Pro e Extensions > VS Hook Basic
+   - procura e registra estes scripts:
+     Windows:
+       C:/Users/Public/VS Hook APP/VS Hook Pro.lua
+       C:/Users/Public/VS Hook APP/VS Hook Basic.lua
+     macOS:
+       Scripts/VS Hook APP/VS Hook Pro.lua
+       Scripts/VS Hook APP/VS Hook Basic.lua
+       Scripts/VS Hook Pro.lua
+       Scripts/VS Hook Basic.lua
+       VS Hook APP/VS Hook Pro.lua
+       VS Hook APP/VS Hook Basic.lua
    - nao registra nem carrega Hook Lyrics
-   - quando clicar, procura primeiro:
-     Scripts/VS Hook APP/VS Hook.lua
-   - tambem tenta:
-     Scripts/VS Hook/VS Hook.lua
-     Scripts/VS Hook Server/VS Hook.lua
+   - adiciona as opcoes:
+       Iniciar VS Hook Pro Junto com o REAPER
+       Iniciar VS Hook Basic Junto com o REAPER
+   - as duas opcoes de auto-inicio sao exclusivas: ao marcar uma, a outra desmarca.
 
 Alteracao desta versao:
-- Menu Extensions limpo: apenas VS Hook.
-- Hook Lyrics nao e mais registrado nem carregado pela extensao. Se ele existir na pasta, fica apenas como arquivo separado.
-- Auto-open, quando ja estiver ativo no ExtState, abre somente o VS Hook principal.
-- Windows agora compila com runtime C/C++ estatico, igual ao padrao da SWS, para evitar DLL nao carregar em maquinas sem VC++ Redistributable.
+- O menu Extensions nao mostra mais "VS Hook" sozinho.
+- Agora mostra "VS Hook Pro" e "VS Hook Basic".
+- O auto-inicio agora salva o modo escolhido: pro, basic ou vazio.
+- Se o usuario antigo ja tinha "Abrir VS Hook junto com o REAPER" ativo, a nova extensao assume VS Hook Pro por compatibilidade.
+- Windows continua compilando com runtime C/C++ estatico, igual ao padrao da SWS, para evitar DLL nao carregar em maquinas sem VC++ Redistributable.

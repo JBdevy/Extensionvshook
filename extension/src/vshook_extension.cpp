@@ -35,25 +35,40 @@ static GetExtState_t GetExtState_ptr = nullptr;
 static SetExtState_t SetExtState_ptr = nullptr;
 
 static const char* kExtStateSection = "VS_HOOK_LOADER";
-static const char* kAutoOpenKey = "AUTO_OPEN_VSHOOK";
+static const char* kAutoOpenModeKey = "AUTO_OPEN_VSHOOK_MODE";
+static const char* kLegacyAutoOpenKey = "AUTO_OPEN_VSHOOK";
 
 struct ScriptEntry {
   custom_action_register_t action;
   const char* displayName;
   const char* fileName;
+  const char* autoOpenMode;
   bool showInExtensionsMenu = false;
-  bool runOnStartup = false;
   std::string scriptPath;
   int scriptCommandId = 0;
   int commandId = 0;
 };
 
+struct AutoOpenEntry {
+  custom_action_register_t action;
+  const char* displayName;
+  const char* autoOpenMode;
+  int commandId = 0;
+};
+
 static ScriptEntry g_scripts[] = {
   {
-    { 0, "VSHOOKRUN", "VS Hook", nullptr },
-    "VS Hook",
-    "VS Hook.lua",
-    true,
+    { 0, "VSHOOKRUN", "VS Hook Pro", nullptr },
+    "VS Hook Pro",
+    "VS Hook Pro.lua",
+    "pro",
+    true
+  },
+  {
+    { 0, "VSHOOKRUNBASIC", "VS Hook Basic", nullptr },
+    "VS Hook Basic",
+    "VS Hook Basic.lua",
+    "basic",
     true
   }
 };
@@ -67,8 +82,18 @@ struct State {
   int startupTimerTicks = 0;
 } g_state;
 
-static custom_action_register_t g_toggleAutoOpenAction = { 0, "VSHOOKAUTOOPEN", "Abrir VS Hook junto com o REAPER", nullptr };
-static int g_toggleAutoOpenCommandId = 0;
+static AutoOpenEntry g_autoOpenEntries[] = {
+  {
+    { 0, "VSHOOKAUTOPRO", "Iniciar VS Hook Pro Junto com o REAPER", nullptr },
+    "Iniciar VS Hook Pro Junto com o REAPER",
+    "pro"
+  },
+  {
+    { 0, "VSHOOKAUTOBASIC", "Iniciar VS Hook Basic Junto com o REAPER", nullptr },
+    "Iniciar VS Hook Basic Junto com o REAPER",
+    "basic"
+  }
+};
 
 #ifdef _WIN32
 static std::wstring utf8ToWide(const std::string& text)
@@ -218,32 +243,61 @@ static void runScript(ScriptEntry& script)
 }
 
 
-static bool getAutoOpenEnabled()
+static std::string getAutoOpenMode()
 {
-  if (!GetExtState_ptr) return false;
+  if (!GetExtState_ptr) return std::string();
 
-  const char* value = GetExtState_ptr(kExtStateSection, kAutoOpenKey);
-  return value && std::strcmp(value, "1") == 0;
+  const char* value = GetExtState_ptr(kExtStateSection, kAutoOpenModeKey);
+  if (value && value[0]) {
+    return value;
+  }
+
+  // Compatibilidade com instalacoes antigas: se o usuario ja tinha
+  // "Abrir VS Hook junto com o REAPER" ativo, a extensao nova assume Pro.
+  const char* legacy = GetExtState_ptr(kExtStateSection, kLegacyAutoOpenKey);
+  if (legacy && std::strcmp(legacy, "1") == 0) {
+    return "pro";
+  }
+
+  return std::string();
 }
 
-static void setAutoOpenEnabled(bool enabled)
+static void setAutoOpenMode(const char* mode)
 {
   if (!SetExtState_ptr) {
     showDiagnostic("REAPER nao entregou a API SetExtState para salvar essa configuracao.");
     return;
   }
 
-  SetExtState_ptr(kExtStateSection, kAutoOpenKey, enabled ? "1" : "0", true);
+  SetExtState_ptr(kExtStateSection, kAutoOpenModeKey, mode ? mode : "", true);
+
+  // Desliga a chave antiga para ela nao religar o Pro depois que o usuario
+  // escolher Basic ou desativar o auto-inicio.
+  SetExtState_ptr(kExtStateSection, kLegacyAutoOpenKey, "0", true);
 }
 
-static void toggleAutoOpen()
+static const char* displayNameForAutoOpenMode(const char* mode)
 {
-  const bool enabled = !getAutoOpenEnabled();
-  setAutoOpenEnabled(enabled);
+  for (const ScriptEntry& script : g_scripts) {
+    if (mode && std::strcmp(script.autoOpenMode, mode) == 0) {
+      return script.displayName;
+    }
+  }
+  return "VS Hook";
+}
 
-  showDiagnostic(enabled
-    ? "VS Hook configurado para abrir junto com o REAPER."
-    : "VS Hook nao vai mais abrir junto com o REAPER.");
+static void toggleAutoOpenMode(const char* mode)
+{
+  const std::string currentMode = getAutoOpenMode();
+
+  if (mode && currentMode == mode) {
+    setAutoOpenMode("");
+    showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " nao vai mais iniciar junto com o REAPER.");
+    return;
+  }
+
+  setAutoOpenMode(mode);
+  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com o REAPER.");
 }
 
 static ScriptEntry* findScriptByCommand(int command)
@@ -261,9 +315,11 @@ static bool hookCommand(int command, int flag)
 {
   (void)flag;
 
-  if (g_toggleAutoOpenCommandId != 0 && command == g_toggleAutoOpenCommandId) {
-    toggleAutoOpen();
-    return true;
+  for (AutoOpenEntry& entry : g_autoOpenEntries) {
+    if (entry.commandId != 0 && command == entry.commandId) {
+      toggleAutoOpenMode(entry.autoOpenMode);
+      return true;
+    }
   }
 
   ScriptEntry* script = findScriptByCommand(command);
@@ -284,9 +340,11 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   (void)relmode;
   (void)hwnd;
 
-  if (g_toggleAutoOpenCommandId != 0 && command == g_toggleAutoOpenCommandId) {
-    toggleAutoOpen();
-    return true;
+  for (AutoOpenEntry& entry : g_autoOpenEntries) {
+    if (entry.commandId != 0 && command == entry.commandId) {
+      toggleAutoOpenMode(entry.autoOpenMode);
+      return true;
+    }
   }
 
   ScriptEntry* script = findScriptByCommand(command);
@@ -298,6 +356,25 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   return false;
 }
 
+static void insertMenuString(HMENU hMenu, const char* text, int commandId, bool checked)
+{
+  MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
+  mi.fMask = MIIM_TYPE | MIIM_ID | MIIM_STATE;
+  mi.fType = MFT_STRING;
+  mi.fState = checked ? MFS_CHECKED : MFS_UNCHECKED;
+  mi.dwTypeData = (char*)text;
+  mi.wID = commandId;
+  InsertMenuItem(hMenu, 0, true, &mi);
+}
+
+static void insertMenuSeparator(HMENU hMenu)
+{
+  MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
+  mi.fMask = MIIM_TYPE;
+  mi.fType = MFT_SEPARATOR;
+  InsertMenuItem(hMenu, 0, true, &mi);
+}
+
 static void menuHook(const char* menustr, HMENU hMenu, int flag)
 {
   if (!menustr || !hMenu) return;
@@ -305,17 +382,27 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 
   if (std::strcmp(menustr, "Main extensions") == 0) {
     // Insere de tras para frente porque cada item entra na posicao 0.
-    // O menu Extensions deve ficar limpo para o usuario final: apenas "VS Hook".
+    // Ordem final no menu:
+    // VS Hook Pro / VS Hook Basic / separador / auto-inicio Pro / auto-inicio Basic.
+    const std::string autoMode = getAutoOpenMode();
+
+    for (int i = static_cast<int>(sizeof(g_autoOpenEntries) / sizeof(g_autoOpenEntries[0])) - 1; i >= 0; --i) {
+      if (g_autoOpenEntries[i].commandId == 0) continue;
+      insertMenuString(
+        hMenu,
+        g_autoOpenEntries[i].displayName,
+        g_autoOpenEntries[i].commandId,
+        autoMode == g_autoOpenEntries[i].autoOpenMode
+      );
+    }
+
+    insertMenuSeparator(hMenu);
+
     for (int i = static_cast<int>(sizeof(g_scripts) / sizeof(g_scripts[0])) - 1; i >= 0; --i) {
       if (!g_scripts[i].showInExtensionsMenu) continue;
       if (g_scripts[i].commandId == 0) continue;
 
-      MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
-      mi.fMask = MIIM_TYPE | MIIM_ID;
-      mi.fType = MFT_STRING;
-      mi.dwTypeData = (char*)g_scripts[i].displayName;
-      mi.wID = g_scripts[i].commandId;
-      InsertMenuItem(hMenu, 0, true, &mi);
+      insertMenuString(hMenu, g_scripts[i].displayName, g_scripts[i].commandId, false);
     }
   }
 }
@@ -333,10 +420,12 @@ static void startupTimer()
     g_state.timerRegistered = false;
   }
 
-  if (getAutoOpenEnabled()) {
+  const std::string autoMode = getAutoOpenMode();
+  if (!autoMode.empty()) {
     for (ScriptEntry& script : g_scripts) {
-      if (script.runOnStartup) {
+      if (autoMode == script.autoOpenMode) {
         runScript(script);
+        break;
       }
     }
   }
@@ -375,9 +464,15 @@ static void initialize()
 {
   if (g_state.initialized) return;
 
-  g_toggleAutoOpenCommandId = plugin_register_ptr("custom_action", (void*)&g_toggleAutoOpenAction);
+  bool hasRegisteredAction = false;
 
-  bool hasRegisteredAction = g_toggleAutoOpenCommandId != 0;
+  for (AutoOpenEntry& entry : g_autoOpenEntries) {
+    entry.commandId = plugin_register_ptr("custom_action", (void*)&entry.action);
+    if (entry.commandId != 0) {
+      hasRegisteredAction = true;
+    }
+  }
+
   for (ScriptEntry& script : g_scripts) {
     script.commandId = plugin_register_ptr("custom_action", (void*)&script.action);
     if (script.commandId != 0) {
@@ -405,14 +500,16 @@ static void initialize()
     AddExtensionsMainMenu_ptr();
   }
 
-  if (getAutoOpenEnabled()) {
+  if (!getAutoOpenMode().empty()) {
     g_state.startupTimerTicks = 0;
     if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
       g_state.timerRegistered = true;
     } else {
+      const std::string autoMode = getAutoOpenMode();
       for (ScriptEntry& script : g_scripts) {
-        if (script.runOnStartup) {
+        if (autoMode == script.autoOpenMode) {
           runScript(script);
+          break;
         }
       }
     }
@@ -452,9 +549,11 @@ static void shutdown()
     }
   }
 
-  if (g_toggleAutoOpenCommandId != 0) {
-    plugin_register_ptr("-custom_action", (void*)&g_toggleAutoOpenAction);
-    g_toggleAutoOpenCommandId = 0;
+  for (AutoOpenEntry& entry : g_autoOpenEntries) {
+    if (entry.commandId != 0) {
+      plugin_register_ptr("-custom_action", (void*)&entry.action);
+      entry.commandId = 0;
+    }
   }
 
   g_state.initialized = false;
