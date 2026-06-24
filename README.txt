@@ -11,11 +11,13 @@ Esta extensao adiciona no menu Extensions:
 
 Regras:
 
+- Pro e Basic sao exclusivos: ao abrir um, a extensao fecha o outro se ele estiver aberto.
 - As opcoes de iniciar junto com o REAPER sao exclusivas: quando Pro esta ativo, Basic fica desativado; quando Basic esta ativo, Pro fica desativado.
 - As opcoes de iniciar junto com ESTE projeto tambem sao exclusivas.
-- A opcao ativa aparece com V no menu.
+- A opcao ativa usa a marcacao nativa do menu do REAPER, sem letra V no texto.
+- A marcacao do menu e atualizada quando o menu abre, sem precisar reiniciar o REAPER.
 - A configuracao global usa ExtState persistente.
-- A configuracao do projeto usa ProjExtState e fica salva no .RPP quando o projeto e salvo.
+- A configuracao por projeto tambem usa ExtState persistente com chave pelo caminho do projeto, entao nao depende de salvar o .RPP.
 
 Scripts esperados:
 

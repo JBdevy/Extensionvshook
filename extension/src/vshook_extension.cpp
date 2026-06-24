@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdint>
 #include <sstream>
+#include <iomanip>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,8 @@ using plugin_getapi_t = void* (*)(const char*);
 using ShowMessageBox_t = int (*)(const char*, const char*, int);
 using GetResourcePath_t = const char* (*)();
 using Main_OnCommand_t = void (*)(int, int);
+using GetToggleCommandState_t = int (*)(int);
+using GetToggleCommandStateEx_t = int (*)(int, int);
 using AddExtensionsMainMenu_t = bool (*)();
 using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
 using GetExtState_t = const char* (*)(const char*, const char*);
@@ -33,6 +36,8 @@ static plugin_getapi_t plugin_getapi_ptr = nullptr;
 static ShowMessageBox_t ShowMessageBox_ptr = nullptr;
 static GetResourcePath_t GetResourcePath_ptr = nullptr;
 static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
+static GetToggleCommandState_t GetToggleCommandState_ptr = nullptr;
+static GetToggleCommandStateEx_t GetToggleCommandStateEx_ptr = nullptr;
 static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
 static GetExtState_t GetExtState_ptr = nullptr;
@@ -85,6 +90,7 @@ struct State {
   bool initialized = false;
   bool commandHookRegistered = false;
   bool commandHook2Registered = false;
+  bool toggleActionRegistered = false;
   bool menuHookRegistered = false;
   bool timerRegistered = false;
   bool apiRegistered = false;
@@ -406,15 +412,93 @@ static bool ensureScriptRegistered(ScriptEntry& script)
   return true;
 }
 
-static void runScript(ScriptEntry& script)
+static int getScriptToggleState(const ScriptEntry& script)
+{
+  if (script.scriptCommandId == 0) return 0;
+
+  if (GetToggleCommandStateEx_ptr) {
+    const int state = GetToggleCommandStateEx_ptr(0, script.scriptCommandId);
+    if (state >= 0) return state;
+  }
+
+  if (GetToggleCommandState_ptr) {
+    const int state = GetToggleCommandState_ptr(script.scriptCommandId);
+    if (state >= 0) return state;
+  }
+
+  return 0;
+}
+
+static bool isScriptRunning(ScriptEntry& script)
+{
+  if (!ensureScriptRegistered(script)) return false;
+  return getScriptToggleState(script) == 1;
+}
+
+static void closeOtherScripts(ScriptEntry& target)
+{
+  if (!Main_OnCommand_ptr) return;
+
+  for (ScriptEntry& other : g_scripts) {
+    if (&other == &target) continue;
+    if (!ensureScriptRegistered(other)) continue;
+
+    if (getScriptToggleState(other) == 1) {
+      Main_OnCommand_ptr(other.scriptCommandId, 0);
+    }
+  }
+}
+
+static void runScript(ScriptEntry& script, bool toggleIfAlreadyOpen = true)
 {
   if (!ensureScriptRegistered(script)) {
     return;
   }
 
-  if (Main_OnCommand_ptr && script.scriptCommandId != 0) {
-    Main_OnCommand_ptr(script.scriptCommandId, 0);
+  closeOtherScripts(script);
+
+  if (!Main_OnCommand_ptr || script.scriptCommandId == 0) return;
+
+  if (!toggleIfAlreadyOpen && getScriptToggleState(script) == 1) {
+    return;
   }
+
+  Main_OnCommand_ptr(script.scriptCommandId, 0);
+}
+
+static std::string stableHashHex(const std::string& text)
+{
+  std::uint64_t h = 1469598103934665603ULL;
+  for (unsigned char c : text) {
+    h ^= static_cast<std::uint64_t>(c);
+    h *= 1099511628211ULL;
+  }
+
+  std::ostringstream oss;
+  oss << std::hex << h;
+  return oss.str();
+}
+
+static ReaProject* getCurrentProject(char* pathOut, int pathOutSize);
+static std::string getCurrentProjectSignature();
+
+static std::string getCurrentProjectPath()
+{
+  char path[2048] = "";
+  getCurrentProject(path, static_cast<int>(sizeof(path)));
+  return normalizeSlashes(path ? path : "");
+}
+
+static std::string getProjectAutoOpenExtStateKey()
+{
+  const std::string path = getCurrentProjectPath();
+  if (!path.empty()) {
+    return std::string("PROJECT_AUTO_OPEN_VSHOOK_MODE_") + stableHashHex(path);
+  }
+
+  // Projeto ainda sem arquivo salvo: guarda por sessao atual do REAPER.
+  // Quando o projeto ganhar um caminho real, a chave passa a ser pelo path.
+  return std::string("PROJECT_AUTO_OPEN_VSHOOK_MODE_UNSAVED_") + stableHashHex(getCurrentProjectSignature());
 }
 
 
@@ -475,28 +559,26 @@ static std::string getCurrentProjectSignature()
 
 static std::string getProjectAutoOpenMode()
 {
-  if (!GetProjExtState_ptr) return std::string();
+  if (!GetExtState_ptr) return std::string();
 
-  char value[64] = "";
-  char path[2048] = "";
-  ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
-  GetProjExtState_ptr(project, kExtStateSection, kProjectAutoOpenModeKey, value, static_cast<int>(sizeof(value)));
-
-  const std::string mode = value;
+  const std::string key = getProjectAutoOpenExtStateKey();
+  const char* value = GetExtState_ptr(kExtStateSection, key.c_str());
+  const std::string mode = value ? value : "";
   return isAutoOpenModeValue(mode) ? mode : std::string();
 }
 
 static void setProjectAutoOpenMode(const char* mode)
 {
-  if (!SetProjExtState_ptr) {
-    showDiagnostic("REAPER nao entregou a API SetProjExtState para salvar configuracao deste projeto.");
+  if (!SetExtState_ptr) {
+    showDiagnostic("REAPER nao entregou a API SetExtState para salvar essa configuracao.");
     return;
   }
 
   const std::string safeMode = (mode && isAutoOpenModeValue(mode)) ? mode : "";
-  char path[2048] = "";
-  ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
-  SetProjExtState_ptr(project, kExtStateSection, kProjectAutoOpenModeKey, safeMode.c_str());
+  const std::string key = getProjectAutoOpenExtStateKey();
+
+  // Persistente fora do .RPP: nao depende de salvar o projeto.
+  SetExtState_ptr(kExtStateSection, key.c_str(), safeMode.c_str(), true);
 
   // Evita que o timer abra imediatamente ao marcar a opcao; ela passa a valer
   // quando este projeto for aberto/carregado de novo.
@@ -542,7 +624,7 @@ static void toggleProjectAutoOpenMode(const char* mode)
   }
 
   setProjectAutoOpenMode(mode);
-  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com ESTE projeto. Salve o projeto para gravar essa configuracao no RPP.");
+  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com ESTE projeto.");
 }
 
 static void runScriptByAutoOpenMode(const std::string& mode)
@@ -551,7 +633,7 @@ static void runScriptByAutoOpenMode(const std::string& mode)
 
   for (ScriptEntry& script : g_scripts) {
     if (mode == script.autoOpenMode) {
-      runScript(script);
+      runScript(script, false);
       return;
     }
   }
@@ -627,6 +709,29 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   return false;
 }
 
+static int toggleActionState(int commandId)
+{
+  for (AutoOpenEntry& entry : g_autoOpenEntries) {
+    if (entry.commandId != 0 && commandId == entry.commandId) {
+      return getAutoOpenMode() == entry.autoOpenMode ? 1 : 0;
+    }
+  }
+
+  for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
+    if (entry.commandId != 0 && commandId == entry.commandId) {
+      return getProjectAutoOpenMode() == entry.autoOpenMode ? 1 : 0;
+    }
+  }
+
+  for (ScriptEntry& script : g_scripts) {
+    if (script.commandId != 0 && commandId == script.commandId) {
+      return isScriptRunning(script) ? 1 : 0;
+    }
+  }
+
+  return -1;
+}
+
 static void insertMenuString(HMENU hMenu, const char* text, int commandId, bool checked)
 {
   MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
@@ -646,60 +751,76 @@ static void insertMenuSeparator(HMENU hMenu)
   InsertMenuItem(hMenu, 0, true, &mi);
 }
 
-static std::string menuCheckLabel(const char* text, bool checked)
+static void setMenuCommandChecked(HMENU hMenu, int commandId, bool checked)
 {
-  // Usa V em texto puro porque alguns REAPERs/Windows nao mostram
-  // checkmark nativo de menu em extensoes carregadas por hookcustommenu.
-  return std::string(checked ? "V  " : "   ") + (text ? text : "");
+  if (!hMenu || commandId == 0) return;
+#ifdef _WIN32
+  CheckMenuItem(hMenu, static_cast<UINT>(commandId), MF_BYCOMMAND | (checked ? MF_CHECKED : MF_UNCHECKED));
+#else
+  CheckMenuItem(hMenu, commandId, MF_BYCOMMAND | (checked ? MF_CHECKED : MF_UNCHECKED));
+#endif
 }
 
 static void menuHook(const char* menustr, HMENU hMenu, int flag)
 {
   if (!menustr || !hMenu) return;
+  if (std::strcmp(menustr, "Main extensions") != 0) return;
+
+  const std::string autoMode = getAutoOpenMode();
+  const std::string projectAutoMode = getProjectAutoOpenMode();
+
+  // flag 1 acontece quando o menu vai ser exibido. Atualiza a marcacao
+  // imediatamente, sem precisar reiniciar o REAPER.
+  if (flag == 1) {
+    for (AutoOpenEntry& entry : g_autoOpenEntries) {
+      setMenuCommandChecked(hMenu, entry.commandId, autoMode == entry.autoOpenMode);
+    }
+    for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
+      setMenuCommandChecked(hMenu, entry.commandId, projectAutoMode == entry.autoOpenMode);
+    }
+    for (ScriptEntry& script : g_scripts) {
+      setMenuCommandChecked(hMenu, script.commandId, script.commandId != 0 && isScriptRunning(script));
+    }
+    return;
+  }
+
   if (flag != 0) return;
 
-  if (std::strcmp(menustr, "Main extensions") == 0) {
-    // Insere de tras para frente porque cada item entra na posicao 0.
-    // Ordem final no menu:
-    // VS Hook Pro / VS Hook Basic
-    // separador / auto-inicio com REAPER / separador / auto-inicio deste projeto.
-    const std::string autoMode = getAutoOpenMode();
-    const std::string projectAutoMode = getProjectAutoOpenMode();
+  // Insere de tras para frente porque cada item entra na posicao 0.
+  // Ordem final no menu:
+  // VS Hook Pro / VS Hook Basic
+  // separador / auto-inicio com REAPER / separador / auto-inicio deste projeto.
+  for (int i = static_cast<int>(sizeof(g_projectAutoOpenEntries) / sizeof(g_projectAutoOpenEntries[0])) - 1; i >= 0; --i) {
+    if (g_projectAutoOpenEntries[i].commandId == 0) continue;
+    const bool checked = projectAutoMode == g_projectAutoOpenEntries[i].autoOpenMode;
+    insertMenuString(
+      hMenu,
+      g_projectAutoOpenEntries[i].displayName,
+      g_projectAutoOpenEntries[i].commandId,
+      checked
+    );
+  }
 
-    for (int i = static_cast<int>(sizeof(g_projectAutoOpenEntries) / sizeof(g_projectAutoOpenEntries[0])) - 1; i >= 0; --i) {
-      if (g_projectAutoOpenEntries[i].commandId == 0) continue;
-      const bool checked = projectAutoMode == g_projectAutoOpenEntries[i].autoOpenMode;
-      const std::string label = menuCheckLabel(g_projectAutoOpenEntries[i].displayName, checked);
-      insertMenuString(
-        hMenu,
-        label.c_str(),
-        g_projectAutoOpenEntries[i].commandId,
-        checked
-      );
-    }
+  insertMenuSeparator(hMenu);
 
-    insertMenuSeparator(hMenu);
+  for (int i = static_cast<int>(sizeof(g_autoOpenEntries) / sizeof(g_autoOpenEntries[0])) - 1; i >= 0; --i) {
+    if (g_autoOpenEntries[i].commandId == 0) continue;
+    const bool checked = autoMode == g_autoOpenEntries[i].autoOpenMode;
+    insertMenuString(
+      hMenu,
+      g_autoOpenEntries[i].displayName,
+      g_autoOpenEntries[i].commandId,
+      checked
+    );
+  }
 
-    for (int i = static_cast<int>(sizeof(g_autoOpenEntries) / sizeof(g_autoOpenEntries[0])) - 1; i >= 0; --i) {
-      if (g_autoOpenEntries[i].commandId == 0) continue;
-      const bool checked = autoMode == g_autoOpenEntries[i].autoOpenMode;
-      const std::string label = menuCheckLabel(g_autoOpenEntries[i].displayName, checked);
-      insertMenuString(
-        hMenu,
-        label.c_str(),
-        g_autoOpenEntries[i].commandId,
-        checked
-      );
-    }
+  insertMenuSeparator(hMenu);
 
-    insertMenuSeparator(hMenu);
+  for (int i = static_cast<int>(sizeof(g_scripts) / sizeof(g_scripts[0])) - 1; i >= 0; --i) {
+    if (!g_scripts[i].showInExtensionsMenu) continue;
+    if (g_scripts[i].commandId == 0) continue;
 
-    for (int i = static_cast<int>(sizeof(g_scripts) / sizeof(g_scripts[0])) - 1; i >= 0; --i) {
-      if (!g_scripts[i].showInExtensionsMenu) continue;
-      if (g_scripts[i].commandId == 0) continue;
-
-      insertMenuString(hMenu, g_scripts[i].displayName, g_scripts[i].commandId, false);
-    }
+    insertMenuString(hMenu, g_scripts[i].displayName, g_scripts[i].commandId, isScriptRunning(g_scripts[i]));
   }
 }
 
@@ -716,8 +837,8 @@ static void startupTimer()
     ++g_state.projectStableTicks;
   }
 
-  // Espera alguns ciclos para o REAPER terminar de montar a interface e carregar
-  // os ProjExtState salvos no RPP.
+  // Espera alguns ciclos para o REAPER terminar de montar a interface e estabilizar
+  // a configuracao externa do projeto.
   if (g_state.startupTimerTicks < 30) return;
 
   const std::string projectMode = getProjectAutoOpenMode();
@@ -759,6 +880,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
   ShowMessageBox_ptr = reinterpret_cast<ShowMessageBox_t>(rec->GetFunc("ShowMessageBox"));
   GetResourcePath_ptr = reinterpret_cast<GetResourcePath_t>(rec->GetFunc("GetResourcePath"));
   Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
+  GetToggleCommandState_ptr = reinterpret_cast<GetToggleCommandState_t>(rec->GetFunc("GetToggleCommandState"));
+  GetToggleCommandStateEx_ptr = reinterpret_cast<GetToggleCommandStateEx_t>(rec->GetFunc("GetToggleCommandStateEx"));
   AddExtensionsMainMenu_ptr = reinterpret_cast<AddExtensionsMainMenu_t>(rec->GetFunc("AddExtensionsMainMenu"));
   AddRemoveReaScript_ptr = reinterpret_cast<AddRemoveReaScript_t>(rec->GetFunc("AddRemoveReaScript"));
   GetExtState_ptr = reinterpret_cast<GetExtState_t>(rec->GetFunc("GetExtState"));
@@ -812,6 +935,10 @@ static void initialize()
     if (plugin_register_ptr("hookcommand2", reinterpret_cast<void*>(&hookCommand2))) {
       g_state.commandHook2Registered = true;
     }
+
+    if (plugin_register_ptr("toggleaction", reinterpret_cast<void*>(&toggleActionState))) {
+      g_state.toggleActionRegistered = true;
+    }
   } else {
     showDiagnostic("VS Hook Loader carregou, mas nao conseguiu registrar as actions no REAPER.");
   }
@@ -854,6 +981,11 @@ static void shutdown()
   if (g_state.menuHookRegistered) {
     plugin_register_ptr("-hookcustommenu", reinterpret_cast<void*>(&menuHook));
     g_state.menuHookRegistered = false;
+  }
+
+  if (g_state.toggleActionRegistered) {
+    plugin_register_ptr("-toggleaction", reinterpret_cast<void*>(&toggleActionState));
+    g_state.toggleActionRegistered = false;
   }
 
   if (g_state.commandHook2Registered) {
