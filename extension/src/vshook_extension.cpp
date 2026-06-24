@@ -45,9 +45,6 @@ static const char* kExtStateSection = "VS_HOOK_LOADER";
 static const char* kAutoOpenModeKey = "AUTO_OPEN_VSHOOK_MODE";
 static const char* kLegacyAutoOpenKey = "AUTO_OPEN_VSHOOK";
 static const char* kProjectAutoOpenModeKey = "PROJECT_AUTO_OPEN_VSHOOK_MODE";
-static const char* kNotesExtStateSection = "VS_HOOK_NOTES";
-static const char* kNotesCurrentSongKey = "CURRENT_SONG";
-static const char* kNotesQueuedSongKey = "QUEUED_SONG";
 
 struct ScriptEntry {
   custom_action_register_t action;
@@ -80,13 +77,6 @@ static ScriptEntry g_scripts[] = {
     "VS Hook Basic",
     "VS Hook Basic.lua",
     "basic",
-    true
-  },
-  {
-    { 0, "VSHOOKNOTES", "VS Hook Anotacoes", nullptr },
-    "VS Hook Anotações",
-    "VS Hook Anotacoes.lua",
-    "notes",
     true
   }
 };
@@ -278,46 +268,11 @@ static bool VS_Hook_GetClipboard(char* buf, int bufSize)
 #endif
 }
 
-static std::string g_notesCurrentSong;
-static std::string g_notesQueuedSong;
-
-static bool VS_Hook_SetNotesState(const char* currentSong, const char* queuedSong)
-{
-  g_notesCurrentSong = currentSong ? currentSong : "";
-  g_notesQueuedSong = queuedSong ? queuedSong : "";
-
-  if (SetExtState_ptr) {
-    SetExtState_ptr(kNotesExtStateSection, kNotesCurrentSongKey, g_notesCurrentSong.c_str(), false);
-    SetExtState_ptr(kNotesExtStateSection, kNotesQueuedSongKey, g_notesQueuedSong.c_str(), false);
-  }
-
-  return true;
-}
-
-static bool VS_Hook_ClearNotesState()
-{
-  g_notesCurrentSong.clear();
-  g_notesQueuedSong.clear();
-
-  if (SetExtState_ptr) {
-    SetExtState_ptr(kNotesExtStateSection, kNotesCurrentSongKey, "", false);
-    SetExtState_ptr(kNotesExtStateSection, kNotesQueuedSongKey, "", false);
-  }
-
-  return true;
-}
-
 static char g_apiDefSetClipboard[] =
   "bool\0const char*\0text\0Write text into the system clipboard using the VS Hook extension.";
 
 static char g_apiDefGetClipboard[] =
   "bool\0char*,int\0textOutNeedBig,textOutNeedBig_sz\0Read text from the system clipboard using the VS Hook extension.";
-
-static char g_apiDefSetNotesState[] =
-  "bool\0const char*,const char*\0currentSong,queuedSong\0Update the VS Hook notes window state.";
-
-static char g_apiDefClearNotesState[] =
-  "bool\0\0\0Clear the VS Hook notes window state.";
 
 static bool registerClipboardApi()
 {
@@ -328,10 +283,6 @@ static bool registerClipboardApi()
   ok = (plugin_register_ptr("APIdef_VS_Hook_SetClipboard", reinterpret_cast<void*>(g_apiDefSetClipboard)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_GetClipboard", reinterpret_cast<void*>(&VS_Hook_GetClipboard)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_GetClipboard", reinterpret_cast<void*>(g_apiDefGetClipboard)) != 0) && ok;
-  ok = (plugin_register_ptr("API_VS_Hook_SetNotesState", reinterpret_cast<void*>(&VS_Hook_SetNotesState)) != 0) && ok;
-  ok = (plugin_register_ptr("APIdef_VS_Hook_SetNotesState", reinterpret_cast<void*>(g_apiDefSetNotesState)) != 0) && ok;
-  ok = (plugin_register_ptr("API_VS_Hook_ClearNotesState", reinterpret_cast<void*>(&VS_Hook_ClearNotesState)) != 0) && ok;
-  ok = (plugin_register_ptr("APIdef_VS_Hook_ClearNotesState", reinterpret_cast<void*>(g_apiDefClearNotesState)) != 0) && ok;
 
   g_state.apiRegistered = ok;
   return ok;
@@ -341,10 +292,6 @@ static void unregisterClipboardApi()
 {
   if (!plugin_register_ptr || !g_state.apiRegistered) return;
 
-  plugin_register_ptr("-APIdef_VS_Hook_ClearNotesState", reinterpret_cast<void*>(g_apiDefClearNotesState));
-  plugin_register_ptr("-API_VS_Hook_ClearNotesState", reinterpret_cast<void*>(&VS_Hook_ClearNotesState));
-  plugin_register_ptr("-APIdef_VS_Hook_SetNotesState", reinterpret_cast<void*>(g_apiDefSetNotesState));
-  plugin_register_ptr("-API_VS_Hook_SetNotesState", reinterpret_cast<void*>(&VS_Hook_SetNotesState));
   plugin_register_ptr("-APIdef_VS_Hook_GetClipboard", reinterpret_cast<void*>(g_apiDefGetClipboard));
   plugin_register_ptr("-API_VS_Hook_GetClipboard", reinterpret_cast<void*>(&VS_Hook_GetClipboard));
   plugin_register_ptr("-APIdef_VS_Hook_SetClipboard", reinterpret_cast<void*>(g_apiDefSetClipboard));
@@ -699,6 +646,13 @@ static void insertMenuSeparator(HMENU hMenu)
   InsertMenuItem(hMenu, 0, true, &mi);
 }
 
+static std::string menuCheckLabel(const char* text, bool checked)
+{
+  // Usa V em texto puro porque alguns REAPERs/Windows nao mostram
+  // checkmark nativo de menu em extensoes carregadas por hookcustommenu.
+  return std::string(checked ? "V  " : "   ") + (text ? text : "");
+}
+
 static void menuHook(const char* menustr, HMENU hMenu, int flag)
 {
   if (!menustr || !hMenu) return;
@@ -707,18 +661,20 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   if (std::strcmp(menustr, "Main extensions") == 0) {
     // Insere de tras para frente porque cada item entra na posicao 0.
     // Ordem final no menu:
-    // VS Hook Pro / VS Hook Basic / VS Hook Anotações
+    // VS Hook Pro / VS Hook Basic
     // separador / auto-inicio com REAPER / separador / auto-inicio deste projeto.
     const std::string autoMode = getAutoOpenMode();
     const std::string projectAutoMode = getProjectAutoOpenMode();
 
     for (int i = static_cast<int>(sizeof(g_projectAutoOpenEntries) / sizeof(g_projectAutoOpenEntries[0])) - 1; i >= 0; --i) {
       if (g_projectAutoOpenEntries[i].commandId == 0) continue;
+      const bool checked = projectAutoMode == g_projectAutoOpenEntries[i].autoOpenMode;
+      const std::string label = menuCheckLabel(g_projectAutoOpenEntries[i].displayName, checked);
       insertMenuString(
         hMenu,
-        g_projectAutoOpenEntries[i].displayName,
+        label.c_str(),
         g_projectAutoOpenEntries[i].commandId,
-        projectAutoMode == g_projectAutoOpenEntries[i].autoOpenMode
+        checked
       );
     }
 
@@ -726,11 +682,13 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 
     for (int i = static_cast<int>(sizeof(g_autoOpenEntries) / sizeof(g_autoOpenEntries[0])) - 1; i >= 0; --i) {
       if (g_autoOpenEntries[i].commandId == 0) continue;
+      const bool checked = autoMode == g_autoOpenEntries[i].autoOpenMode;
+      const std::string label = menuCheckLabel(g_autoOpenEntries[i].displayName, checked);
       insertMenuString(
         hMenu,
-        g_autoOpenEntries[i].displayName,
+        label.c_str(),
         g_autoOpenEntries[i].commandId,
-        autoMode == g_autoOpenEntries[i].autoOpenMode
+        checked
       );
     }
 

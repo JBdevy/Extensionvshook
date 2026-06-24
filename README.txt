@@ -1,28 +1,33 @@
-VS Hook Loader - Hook Developer
+VS Hook Loader | Hook Developer
 
-Arquivos principais:
-- extension/src/vshook_extension.cpp
-- VS Hook Anotacoes.lua
+Esta extensao adiciona no menu Extensions:
 
-Funcoes da extensao:
-- Abre VS Hook Pro pelo menu Extensions.
-- Abre VS Hook Basic pelo menu Extensions.
-- Abre VS Hook Anotacoes pelo menu Extensions.
-- Permite iniciar Pro ou Basic junto com o REAPER.
-- Permite iniciar Pro ou Basic junto com o projeto atual. Essa opcao fica salva no RPP via ProjExtState. Depois de marcar, salve o projeto.
-- Clipboard nativo sem SWS:
-  reaper.VS_Hook_SetClipboard(texto)
-  reaper.VS_Hook_GetClipboard("", 65536)
-- API para alimentar a janela de anotações:
-  reaper.VS_Hook_SetNotesState(musicaAtual, musicaNaFila)
-  reaper.VS_Hook_ClearNotesState()
+- VS Hook Pro
+- VS Hook Basic
+- Iniciar VS Hook Pro junto com o REAPER
+- Iniciar VS Hook Basic junto com o REAPER
+- Iniciar VS Hook Pro junto com ESTE projeto
+- Iniciar VS Hook Basic junto com ESTE projeto
 
-Instalacao esperada dos scripts:
-- Windows: C:/Users/Public/VS Hook APP/VS Hook Pro.lua
-- Windows: C:/Users/Public/VS Hook APP/VS Hook Basic.lua
-- Windows: C:/Users/Public/VS Hook APP/VS Hook Anotacoes.lua
-- macOS: REAPER Resource Path/Scripts/VS Hook APP/...
+Regras:
 
-A janela VS Hook Anotacoes mostra somente:
-- musica em reproducao
-- musica na fila de espera
+- As opcoes de iniciar junto com o REAPER sao exclusivas: quando Pro esta ativo, Basic fica desativado; quando Basic esta ativo, Pro fica desativado.
+- As opcoes de iniciar junto com ESTE projeto tambem sao exclusivas.
+- A opcao ativa aparece com V no menu.
+- A configuracao global usa ExtState persistente.
+- A configuracao do projeto usa ProjExtState e fica salva no .RPP quando o projeto e salvo.
+
+Scripts esperados:
+
+Windows:
+- C:/Users/Public/VS Hook APP/VS Hook Pro.lua
+- C:/Users/Public/VS Hook APP/VS Hook Basic.lua
+
+macOS:
+- REAPER/Scripts/VS Hook APP/VS Hook Pro.lua
+- REAPER/Scripts/VS Hook APP/VS Hook Basic.lua
+
+APIs nativas mantidas:
+
+reaper.VS_Hook_SetClipboard(texto)
+reaper.VS_Hook_GetClipboard("", 65536)
