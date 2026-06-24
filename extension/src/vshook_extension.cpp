@@ -466,41 +466,8 @@ static void runScript(ScriptEntry& script, bool toggleIfAlreadyOpen = true)
   Main_OnCommand_ptr(script.scriptCommandId, 0);
 }
 
-static std::string stableHashHex(const std::string& text)
-{
-  std::uint64_t h = 1469598103934665603ULL;
-  for (unsigned char c : text) {
-    h ^= static_cast<std::uint64_t>(c);
-    h *= 1099511628211ULL;
-  }
-
-  std::ostringstream oss;
-  oss << std::hex << h;
-  return oss.str();
-}
-
 static ReaProject* getCurrentProject(char* pathOut, int pathOutSize);
 static std::string getCurrentProjectSignature();
-
-static std::string getCurrentProjectPath()
-{
-  char path[2048] = "";
-  getCurrentProject(path, static_cast<int>(sizeof(path)));
-  return normalizeSlashes(path ? path : "");
-}
-
-static std::string getProjectAutoOpenExtStateKey()
-{
-  const std::string path = getCurrentProjectPath();
-  if (!path.empty()) {
-    return std::string("PROJECT_AUTO_OPEN_VSHOOK_MODE_") + stableHashHex(path);
-  }
-
-  // Projeto ainda sem arquivo salvo: guarda por sessao atual do REAPER.
-  // Quando o projeto ganhar um caminho real, a chave passa a ser pelo path.
-  return std::string("PROJECT_AUTO_OPEN_VSHOOK_MODE_UNSAVED_") + stableHashHex(getCurrentProjectSignature());
-}
-
 
 static std::string getAutoOpenMode()
 {
@@ -559,26 +526,32 @@ static std::string getCurrentProjectSignature()
 
 static std::string getProjectAutoOpenMode()
 {
-  if (!GetExtState_ptr) return std::string();
+  if (!GetProjExtState_ptr) return std::string();
 
-  const std::string key = getProjectAutoOpenExtStateKey();
-  const char* value = GetExtState_ptr(kExtStateSection, key.c_str());
-  const std::string mode = value ? value : "";
+  char value[64] = "";
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
+
+  // Igual a logica de startup action por projeto da SWS: a configuracao fica no .RPP.
+  GetProjExtState_ptr(project, kExtStateSection, kProjectAutoOpenModeKey, value, static_cast<int>(sizeof(value)));
+
+  const std::string mode = value;
   return isAutoOpenModeValue(mode) ? mode : std::string();
 }
 
 static void setProjectAutoOpenMode(const char* mode)
 {
-  if (!SetExtState_ptr) {
-    showDiagnostic("REAPER nao entregou a API SetExtState para salvar essa configuracao.");
+  if (!SetProjExtState_ptr) {
+    showDiagnostic("REAPER nao entregou a API SetProjExtState para salvar configuracao deste projeto.");
     return;
   }
 
   const std::string safeMode = (mode && isAutoOpenModeValue(mode)) ? mode : "";
-  const std::string key = getProjectAutoOpenExtStateKey();
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
 
-  // Persistente fora do .RPP: nao depende de salvar o projeto.
-  SetExtState_ptr(kExtStateSection, key.c_str(), safeMode.c_str(), true);
+  // Igual a SWS: grava no ProjExtState do projeto. Para ficar permanente, salve o .RPP.
+  SetProjExtState_ptr(project, kExtStateSection, kProjectAutoOpenModeKey, safeMode.c_str());
 
   // Evita que o timer abra imediatamente ao marcar a opcao; ela passa a valer
   // quando este projeto for aberto/carregado de novo.
@@ -624,7 +597,7 @@ static void toggleProjectAutoOpenMode(const char* mode)
   }
 
   setProjectAutoOpenMode(mode);
-  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com ESTE projeto.");
+  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com ESTE projeto. Salve o projeto para gravar essa configuracao no RPP.");
 }
 
 static void runScriptByAutoOpenMode(const std::string& mode)
@@ -837,8 +810,8 @@ static void startupTimer()
     ++g_state.projectStableTicks;
   }
 
-  // Espera alguns ciclos para o REAPER terminar de montar a interface e estabilizar
-  // a configuracao externa do projeto.
+  // Espera alguns ciclos para o REAPER terminar de montar a interface e carregar
+  // os ProjExtState salvos no RPP.
   if (g_state.startupTimerTicks < 30) return;
 
   const std::string projectMode = getProjectAutoOpenMode();

@@ -40,7 +40,7 @@ jobs:
             extension/build/**/reaper_vshook.dll
 
   build-macos-universal:
-    name: macOS Universal
+    name: macOS 11+ Universal
     runs-on: macos-latest
 
     steps:
@@ -57,26 +57,26 @@ jobs:
 
       - name: Clean build dir
         shell: bash
-        run: rm -rf extension/build
+        run: rm -rf extension/build-macos-universal
 
       - name: Configure
         shell: bash
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: >
-          cmake -S extension -B extension/build
+          cmake -S extension -B extension/build-macos-universal
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
           -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
 
       - name: Build
         shell: bash
-        run: cmake --build extension/build --config Release
+        run: cmake --build extension/build-macos-universal --config Release
 
       - name: Verify exported entrypoint
         shell: bash
         run: |
-          BIN="$(find extension/build -type f \( -name 'reaper_vshook.dylib' -o -name 'libreaper_vshook.dylib' \) | head -n 1)"
+          BIN="$(find extension/build-macos-universal -type f \( -name 'reaper_vshook.dylib' -o -name 'libreaper_vshook.dylib' \) | head -n 1)"
           test -n "$BIN"
           echo "Binary: $BIN"
           file "$BIN"
@@ -87,8 +87,63 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vshook-loader-macos-universal
+          name: vshook-loader-macos-11-universal
           if-no-files-found: error
           path: |
-            extension/build/**/reaper_vshook.dylib
-            extension/build/**/libreaper_vshook.dylib
+            extension/build-macos-universal/**/reaper_vshook.dylib
+            extension/build-macos-universal/**/libreaper_vshook.dylib
+
+  build-macos-legacy:
+    name: macOS 10.13+ Legacy Intel
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check SDK headers
+        shell: bash
+        run: |
+          test -f extension/sdk/reaper_plugin.h
+          test -f extension/sdk/reaper_plugin_functions.h
+          test -f extension/WDL/swell/swell.h
+          echo "SDK headers found."
+
+      - name: Clean build dir
+        shell: bash
+        run: rm -rf extension/build-macos-legacy
+
+      - name: Configure Legacy
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.13"
+        run: >
+          cmake -S extension -B extension/build-macos-legacy
+          -DCMAKE_BUILD_TYPE=Release
+          -DVSHOOK_MAC_LEGACY=ON
+          -DCMAKE_OSX_ARCHITECTURES="x86_64"
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+
+      - name: Build Legacy
+        shell: bash
+        run: cmake --build extension/build-macos-legacy --config Release
+
+      - name: Verify Legacy target
+        shell: bash
+        run: |
+          BIN="$(find extension/build-macos-legacy -type f \( -name 'reaper_vshook.dylib' -o -name 'libreaper_vshook.dylib' \) | head -n 1)"
+          test -n "$BIN"
+          echo "Binary: $BIN"
+          file "$BIN"
+          lipo -info "$BIN" || true
+          otool -l "$BIN" | grep -A3 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX" || true
+          nm -gU "$BIN" | grep "_ReaperPluginEntry"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vshook-loader-macos-10.13-legacy-intel
+          if-no-files-found: error
+          path: |
+            extension/build-macos-legacy/**/reaper_vshook.dylib
+            extension/build-macos-legacy/**/libreaper_vshook.dylib

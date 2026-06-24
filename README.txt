@@ -17,7 +17,14 @@ Regras:
 - A opcao ativa usa a marcacao nativa do menu do REAPER, sem letra V no texto.
 - A marcacao do menu e atualizada quando o menu abre, sem precisar reiniciar o REAPER.
 - A configuracao global usa ExtState persistente.
-- A configuracao por projeto tambem usa ExtState persistente com chave pelo caminho do projeto, entao nao depende de salvar o .RPP.
+- A configuracao por projeto usa ProjExtState dentro do proprio .RPP, igual a SWS. Depois de marcar, salve o projeto para a configuracao ficar permanente.
+
+Builds macOS:
+
+- macOS 11+ Universal: x86_64 + arm64, deployment target 11.0.
+- macOS 10.13+ Legacy: x86_64/Intel, deployment target 10.13.
+
+O alvo Legacy existe para manter compatibilidade formal com macOS 10.x.
 
 Scripts esperados:
 

@@ -5,8 +5,25 @@ if(POLICY CMP0091)
 endif()
 
 if(APPLE)
-  set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
-  set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS universal build" FORCE)
+  # VS Hook precisa manter dois alvos de macOS:
+  # - Normal/universal: macOS 11+ com Intel + Apple Silicon.
+  # - Legacy: macOS 10.13+ somente Intel/x86_64.
+  #
+  # Nao forcar sempre 11.0 aqui, porque isso impede o build Legacy.
+  # O workflow passa VSHOOK_MAC_LEGACY=ON quando for gerar o pacote 10.x.
+  set(VSHOOK_MAC_LEGACY OFF CACHE BOOL "Build macOS Legacy 10.13+ Intel/x86_64")
+
+  if(VSHOOK_MAC_LEGACY)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version" FORCE)
+    set(CMAKE_OSX_ARCHITECTURES "x86_64" CACHE STRING "macOS Legacy Intel build" FORCE)
+  else()
+    if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+      set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
+    endif()
+    if(NOT DEFINED CMAKE_OSX_ARCHITECTURES OR CMAKE_OSX_ARCHITECTURES STREQUAL "")
+      set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS universal build" FORCE)
+    endif()
+  endif()
 endif()
 
 project(reaper_vshook_loader LANGUAGES CXX)
