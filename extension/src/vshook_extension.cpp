@@ -2,6 +2,7 @@
 #include "reaper_plugin.h"
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -23,6 +24,9 @@ using AddExtensionsMainMenu_t = bool (*)();
 using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
 using GetExtState_t = const char* (*)(const char*, const char*);
 using SetExtState_t = void (*)(const char*, const char*, const char*, bool);
+using EnumProjects_t = ReaProject* (*)(int, char*, int);
+using GetProjExtState_t = int (*)(ReaProject*, const char*, const char*, char*, int);
+using SetProjExtState_t = int (*)(ReaProject*, const char*, const char*, const char*);
 
 static plugin_register_t plugin_register_ptr = nullptr;
 static plugin_getapi_t plugin_getapi_ptr = nullptr;
@@ -33,10 +37,17 @@ static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
 static GetExtState_t GetExtState_ptr = nullptr;
 static SetExtState_t SetExtState_ptr = nullptr;
+static EnumProjects_t EnumProjects_ptr = nullptr;
+static GetProjExtState_t GetProjExtState_ptr = nullptr;
+static SetProjExtState_t SetProjExtState_ptr = nullptr;
 
 static const char* kExtStateSection = "VS_HOOK_LOADER";
 static const char* kAutoOpenModeKey = "AUTO_OPEN_VSHOOK_MODE";
 static const char* kLegacyAutoOpenKey = "AUTO_OPEN_VSHOOK";
+static const char* kProjectAutoOpenModeKey = "PROJECT_AUTO_OPEN_VSHOOK_MODE";
+static const char* kNotesExtStateSection = "VS_HOOK_NOTES";
+static const char* kNotesCurrentSongKey = "CURRENT_SONG";
+static const char* kNotesQueuedSongKey = "QUEUED_SONG";
 
 struct ScriptEntry {
   custom_action_register_t action;
@@ -70,6 +81,13 @@ static ScriptEntry g_scripts[] = {
     "VS Hook Basic.lua",
     "basic",
     true
+  },
+  {
+    { 0, "VSHOOKNOTES", "VS Hook Anotacoes", nullptr },
+    "VS Hook Anotações",
+    "VS Hook Anotacoes.lua",
+    "notes",
+    true
   }
 };
 
@@ -79,18 +97,36 @@ struct State {
   bool commandHook2Registered = false;
   bool menuHookRegistered = false;
   bool timerRegistered = false;
+  bool apiRegistered = false;
   int startupTimerTicks = 0;
+  int projectStableTicks = 0;
+  bool didGlobalStartupAutoOpen = false;
+  std::string activeProjectSignature;
+  std::string autoOpenedProjectSignature;
 } g_state;
 
 static AutoOpenEntry g_autoOpenEntries[] = {
   {
-    { 0, "VSHOOKAUTOPRO", "Iniciar VS Hook Pro Junto com o REAPER", nullptr },
-    "Iniciar VS Hook Pro Junto com o REAPER",
+    { 0, "VSHOOKAUTOPRO", "Iniciar VS Hook Pro junto com o REAPER", nullptr },
+    "Iniciar VS Hook Pro junto com o REAPER",
     "pro"
   },
   {
-    { 0, "VSHOOKAUTOBASIC", "Iniciar VS Hook Basic Junto com o REAPER", nullptr },
-    "Iniciar VS Hook Basic Junto com o REAPER",
+    { 0, "VSHOOKAUTOBASIC", "Iniciar VS Hook Basic junto com o REAPER", nullptr },
+    "Iniciar VS Hook Basic junto com o REAPER",
+    "basic"
+  }
+};
+
+static AutoOpenEntry g_projectAutoOpenEntries[] = {
+  {
+    { 0, "VSHOOKPROJECTAUTOPRO", "Iniciar VS Hook Pro junto com ESTE projeto", nullptr },
+    "Iniciar VS Hook Pro junto com ESTE projeto",
+    "pro"
+  },
+  {
+    { 0, "VSHOOKPROJECTAUTOBASIC", "Iniciar VS Hook Basic junto com ESTE projeto", nullptr },
+    "Iniciar VS Hook Basic junto com ESTE projeto",
     "basic"
   }
 };
@@ -122,7 +158,199 @@ static std::wstring utf8ToWide(const std::string& text)
   if (!wide.empty() && wide.back() == L'\0') wide.pop_back();
   return wide;
 }
+
 #endif
+
+#ifndef _WIN32
+static std::string wideToUtf8Fallback(const void* data)
+{
+  (void)data;
+  return std::string();
+}
+#endif
+
+static bool VS_Hook_SetClipboard(const char* text)
+{
+  const std::string value = text ? text : "";
+
+#ifdef _WIN32
+  const std::wstring wide = utf8ToWide(value);
+  const size_t bytes = (wide.size() + 1) * sizeof(wchar_t);
+  HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+  if (!mem) return false;
+
+  void* locked = GlobalLock(mem);
+  if (!locked) {
+    GlobalFree(mem);
+    return false;
+  }
+
+  std::memcpy(locked, wide.c_str(), bytes);
+  GlobalUnlock(mem);
+
+  if (!OpenClipboard(nullptr)) {
+    GlobalFree(mem);
+    return false;
+  }
+
+  EmptyClipboard();
+  if (!SetClipboardData(CF_UNICODETEXT, mem)) {
+    CloseClipboard();
+    GlobalFree(mem);
+    return false;
+  }
+
+  CloseClipboard();
+  return true;
+#else
+  const size_t bytes = value.size() + 1;
+  HANDLE mem = GlobalAlloc(GMEM_MOVEABLE, static_cast<int>(bytes));
+  if (!mem) return false;
+
+  void* locked = GlobalLock(mem);
+  if (!locked) {
+    GlobalFree(mem);
+    return false;
+  }
+
+  std::memcpy(locked, value.c_str(), bytes);
+  GlobalUnlock(mem);
+
+  if (!OpenClipboard(nullptr)) {
+    GlobalFree(mem);
+    return false;
+  }
+
+  EmptyClipboard();
+  SetClipboardData(CF_TEXT, mem);
+  CloseClipboard();
+  return true;
+#endif
+}
+
+static bool VS_Hook_GetClipboard(char* buf, int bufSize)
+{
+  if (!buf || bufSize <= 0) return false;
+  buf[0] = '\0';
+
+  if (!OpenClipboard(nullptr)) return false;
+
+#ifdef _WIN32
+  HANDLE mem = GetClipboardData(CF_UNICODETEXT);
+  if (!mem) {
+    CloseClipboard();
+    return false;
+  }
+
+  const wchar_t* data = static_cast<const wchar_t*>(GlobalLock(mem));
+  if (!data) {
+    CloseClipboard();
+    return false;
+  }
+
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, data, -1, nullptr, 0, nullptr, nullptr);
+  if (needed > 0) {
+    WideCharToMultiByte(CP_UTF8, 0, data, -1, buf, bufSize, nullptr, nullptr);
+    buf[bufSize - 1] = '\0';
+  }
+
+  GlobalUnlock(mem);
+  CloseClipboard();
+  return needed > 0;
+#else
+  HANDLE mem = GetClipboardData(CF_TEXT);
+  if (!mem) {
+    CloseClipboard();
+    return false;
+  }
+
+  const char* data = static_cast<const char*>(GlobalLock(mem));
+  if (!data) {
+    CloseClipboard();
+    return false;
+  }
+
+  std::strncpy(buf, data, static_cast<size_t>(bufSize - 1));
+  buf[bufSize - 1] = '\0';
+  GlobalUnlock(mem);
+  CloseClipboard();
+  return true;
+#endif
+}
+
+static std::string g_notesCurrentSong;
+static std::string g_notesQueuedSong;
+
+static bool VS_Hook_SetNotesState(const char* currentSong, const char* queuedSong)
+{
+  g_notesCurrentSong = currentSong ? currentSong : "";
+  g_notesQueuedSong = queuedSong ? queuedSong : "";
+
+  if (SetExtState_ptr) {
+    SetExtState_ptr(kNotesExtStateSection, kNotesCurrentSongKey, g_notesCurrentSong.c_str(), false);
+    SetExtState_ptr(kNotesExtStateSection, kNotesQueuedSongKey, g_notesQueuedSong.c_str(), false);
+  }
+
+  return true;
+}
+
+static bool VS_Hook_ClearNotesState()
+{
+  g_notesCurrentSong.clear();
+  g_notesQueuedSong.clear();
+
+  if (SetExtState_ptr) {
+    SetExtState_ptr(kNotesExtStateSection, kNotesCurrentSongKey, "", false);
+    SetExtState_ptr(kNotesExtStateSection, kNotesQueuedSongKey, "", false);
+  }
+
+  return true;
+}
+
+static char g_apiDefSetClipboard[] =
+  "bool\0const char*\0text\0Write text into the system clipboard using the VS Hook extension.";
+
+static char g_apiDefGetClipboard[] =
+  "bool\0char*,int\0textOutNeedBig,textOutNeedBig_sz\0Read text from the system clipboard using the VS Hook extension.";
+
+static char g_apiDefSetNotesState[] =
+  "bool\0const char*,const char*\0currentSong,queuedSong\0Update the VS Hook notes window state.";
+
+static char g_apiDefClearNotesState[] =
+  "bool\0\0\0Clear the VS Hook notes window state.";
+
+static bool registerClipboardApi()
+{
+  if (!plugin_register_ptr) return false;
+
+  bool ok = true;
+  ok = (plugin_register_ptr("API_VS_Hook_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_SetClipboard", reinterpret_cast<void*>(g_apiDefSetClipboard)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_GetClipboard", reinterpret_cast<void*>(&VS_Hook_GetClipboard)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_GetClipboard", reinterpret_cast<void*>(g_apiDefGetClipboard)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_SetNotesState", reinterpret_cast<void*>(&VS_Hook_SetNotesState)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_SetNotesState", reinterpret_cast<void*>(g_apiDefSetNotesState)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_ClearNotesState", reinterpret_cast<void*>(&VS_Hook_ClearNotesState)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_ClearNotesState", reinterpret_cast<void*>(g_apiDefClearNotesState)) != 0) && ok;
+
+  g_state.apiRegistered = ok;
+  return ok;
+}
+
+static void unregisterClipboardApi()
+{
+  if (!plugin_register_ptr || !g_state.apiRegistered) return;
+
+  plugin_register_ptr("-APIdef_VS_Hook_ClearNotesState", reinterpret_cast<void*>(g_apiDefClearNotesState));
+  plugin_register_ptr("-API_VS_Hook_ClearNotesState", reinterpret_cast<void*>(&VS_Hook_ClearNotesState));
+  plugin_register_ptr("-APIdef_VS_Hook_SetNotesState", reinterpret_cast<void*>(g_apiDefSetNotesState));
+  plugin_register_ptr("-API_VS_Hook_SetNotesState", reinterpret_cast<void*>(&VS_Hook_SetNotesState));
+  plugin_register_ptr("-APIdef_VS_Hook_GetClipboard", reinterpret_cast<void*>(g_apiDefGetClipboard));
+  plugin_register_ptr("-API_VS_Hook_GetClipboard", reinterpret_cast<void*>(&VS_Hook_GetClipboard));
+  plugin_register_ptr("-APIdef_VS_Hook_SetClipboard", reinterpret_cast<void*>(g_apiDefSetClipboard));
+  plugin_register_ptr("-API_VS_Hook_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard));
+  g_state.apiRegistered = false;
+}
 
 static std::string joinPath(const std::string& base, const std::string& child)
 {
@@ -276,6 +504,62 @@ static void setAutoOpenMode(const char* mode)
   SetExtState_ptr(kExtStateSection, kLegacyAutoOpenKey, "0", true);
 }
 
+static bool isAutoOpenModeValue(const std::string& mode)
+{
+  return mode == "pro" || mode == "basic";
+}
+
+static ReaProject* getCurrentProject(char* pathOut, int pathOutSize)
+{
+  if (pathOut && pathOutSize > 0) pathOut[0] = '\0';
+  if (!EnumProjects_ptr) return nullptr;
+  return EnumProjects_ptr(-1, pathOut, pathOutSize);
+}
+
+static std::string getCurrentProjectSignature()
+{
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
+
+  std::ostringstream oss;
+  oss << reinterpret_cast<std::uintptr_t>(project) << "|" << normalizeSlashes(path ? path : "");
+  return oss.str();
+}
+
+static std::string getProjectAutoOpenMode()
+{
+  if (!GetProjExtState_ptr) return std::string();
+
+  char value[64] = "";
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
+  GetProjExtState_ptr(project, kExtStateSection, kProjectAutoOpenModeKey, value, static_cast<int>(sizeof(value)));
+
+  const std::string mode = value;
+  return isAutoOpenModeValue(mode) ? mode : std::string();
+}
+
+static void setProjectAutoOpenMode(const char* mode)
+{
+  if (!SetProjExtState_ptr) {
+    showDiagnostic("REAPER nao entregou a API SetProjExtState para salvar configuracao deste projeto.");
+    return;
+  }
+
+  const std::string safeMode = (mode && isAutoOpenModeValue(mode)) ? mode : "";
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
+  SetProjExtState_ptr(project, kExtStateSection, kProjectAutoOpenModeKey, safeMode.c_str());
+
+  // Evita que o timer abra imediatamente ao marcar a opcao; ela passa a valer
+  // quando este projeto for aberto/carregado de novo.
+  if (!safeMode.empty()) {
+    g_state.autoOpenedProjectSignature = getCurrentProjectSignature() + "|" + safeMode;
+  } else {
+    g_state.autoOpenedProjectSignature.clear();
+  }
+}
+
 static const char* displayNameForAutoOpenMode(const char* mode)
 {
   for (const ScriptEntry& script : g_scripts) {
@@ -300,6 +584,32 @@ static void toggleAutoOpenMode(const char* mode)
   showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com o REAPER.");
 }
 
+static void toggleProjectAutoOpenMode(const char* mode)
+{
+  const std::string currentMode = getProjectAutoOpenMode();
+
+  if (mode && currentMode == mode) {
+    setProjectAutoOpenMode("");
+    showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " nao vai mais iniciar junto com ESTE projeto.");
+    return;
+  }
+
+  setProjectAutoOpenMode(mode);
+  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com ESTE projeto. Salve o projeto para gravar essa configuracao no RPP.");
+}
+
+static void runScriptByAutoOpenMode(const std::string& mode)
+{
+  if (!isAutoOpenModeValue(mode)) return;
+
+  for (ScriptEntry& script : g_scripts) {
+    if (mode == script.autoOpenMode) {
+      runScript(script);
+      return;
+    }
+  }
+}
+
 static ScriptEntry* findScriptByCommand(int command)
 {
   for (ScriptEntry& script : g_scripts) {
@@ -318,6 +628,13 @@ static bool hookCommand(int command, int flag)
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && command == entry.commandId) {
       toggleAutoOpenMode(entry.autoOpenMode);
+      return true;
+    }
+  }
+
+  for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
+    if (entry.commandId != 0 && command == entry.commandId) {
+      toggleProjectAutoOpenMode(entry.autoOpenMode);
       return true;
     }
   }
@@ -343,6 +660,13 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && command == entry.commandId) {
       toggleAutoOpenMode(entry.autoOpenMode);
+      return true;
+    }
+  }
+
+  for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
+    if (entry.commandId != 0 && command == entry.commandId) {
+      toggleProjectAutoOpenMode(entry.autoOpenMode);
       return true;
     }
   }
@@ -383,8 +707,22 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   if (std::strcmp(menustr, "Main extensions") == 0) {
     // Insere de tras para frente porque cada item entra na posicao 0.
     // Ordem final no menu:
-    // VS Hook Pro / VS Hook Basic / separador / auto-inicio Pro / auto-inicio Basic.
+    // VS Hook Pro / VS Hook Basic / VS Hook Anotações
+    // separador / auto-inicio com REAPER / separador / auto-inicio deste projeto.
     const std::string autoMode = getAutoOpenMode();
+    const std::string projectAutoMode = getProjectAutoOpenMode();
+
+    for (int i = static_cast<int>(sizeof(g_projectAutoOpenEntries) / sizeof(g_projectAutoOpenEntries[0])) - 1; i >= 0; --i) {
+      if (g_projectAutoOpenEntries[i].commandId == 0) continue;
+      insertMenuString(
+        hMenu,
+        g_projectAutoOpenEntries[i].displayName,
+        g_projectAutoOpenEntries[i].commandId,
+        projectAutoMode == g_projectAutoOpenEntries[i].autoOpenMode
+      );
+    }
+
+    insertMenuSeparator(hMenu);
 
     for (int i = static_cast<int>(sizeof(g_autoOpenEntries) / sizeof(g_autoOpenEntries[0])) - 1; i >= 0; --i) {
       if (g_autoOpenEntries[i].commandId == 0) continue;
@@ -412,21 +750,37 @@ static void startupTimer()
 {
   ++g_state.startupTimerTicks;
 
-  // Espera alguns ciclos para o REAPER terminar de montar a interface.
-  if (g_state.startupTimerTicks < 30) return;
-
-  if (g_state.timerRegistered && plugin_register_ptr) {
-    plugin_register_ptr("-timer", reinterpret_cast<void*>(&startupTimer));
-    g_state.timerRegistered = false;
+  const std::string projectSignature = getCurrentProjectSignature();
+  if (projectSignature != g_state.activeProjectSignature) {
+    g_state.activeProjectSignature = projectSignature;
+    g_state.projectStableTicks = 0;
+  } else {
+    ++g_state.projectStableTicks;
   }
 
-  const std::string autoMode = getAutoOpenMode();
-  if (!autoMode.empty()) {
-    for (ScriptEntry& script : g_scripts) {
-      if (autoMode == script.autoOpenMode) {
-        runScript(script);
-        break;
-      }
+  // Espera alguns ciclos para o REAPER terminar de montar a interface e carregar
+  // os ProjExtState salvos no RPP.
+  if (g_state.startupTimerTicks < 30) return;
+
+  const std::string projectMode = getProjectAutoOpenMode();
+
+  if (!projectMode.empty() && g_state.projectStableTicks >= 6) {
+    const std::string projectRunKey = projectSignature + "|" + projectMode;
+    if (g_state.autoOpenedProjectSignature != projectRunKey) {
+      g_state.autoOpenedProjectSignature = projectRunKey;
+      g_state.didGlobalStartupAutoOpen = true;
+      runScriptByAutoOpenMode(projectMode);
+      return;
+    }
+  }
+
+  // Auto-inicio global: roda apenas uma vez na abertura do REAPER e nao compete
+  // com configuracao especifica do projeto.
+  if (!g_state.didGlobalStartupAutoOpen && projectMode.empty()) {
+    g_state.didGlobalStartupAutoOpen = true;
+    const std::string autoMode = getAutoOpenMode();
+    if (!autoMode.empty()) {
+      runScriptByAutoOpenMode(autoMode);
     }
   }
 }
@@ -451,6 +805,9 @@ static bool loadApi(reaper_plugin_info_t* rec)
   AddRemoveReaScript_ptr = reinterpret_cast<AddRemoveReaScript_t>(rec->GetFunc("AddRemoveReaScript"));
   GetExtState_ptr = reinterpret_cast<GetExtState_t>(rec->GetFunc("GetExtState"));
   SetExtState_ptr = reinterpret_cast<SetExtState_t>(rec->GetFunc("SetExtState"));
+  EnumProjects_ptr = reinterpret_cast<EnumProjects_t>(rec->GetFunc("EnumProjects"));
+  GetProjExtState_ptr = reinterpret_cast<GetProjExtState_t>(rec->GetFunc("GetProjExtState"));
+  SetProjExtState_ptr = reinterpret_cast<SetProjExtState_t>(rec->GetFunc("SetProjExtState"));
 
   if (!plugin_register_ptr) {
     showDiagnostic("VS Hook Loader nao carregou: plugin_register indisponivel.");
@@ -473,12 +830,21 @@ static void initialize()
     }
   }
 
+  for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
+    entry.commandId = plugin_register_ptr("custom_action", (void*)&entry.action);
+    if (entry.commandId != 0) {
+      hasRegisteredAction = true;
+    }
+  }
+
   for (ScriptEntry& script : g_scripts) {
     script.commandId = plugin_register_ptr("custom_action", (void*)&script.action);
     if (script.commandId != 0) {
       hasRegisteredAction = true;
     }
   }
+
+  registerClipboardApi();
 
   if (hasRegisteredAction) {
     if (plugin_register_ptr("hookcommand", reinterpret_cast<void*>(&hookCommand))) {
@@ -500,19 +866,17 @@ static void initialize()
     AddExtensionsMainMenu_ptr();
   }
 
-  if (!getAutoOpenMode().empty()) {
-    g_state.startupTimerTicks = 0;
-    if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
-      g_state.timerRegistered = true;
-    } else {
-      const std::string autoMode = getAutoOpenMode();
-      for (ScriptEntry& script : g_scripts) {
-        if (autoMode == script.autoOpenMode) {
-          runScript(script);
-          break;
-        }
-      }
-    }
+  // O timer fica ativo de forma leve para suportar auto-inicio por projeto
+  // quando o usuario troca/abre projetos depois do REAPER ja estar rodando.
+  g_state.startupTimerTicks = 0;
+  g_state.projectStableTicks = 0;
+  g_state.didGlobalStartupAutoOpen = false;
+  g_state.activeProjectSignature.clear();
+  g_state.autoOpenedProjectSignature.clear();
+  if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
+    g_state.timerRegistered = true;
+  } else if (!getAutoOpenMode().empty()) {
+    runScriptByAutoOpenMode(getAutoOpenMode());
   }
 
   g_state.initialized = true;
@@ -526,6 +890,8 @@ static void shutdown()
     plugin_register_ptr("-timer", reinterpret_cast<void*>(&startupTimer));
     g_state.timerRegistered = false;
   }
+
+  unregisterClipboardApi();
 
   if (g_state.menuHookRegistered) {
     plugin_register_ptr("-hookcustommenu", reinterpret_cast<void*>(&menuHook));
@@ -556,6 +922,15 @@ static void shutdown()
     }
   }
 
+  for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
+    if (entry.commandId != 0) {
+      plugin_register_ptr("-custom_action", (void*)&entry.action);
+      entry.commandId = 0;
+    }
+  }
+
+  g_state.activeProjectSignature.clear();
+  g_state.autoOpenedProjectSignature.clear();
   g_state.initialized = false;
 }
 

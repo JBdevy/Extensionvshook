@@ -1,0 +1,11 @@
+Para alimentar a janela VS Hook Anotacoes pelo Lua principal, chame sempre que mudar musica/fila:
+
+if reaper.VS_Hook_SetNotesState then
+  reaper.VS_Hook_SetNotesState(nome_musica_em_reproducao or "", nome_musica_na_fila or "")
+end
+
+Para limpar:
+
+if reaper.VS_Hook_ClearNotesState then
+  reaper.VS_Hook_ClearNotesState()
+end
