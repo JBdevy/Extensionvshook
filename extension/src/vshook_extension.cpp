@@ -99,6 +99,7 @@ struct State {
   bool didGlobalStartupAutoOpen = false;
   std::string activeProjectSignature;
   std::string autoOpenedProjectSignature;
+  std::string lastLaunchedMode;
 } g_state;
 
 static AutoOpenEntry g_autoOpenEntries[] = {
@@ -443,7 +444,16 @@ static void closeOtherScripts(ScriptEntry& target)
     if (&other == &target) continue;
     if (!ensureScriptRegistered(other)) continue;
 
-    if (getScriptToggleState(other) == 1) {
+    const int otherState = getScriptToggleState(other);
+
+    // Preferimos o estado nativo do REAPER quando ele funciona.
+    // Em alguns setups o defer script nao informa toggle=1 de forma confiavel;
+    // por isso tambem usamos o ultimo modo aberto pela propria extensao nesta sessao.
+    const bool shouldClose =
+      (otherState == 1) ||
+      (!g_state.lastLaunchedMode.empty() && other.autoOpenMode && g_state.lastLaunchedMode == other.autoOpenMode);
+
+    if (shouldClose && other.scriptCommandId != 0) {
       Main_OnCommand_ptr(other.scriptCommandId, 0);
     }
   }
@@ -459,11 +469,29 @@ static void runScript(ScriptEntry& script, bool toggleIfAlreadyOpen = true)
 
   if (!Main_OnCommand_ptr || script.scriptCommandId == 0) return;
 
-  if (!toggleIfAlreadyOpen && getScriptToggleState(script) == 1) {
+  const int nativeStateBefore = getScriptToggleState(script);
+  const bool rememberedAsOpen =
+    script.autoOpenMode && !g_state.lastLaunchedMode.empty() && g_state.lastLaunchedMode == script.autoOpenMode;
+  const bool consideredOpen = (nativeStateBefore == 1) || rememberedAsOpen;
+
+  if (!toggleIfAlreadyOpen && nativeStateBefore == 1) {
+    if (script.autoOpenMode) g_state.lastLaunchedMode = script.autoOpenMode;
     return;
   }
 
   Main_OnCommand_ptr(script.scriptCommandId, 0);
+
+  if (script.autoOpenMode) {
+    // Clique manual no mesmo modo funciona como toggle: se ele ja era o ultimo
+    // aberto, considera que o usuario quis fechar e limpa a memoria.
+    // Na troca Pro -> Basic / Basic -> Pro, closeOtherScripts ja fechou o outro
+    // e aqui registramos o novo modo ativo.
+    if (toggleIfAlreadyOpen && consideredOpen) {
+      g_state.lastLaunchedMode.clear();
+    } else {
+      g_state.lastLaunchedMode = script.autoOpenMode;
+    }
+  }
 }
 
 static ReaProject* getCurrentProject(char* pathOut, int pathOutSize);
@@ -488,10 +516,12 @@ static std::string getAutoOpenMode()
   return std::string();
 }
 
-static void setAutoOpenMode(const char* mode)
+static void setAutoOpenModeRaw(const char* mode, bool showError)
 {
   if (!SetExtState_ptr) {
-    showDiagnostic("REAPER nao entregou a API SetExtState para salvar essa configuracao.");
+    if (showError) {
+      showDiagnostic("REAPER nao entregou a API SetExtState para salvar essa configuracao.");
+    }
     return;
   }
 
@@ -500,6 +530,11 @@ static void setAutoOpenMode(const char* mode)
   // Desliga a chave antiga para ela nao religar o Pro depois que o usuario
   // escolher Basic ou desativar o auto-inicio.
   SetExtState_ptr(kExtStateSection, kLegacyAutoOpenKey, "0", true);
+}
+
+static void setAutoOpenMode(const char* mode)
+{
+  setAutoOpenModeRaw(mode, true);
 }
 
 static bool isAutoOpenModeValue(const std::string& mode)
@@ -539,10 +574,12 @@ static std::string getProjectAutoOpenMode()
   return isAutoOpenModeValue(mode) ? mode : std::string();
 }
 
-static void setProjectAutoOpenMode(const char* mode)
+static void setProjectAutoOpenModeRaw(const char* mode, bool showError)
 {
   if (!SetProjExtState_ptr) {
-    showDiagnostic("REAPER nao entregou a API SetProjExtState para salvar configuracao deste projeto.");
+    if (showError) {
+      showDiagnostic("REAPER nao entregou a API SetProjExtState para salvar configuracao deste projeto.");
+    }
     return;
   }
 
@@ -559,6 +596,20 @@ static void setProjectAutoOpenMode(const char* mode)
     g_state.autoOpenedProjectSignature = getCurrentProjectSignature() + "|" + safeMode;
   } else {
     g_state.autoOpenedProjectSignature.clear();
+  }
+}
+
+static void setProjectAutoOpenMode(const char* mode)
+{
+  setProjectAutoOpenModeRaw(mode, true);
+}
+
+static void normalizeAutoOpenConflict()
+{
+  // Se uma configuracao antiga deixou REAPER e projeto ativos ao mesmo tempo,
+  // o projeto ganha por ser mais especifico. Isso evita duplo disparo ao abrir.
+  if (!getAutoOpenMode().empty() && !getProjectAutoOpenMode().empty()) {
+    setAutoOpenModeRaw("", false);
   }
 }
 
@@ -582,8 +633,11 @@ static void toggleAutoOpenMode(const char* mode)
     return;
   }
 
+  // Regra de exclusividade: escolher iniciar junto com o REAPER desmarca
+  // qualquer configuracao deste projeto, para nao existir duplo disparo.
+  setProjectAutoOpenModeRaw("", false);
   setAutoOpenMode(mode);
-  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com o REAPER.");
+  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com o REAPER. A opcao deste projeto foi desmarcada.");
 }
 
 static void toggleProjectAutoOpenMode(const char* mode)
@@ -596,8 +650,11 @@ static void toggleProjectAutoOpenMode(const char* mode)
     return;
   }
 
+  // Regra de exclusividade: escolher iniciar junto com ESTE projeto desmarca
+  // o auto-inicio global com o REAPER, para nao existir conflito.
+  setAutoOpenModeRaw("", false);
   setProjectAutoOpenMode(mode);
-  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com ESTE projeto. Salve o projeto para gravar essa configuracao no RPP.");
+  showDiagnostic(std::string(displayNameForAutoOpenMode(mode)) + " configurado para iniciar junto com ESTE projeto. O auto-inicio com o REAPER foi desmarcado. Salve o projeto para gravar essa configuracao no RPP.");
 }
 
 static void runScriptByAutoOpenMode(const std::string& mode)
@@ -684,6 +741,8 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
 
 static int toggleActionState(int commandId)
 {
+  normalizeAutoOpenConflict();
+
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && commandId == entry.commandId) {
       return getAutoOpenMode() == entry.autoOpenMode ? 1 : 0;
@@ -738,6 +797,8 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 {
   if (!menustr || !hMenu) return;
   if (std::strcmp(menustr, "Main extensions") != 0) return;
+
+  normalizeAutoOpenConflict();
 
   const std::string autoMode = getAutoOpenMode();
   const std::string projectAutoMode = getProjectAutoOpenMode();
@@ -813,6 +874,8 @@ static void startupTimer()
   // Espera alguns ciclos para o REAPER terminar de montar a interface e carregar
   // os ProjExtState salvos no RPP.
   if (g_state.startupTimerTicks < 30) return;
+
+  normalizeAutoOpenConflict();
 
   const std::string projectMode = getProjectAutoOpenMode();
 
@@ -931,6 +994,7 @@ static void initialize()
   g_state.didGlobalStartupAutoOpen = false;
   g_state.activeProjectSignature.clear();
   g_state.autoOpenedProjectSignature.clear();
+  g_state.lastLaunchedMode.clear();
   if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
     g_state.timerRegistered = true;
   } else if (!getAutoOpenMode().empty()) {
@@ -994,6 +1058,7 @@ static void shutdown()
 
   g_state.activeProjectSignature.clear();
   g_state.autoOpenedProjectSignature.clear();
+  g_state.lastLaunchedMode.clear();
   g_state.initialized = false;
 }
 

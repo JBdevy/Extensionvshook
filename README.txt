@@ -12,8 +12,10 @@ Esta extensao adiciona no menu Extensions:
 Regras:
 
 - Pro e Basic sao exclusivos: ao abrir um, a extensao fecha o outro se ele estiver aberto.
+- A extensao tambem guarda o ultimo modo aberto na sessao para fechar o anterior mesmo quando o REAPER nao reporta corretamente o toggle do defer script.
 - As opcoes de iniciar junto com o REAPER sao exclusivas: quando Pro esta ativo, Basic fica desativado; quando Basic esta ativo, Pro fica desativado.
 - As opcoes de iniciar junto com ESTE projeto tambem sao exclusivas.
+- Iniciar junto com o REAPER e iniciar junto com ESTE projeto tambem sao exclusivos entre si: marcou um, o outro e desmarcado.
 - A opcao ativa usa a marcacao nativa do menu do REAPER, sem letra V no texto.
 - A marcacao do menu e atualizada quando o menu abre, sem precisar reiniciar o REAPER.
 - A configuracao global usa ExtState persistente.
