@@ -55,40 +55,74 @@ jobs:
           test -f extension/WDL/swell/swell.h
           echo "SDK headers found."
 
-      - name: Clean build dir
+      - name: Clean build dirs
         shell: bash
-        run: rm -rf extension/build
+        run: rm -rf extension/build-x86_64 extension/build-arm64 extension/build-universal
 
-      - name: Configure
+      # Mesmo modelo da SWS: cada arquitetura recebe seu deployment target.
+      # Depois juntamos os dois binarios em um unico reaper_vshook.dylib via lipo.
+      - name: Configure x86_64 macOS 10.13+
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.13"
+        run: >
+          cmake -S extension -B extension/build-x86_64
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=x86_64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+
+      - name: Build x86_64 macOS 10.13+
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.13"
+        run: cmake --build extension/build-x86_64 --config Release
+
+      - name: Configure arm64 macOS 11+
         shell: bash
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: >
-          cmake -S extension -B extension/build
+          cmake -S extension -B extension/build-arm64
           -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+          -DCMAKE_OSX_ARCHITECTURES=arm64
           -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
 
-      - name: Build
+      - name: Build arm64 macOS 11+
         shell: bash
-        run: cmake --build extension/build --config Release
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cmake --build extension/build-arm64 --config Release
 
-      - name: Verify exported entrypoint
+      - name: Create single universal dylib
         shell: bash
         run: |
-          BIN="$(find extension/build -type f \( -name 'reaper_vshook.dylib' -o -name 'libreaper_vshook.dylib' \) | head -n 1)"
-          test -n "$BIN"
+          mkdir -p extension/build-universal
+          X86_BIN="$(find extension/build-x86_64 -type f \( -name 'reaper_vshook.dylib' -o -name 'libreaper_vshook.dylib' \) | head -n 1)"
+          ARM_BIN="$(find extension/build-arm64 -type f \( -name 'reaper_vshook.dylib' -o -name 'libreaper_vshook.dylib' \) | head -n 1)"
+          test -n "$X86_BIN"
+          test -n "$ARM_BIN"
+          echo "x86_64: $X86_BIN"
+          echo "arm64:  $ARM_BIN"
+          lipo -create "$X86_BIN" "$ARM_BIN" -output extension/build-universal/reaper_vshook.dylib
+
+      - name: Verify exported entrypoint and macOS targets
+        shell: bash
+        run: |
+          BIN="extension/build-universal/reaper_vshook.dylib"
+          test -f "$BIN"
           echo "Binary: $BIN"
           file "$BIN"
-          lipo -info "$BIN" || true
-          otool -l "$BIN" | grep -A3 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX" || true
-          nm -gU "$BIN" | grep "_ReaperPluginEntry"
+          lipo -info "$BIN"
+          echo "--- x86_64 deployment target ---"
+          otool -arch x86_64 -l "$BIN" | grep -A5 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX"
+          echo "--- arm64 deployment target ---"
+          otool -arch arm64 -l "$BIN" | grep -A5 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX"
+          nm -arch x86_64 -gU "$BIN" | grep "_ReaperPluginEntry"
+          nm -arch arm64 -gU "$BIN" | grep "_ReaperPluginEntry"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: vshook-loader-macos-universal
           if-no-files-found: error
-          path: |
-            extension/build/**/reaper_vshook.dylib
-            extension/build/**/libreaper_vshook.dylib
+          path: extension/build-universal/reaper_vshook.dylib

@@ -1,0 +1,3 @@
+/mnt/data/vshook_src/VSHookwinmac/extension/build-linux-test/CMakeFiles/reaper_vshook.dir
+/mnt/data/vshook_src/VSHookwinmac/extension/build-linux-test/CMakeFiles/edit_cache.dir
+/mnt/data/vshook_src/VSHookwinmac/extension/build-linux-test/CMakeFiles/rebuild_cache.dir

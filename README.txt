@@ -35,3 +35,9 @@ APIs nativas mantidas:
 
 reaper.VS_Hook_SetClipboard(texto)
 reaper.VS_Hook_GetClipboard("", 65536)
+
+Build macOS corrigido:
+- O artefato macOS continua sendo um unico reaper_vshook.dylib.
+- x86_64 e compilado com deployment target 10.13 para clientes macOS 10.x Intel.
+- arm64 e compilado com deployment target 11.0 para Apple Silicon.
+- O universal final e criado com lipo, seguindo a mesma ideia da SWS: target por arquitetura antes de juntar.

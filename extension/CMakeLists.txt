@@ -5,8 +5,20 @@ if(POLICY CMP0091)
 endif()
 
 if(APPLE)
-  set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version" FORCE)
-  set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64" CACHE STRING "macOS universal build" FORCE)
+  # Nao force target/arquitetura aqui.
+  # Igual a estrategia da SWS: o workflow define o deployment target por arquitetura.
+  # x86_64 precisa continuar carregando no macOS 10.13; arm64 exige macOS 11+.
+  if(NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "x86_64" CACHE STRING "macOS architecture")
+  endif()
+
+  if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+      set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
+    else()
+      set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
+    endif()
+  endif()
 endif()
 
 project(reaper_vshook_loader LANGUAGES CXX)
