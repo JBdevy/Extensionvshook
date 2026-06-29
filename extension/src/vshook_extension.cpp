@@ -933,8 +933,8 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 // ==========================================================
 
 static const int kNativeBridgePort = 47830;
-static const int kNativeBridgeLiveIntervalMs = 250;
-static const int kNativeBridgeSnapshotIntervalMs = 1500;
+static const int kNativeBridgeLiveIntervalMs = 50;
+static const int kNativeBridgeSnapshotIntervalMs = 700;
 static const char* kPlaylistExtSection = "CHATGPT_REGION_PLAYLIST";
 static const char* kPlaylistExtKey = "PLAYLISTS_DB_V3";
 static const char* kNativeExtStateSection = "VS_HOOK_NATIVE_BRIDGE";
@@ -967,6 +967,7 @@ static std::string g_nativePublishedCommandsSignature;
 static std::chrono::steady_clock::time_point g_nativeLastLiveBuild;
 static std::chrono::steady_clock::time_point g_nativeLastSnapshotBuild;
 static bool g_nativeWinsockStarted = false;
+static std::atomic<bool> g_nativeForceStateBuild{false};
 
 static std::string nativeJsonEscape(const std::string& value)
 {
@@ -1843,16 +1844,33 @@ static std::string nativeBuildPremixJson(ReaProject* project, const std::vector<
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     selectedId = g_nativePremixSelectedSongId;
   }
+
   const NativeSongWindow* selected = nativeFindSongById(songs, selectedId);
+  const std::string selectedTracksJson = nativeBuildPremixTracksJson(project, selected);
+
+  // Importante: não monta Premix de todas as músicas em todo /state.
+  // Isso estava deixando o snapshot pesado, atrasando comando App -> Lua e causando
+  // sumiço temporário de repertório no app quando a Hook Center estourava timeout.
+  std::ostringstream selectedMap;
+  selectedMap << "{";
+  if (selected) {
+    selectedMap << nativeJsonString(selected->id) << ":" << selectedTracksJson;
+    const std::string sourceId = std::to_string(selected->sourceNumber);
+    if (sourceId != selected->id) {
+      selectedMap << "," << nativeJsonString(sourceId) << ":" << selectedTracksJson;
+    }
+  }
+  selectedMap << "}";
+
   std::ostringstream oss;
   oss << "{";
   oss << "\"mode\":\"item\",\"itemMode\":true,\"globalEnabled\":false,\"bypassEnabled\":false,";
   oss << "\"selectedSongId\":" << nativeJsonString(selected ? selected->id : selectedId) << ",";
   oss << "\"selectedPremixEnabled\":true,\"selectedCanEdit\":true,";
   oss << "\"songs\":" << nativeBuildPremixSongsJson(songs) << ",";
-  oss << "\"tracks\":" << nativeBuildPremixTracksJson(project, selected) << ",";
-  oss << "\"tracksBySongId\":" << nativeBuildPremixTracksBySongIdJson(project, songs) << ",";
-  oss << "\"tracksByRegionId\":" << nativeBuildPremixTracksBySongIdJson(project, songs) << ",";
+  oss << "\"tracks\":" << selectedTracksJson << ",";
+  oss << "\"tracksBySongId\":" << selectedMap.str() << ",";
+  oss << "\"tracksByRegionId\":" << selectedMap.str() << ",";
   oss << "\"groups\":[]";
   oss << "}";
   return oss.str();
@@ -2002,9 +2020,10 @@ static void nativeBridgeTick()
 {
   nativePublishCommandsToExtState();
   const auto now = std::chrono::steady_clock::now();
-  const bool liveDue = g_nativeLastLiveBuild.time_since_epoch().count() == 0 ||
+  const bool forced = g_nativeForceStateBuild.exchange(false);
+  const bool liveDue = forced || g_nativeLastLiveBuild.time_since_epoch().count() == 0 ||
     std::chrono::duration_cast<std::chrono::milliseconds>(now - g_nativeLastLiveBuild).count() >= kNativeBridgeLiveIntervalMs;
-  const bool snapshotDue = g_nativeLastSnapshotBuild.time_since_epoch().count() == 0 ||
+  const bool snapshotDue = forced || g_nativeLastSnapshotBuild.time_since_epoch().count() == 0 ||
     std::chrono::duration_cast<std::chrono::milliseconds>(now - g_nativeLastSnapshotBuild).count() >= kNativeBridgeSnapshotIntervalMs;
   if (!liveDue && !snapshotDue) return;
   g_nativeLastLiveBuild = now;
@@ -2208,6 +2227,7 @@ static void nativeHandleClient(native_socket_t client)
         g_nativeCommandHistory.erase(g_nativeCommandHistory.begin(), g_nativeCommandHistory.begin() + static_cast<long>(g_nativeCommandHistory.size() - 120));
       }
       ++g_nativeCommandSequence;
+      g_nativeForceStateBuild.store(true);
     }
     body = nativeHttpResponse(200, "{\"ok\":true,\"nativeBridge\":true}");
   } else if (path == "/health" || path == "/ping") {
