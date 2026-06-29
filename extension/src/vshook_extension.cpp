@@ -1238,6 +1238,15 @@ static bool nativeItemStartsInRange(MediaItem* item, double start, double end)
   return pos >= start - 0.0005 && pos < end - 0.0005;
 }
 
+static bool nativeItemOverlapsRange(MediaItem* item, double start, double end)
+{
+  if (!item || !GetMediaItemInfo_Value_ptr) return false;
+  const double pos = GetMediaItemInfo_Value_ptr(item, "D_POSITION");
+  const double len = std::max(0.0, GetMediaItemInfo_Value_ptr(item, "D_LENGTH"));
+  const double itemEnd = pos + len;
+  return itemEnd > start + 0.0005 && pos < end - 0.0005;
+}
+
 struct NativeSongWindow {
   std::string id;
   std::string name;
@@ -1732,48 +1741,98 @@ static std::string nativeBuildPremixTracksJson(ReaProject* project, const Native
   if (!selected || !CountTracks_ptr || !GetTrack_ptr || !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr || !GetMediaItemInfo_Value_ptr) {
     oss << "]"; return oss.str();
   }
+
+  struct PremixItemRow {
+    std::string guid;
+    std::string name;
+    std::string trackName;
+    double volume = 1.0;
+    bool muted = false;
+    int fxCount = 0;
+    bool fxEnabled = false;
+    bool drawer = false;
+  };
+
+  auto collectRows = [&](bool overlapFallback) {
+    std::vector<PremixItemRow> rows;
+    const int trackCount = CountTracks_ptr(project);
+    for (int ti = 0; ti < trackCount; ++ti) {
+      MediaTrack* track = GetTrack_ptr(project, ti);
+      if (!track) continue;
+      const std::string trackName = nativeTrackName(track, ti);
+      const int itemCount = GetTrackNumMediaItems_ptr(track);
+      for (int ii = 0; ii < itemCount; ++ii) {
+        MediaItem* item = GetTrackMediaItem_ptr(track, ii);
+        const bool belongs = overlapFallback
+          ? nativeItemOverlapsRange(item, selected->start, selected->end)
+          : nativeItemStartsInRange(item, selected->start, selected->end);
+        if (!belongs) continue;
+        PremixItemRow row;
+        row.guid = nativeMediaItemGuid(item, std::string("item_") + std::to_string(ti + 1) + "_" + std::to_string(ii + 1));
+        row.name = nativeTakeName(item, trackName);
+        row.trackName = trackName;
+        row.volume = GetMediaItemInfo_Value_ptr(item, "D_VOL");
+        row.muted = GetMediaItemInfo_Value_ptr(item, "B_MUTE") > 0.5;
+        row.fxCount = nativeTakeFxCount(item);
+        row.fxEnabled = nativeTakeAnyFxEnabled(item);
+        row.drawer = false;
+        rows.push_back(row);
+      }
+    }
+    return rows;
+  };
+
+  std::vector<PremixItemRow> rows = collectRows(false);
+  if (rows.empty()) {
+    // Fallback: se nenhum item começar dentro do trecho, mostra os itens que atravessam o trecho.
+    // Isso evita Premix vazio em projetos onde os áudios começam antes do marker/região.
+    rows = collectRows(true);
+  }
+
   bool first = true;
   int outIndex = 1;
-  const int trackCount = CountTracks_ptr(project);
-  for (int ti = 0; ti < trackCount; ++ti) {
-    MediaTrack* track = GetTrack_ptr(project, ti);
-    if (!track) continue;
-    const std::string trackName = nativeTrackName(track, ti);
-    const int itemCount = GetTrackNumMediaItems_ptr(track);
-    for (int ii = 0; ii < itemCount; ++ii) {
-      MediaItem* item = GetTrackMediaItem_ptr(track, ii);
-      if (!nativeItemStartsInRange(item, selected->start, selected->end)) continue;
-      const std::string guid = nativeMediaItemGuid(item, std::string("item_") + std::to_string(ti + 1) + "_" + std::to_string(ii + 1));
-      const std::string itemName = nativeTakeName(item, trackName);
-      const double vol = GetMediaItemInfo_Value_ptr(item, "D_VOL");
-      const bool muted = GetMediaItemInfo_Value_ptr(item, "B_MUTE") > 0.5;
-      const int fxCount = nativeTakeFxCount(item);
-      const bool fxEnabled = nativeTakeAnyFxEnabled(item);
-      if (!first) oss << ",";
-      first = false;
-      oss << "{";
-      oss << "\"id\":" << nativeJsonString(guid) << ",";
-      oss << "\"guid\":" << nativeJsonString(guid) << ",";
-      oss << "\"itemId\":" << nativeJsonString(guid) << ",";
-      oss << "\"index\":" << outIndex++ << ",";
-      oss << "\"name\":" << nativeJsonString(itemName) << ",";
-      oss << "\"label\":" << nativeJsonString(itemName) << ",";
-      oss << "\"trackName\":" << nativeJsonString(trackName) << ",";
-      oss << "\"volume\":" << nativeNumber(vol) << ",";
-      oss << "\"volumeRatio\":" << nativeNumber(nativeVolumeToRatio(vol), 6) << ",";
-      oss << "\"liveVolumeRatio\":" << nativeNumber(nativeVolumeToRatio(vol), 6) << ",";
-      oss << "\"db\":" << nativeNumber(nativeVolumeToDb(vol), 3) << ",";
-      oss << "\"displayScale\":\"db\",";
-      oss << "\"mute\":" << (muted ? "true" : "false") << ",";
-      oss << "\"muted\":" << (muted ? "true" : "false") << ",";
-      oss << "\"hasFx\":" << (fxCount > 0 ? "true" : "false") << ",";
-      oss << "\"fxCount\":" << fxCount << ",";
-      oss << "\"fxEnabled\":" << (fxEnabled ? "true" : "false") << ",";
-      oss << "\"fxOn\":" << (fxEnabled ? "true" : "false");
-      oss << "}";
-    }
+  for (const auto& row : rows) {
+    if (!first) oss << ",";
+    first = false;
+    oss << "{";
+    oss << "\"id\":" << nativeJsonString(row.guid) << ",";
+    oss << "\"guid\":" << nativeJsonString(row.guid) << ",";
+    oss << "\"itemId\":" << nativeJsonString(row.guid) << ",";
+    oss << "\"songId\":" << nativeJsonString(selected->id) << ",";
+    oss << "\"selectedSongId\":" << nativeJsonString(selected->id) << ",";
+    oss << "\"index\":" << outIndex++ << ",";
+    oss << "\"name\":" << nativeJsonString(row.name) << ",";
+    oss << "\"label\":" << nativeJsonString(row.name) << ",";
+    oss << "\"trackName\":" << nativeJsonString(row.trackName) << ",";
+    oss << "\"volume\":" << nativeNumber(row.volume) << ",";
+    oss << "\"volumeRatio\":" << nativeNumber(nativeVolumeToRatio(row.volume), 6) << ",";
+    oss << "\"liveVolumeRatio\":" << nativeNumber(nativeVolumeToRatio(row.volume), 6) << ",";
+    oss << "\"db\":" << nativeNumber(nativeVolumeToDb(row.volume), 3) << ",";
+    oss << "\"displayScale\":\"db\",";
+    oss << "\"mute\":" << (row.muted ? "true" : "false") << ",";
+    oss << "\"muted\":" << (row.muted ? "true" : "false") << ",";
+    oss << "\"hasFx\":" << (row.fxCount > 0 ? "true" : "false") << ",";
+    oss << "\"fxCount\":" << row.fxCount << ",";
+    oss << "\"fxEnabled\":" << (row.fxEnabled ? "true" : "false") << ",";
+    oss << "\"fxOn\":" << (row.fxEnabled ? "true" : "false");
+    oss << "}";
   }
   oss << "]";
+  return oss.str();
+}
+
+static std::string nativeBuildPremixTracksBySongIdJson(ReaProject* project, const std::vector<NativeSongWindow>& songs)
+{
+  std::ostringstream oss;
+  oss << "{";
+  bool first = true;
+  for (const auto& s : songs) {
+    if (s.isBlock || s.isHashParent) continue;
+    if (!first) oss << ",";
+    first = false;
+    oss << nativeJsonString(s.id) << ":" << nativeBuildPremixTracksJson(project, &s);
+  }
+  oss << "}";
   return oss.str();
 }
 
@@ -1792,6 +1851,8 @@ static std::string nativeBuildPremixJson(ReaProject* project, const std::vector<
   oss << "\"selectedPremixEnabled\":true,\"selectedCanEdit\":true,";
   oss << "\"songs\":" << nativeBuildPremixSongsJson(songs) << ",";
   oss << "\"tracks\":" << nativeBuildPremixTracksJson(project, selected) << ",";
+  oss << "\"tracksBySongId\":" << nativeBuildPremixTracksBySongIdJson(project, songs) << ",";
+  oss << "\"tracksByRegionId\":" << nativeBuildPremixTracksBySongIdJson(project, songs) << ",";
   oss << "\"groups\":[]";
   oss << "}";
   return oss.str();
