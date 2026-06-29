@@ -1067,10 +1067,22 @@ struct NativeSongWindow {
 };
 
 static std::vector<NativeSongWindow> g_nativeSongWindows;
+static bool g_nativeCurrentTransportPlaying = false;
+static std::string g_nativeCurrentPlayingId;
+static double g_nativeCurrentPlayPosition = 0.0;
 
 static std::string nativeSongToJson(const NativeSongWindow& item, int index)
 {
   const double duration = std::max(0.0, item.end - item.start);
+  double elapsed = 0.0;
+  double remaining = duration;
+  bool playingThis = false;
+  if (!item.isBlock && g_nativeCurrentTransportPlaying && !g_nativeCurrentPlayingId.empty() && g_nativeCurrentPlayingId == item.id) {
+    elapsed = std::max(0.0, std::min(duration, g_nativeCurrentPlayPosition - item.start));
+    remaining = std::max(0.0, duration - elapsed);
+    playingThis = true;
+  }
+  const double progress = duration > 0.0 ? std::max(0.0, std::min(1.0, elapsed / duration)) : 0.0;
   std::ostringstream oss;
   oss << "{";
   oss << "\"id\":" << nativeJsonString(item.id) << ",";
@@ -1087,7 +1099,11 @@ static std::string nativeSongToJson(const NativeSongWindow& item, int index)
   oss << "\"startPos\":" << nativeNumber(item.start) << ",";
   oss << "\"endPos\":" << nativeNumber(item.end) << ",";
   oss << "\"durationSec\":" << (int)std::floor(duration + 0.5) << ",";
-  oss << "\"remainingSec\":" << (int)std::floor(duration + 0.5) << ",";
+  oss << "\"remainingSec\":" << nativeNumber(remaining) << ",";
+  oss << "\"elapsedSec\":" << nativeNumber(elapsed) << ",";
+  oss << "\"progress\":" << nativeNumber(progress, 6) << ",";
+  oss << "\"playbackProgress\":" << nativeNumber(progress, 6) << ",";
+  oss << "\"playing\":" << (playingThis ? "true" : "false") << ",";
   oss << "\"isHashParent\":" << (item.isHashParent ? "true" : "false") << ",";
   oss << "\"isHashChild\":" << (item.isHashChild ? "true" : "false") << ",";
   oss << "\"isFamilyItem\":" << ((item.isHashParent || item.isHashChild) ? "true" : "false") << ",";
@@ -1268,12 +1284,15 @@ static std::string nativeBuildRegionsJson(const std::vector<NativeSongWindow>& s
   return oss.str();
 }
 
-static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vector<NativeSongWindow>& projectSongs)
+static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vector<NativeSongWindow>& projectSongs, int& activePlaylistIndexOut, std::string& activePlaylistNameOut)
 {
+  activePlaylistIndexOut = 1;
+  activePlaylistNameOut = "Músicas";
+  const std::string savedPlaylistName = nativeTrim(nativeGetProjExtStateString(project, kPlaylistExtSection, "LAST_PLAYLIST_NAME_V1"));
   const std::string data = nativeGetProjExtStateString(project, kPlaylistExtSection, kPlaylistExtKey);
   if (data.empty()) {
     std::ostringstream fallback;
-    fallback << "[{\"id\":\"1\",\"name\":\"Músicas\",\"songs\":" << nativeBuildRegionsJson(projectSongs) << "}]";
+    fallback << "[{\"id\":\"1\",\"name\":\"Músicas\",\"active\":true,\"current\":true,\"songs\":" << nativeBuildRegionsJson(projectSongs) << "}]";
     return fallback.str();
   }
 
@@ -1298,7 +1317,9 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
       itemIndex = 0;
       ++playlistIndex;
       const std::string name = fields.size() > 1 ? nativeUnescapeExtField(fields[1]) : std::string("Repertório ") + std::to_string(playlistIndex);
-      out << "{\"id\":" << nativeJsonString(std::to_string(playlistIndex)) << ",\"name\":" << nativeJsonString(name) << ",\"songs\":[";
+      const bool activeThis = (savedPlaylistName.empty() && playlistIndex == 1) || (!savedPlaylistName.empty() && nativeTrim(name) == savedPlaylistName);
+      if (activeThis) { activePlaylistIndexOut = playlistIndex; activePlaylistNameOut = name; }
+      out << "{\"id\":" << nativeJsonString(std::to_string(playlistIndex)) << ",\"name\":" << nativeJsonString(name) << ",\"active\":" << (activeThis ? "true" : "false") << ",\"current\":" << (activeThis ? "true" : "false") << ",\"songs\":[";
     } else if (tag == "ITEM" && inPlaylist) {
       const std::string itemType = fields.size() > 1 ? fields[1] : "";
       const int sourceNumber = fields.size() > 2 ? std::atoi(fields[2].c_str()) : 0;
@@ -1386,8 +1407,6 @@ static void nativeRebuildState(bool forceSnapshot)
 
   std::string markersJson;
   std::vector<NativeSongWindow> songs = nativeCollectProjectSongs(activeProject, markersJson);
-  const std::string regionsJson = nativeBuildRegionsJson(songs);
-  const std::string playlistsJson = nativeBuildPlaylistsJson(activeProject, songs);
 
   int playState = GetPlayStateEx_ptr ? GetPlayStateEx_ptr(activeProject) : 0;
   const bool playing = (playState & 1) == 1 || (playState & 4) == 4;
@@ -1397,8 +1416,18 @@ static void nativeRebuildState(bool forceSnapshot)
   double songEnd = 0.0;
   const std::string playingId = playing ? nativeFindPlayingId(songs, playPos, playingName, songStart, songEnd) : "";
   const double duration = std::max(0.0, songEnd - songStart);
-  const double elapsed = playingId.empty() ? 0.0 : std::max(0.0, playPos - songStart);
+  const double elapsed = playingId.empty() ? 0.0 : std::max(0.0, std::min(duration, playPos - songStart));
+  const double remaining = playingId.empty() ? 0.0 : std::max(0.0, duration - elapsed);
   const double progress = duration > 0.0 ? std::min(1.0, std::max(0.0, elapsed / duration)) : 0.0;
+
+  g_nativeCurrentTransportPlaying = playing;
+  g_nativeCurrentPlayingId = playingId;
+  g_nativeCurrentPlayPosition = playPos;
+
+  const std::string regionsJson = nativeBuildRegionsJson(songs);
+  int activePlaylistIndex = 1;
+  std::string activePlaylistName = "Músicas";
+  const std::string playlistsJson = nativeBuildPlaylistsJson(activeProject, songs, activePlaylistIndex, activePlaylistName);
   const std::string nowIso = nativeIsoNow();
 
   std::string luaLiveRaw;
@@ -1432,8 +1461,10 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"regions\":" << regionsJson << ",";
   json << "\"markers\":" << markersJson << ",";
   json << "\"playlists\":" << playlistsJson << ",";
-  json << "\"currentPlaylistName\":\"\",";
-  json << "\"activePlaylistId\":\"1\",";
+  json << "\"currentPlaylistName\":" << nativeJsonString(activePlaylistName) << ",";
+  json << "\"activePlaylistName\":" << nativeJsonString(activePlaylistName) << ",";
+  json << "\"activePlaylistId\":" << nativeJsonString(std::to_string(activePlaylistIndex)) << ",";
+  json << "\"currentPlaylistIndex\":" << activePlaylistIndex << ",";
   json << "\"playing\":" << (playing && !playingId.empty() ? "true" : "false") << ",";
   json << "\"isPlaying\":" << (playing && !playingId.empty() ? "true" : "false") << ",";
   json << "\"transportPlaying\":" << (playing ? "true" : "false") << ",";
@@ -1449,6 +1480,15 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"currentSongEnd\":" << nativeNumber(songEnd) << ",";
   json << "\"currentSongDurationSec\":" << nativeNumber(duration) << ",";
   json << "\"currentSongElapsedSec\":" << nativeNumber(elapsed) << ",";
+  json << "\"currentSongRemainingSec\":" << nativeNumber(remaining) << ",";
+  json << "\"playbackDurationSec\":" << nativeNumber(duration) << ",";
+  json << "\"playbackElapsedSec\":" << nativeNumber(elapsed) << ",";
+  json << "\"playbackRemainingSec\":" << nativeNumber(remaining) << ",";
+  json << "\"playbackStartPos\":" << nativeNumber(songStart) << ",";
+  json << "\"playbackEndPos\":" << nativeNumber(songEnd) << ",";
+  json << "\"durationSec\":" << nativeNumber(duration) << ",";
+  json << "\"elapsedSec\":" << nativeNumber(elapsed) << ",";
+  json << "\"remainingSec\":" << nativeNumber(remaining) << ",";
   json << "\"currentSongProgress\":" << nativeNumber(progress, 6);
   if (!luaFragment.empty()) json << "," << luaFragment;
   json << "}";
