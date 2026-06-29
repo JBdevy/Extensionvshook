@@ -2003,9 +2003,12 @@ static void nativePublishCommandsToExtState()
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     std::ostringstream oss;
     oss << "{\"seq\":" << static_cast<unsigned long long>(g_nativeCommandSequence) << ",\"commands\":[";
-    for (size_t i = 0; i < g_nativeCommandHistory.size(); ++i) {
+    // FIX12: não publica histórico antigo em ExtState.
+    // O Lua puxa a fila real por VS_Hook_Native_PullCommand; publicar histórico fazia comandos velhos
+    // voltarem quando o script era fechado e aberto novamente.
+    for (size_t i = 0; i < g_nativeCommandQueue.size(); ++i) {
       if (i) oss << ",";
-      oss << g_nativeCommandHistory[i];
+      oss << g_nativeCommandQueue[i];
     }
     oss << "]}";
     payload = oss.str();
