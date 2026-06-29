@@ -901,6 +901,9 @@ static const int kNativeBridgeLiveIntervalMs = 250;
 static const int kNativeBridgeSnapshotIntervalMs = 1500;
 static const char* kPlaylistExtSection = "CHATGPT_REGION_PLAYLIST";
 static const char* kPlaylistExtKey = "PLAYLISTS_DB_V3";
+static const char* kNativeExtStateSection = "VS_HOOK_NATIVE_BRIDGE";
+static const char* kNativeCommandsExtKey = "COMMANDS_JSON_V1";
+static const char* kNativeLuaLiveExtKey = "LUA_LIVE_JSON_V1";
 
 #ifdef _WIN32
 using native_socket_t = SOCKET;
@@ -920,6 +923,9 @@ static std::string g_nativeStateJson;
 static std::string g_nativeSnapshotSignature;
 static std::string g_nativeLuaLiveFragment;
 static std::deque<std::string> g_nativeCommandQueue;
+static std::vector<std::string> g_nativeCommandHistory;
+static uint64_t g_nativeCommandSequence = 0;
+static std::string g_nativePublishedCommandsSignature;
 static std::chrono::steady_clock::time_point g_nativeLastLiveBuild;
 static std::chrono::steady_clock::time_point g_nativeLastSnapshotBuild;
 static bool g_nativeWinsockStarted = false;
@@ -1395,11 +1401,16 @@ static void nativeRebuildState(bool forceSnapshot)
   const double progress = duration > 0.0 ? std::min(1.0, std::max(0.0, elapsed / duration)) : 0.0;
   const std::string nowIso = nativeIsoNow();
 
-  std::string luaFragment;
+  std::string luaLiveRaw;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
-    luaFragment = nativeStripJsonObjectBraces(g_nativeLuaLiveFragment);
+    luaLiveRaw = g_nativeLuaLiveFragment;
   }
+  if (GetExtState_ptr) {
+    const char* extLuaLive = GetExtState_ptr(kNativeExtStateSection, kNativeLuaLiveExtKey);
+    if (extLuaLive && *extLuaLive) luaLiveRaw = extLuaLive;
+  }
+  std::string luaFragment = nativeStripJsonObjectBraces(luaLiveRaw);
 
   std::ostringstream json;
   json << "{";
@@ -1449,8 +1460,32 @@ static void nativeRebuildState(bool forceSnapshot)
   }
 }
 
+
+static void nativePublishCommandsToExtState()
+{
+  if (!SetExtState_ptr) return;
+
+  std::string payload;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    std::ostringstream oss;
+    oss << "{\"seq\":" << static_cast<unsigned long long>(g_nativeCommandSequence) << ",\"commands\":[";
+    for (size_t i = 0; i < g_nativeCommandHistory.size(); ++i) {
+      if (i) oss << ",";
+      oss << g_nativeCommandHistory[i];
+    }
+    oss << "]}";
+    payload = oss.str();
+  }
+
+  if (payload == g_nativePublishedCommandsSignature) return;
+  g_nativePublishedCommandsSignature = payload;
+  SetExtState_ptr(kNativeExtStateSection, kNativeCommandsExtKey, payload.c_str(), false);
+}
+
 static void nativeBridgeTick()
 {
+  nativePublishCommandsToExtState();
   const auto now = std::chrono::steady_clock::now();
   const bool liveDue = g_nativeLastLiveBuild.time_since_epoch().count() == 0 ||
     std::chrono::duration_cast<std::chrono::milliseconds>(now - g_nativeLastLiveBuild).count() >= kNativeBridgeLiveIntervalMs;
@@ -1639,6 +1674,11 @@ static void nativeHandleClient(native_socket_t client)
       std::lock_guard<std::mutex> lock(g_nativeMutex);
       if (g_nativeCommandQueue.size() > 200) g_nativeCommandQueue.pop_front();
       g_nativeCommandQueue.push_back(commandBody);
+      g_nativeCommandHistory.push_back(commandBody);
+      if (g_nativeCommandHistory.size() > 120) {
+        g_nativeCommandHistory.erase(g_nativeCommandHistory.begin(), g_nativeCommandHistory.begin() + static_cast<long>(g_nativeCommandHistory.size() - 120));
+      }
+      ++g_nativeCommandSequence;
     }
     body = nativeHttpResponse(200, "{\"ok\":true,\"nativeBridge\":true}");
   } else if (path == "/health" || path == "/ping") {
