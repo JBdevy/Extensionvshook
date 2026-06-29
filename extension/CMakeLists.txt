@@ -49,6 +49,10 @@ target_compile_definitions(reaper_vshook PRIVATE
   NOMINMAX
 )
 
+if(WIN32)
+  target_link_libraries(reaper_vshook PRIVATE ws2_32)
+endif()
+
 if(MSVC)
   # Igual ao padrao da SWS: runtime C/C++ estatico.
   # Evita clientes Windows sem VC++ Redistributable ficarem sem carregar a DLL,
