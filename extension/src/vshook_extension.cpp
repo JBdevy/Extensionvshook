@@ -53,6 +53,24 @@ using EnumProjectMarkers3_t = int (*)(ReaProject*, int, bool*, double*, double*,
 using GetPlayStateEx_t = int (*)(ReaProject*);
 using GetPlayPositionEx_t = double (*)(ReaProject*);
 
+using CountTracks_t = int (*)(ReaProject*);
+using GetTrack_t = MediaTrack* (*)(ReaProject*, int);
+using GetMasterTrack_t = MediaTrack* (*)(ReaProject*);
+using GetTrackName_t = bool (*)(MediaTrack*, char*, int);
+using GetTrackNumMediaItems_t = int (*)(MediaTrack*);
+using GetTrackMediaItem_t = MediaItem* (*)(MediaTrack*, int);
+using GetMediaItemInfo_Value_t = double (*)(MediaItem*, const char*);
+using SetMediaItemInfo_Value_t = bool (*)(MediaItem*, const char*, double);
+using GetSetMediaItemInfo_String_t = bool (*)(MediaItem*, const char*, char*, bool);
+using GetActiveTake_t = MediaItem_Take* (*)(MediaItem*);
+using GetTakeName_t = const char* (*)(MediaItem_Take*);
+using TakeFX_GetCount_t = int (*)(MediaItem_Take*);
+using TakeFX_GetEnabled_t = bool (*)(MediaItem_Take*, int);
+using TakeFX_SetEnabled_t = void (*)(MediaItem_Take*, int, bool);
+using GetMediaTrackInfo_Value_t = double (*)(MediaTrack*, const char*);
+using GetTrackGUID_t = GUID* (*)(MediaTrack*);
+using guidToString_t = void (*)(const GUID*, char*);
+
 static plugin_register_t plugin_register_ptr = nullptr;
 static plugin_getapi_t plugin_getapi_ptr = nullptr;
 static ShowMessageBox_t ShowMessageBox_ptr = nullptr;
@@ -71,6 +89,24 @@ static CountProjectMarkers_t CountProjectMarkers_ptr = nullptr;
 static EnumProjectMarkers3_t EnumProjectMarkers3_ptr = nullptr;
 static GetPlayStateEx_t GetPlayStateEx_ptr = nullptr;
 static GetPlayPositionEx_t GetPlayPositionEx_ptr = nullptr;
+
+static CountTracks_t CountTracks_ptr = nullptr;
+static GetTrack_t GetTrack_ptr = nullptr;
+static GetMasterTrack_t GetMasterTrack_ptr = nullptr;
+static GetTrackName_t GetTrackName_ptr = nullptr;
+static GetTrackNumMediaItems_t GetTrackNumMediaItems_ptr = nullptr;
+static GetTrackMediaItem_t GetTrackMediaItem_ptr = nullptr;
+static GetMediaItemInfo_Value_t GetMediaItemInfo_Value_ptr = nullptr;
+static SetMediaItemInfo_Value_t SetMediaItemInfo_Value_ptr = nullptr;
+static GetSetMediaItemInfo_String_t GetSetMediaItemInfo_String_ptr = nullptr;
+static GetActiveTake_t GetActiveTake_ptr = nullptr;
+static GetTakeName_t GetTakeName_ptr = nullptr;
+static TakeFX_GetCount_t TakeFX_GetCount_ptr = nullptr;
+static TakeFX_GetEnabled_t TakeFX_GetEnabled_ptr = nullptr;
+static TakeFX_SetEnabled_t TakeFX_SetEnabled_ptr = nullptr;
+static GetMediaTrackInfo_Value_t GetMediaTrackInfo_Value_ptr = nullptr;
+static GetTrackGUID_t GetTrackGUID_ptr = nullptr;
+static guidToString_t guidToString_ptr = nullptr;
 
 static const char* kExtStateSection = "VS_HOOK_LOADER";
 static const char* kAutoOpenModeKey = "AUTO_OPEN_VSHOOK_MODE";
@@ -925,6 +961,8 @@ static std::string g_nativeLuaLiveFragment;
 static std::deque<std::string> g_nativeCommandQueue;
 static std::vector<std::string> g_nativeCommandHistory;
 static uint64_t g_nativeCommandSequence = 0;
+static std::string g_nativePremixSelectedSongId;
+static std::chrono::steady_clock::time_point g_nativeLastDirectorHeartbeat;
 static std::string g_nativePublishedCommandsSignature;
 static std::chrono::steady_clock::time_point g_nativeLastLiveBuild;
 static std::chrono::steady_clock::time_point g_nativeLastSnapshotBuild;
@@ -1052,6 +1090,154 @@ static std::string nativeNumber(double v, int precision = 6)
   return oss.str();
 }
 
+static std::string nativeHexByte(double value)
+{
+  int n = static_cast<int>(std::round(std::max(0.0, std::min(1.0, value)) * 255.0));
+  std::ostringstream oss;
+  oss << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << n;
+  return oss.str();
+}
+
+static std::string nativeRgbHex(double r, double g, double b)
+{
+  return std::string("#") + nativeHexByte(r) + nativeHexByte(g) + nativeHexByte(b);
+}
+
+static std::string nativeBlockColorHexFromKey(const std::string& rawKey, int blockNumber)
+{
+  const std::string key = nativeTrim(rawKey);
+  if (key == "none") return std::string();
+  if (key == "yellow") return nativeRgbHex(1.00, 0.74, 0.12);
+  if (key == "green")  return nativeRgbHex(0.18, 0.74, 0.36);
+  if (key == "blue")   return nativeRgbHex(0.20, 0.52, 1.00);
+  if (key == "purple") return nativeRgbHex(0.56, 0.34, 0.94);
+  if (key == "red")    return nativeRgbHex(1.00, 0.38, 0.28);
+  if (key == "cyan")   return nativeRgbHex(0.10, 0.70, 0.78);
+  if (key == "pink")   return nativeRgbHex(0.95, 0.38, 0.72);
+  if (key == "olive")  return nativeRgbHex(0.58, 0.70, 0.18);
+  if (key == "orange") return nativeRgbHex(0.96, 0.56, 0.16);
+  if (key == "white")  return nativeRgbHex(0.62, 0.62, 0.62);
+
+  static const double palette[][3] = {
+    {1.00, 0.74, 0.12}, {0.18, 0.74, 0.36}, {0.20, 0.52, 1.00}, {0.56, 0.34, 0.94},
+    {1.00, 0.38, 0.28}, {0.10, 0.70, 0.78}, {0.95, 0.38, 0.72}, {0.58, 0.70, 0.18}
+  };
+  const int safeBlock = std::max(1, blockNumber);
+  const int idx = (safeBlock - 1) % 8;
+  return nativeRgbHex(palette[idx][0], palette[idx][1], palette[idx][2]);
+}
+
+static double nativeVolumeToRatio(double volume)
+{
+  if (!std::isfinite(volume) || volume <= 0.000001) return 0.0;
+  const double db = 20.0 * std::log10(volume);
+  return std::max(0.0, std::min(1.0, (db + 60.0) / 72.0));
+}
+
+static double nativeVolumeToDb(double volume)
+{
+  if (!std::isfinite(volume) || volume <= 0.000001) return -150.0;
+  return 20.0 * std::log10(volume);
+}
+
+static std::string nativeTrackName(MediaTrack* track, int index)
+{
+  char buf[512] = "";
+  if (track && GetTrackName_ptr && GetTrackName_ptr(track, buf, static_cast<int>(sizeof(buf))) && buf[0]) return std::string(buf);
+  return std::string("Pista ") + std::to_string(index + 1);
+}
+
+static std::string nativeTrackGuid(MediaTrack* track, int index)
+{
+  if (track && GetTrackGUID_ptr && guidToString_ptr) {
+    GUID* guid = GetTrackGUID_ptr(track);
+    if (guid) {
+      char buf[80] = "";
+      guidToString_ptr(guid, buf);
+      if (buf[0]) return std::string(buf);
+    }
+  }
+  return std::string("track_") + std::to_string(index + 1);
+}
+
+static std::string nativeMediaItemGuid(MediaItem* item, const std::string& fallback)
+{
+  if (item && GetSetMediaItemInfo_String_ptr) {
+    char buf[128] = "";
+    if (GetSetMediaItemInfo_String_ptr(item, "GUID", buf, false) && buf[0]) return std::string(buf);
+  }
+  return fallback;
+}
+
+static std::string nativeTakeName(MediaItem* item, const std::string& fallback)
+{
+  if (item && GetActiveTake_ptr && GetTakeName_ptr) {
+    MediaItem_Take* take = GetActiveTake_ptr(item);
+    const char* name = take ? GetTakeName_ptr(take) : nullptr;
+    if (name && *name) return std::string(name);
+  }
+  return fallback;
+}
+
+static int nativeTakeFxCount(MediaItem* item)
+{
+  if (!item || !GetActiveTake_ptr || !TakeFX_GetCount_ptr) return 0;
+  MediaItem_Take* take = GetActiveTake_ptr(item);
+  return take ? std::max(0, TakeFX_GetCount_ptr(take)) : 0;
+}
+
+static bool nativeTakeAnyFxEnabled(MediaItem* item)
+{
+  if (!item || !GetActiveTake_ptr) return false;
+  MediaItem_Take* take = GetActiveTake_ptr(item);
+  if (!take) return false;
+  const int count = nativeTakeFxCount(item);
+  if (count <= 0) return false;
+  if (!TakeFX_GetEnabled_ptr) return true;
+  for (int i = 0; i < count; ++i) {
+    if (TakeFX_GetEnabled_ptr(take, i)) return true;
+  }
+  return false;
+}
+
+static std::string nativeJsonExtractString(const std::string& json, const std::string& key)
+{
+  const std::string pat = std::string("\"") + key + "\"";
+  size_t p = json.find(pat);
+  if (p == std::string::npos) return std::string();
+  p = json.find(':', p + pat.size());
+  if (p == std::string::npos) return std::string();
+  ++p;
+  while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' || json[p] == '\n')) ++p;
+  if (p >= json.size()) return std::string();
+  if (json[p] == '"') {
+    ++p;
+    std::string out;
+    while (p < json.size()) {
+      char c = json[p++];
+      if (c == '"') break;
+      if (c == '\\' && p < json.size()) {
+        char n = json[p++];
+        if (n == 'n') out += '\n';
+        else if (n == 'r') out += '\r';
+        else if (n == 't') out += '\t';
+        else out += n;
+      } else out += c;
+    }
+    return out;
+  }
+  size_t e = p;
+  while (e < json.size() && json[e] != ',' && json[e] != '}' && json[e] != ']' && json[e] != '\r' && json[e] != '\n') ++e;
+  return nativeTrim(json.substr(p, e - p));
+}
+
+static bool nativeItemStartsInRange(MediaItem* item, double start, double end)
+{
+  if (!item || !GetMediaItemInfo_Value_ptr) return false;
+  const double pos = GetMediaItemInfo_Value_ptr(item, "D_POSITION");
+  return pos >= start - 0.0005 && pos < end - 0.0005;
+}
+
 struct NativeSongWindow {
   std::string id;
   std::string name;
@@ -1064,6 +1250,9 @@ struct NativeSongWindow {
   bool isHashChild = false;
   std::string parentId;
   std::string parentName;
+  std::string blockColorKey;
+  std::string blockColorHex;
+  std::string inheritedBlockColorHex;
 };
 
 static std::vector<NativeSongWindow> g_nativeSongWindows;
@@ -1110,6 +1299,12 @@ static std::string nativeSongToJson(const NativeSongWindow& item, int index)
   oss << "\"familyRole\":" << nativeJsonString(item.isHashParent ? "parent" : (item.isHashChild ? "child" : "none")) << ",";
   oss << "\"parentId\":" << nativeJsonString(item.parentId) << ",";
   oss << "\"parentName\":" << nativeJsonString(item.parentName) << ",";
+  oss << "\"blockColorKey\":" << nativeJsonString(item.blockColorKey) << ",";
+  oss << "\"blockColorHex\":" << nativeJsonString(item.blockColorHex) << ",";
+  oss << "\"bridgeBlockColorHex\":" << nativeJsonString(item.blockColorHex) << ",";
+  oss << "\"inheritedBlockColorHex\":" << nativeJsonString(item.inheritedBlockColorHex) << ",";
+  oss << "\"textColorHex\":" << nativeJsonString(item.inheritedBlockColorHex) << ",";
+  oss << "\"finalTextColorHex\":" << nativeJsonString(item.inheritedBlockColorHex) << ",";
   oss << "\"depth\":" << (item.isHashChild ? 1 : 0);
   oss << "}";
   return oss.str();
@@ -1296,12 +1491,30 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
     return fallback.str();
   }
 
+  auto findActualSong = [&](int primary, int fallback, bool childWanted) -> const NativeSongWindow* {
+    if (primary != 0) {
+      for (const auto& s : projectSongs) {
+        if (s.sourceNumber == primary && (!childWanted || s.isHashChild)) return &s;
+      }
+      for (const auto& s : projectSongs) {
+        if (s.sourceNumber == primary) return &s;
+      }
+    }
+    if (fallback != 0) {
+      for (const auto& s : projectSongs) {
+        if (s.sourceNumber == fallback && !s.isHashChild) return &s;
+      }
+    }
+    return nullptr;
+  };
+
   std::ostringstream out;
   out << "[";
   bool firstPlaylist = true;
   int playlistIndex = 0;
   bool inPlaylist = false;
   int itemIndex = 0;
+  std::string currentBlockColorHex;
 
   const auto lines = nativeSplit(data, '\n');
   for (const std::string& rawLine : lines) {
@@ -1315,6 +1528,7 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
       firstPlaylist = false;
       inPlaylist = true;
       itemIndex = 0;
+      currentBlockColorHex.clear();
       ++playlistIndex;
       const std::string name = fields.size() > 1 ? nativeUnescapeExtField(fields[1]) : std::string("Repertório ") + std::to_string(playlistIndex);
       const bool activeThis = (savedPlaylistName.empty() && playlistIndex == 1) || (!savedPlaylistName.empty() && nativeTrim(name) == savedPlaylistName);
@@ -1326,28 +1540,50 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
       const double startPos = fields.size() > 3 ? std::atof(fields[3].c_str()) : 0.0;
       const double endPos = fields.size() > 4 ? std::atof(fields[4].c_str()) : 0.0;
       const std::string name = fields.size() > 5 ? nativeUnescapeExtField(fields[5]) : "";
-      const std::string blockColor = fields.size() > 6 ? nativeUnescapeExtField(fields[6]) : "";
-      const std::string sourceKind = fields.size() > 7 ? nativeUnescapeExtField(fields[7]) : "";
-      const bool isHashParent = fields.size() > 8 && fields[8] == "1";
-      const bool isHashChild = fields.size() > 9 && fields[9] == "1";
+      const std::string blockColorKey = fields.size() > 6 ? nativeUnescapeExtField(fields[6]) : "";
+      const bool storedHashParent = fields.size() > 8 && fields[8] == "1";
+      const bool storedHashChild = fields.size() > 9 && fields[9] == "1";
       const int markerNumber = fields.size() > 10 ? std::atoi(fields[10].c_str()) : 0;
-      const int parentNumber = fields.size() > 12 ? std::atoi(fields[12].c_str()) : 0;
-      const std::string parentName = fields.size() > 14 ? nativeUnescapeExtField(fields[14]) : "";
       const bool isBlock = itemType == "block" || sourceNumber < 0;
 
       NativeSongWindow item;
-      item.id = std::to_string(isHashChild && markerNumber ? markerNumber : sourceNumber);
-      item.name = isBlock ? name : nativeCleanSongName(name);
-      item.type = isBlock ? "block" : (isHashParent ? "hash_parent" : (isHashChild ? "hash_child" : "song"));
-      item.start = isBlock ? 0.0 : startPos;
-      item.end = isBlock ? 0.0 : endPos;
-      item.sourceNumber = isHashChild && markerNumber ? markerNumber : sourceNumber;
-      item.isBlock = isBlock;
-      item.isHashParent = isHashParent;
-      item.isHashChild = isHashChild;
-      item.parentId = parentNumber ? std::to_string(parentNumber) : "";
-      item.parentName = nativeCleanSongName(parentName);
-      if (isBlock) item.name = name.empty() ? (std::string("BLOCO ") + std::to_string(std::abs(sourceNumber))) : name;
+      if (isBlock) {
+        item.id = std::to_string(sourceNumber);
+        item.name = name.empty() ? (std::string("BLOCO ") + std::to_string(std::abs(sourceNumber))) : name;
+        item.type = "block";
+        item.isBlock = true;
+        item.sourceNumber = sourceNumber;
+        int blockNumber = std::abs(sourceNumber);
+        if (blockNumber <= 0) {
+          const size_t p = item.name.find("BLOCO");
+          blockNumber = (p != std::string::npos) ? std::atoi(item.name.c_str() + p + 5) : (itemIndex + 1);
+        }
+        item.blockColorKey = blockColorKey;
+        item.blockColorHex = nativeBlockColorHexFromKey(blockColorKey, blockNumber);
+        currentBlockColorHex = item.blockColorHex;
+      } else {
+        const NativeSongWindow* actual = findActualSong(storedHashChild && markerNumber ? markerNumber : sourceNumber, sourceNumber, storedHashChild);
+        // Se era filho antigo e o marker nao existe mais, nao envia filho fantasma para o app.
+        if (!actual) continue;
+        item = *actual;
+        item.inheritedBlockColorHex = currentBlockColorHex;
+        // Se a região deixou de ser pai no projeto, força tratamento como música solta.
+        if (!actual->isHashParent && storedHashParent) {
+          item.isHashParent = false;
+          item.isHashChild = false;
+          item.type = "song";
+          item.parentId.clear();
+          item.parentName.clear();
+        }
+        // Se era filho salvo mas o projeto atual já não traz esse filho, não mantém flag velha.
+        if (!actual->isHashChild && storedHashChild) {
+          item.isHashChild = false;
+          item.parentId.clear();
+          item.parentName.clear();
+          item.type = actual->isHashParent ? "hash_parent" : "song";
+        }
+        (void)startPos; (void)endPos;
+      }
 
       if (itemIndex > 0) out << ",";
       out << nativeSongToJson(item, itemIndex + 1);
@@ -1393,6 +1629,174 @@ static std::string nativeStripJsonObjectBraces(std::string json)
   return json;
 }
 
+
+static const NativeSongWindow* nativeFindSongById(const std::vector<NativeSongWindow>& songs, const std::string& id)
+{
+  const std::string wanted = nativeTrim(id);
+  if (wanted.empty()) return nullptr;
+  for (const auto& s : songs) {
+    if (s.id == wanted || std::to_string(s.sourceNumber) == wanted) return &s;
+  }
+  return nullptr;
+}
+
+static std::string nativeBuildMixerTracksJson(ReaProject* project, bool groupsOnly)
+{
+  std::ostringstream oss;
+  oss << "[";
+  if (!CountTracks_ptr || !GetTrack_ptr) { oss << "]"; return oss.str(); }
+  bool first = true;
+  const int count = CountTracks_ptr(project);
+  for (int i = 0; i < count; ++i) {
+    MediaTrack* track = GetTrack_ptr(project, i);
+    if (!track) continue;
+    const double folderDepth = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "I_FOLDERDEPTH") : 0.0;
+    if (groupsOnly && static_cast<int>(folderDepth) <= 0) continue;
+    const std::string guid = nativeTrackGuid(track, i);
+    const std::string name = nativeTrackName(track, i);
+    const double vol = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "D_VOL") : 1.0;
+    const bool mute = GetMediaTrackInfo_Value_ptr ? (GetMediaTrackInfo_Value_ptr(track, "B_MUTE") > 0.5) : false;
+    const bool solo = GetMediaTrackInfo_Value_ptr ? (GetMediaTrackInfo_Value_ptr(track, "I_SOLO") > 0.5) : false;
+    if (!first) oss << ",";
+    first = false;
+    oss << "{";
+    oss << "\"id\":" << nativeJsonString(guid) << ",";
+    oss << "\"guid\":" << nativeJsonString(guid) << ",";
+    oss << "\"index\":" << (i + 1) << ",";
+    oss << "\"name\":" << nativeJsonString(name) << ",";
+    oss << "\"label\":" << nativeJsonString(name) << ",";
+    oss << "\"volume\":" << nativeNumber(vol) << ",";
+    oss << "\"volumeRatio\":" << nativeNumber(nativeVolumeToRatio(vol), 6) << ",";
+    oss << "\"db\":" << nativeNumber(nativeVolumeToDb(vol), 3) << ",";
+    oss << "\"displayScale\":\"db\",";
+    oss << "\"mute\":" << (mute ? "true" : "false") << ",";
+    oss << "\"solo\":" << (solo ? "true" : "false") << ",";
+    oss << "\"folderDepth\":" << static_cast<int>(folderDepth);
+    oss << "}";
+  }
+  oss << "]";
+  return oss.str();
+}
+
+static std::string nativeBuildMixerMasterJson(ReaProject* project)
+{
+  MediaTrack* master = GetMasterTrack_ptr ? GetMasterTrack_ptr(project) : nullptr;
+  if (!master) return "null";
+  const double vol = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(master, "D_VOL") : 1.0;
+  const bool mute = GetMediaTrackInfo_Value_ptr ? (GetMediaTrackInfo_Value_ptr(master, "B_MUTE") > 0.5) : false;
+  const bool solo = GetMediaTrackInfo_Value_ptr ? (GetMediaTrackInfo_Value_ptr(master, "I_SOLO") > 0.5) : false;
+  std::ostringstream oss;
+  oss << "{";
+  oss << "\"id\":\"MASTER_TRACK\",\"guid\":\"MASTER_TRACK\",\"index\":0,";
+  oss << "\"name\":\"MASTER\",\"label\":\"MASTER\",";
+  oss << "\"volume\":" << nativeNumber(vol) << ",";
+  oss << "\"volumeRatio\":" << nativeNumber(nativeVolumeToRatio(vol), 6) << ",";
+  oss << "\"db\":" << nativeNumber(nativeVolumeToDb(vol), 3) << ",";
+  oss << "\"displayScale\":\"db\",";
+  oss << "\"mute\":" << (mute ? "true" : "false") << ",";
+  oss << "\"solo\":" << (solo ? "true" : "false");
+  oss << "}";
+  return oss.str();
+}
+
+static std::string nativeBuildMixerJson(ReaProject* project)
+{
+  std::ostringstream oss;
+  const std::string tracks = nativeBuildMixerTracksJson(project, false);
+  const std::string groups = nativeBuildMixerTracksJson(project, true);
+  const std::string master = nativeBuildMixerMasterJson(project);
+  oss << "{\"tracks\":" << tracks << ",\"groups\":" << groups << ",\"master\":" << master << "}";
+  return oss.str();
+}
+
+static std::string nativeBuildPremixSongsJson(const std::vector<NativeSongWindow>& songs)
+{
+  std::ostringstream oss;
+  oss << "[";
+  bool first = true;
+  int index = 1;
+  for (const auto& s : songs) {
+    if (s.isBlock || s.isHashParent) continue;
+    if (!first) oss << ",";
+    first = false;
+    oss << nativeSongToJson(s, index++);
+  }
+  oss << "]";
+  return oss.str();
+}
+
+static std::string nativeBuildPremixTracksJson(ReaProject* project, const NativeSongWindow* selected)
+{
+  std::ostringstream oss;
+  oss << "[";
+  if (!selected || !CountTracks_ptr || !GetTrack_ptr || !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr || !GetMediaItemInfo_Value_ptr) {
+    oss << "]"; return oss.str();
+  }
+  bool first = true;
+  int outIndex = 1;
+  const int trackCount = CountTracks_ptr(project);
+  for (int ti = 0; ti < trackCount; ++ti) {
+    MediaTrack* track = GetTrack_ptr(project, ti);
+    if (!track) continue;
+    const std::string trackName = nativeTrackName(track, ti);
+    const int itemCount = GetTrackNumMediaItems_ptr(track);
+    for (int ii = 0; ii < itemCount; ++ii) {
+      MediaItem* item = GetTrackMediaItem_ptr(track, ii);
+      if (!nativeItemStartsInRange(item, selected->start, selected->end)) continue;
+      const std::string guid = nativeMediaItemGuid(item, std::string("item_") + std::to_string(ti + 1) + "_" + std::to_string(ii + 1));
+      const std::string itemName = nativeTakeName(item, trackName);
+      const double vol = GetMediaItemInfo_Value_ptr(item, "D_VOL");
+      const bool muted = GetMediaItemInfo_Value_ptr(item, "B_MUTE") > 0.5;
+      const int fxCount = nativeTakeFxCount(item);
+      const bool fxEnabled = nativeTakeAnyFxEnabled(item);
+      if (!first) oss << ",";
+      first = false;
+      oss << "{";
+      oss << "\"id\":" << nativeJsonString(guid) << ",";
+      oss << "\"guid\":" << nativeJsonString(guid) << ",";
+      oss << "\"itemId\":" << nativeJsonString(guid) << ",";
+      oss << "\"index\":" << outIndex++ << ",";
+      oss << "\"name\":" << nativeJsonString(itemName) << ",";
+      oss << "\"label\":" << nativeJsonString(itemName) << ",";
+      oss << "\"trackName\":" << nativeJsonString(trackName) << ",";
+      oss << "\"volume\":" << nativeNumber(vol) << ",";
+      oss << "\"volumeRatio\":" << nativeNumber(nativeVolumeToRatio(vol), 6) << ",";
+      oss << "\"liveVolumeRatio\":" << nativeNumber(nativeVolumeToRatio(vol), 6) << ",";
+      oss << "\"db\":" << nativeNumber(nativeVolumeToDb(vol), 3) << ",";
+      oss << "\"displayScale\":\"db\",";
+      oss << "\"mute\":" << (muted ? "true" : "false") << ",";
+      oss << "\"muted\":" << (muted ? "true" : "false") << ",";
+      oss << "\"hasFx\":" << (fxCount > 0 ? "true" : "false") << ",";
+      oss << "\"fxCount\":" << fxCount << ",";
+      oss << "\"fxEnabled\":" << (fxEnabled ? "true" : "false") << ",";
+      oss << "\"fxOn\":" << (fxEnabled ? "true" : "false");
+      oss << "}";
+    }
+  }
+  oss << "]";
+  return oss.str();
+}
+
+static std::string nativeBuildPremixJson(ReaProject* project, const std::vector<NativeSongWindow>& songs)
+{
+  std::string selectedId;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    selectedId = g_nativePremixSelectedSongId;
+  }
+  const NativeSongWindow* selected = nativeFindSongById(songs, selectedId);
+  std::ostringstream oss;
+  oss << "{";
+  oss << "\"mode\":\"item\",\"itemMode\":true,\"globalEnabled\":false,\"bypassEnabled\":false,";
+  oss << "\"selectedSongId\":" << nativeJsonString(selected ? selected->id : selectedId) << ",";
+  oss << "\"selectedPremixEnabled\":true,\"selectedCanEdit\":true,";
+  oss << "\"songs\":" << nativeBuildPremixSongsJson(songs) << ",";
+  oss << "\"tracks\":" << nativeBuildPremixTracksJson(project, selected) << ",";
+  oss << "\"groups\":[]";
+  oss << "}";
+  return oss.str();
+}
+
 static void nativeRebuildState(bool forceSnapshot)
 {
   if (!EnumProjects_ptr) return;
@@ -1428,7 +1832,11 @@ static void nativeRebuildState(bool forceSnapshot)
   int activePlaylistIndex = 1;
   std::string activePlaylistName = "Músicas";
   const std::string playlistsJson = nativeBuildPlaylistsJson(activeProject, songs, activePlaylistIndex, activePlaylistName);
+  const std::string mixerJson = nativeBuildMixerJson(activeProject);
+  const std::string premixJson = nativeBuildPremixJson(activeProject, songs);
   const std::string nowIso = nativeIsoNow();
+  const bool appActive = g_nativeLastDirectorHeartbeat.time_since_epoch().count() != 0 &&
+    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - g_nativeLastDirectorHeartbeat).count() < 12;
 
   std::string luaLiveRaw;
   {
@@ -1461,6 +1869,10 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"regions\":" << regionsJson << ",";
   json << "\"markers\":" << markersJson << ",";
   json << "\"playlists\":" << playlistsJson << ",";
+  json << "\"mixer\":" << mixerJson << ",";
+  json << "\"mixerTracks\":" << nativeBuildMixerTracksJson(activeProject, false) << ",";
+  json << "\"mixerGroups\":" << nativeBuildMixerTracksJson(activeProject, true) << ",";
+  json << "\"mixerMaster\":" << nativeBuildMixerMasterJson(activeProject) << ",";
   json << "\"currentPlaylistName\":" << nativeJsonString(activePlaylistName) << ",";
   json << "\"activePlaylistName\":" << nativeJsonString(activePlaylistName) << ",";
   json << "\"activePlaylistId\":" << nativeJsonString(std::to_string(activePlaylistIndex)) << ",";
@@ -1491,6 +1903,8 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"remainingSec\":" << nativeNumber(remaining) << ",";
   json << "\"currentSongProgress\":" << nativeNumber(progress, 6);
   if (!luaFragment.empty()) json << "," << luaFragment;
+  // Native premix vem por ultimo para sobrepor qualquer fragmento antigo do Lua.
+  json << ",\"premix\":" << premixJson;
   json << "}";
 
   {
@@ -1711,6 +2125,20 @@ static void nativeHandleClient(native_socket_t client)
   } else if (path == "/command" && nativeRequestIsPost(req)) {
     const std::string commandBody = nativeTrim(nativeRequestBody(req));
     if (!commandBody.empty()) {
+      const std::string commandType = nativeJsonExtractString(commandBody, "type");
+      if (commandType == "app_heartbeat") {
+        g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::now();
+      }
+      if (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx") {
+        std::string selected = nativeJsonExtractString(commandBody, "selectedRegionId");
+        if (selected.empty()) selected = nativeJsonExtractString(commandBody, "songId");
+        if (selected.empty()) selected = nativeJsonExtractString(commandBody, "regionId");
+        if (selected.empty()) selected = nativeJsonExtractString(commandBody, "id");
+        if (!selected.empty()) {
+          std::lock_guard<std::mutex> lock(g_nativeMutex);
+          g_nativePremixSelectedSongId = selected;
+        }
+      }
       std::lock_guard<std::mutex> lock(g_nativeMutex);
       if (g_nativeCommandQueue.size() > 200) g_nativeCommandQueue.pop_front();
       g_nativeCommandQueue.push_back(commandBody);
@@ -1885,6 +2313,23 @@ static bool loadApi(reaper_plugin_info_t* rec)
   EnumProjectMarkers3_ptr = reinterpret_cast<EnumProjectMarkers3_t>(rec->GetFunc("EnumProjectMarkers3"));
   GetPlayStateEx_ptr = reinterpret_cast<GetPlayStateEx_t>(rec->GetFunc("GetPlayStateEx"));
   GetPlayPositionEx_ptr = reinterpret_cast<GetPlayPositionEx_t>(rec->GetFunc("GetPlayPositionEx"));
+  CountTracks_ptr = reinterpret_cast<CountTracks_t>(rec->GetFunc("CountTracks"));
+  GetTrack_ptr = reinterpret_cast<GetTrack_t>(rec->GetFunc("GetTrack"));
+  GetMasterTrack_ptr = reinterpret_cast<GetMasterTrack_t>(rec->GetFunc("GetMasterTrack"));
+  GetTrackName_ptr = reinterpret_cast<GetTrackName_t>(rec->GetFunc("GetTrackName"));
+  GetTrackNumMediaItems_ptr = reinterpret_cast<GetTrackNumMediaItems_t>(rec->GetFunc("GetTrackNumMediaItems"));
+  GetTrackMediaItem_ptr = reinterpret_cast<GetTrackMediaItem_t>(rec->GetFunc("GetTrackMediaItem"));
+  GetMediaItemInfo_Value_ptr = reinterpret_cast<GetMediaItemInfo_Value_t>(rec->GetFunc("GetMediaItemInfo_Value"));
+  SetMediaItemInfo_Value_ptr = reinterpret_cast<SetMediaItemInfo_Value_t>(rec->GetFunc("SetMediaItemInfo_Value"));
+  GetSetMediaItemInfo_String_ptr = reinterpret_cast<GetSetMediaItemInfo_String_t>(rec->GetFunc("GetSetMediaItemInfo_String"));
+  GetActiveTake_ptr = reinterpret_cast<GetActiveTake_t>(rec->GetFunc("GetActiveTake"));
+  GetTakeName_ptr = reinterpret_cast<GetTakeName_t>(rec->GetFunc("GetTakeName"));
+  TakeFX_GetCount_ptr = reinterpret_cast<TakeFX_GetCount_t>(rec->GetFunc("TakeFX_GetCount"));
+  TakeFX_GetEnabled_ptr = reinterpret_cast<TakeFX_GetEnabled_t>(rec->GetFunc("TakeFX_GetEnabled"));
+  TakeFX_SetEnabled_ptr = reinterpret_cast<TakeFX_SetEnabled_t>(rec->GetFunc("TakeFX_SetEnabled"));
+  GetMediaTrackInfo_Value_ptr = reinterpret_cast<GetMediaTrackInfo_Value_t>(rec->GetFunc("GetMediaTrackInfo_Value"));
+  GetTrackGUID_ptr = reinterpret_cast<GetTrackGUID_t>(rec->GetFunc("GetTrackGUID"));
+  guidToString_ptr = reinterpret_cast<guidToString_t>(rec->GetFunc("guidToString"));
 
   if (!plugin_register_ptr) {
     showDiagnostic("VS Hook Loader nao carregou: plugin_register indisponivel.");
