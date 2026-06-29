@@ -1563,18 +1563,68 @@ static std::string nativeRequestBody(const std::string& req)
   return req.substr(p + 4);
 }
 
+static size_t nativeHttpHeaderEnd(const std::string& req)
+{
+  size_t p = req.find("\r\n\r\n");
+  if (p != std::string::npos) return p + 4;
+  p = req.find("\n\n");
+  if (p != std::string::npos) return p + 2;
+  return std::string::npos;
+}
+
+static size_t nativeHttpContentLength(const std::string& req)
+{
+  size_t headerEnd = nativeHttpHeaderEnd(req);
+  if (headerEnd == std::string::npos) headerEnd = req.size();
+  std::string headers = req.substr(0, headerEnd);
+
+  const char* keys[] = { "Content-Length:", "content-length:", "CONTENT-LENGTH:" };
+  for (const char* key : keys) {
+    size_t p = headers.find(key);
+    if (p == std::string::npos) continue;
+    p += std::strlen(key);
+    while (p < headers.size() && (headers[p] == ' ' || headers[p] == '\t')) ++p;
+    size_t e = p;
+    while (e < headers.size() && headers[e] >= '0' && headers[e] <= '9') ++e;
+    if (e > p) {
+      try { return static_cast<size_t>(std::stoul(headers.substr(p, e - p))); } catch (...) { return 0; }
+    }
+  }
+  return 0;
+}
+
+static std::string nativeReadHttpRequest(native_socket_t client)
+{
+  std::string req;
+  req.reserve(8192);
+  char buffer[8192];
+  const size_t maxRequestBytes = 1024 * 1024;
+
+  for (;;) {
+    int received = 0;
+#ifdef _WIN32
+    received = recv(client, buffer, static_cast<int>(sizeof(buffer)), 0);
+#else
+    received = static_cast<int>(recv(client, buffer, sizeof(buffer), 0));
+#endif
+    if (received <= 0) break;
+    req.append(buffer, static_cast<size_t>(received));
+    if (req.size() > maxRequestBytes) break;
+
+    const size_t headerEnd = nativeHttpHeaderEnd(req);
+    if (headerEnd != std::string::npos) {
+      const size_t contentLength = nativeHttpContentLength(req);
+      if (req.size() >= headerEnd + contentLength) break;
+    }
+  }
+
+  return req;
+}
+
 static void nativeHandleClient(native_socket_t client)
 {
-  char buffer[65536];
-  int received = 0;
-#ifdef _WIN32
-  received = recv(client, buffer, static_cast<int>(sizeof(buffer) - 1), 0);
-#else
-  received = static_cast<int>(recv(client, buffer, sizeof(buffer) - 1, 0));
-#endif
-  if (received <= 0) { nativeCloseSocket(client); return; }
-  buffer[received] = '\0';
-  const std::string req(buffer, static_cast<size_t>(received));
+  const std::string req = nativeReadHttpRequest(client);
+  if (req.empty()) { nativeCloseSocket(client); return; }
   const std::string path = nativeRequestPath(req);
   std::string body;
 
