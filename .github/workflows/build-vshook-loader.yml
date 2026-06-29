@@ -23,6 +23,11 @@ jobs:
           test -f extension/sdk/reaper_plugin_functions.h
           echo "SDK headers found."
 
+      - name: Clean Windows build dir
+        shell: pwsh
+        run: |
+          if (Test-Path extension/build) { Remove-Item -Recurse -Force extension/build }
+
       - name: Configure
         shell: pwsh
         run: cmake -S extension -B extension/build -A x64
@@ -57,7 +62,7 @@ jobs:
 
       - name: Clean build dirs
         shell: bash
-        run: rm -rf extension/build-x86_64 extension/build-arm64 extension/build-universal
+        run: rm -rf extension/build extension/build-* extension/build-x86_64 extension/build-arm64 extension/build-universal
 
       # Mesmo modelo da SWS: cada arquitetura recebe seu deployment target.
       # Depois juntamos os dois binarios em um unico reaper_vshook.dylib via lipo.

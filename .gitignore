@@ -1,0 +1,23 @@
+# CMake build folders
+extension/build/
+extension/build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.vcxproj
+*.vcxproj.filters
+*.sln
+
+# Build outputs
+*.dll
+*.dylib
+*.so
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+.DS_Store
