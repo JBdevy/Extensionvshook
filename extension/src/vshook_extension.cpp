@@ -2612,7 +2612,11 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
     if (type == "marker_select" || type == "select_marker") g_nativeArmedMarkerId.clear();
   }
 
-  if (SetEditCurPos2_ptr) SetEditCurPos2_ptr(project, markerPos, true, false);
+  // FIX47: primeiro toque no App Diretor apenas seleciona o marker (amarelo).
+  // Só marker_go/trigger_marker confirma o engatilhamento e move o cursor de edição.
+  if ((type == "marker_go" || type == "trigger_marker") && SetEditCurPos2_ptr) {
+    SetEditCurPos2_ptr(project, markerPos, true, false);
+  }
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
   return true;
