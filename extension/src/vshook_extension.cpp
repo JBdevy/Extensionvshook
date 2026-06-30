@@ -72,6 +72,7 @@ using SetMediaTrackInfo_Value_t = bool (*)(MediaTrack*, const char*, double);
 using SelectProjectInstance_t = void (*)(ReaProject*);
 using TrackList_AdjustWindows_t = void (*)(bool);
 using UpdateArrange_t = void (*)();
+using SetEditCurPos2_t = void (*)(ReaProject*, double, bool, bool);
 using GetTrackGUID_t = GUID* (*)(MediaTrack*);
 using guidToString_t = void (*)(const GUID*, char*);
 
@@ -113,6 +114,7 @@ static SetMediaTrackInfo_Value_t SetMediaTrackInfo_Value_ptr = nullptr;
 static SelectProjectInstance_t SelectProjectInstance_ptr = nullptr;
 static TrackList_AdjustWindows_t TrackList_AdjustWindows_ptr = nullptr;
 static UpdateArrange_t UpdateArrange_ptr = nullptr;
+static SetEditCurPos2_t SetEditCurPos2_ptr = nullptr;
 static GetTrackGUID_t GetTrackGUID_ptr = nullptr;
 static guidToString_t guidToString_ptr = nullptr;
 
@@ -1312,12 +1314,18 @@ struct NativeSongWindow {
   std::string blockColorHex;
   std::string inheritedBlockColorHex;
   std::string lyricsText;
+  int playlistOrder = 0;
+  std::string playlistEntryId;
 };
 
 static std::vector<NativeSongWindow> g_nativeSongWindows;
 static bool g_nativeCurrentTransportPlaying = false;
 static std::string g_nativeCurrentPlayingId;
 static double g_nativeCurrentPlayPosition = 0.0;
+static std::string g_nativeSelectedId;
+static std::string g_nativeSelectedTab;
+static double g_nativeSelectedStart = 0.0;
+static double g_nativeSelectedEnd = 0.0;
 
 static std::string nativeSongToJson(const NativeSongWindow& item, int index)
 {
@@ -1336,6 +1344,9 @@ static std::string nativeSongToJson(const NativeSongWindow& item, int index)
   oss << "\"id\":" << nativeJsonString(item.id) << ",";
   oss << "\"uid\":" << nativeJsonString(item.id + "|" + nativeNumber(item.start, 3) + "|" + nativeNumber(item.end, 3)) << ",";
   oss << "\"index\":" << index << ",";
+  oss << "\"order\":" << (item.playlistOrder > 0 ? item.playlistOrder : index) << ",";
+  oss << "\"playlistOrder\":" << (item.playlistOrder > 0 ? item.playlistOrder : index) << ",";
+  oss << "\"playlistEntryId\":" << nativeJsonString(item.playlistEntryId.empty() ? item.id : item.playlistEntryId) << ",";
   oss << "\"name\":" << nativeJsonString(item.name) << ",";
   oss << "\"label\":" << nativeJsonString(item.name) << ",";
   oss << "\"type\":" << nativeJsonString(item.type.empty() ? (item.isBlock ? "block" : "song") : item.type) << ",";
@@ -1541,7 +1552,7 @@ static std::string nativeBuildRegionsJson(const std::vector<NativeSongWindow>& s
     if (s.isBlock) continue;
     if (!first) oss << ",";
     first = false;
-    oss << nativeSongToJson(s, index++);
+    NativeSongWindow copy = s; if (copy.playlistOrder <= 0) copy.playlistOrder = index; oss << nativeSongToJson(copy, index++);
   }
   oss << "]";
   return oss.str();
@@ -1653,6 +1664,8 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
         (void)startPos; (void)endPos;
       }
 
+      item.playlistOrder = itemIndex + 1;
+      item.playlistEntryId = std::to_string(playlistIndex) + ":" + std::to_string(itemIndex + 1) + ":" + item.id;
       if (itemIndex > 0) out << ",";
       out << nativeSongToJson(item, itemIndex + 1);
       ++itemIndex;
@@ -1787,7 +1800,7 @@ static std::string nativeBuildPremixSongsJson(const std::vector<NativeSongWindow
     if (s.isBlock || s.isHashParent) continue;
     if (!first) oss << ",";
     first = false;
-    oss << nativeSongToJson(s, index++);
+    NativeSongWindow copy = s; if (copy.playlistOrder <= 0) copy.playlistOrder = index; oss << nativeSongToJson(copy, index++);
   }
   oss << "]";
   return oss.str();
@@ -2009,6 +2022,15 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"remainingSec\":" << nativeNumber(remaining) << ",";
   json << "\"currentSongProgress\":" << nativeNumber(progress, 6);
   if (!luaFragment.empty()) json << "," << luaFragment;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    json << ",\"selectedPlaylistSongId\":" << ((g_nativeSelectedTab == "playlist" && !g_nativeSelectedId.empty()) ? nativeJsonString(g_nativeSelectedId) : std::string("null"));
+    json << ",\"selectedRegionId\":" << ((g_nativeSelectedTab == "regions" && !g_nativeSelectedId.empty()) ? nativeJsonString(g_nativeSelectedId) : std::string("null"));
+    json << ",\"selectedSongId\":" << (!g_nativeSelectedId.empty() ? nativeJsonString(g_nativeSelectedId) : std::string("null"));
+    json << ",\"selectedStartPos\":" << nativeNumber(g_nativeSelectedStart);
+    json << ",\"selectedEndPos\":" << nativeNumber(g_nativeSelectedEnd);
+    json << ",\"selectionUpdatedAt\":" << nativeJsonString(nowIso);
+  }
   // Native premix vem por ultimo para sobrepor qualquer fragmento antigo do Lua.
   json << ",\"premix\":" << premixJson;
   json << "}";
@@ -2292,6 +2314,84 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
   return changed;
 }
 
+
+static const NativeSongWindow* nativeFindSongForCommand(const std::string& idValue, double startPos, double endPos)
+{
+  const NativeSongWindow* firstIdMatch = nullptr;
+  const NativeSongWindow* best = nullptr;
+  double bestScore = 1e99;
+  for (const auto& s : g_nativeSongWindows) {
+    if (s.isBlock) continue;
+    const bool idMatch = (!idValue.empty() && (s.id == idValue || std::to_string(s.sourceNumber) == idValue || s.playlistEntryId == idValue));
+    const bool hasRange = startPos > 0.0 || endPos > 0.0;
+    const double score = std::fabs(s.start - startPos) + std::fabs(s.end - endPos);
+    if (idMatch && !firstIdMatch) firstIdMatch = &s;
+    if (hasRange && idMatch && score < bestScore) { best = &s; bestScore = score; }
+  }
+  if (best) return best;
+  if (firstIdMatch) return firstIdMatch;
+  if (startPos > 0.0 || endPos > 0.0) {
+    for (const auto& s : g_nativeSongWindows) {
+      if (s.isBlock) continue;
+      const double score = std::fabs(s.start - startPos) + std::fabs(s.end - endPos);
+      if (score < bestScore) { best = &s; bestScore = score; }
+    }
+  }
+  return best;
+}
+
+static bool nativeApplySelectionCommand(const std::string& commandBody)
+{
+  const std::string type = nativeJsonExtractString(commandBody, "type");
+  if (type != "select_playlist_song" && type != "select_region" && type != "clear_selection" && type != "clear_selected_song") return false;
+  if (type == "clear_selection" || type == "clear_selected_song") {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativeSelectedId.clear();
+    g_nativeSelectedTab.clear();
+    g_nativeSelectedStart = 0.0;
+    g_nativeSelectedEnd = 0.0;
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  std::string idValue = nativeJsonExtractString(commandBody, "targetId");
+  if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "songId");
+  if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "id");
+  std::string startValue = nativeJsonExtractString(commandBody, "startPos");
+  if (startValue.empty()) startValue = nativeJsonExtractString(commandBody, "start_pos");
+  std::string endValue = nativeJsonExtractString(commandBody, "endPos");
+  if (endValue.empty()) endValue = nativeJsonExtractString(commandBody, "end_pos");
+  const double startPos = nativeLooksNumeric(startValue) ? std::atof(startValue.c_str()) : 0.0;
+  const double endPos = nativeLooksNumeric(endValue) ? std::atof(endValue.c_str()) : 0.0;
+
+  double targetPos = startPos;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    const NativeSongWindow* song = nativeFindSongForCommand(idValue, startPos, endPos);
+    if (song) {
+      g_nativeSelectedId = song->id;
+      g_nativeSelectedTab = (type == "select_region") ? "regions" : "playlist";
+      g_nativeSelectedStart = song->start;
+      g_nativeSelectedEnd = song->end;
+      targetPos = song->start;
+    } else if (!idValue.empty()) {
+      g_nativeSelectedId = idValue;
+      g_nativeSelectedTab = (type == "select_region") ? "regions" : "playlist";
+      g_nativeSelectedStart = startPos;
+      g_nativeSelectedEnd = endPos;
+    }
+  }
+
+  if (SetEditCurPos2_ptr && targetPos >= 0.0) {
+    char pathBuf[2048] = "";
+    ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
+    SetEditCurPos2_ptr(project, targetPos, true, false);
+  }
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
 static bool nativeSelectProjectFromCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
@@ -2352,7 +2452,7 @@ static void nativeHandleClient(native_socket_t client)
       }
 
       const bool premixCommandRemoved = (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx" || commandType == "premix_set_volume" || commandType == "premix_toggle_mute" || commandType == "premix_toggle_fx");
-      const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
+      const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
 
       if (!handledByNative && !premixCommandRemoved) {
         std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -2550,6 +2650,7 @@ static bool loadApi(reaper_plugin_info_t* rec)
   SelectProjectInstance_ptr = reinterpret_cast<SelectProjectInstance_t>(rec->GetFunc("SelectProjectInstance"));
   TrackList_AdjustWindows_ptr = reinterpret_cast<TrackList_AdjustWindows_t>(rec->GetFunc("TrackList_AdjustWindows"));
   UpdateArrange_ptr = reinterpret_cast<UpdateArrange_t>(rec->GetFunc("UpdateArrange"));
+  SetEditCurPos2_ptr = reinterpret_cast<SetEditCurPos2_t>(rec->GetFunc("SetEditCurPos2"));
   GetTrackGUID_ptr = reinterpret_cast<GetTrackGUID_t>(rec->GetFunc("GetTrackGUID"));
   guidToString_ptr = reinterpret_cast<guidToString_t>(rec->GetFunc("guidToString"));
 
