@@ -124,6 +124,51 @@ static const char* kAutoOpenModeKey = "AUTO_OPEN_VSHOOK_MODE";
 static const char* kLegacyAutoOpenKey = "AUTO_OPEN_VSHOOK";
 static const char* kProjectAutoOpenModeKey = "PROJECT_AUTO_OPEN_VSHOOK_MODE";
 
+static const char* kTransportProtectionKey = "TRANSPORT_PROTECTION_DOUBLE_TAP";
+static custom_action_register_t g_transportProtectionAction = { 0, "VSHOOKPROTECTION", "VS Hook Protection - Space duplo", nullptr };
+static int g_transportProtectionCommandId = 0;
+static bool g_transportProtectionBypass = false;
+static std::chrono::steady_clock::time_point g_transportProtectionLastTap;
+static const int kTransportProtectionWindowMs = 420;
+static const int kReaperTransportPlayStopCommandId = 40044;
+
+static bool getTransportProtectionEnabled()
+{
+  if (!GetExtState_ptr) return false;
+  const char* value = GetExtState_ptr(kExtStateSection, kTransportProtectionKey);
+  return value && std::strcmp(value, "1") == 0;
+}
+
+static void setTransportProtectionEnabled(bool enabled)
+{
+  if (SetExtState_ptr) SetExtState_ptr(kExtStateSection, kTransportProtectionKey, enabled ? "1" : "0", true);
+}
+
+static void toggleTransportProtectionMode()
+{
+  setTransportProtectionEnabled(!getTransportProtectionEnabled());
+}
+
+static bool handleProtectedTransportCommand(int command)
+{
+  if (g_transportProtectionBypass) return false;
+  if (command != kReaperTransportPlayStopCommandId) return false;
+  if (!getTransportProtectionEnabled()) return false;
+
+  const auto now = std::chrono::steady_clock::now();
+  const bool secondTap = g_transportProtectionLastTap.time_since_epoch().count() != 0 &&
+    std::chrono::duration_cast<std::chrono::milliseconds>(now - g_transportProtectionLastTap).count() <= kTransportProtectionWindowMs;
+  g_transportProtectionLastTap = now;
+
+  if (secondTap && Main_OnCommand_ptr) {
+    g_transportProtectionLastTap = std::chrono::steady_clock::time_point();
+    g_transportProtectionBypass = true;
+    Main_OnCommand_ptr(kReaperTransportPlayStopCommandId, 0);
+    g_transportProtectionBypass = false;
+  }
+  return true;
+}
+
 struct ScriptEntry {
   custom_action_register_t action;
   const char* displayName;
@@ -757,6 +802,12 @@ static bool hookCommand(int command, int flag)
 {
   (void)flag;
 
+  if (handleProtectedTransportCommand(command)) return true;
+  if (g_transportProtectionCommandId != 0 && command == g_transportProtectionCommandId) {
+    toggleTransportProtectionMode();
+    return true;
+  }
+
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && command == entry.commandId) {
       toggleAutoOpenMode(entry.autoOpenMode);
@@ -789,6 +840,12 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   (void)relmode;
   (void)hwnd;
 
+  if (handleProtectedTransportCommand(command)) return true;
+  if (g_transportProtectionCommandId != 0 && command == g_transportProtectionCommandId) {
+    toggleTransportProtectionMode();
+    return true;
+  }
+
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && command == entry.commandId) {
       toggleAutoOpenMode(entry.autoOpenMode);
@@ -815,6 +872,10 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
 static int toggleActionState(int commandId)
 {
   normalizeAutoOpenConflict();
+
+  if (g_transportProtectionCommandId != 0 && commandId == g_transportProtectionCommandId) {
+    return getTransportProtectionEnabled() ? 1 : 0;
+  }
 
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && commandId == entry.commandId) {
@@ -888,6 +949,7 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
     for (ScriptEntry& script : g_scripts) {
       setMenuCommandChecked(hMenu, script.commandId, script.commandId != 0 && isScriptRunning(script));
     }
+    setMenuCommandChecked(hMenu, g_transportProtectionCommandId, getTransportProtectionEnabled());
     return;
   }
 
@@ -922,6 +984,11 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   }
 
   insertMenuSeparator(hMenu);
+
+  if (g_transportProtectionCommandId != 0) {
+    insertMenuString(hMenu, "Protection: Space duplo", g_transportProtectionCommandId, getTransportProtectionEnabled());
+    insertMenuSeparator(hMenu);
+  }
 
   for (int i = static_cast<int>(sizeof(g_scripts) / sizeof(g_scripts[0])) - 1; i >= 0; --i) {
     if (!g_scripts[i].showInExtensionsMenu) continue;
@@ -1984,6 +2051,7 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "{";
   json << "\"ok\":true,";
   json << "\"nativeBridge\":true,";
+  json << "\"transportProtectionEnabled\":" << (getTransportProtectionEnabled() ? "true" : "false") << ",";
   json << "\"bridgeVersion\":2,";
   json << "\"connected\":true,";
   json << "\"updatedAt\":" << nativeJsonString(nowIso) << ",";
@@ -2690,6 +2758,21 @@ static void nativeHandleClient(native_socket_t client)
         g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::now();
       }
 
+      if (commandType == "transport_protection_set" || commandType == "protection_set" || commandType == "play_protection_set") {
+        const std::string enabledValue = nativeJsonExtractString(commandBody, "enabled");
+        const bool enabled = enabledValue == "1" || enabledValue == "true" || enabledValue == "on";
+        setTransportProtectionEnabled(enabled);
+        g_nativeForceStateBuild.store(true);
+        body = nativeHttpResponse(200, "{\"ok\":true,\"nativeBridge\":true}");
+#ifdef _WIN32
+        send(client, body.c_str(), static_cast<int>(body.size()), 0);
+#else
+        send(client, body.c_str(), body.size(), 0);
+#endif
+        nativeCloseSocket(client);
+        return;
+      }
+
       const bool premixCommandRemoved = (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx" || commandType == "premix_set_volume" || commandType == "premix_toggle_mute" || commandType == "premix_toggle_fx");
       const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeApplyMarkerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
 
@@ -2926,6 +3009,11 @@ static void initialize()
     if (script.commandId != 0) {
       hasRegisteredAction = true;
     }
+  }
+
+  g_transportProtectionCommandId = plugin_register_ptr("custom_action", (void*)&g_transportProtectionAction);
+  if (g_transportProtectionCommandId != 0) {
+    hasRegisteredAction = true;
   }
 
   registerClipboardApi();
