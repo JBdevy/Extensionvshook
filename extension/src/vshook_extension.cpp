@@ -2513,7 +2513,7 @@ static bool nativeFindMarkerByCommandId(ReaProject* project, const std::string& 
   std::string bestId;
   bool found = false;
   for (int i = 0; i < total; ++i) {
-    int isRegion = 0;
+    bool isRegion = false;
     double pos = 0.0;
     double end = 0.0;
     const char* name = nullptr;
@@ -2547,7 +2547,7 @@ static bool nativeFindNextMarkerAfterPlayCursor(ReaProject* project, double& pos
   double bestPos = 0.0;
   int bestNumber = 0;
   for (int i = 0; i < total; ++i) {
-    int isRegion = 0;
+    bool isRegion = false;
     double pos = 0.0;
     double end = 0.0;
     const char* name = nullptr;
