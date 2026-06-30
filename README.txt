@@ -2,8 +2,8 @@ VS Hook Loader | Hook Developer
 
 Esta extensao adiciona no menu Extensions:
 
-- VS Hook Pro
-- VS Hook Basic
+- VS Hook Pro 2.3
+- VS Hook Basic 2.3
 - Iniciar VS Hook Pro junto com o REAPER
 - Iniciar VS Hook Basic junto com o REAPER
 - Iniciar VS Hook Pro junto com ESTE projeto
