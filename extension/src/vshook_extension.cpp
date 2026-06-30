@@ -15,6 +15,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -2392,6 +2393,94 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
   return true;
 }
 
+
+static bool nativeApplyTransportCommand(const std::string& commandBody)
+{
+  const std::string type = nativeJsonExtractString(commandBody, "type");
+  if (type != "play_start" && type != "play" && type != "play_stop" && type != "stop" &&
+      type != "play_toggle" && type != "director_play_button" && type != "play_button" &&
+      type != "director_play_no_seek" && type != "director_stop_no_seek") {
+    return false;
+  }
+  if (!Main_OnCommand_ptr) return false;
+
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
+  const int playState = GetPlayStateEx_ptr ? GetPlayStateEx_ptr(project) : 0;
+  const bool isPlaying = ((playState & 1) == 1) || ((playState & 4) == 4);
+
+  std::string desired = nativeJsonExtractString(commandBody, "desiredPlaying");
+  if (desired.empty()) desired = nativeJsonExtractString(commandBody, "requestedPlaybackState");
+  if (desired.empty()) desired = nativeJsonExtractString(commandBody, "desiredState");
+  if (desired.empty()) desired = nativeJsonExtractString(commandBody, "forcePlay");
+  if (desired.empty()) desired = nativeJsonExtractString(commandBody, "forceStop");
+  desired = nativeTrim(desired);
+  std::transform(desired.begin(), desired.end(), desired.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+
+  bool wantsPlay = false;
+  bool wantsStop = false;
+  if (type == "play_start" || type == "play" || type == "director_play_no_seek") wantsPlay = true;
+  if (type == "play_stop" || type == "stop" || type == "director_stop_no_seek") wantsStop = true;
+  if (desired == "true" || desired == "1" || desired == "play" || desired == "playing" || desired == "on") wantsPlay = true;
+  if (desired == "false" || desired == "0" || desired == "stop" || desired == "stopped" || desired == "off") wantsStop = true;
+  if (type == "play_toggle" || type == "director_play_button" || type == "play_button") {
+    if (!wantsPlay && !wantsStop) {
+      wantsPlay = !isPlaying;
+      wantsStop = isPlaying;
+    }
+  }
+
+  if (wantsStop && !wantsPlay) {
+    Main_OnCommand_ptr(1016, 0); // Transport: Stop
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  if (wantsPlay && !wantsStop) {
+    std::string noSeekValue = nativeJsonExtractString(commandBody, "noSeek");
+    std::string transportOnlyValue = nativeJsonExtractString(commandBody, "transportOnly");
+    std::transform(noSeekValue.begin(), noSeekValue.end(), noSeekValue.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    std::transform(transportOnlyValue.begin(), transportOnlyValue.end(), transportOnlyValue.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    const bool noSeek = (noSeekValue == "true" || noSeekValue == "1" || transportOnlyValue == "true" || transportOnlyValue == "1" || type == "director_play_no_seek");
+    std::string idValue = nativeJsonExtractString(commandBody, "targetId");
+    if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "songId");
+    if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "selectedPlaylistSongId");
+    if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "selectedRegionId");
+    if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "id");
+    std::string startValue = nativeJsonExtractString(commandBody, "startPos");
+    if (startValue.empty()) startValue = nativeJsonExtractString(commandBody, "start_pos");
+    std::string endValue = nativeJsonExtractString(commandBody, "endPos");
+    if (endValue.empty()) endValue = nativeJsonExtractString(commandBody, "end_pos");
+    double startPos = nativeLooksNumeric(startValue) ? std::atof(startValue.c_str()) : 0.0;
+    const double endPos = nativeLooksNumeric(endValue) ? std::atof(endValue.c_str()) : 0.0;
+
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      const NativeSongWindow* song = nativeFindSongForCommand(idValue, startPos, endPos);
+      if (song) {
+        startPos = song->start;
+        g_nativeSelectedId = song->id;
+        g_nativeSelectedStart = song->start;
+        g_nativeSelectedEnd = song->end;
+      } else if (!idValue.empty()) {
+        g_nativeSelectedId = idValue;
+        g_nativeSelectedStart = startPos;
+        g_nativeSelectedEnd = endPos;
+      }
+    }
+
+    if (!noSeek && SetEditCurPos2_ptr && startPos >= 0.0) {
+      SetEditCurPos2_ptr(project, startPos, true, false);
+    }
+    Main_OnCommand_ptr(1007, 0); // Transport: Play
+    if (UpdateArrange_ptr) UpdateArrange_ptr();
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  return false;
+}
+
 static bool nativeSelectProjectFromCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
@@ -2452,7 +2541,7 @@ static void nativeHandleClient(native_socket_t client)
       }
 
       const bool premixCommandRemoved = (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx" || commandType == "premix_set_volume" || commandType == "premix_toggle_mute" || commandType == "premix_toggle_fx");
-      const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
+      const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
 
       if (!handledByNative && !premixCommandRemoved) {
         std::lock_guard<std::mutex> lock(g_nativeMutex);
