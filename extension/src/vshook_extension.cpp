@@ -68,6 +68,10 @@ using TakeFX_GetCount_t = int (*)(MediaItem_Take*);
 using TakeFX_GetEnabled_t = bool (*)(MediaItem_Take*, int);
 using TakeFX_SetEnabled_t = void (*)(MediaItem_Take*, int, bool);
 using GetMediaTrackInfo_Value_t = double (*)(MediaTrack*, const char*);
+using SetMediaTrackInfo_Value_t = bool (*)(MediaTrack*, const char*, double);
+using SelectProjectInstance_t = void (*)(ReaProject*);
+using TrackList_AdjustWindows_t = void (*)(bool);
+using UpdateArrange_t = void (*)();
 using GetTrackGUID_t = GUID* (*)(MediaTrack*);
 using guidToString_t = void (*)(const GUID*, char*);
 
@@ -105,6 +109,10 @@ static TakeFX_GetCount_t TakeFX_GetCount_ptr = nullptr;
 static TakeFX_GetEnabled_t TakeFX_GetEnabled_ptr = nullptr;
 static TakeFX_SetEnabled_t TakeFX_SetEnabled_ptr = nullptr;
 static GetMediaTrackInfo_Value_t GetMediaTrackInfo_Value_ptr = nullptr;
+static SetMediaTrackInfo_Value_t SetMediaTrackInfo_Value_ptr = nullptr;
+static SelectProjectInstance_t SelectProjectInstance_ptr = nullptr;
+static TrackList_AdjustWindows_t TrackList_AdjustWindows_ptr = nullptr;
+static UpdateArrange_t UpdateArrange_ptr = nullptr;
 static GetTrackGUID_t GetTrackGUID_ptr = nullptr;
 static guidToString_t guidToString_ptr = nullptr;
 
@@ -1232,6 +1240,46 @@ static std::string nativeJsonExtractString(const std::string& json, const std::s
   return nativeTrim(json.substr(p, e - p));
 }
 
+
+static std::string nativeMediaItemNotes(MediaItem* item)
+{
+  if (!item || !GetSetMediaItemInfo_String_ptr) return std::string();
+  std::string buf(65536, '\0');
+  if (!GetSetMediaItemInfo_String_ptr(item, "P_NOTES", buf.data(), false)) return std::string();
+  const size_t n = buf.find('\0');
+  if (n != std::string::npos) buf.resize(n);
+  return nativeTrim(buf);
+}
+
+static std::string nativeCollectLyricsForRange(ReaProject* project, double start, double end)
+{
+  if (!project || !CountTracks_ptr || !GetTrack_ptr || !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr || !GetMediaItemInfo_Value_ptr) return std::string();
+  std::string best;
+  const int trackCount = CountTracks_ptr(project);
+  for (int ti = 0; ti < trackCount; ++ti) {
+    MediaTrack* track = GetTrack_ptr(project, ti);
+    if (!track) continue;
+    const int itemCount = GetTrackNumMediaItems_ptr(track);
+    for (int ii = 0; ii < itemCount; ++ii) {
+      MediaItem* item = GetTrackMediaItem_ptr(track, ii);
+      if (!item) continue;
+      const double pos = GetMediaItemInfo_Value_ptr(item, "D_POSITION");
+      const double len = std::max(0.0, GetMediaItemInfo_Value_ptr(item, "D_LENGTH"));
+      const double itemEnd = pos + len;
+      const bool startsInside = pos >= start - 0.0005 && pos < end - 0.0005;
+      const bool overlaps = itemEnd > start + 0.0005 && pos < end - 0.0005;
+      if (!startsInside && !overlaps) continue;
+      const std::string notes = nativeMediaItemNotes(item);
+      if (!notes.empty()) {
+        // Prioriza texto que começa dentro da música; se só atravessa, guarda como fallback.
+        if (startsInside) return notes;
+        if (best.empty()) best = notes;
+      }
+    }
+  }
+  return best;
+}
+
 static bool nativeItemStartsInRange(MediaItem* item, double start, double end)
 {
   if (!item || !GetMediaItemInfo_Value_ptr) return false;
@@ -1263,6 +1311,7 @@ struct NativeSongWindow {
   std::string blockColorKey;
   std::string blockColorHex;
   std::string inheritedBlockColorHex;
+  std::string lyricsText;
 };
 
 static std::vector<NativeSongWindow> g_nativeSongWindows;
@@ -1315,6 +1364,9 @@ static std::string nativeSongToJson(const NativeSongWindow& item, int index)
   oss << "\"inheritedBlockColorHex\":" << nativeJsonString(item.inheritedBlockColorHex) << ",";
   oss << "\"textColorHex\":" << nativeJsonString(item.inheritedBlockColorHex) << ",";
   oss << "\"finalTextColorHex\":" << nativeJsonString(item.inheritedBlockColorHex) << ",";
+  oss << "\"lyricsText\":" << nativeJsonString(item.lyricsText) << ",";
+  oss << "\"lyrics\":" << nativeJsonString(item.lyricsText) << ",";
+  oss << "\"tp1LyricsText\":" << nativeJsonString(item.lyricsText) << ",";
   oss << "\"depth\":" << (item.isHashChild ? 1 : 0);
   oss << "}";
   return oss.str();
@@ -1470,6 +1522,12 @@ static std::vector<NativeSongWindow> nativeCollectProjectSongs(ReaProject* proje
     if (a.start == b.start) return a.end < b.end;
     return a.start < b.start;
   });
+
+  // A extensão entrega a letra dos Empty Items direto para Diretor/Músicos.
+  // O Lua não precisa mais escrever JSON pesado só para teleprompt/letras.
+  for (auto& s : songs) {
+    if (!s.isBlock) s.lyricsText = nativeCollectLyricsForRange(project, s.start, s.end);
+  }
   return songs;
 }
 
@@ -1839,41 +1897,10 @@ static std::string nativeBuildPremixTracksBySongIdJson(ReaProject* project, cons
 
 static std::string nativeBuildPremixJson(ReaProject* project, const std::vector<NativeSongWindow>& songs)
 {
-  std::string selectedId;
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    selectedId = g_nativePremixSelectedSongId;
-  }
-
-  const NativeSongWindow* selected = nativeFindSongById(songs, selectedId);
-  const std::string selectedTracksJson = nativeBuildPremixTracksJson(project, selected);
-
-  // Importante: não monta Premix de todas as músicas em todo /state.
-  // Isso estava deixando o snapshot pesado, atrasando comando App -> Lua e causando
-  // sumiço temporário de repertório no app quando a Hook Center estourava timeout.
-  std::ostringstream selectedMap;
-  selectedMap << "{";
-  if (selected) {
-    selectedMap << nativeJsonString(selected->id) << ":" << selectedTracksJson;
-    const std::string sourceId = std::to_string(selected->sourceNumber);
-    if (sourceId != selected->id) {
-      selectedMap << "," << nativeJsonString(sourceId) << ":" << selectedTracksJson;
-    }
-  }
-  selectedMap << "}";
-
-  std::ostringstream oss;
-  oss << "{";
-  oss << "\"mode\":\"item\",\"itemMode\":true,\"globalEnabled\":false,\"bypassEnabled\":false,";
-  oss << "\"selectedSongId\":" << nativeJsonString(selected ? selected->id : selectedId) << ",";
-  oss << "\"selectedPremixEnabled\":true,\"selectedCanEdit\":true,";
-  oss << "\"songs\":" << nativeBuildPremixSongsJson(songs) << ",";
-  oss << "\"tracks\":" << selectedTracksJson << ",";
-  oss << "\"tracksBySongId\":" << selectedMap.str() << ",";
-  oss << "\"tracksByRegionId\":" << selectedMap.str() << ",";
-  oss << "\"groups\":[]";
-  oss << "}";
-  return oss.str();
+  (void)project;
+  (void)songs;
+  // Premix do App Diretor removido. Premix continua local no Lua, sem Bridge/App.
+  return "{\"available\":false,\"enabled\":false,\"mode\":\"disabled\",\"songs\":[],\"tracks\":[],\"groups\":[]}";
 }
 
 static void nativeRebuildState(bool forceSnapshot)
@@ -2193,6 +2220,117 @@ static std::string nativeReadHttpRequest(native_socket_t client)
   return req;
 }
 
+
+static double nativeRatioToVolume(double ratio)
+{
+  if (!std::isfinite(ratio)) ratio = 0.5;
+  ratio = std::max(0.0, std::min(1.0, ratio));
+  const double db = ratio * 72.0 - 60.0;
+  return std::pow(10.0, db / 20.0);
+}
+
+static bool nativeLooksNumeric(const std::string& value)
+{
+  if (value.empty()) return false;
+  size_t i = (value[0] == '-' || value[0] == '+') ? 1 : 0;
+  if (i >= value.size()) return false;
+  for (; i < value.size(); ++i) if (value[i] < '0' || value[i] > '9') return false;
+  return true;
+}
+
+static MediaTrack* nativeFindTrackById(ReaProject* project, const std::string& rawId)
+{
+  const std::string id = nativeTrim(rawId);
+  if (id.empty()) return nullptr;
+  if (id == "MASTER_TRACK" || id == "MASTER" || id == "master") return GetMasterTrack_ptr ? GetMasterTrack_ptr(project) : nullptr;
+  if (!CountTracks_ptr || !GetTrack_ptr) return nullptr;
+  const int count = CountTracks_ptr(project);
+  for (int i = 0; i < count; ++i) {
+    MediaTrack* tr = GetTrack_ptr(project, i);
+    if (!tr) continue;
+    const std::string guid = nativeTrackGuid(tr, i);
+    if (guid == id) return tr;
+    if (nativeLooksNumeric(id) && std::atoi(id.c_str()) == i + 1) return tr;
+  }
+  return nullptr;
+}
+
+static bool nativeApplyMixerCommand(const std::string& commandBody)
+{
+  const std::string type = nativeJsonExtractString(commandBody, "type");
+  if (type != "mixer_set_volume" && type != "mixer_toggle_mute" && type != "mixer_toggle_solo") return false;
+  if (!EnumProjects_ptr) return false;
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project) return false;
+  std::string id = nativeJsonExtractString(commandBody, "targetId");
+  if (id.empty()) id = nativeJsonExtractString(commandBody, "trackId");
+  if (id.empty()) id = nativeJsonExtractString(commandBody, "guid");
+  if (id.empty()) id = nativeJsonExtractString(commandBody, "id");
+  MediaTrack* tr = nativeFindTrackById(project, id);
+  if (!tr || !SetMediaTrackInfo_Value_ptr) return false;
+  bool changed = false;
+  if (type == "mixer_set_volume") {
+    std::string rv = nativeJsonExtractString(commandBody, "ratio");
+    if (rv.empty()) rv = nativeJsonExtractString(commandBody, "volumeRatio");
+    if (rv.empty()) rv = nativeJsonExtractString(commandBody, "scrollRatio");
+    if (rv.empty()) rv = nativeJsonExtractString(commandBody, "value");
+    double ratio = rv.empty() ? 0.5 : std::atof(rv.c_str());
+    changed = SetMediaTrackInfo_Value_ptr(tr, "D_VOL", nativeRatioToVolume(ratio));
+  } else if (type == "mixer_toggle_mute") {
+    const double cur = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(tr, "B_MUTE") : 0.0;
+    changed = SetMediaTrackInfo_Value_ptr(tr, "B_MUTE", cur > 0.5 ? 0.0 : 1.0);
+  } else if (type == "mixer_toggle_solo") {
+    const double cur = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(tr, "I_SOLO") : 0.0;
+    changed = SetMediaTrackInfo_Value_ptr(tr, "I_SOLO", cur > 0.5 ? 0.0 : 1.0);
+  }
+  if (changed) {
+    if (TrackList_AdjustWindows_ptr) TrackList_AdjustWindows_ptr(false);
+    if (UpdateArrange_ptr) UpdateArrange_ptr();
+    g_nativeForceStateBuild.store(true);
+  }
+  return changed;
+}
+
+static bool nativeSelectProjectFromCommand(const std::string& commandBody)
+{
+  const std::string type = nativeJsonExtractString(commandBody, "type");
+  if (type != "set_project_tab" && type != "select_project_tab" && type != "switch_project_tab" && type != "project_tab_select") return false;
+  if (!EnumProjects_ptr || !SelectProjectInstance_ptr) return false;
+  std::string idxValue = nativeJsonExtractString(commandBody, "projectTabIndex");
+  if (idxValue.empty()) idxValue = nativeJsonExtractString(commandBody, "tabIndex");
+  if (idxValue.empty()) idxValue = nativeJsonExtractString(commandBody, "projectIndex");
+  if (idxValue.empty()) idxValue = nativeJsonExtractString(commandBody, "index");
+  std::string idValue = nativeJsonExtractString(commandBody, "projectId");
+  if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "id");
+  std::string nameValue = nativeJsonExtractString(commandBody, "projectName");
+  std::string pathValue = normalizeSlashes(nativeJsonExtractString(commandBody, "projectPath"));
+
+  ReaProject* target = nullptr;
+  if (!idxValue.empty() && nativeLooksNumeric(idxValue)) {
+    char pathBuf[2048] = "";
+    target = EnumProjects_ptr(std::atoi(idxValue.c_str()), pathBuf, static_cast<int>(sizeof(pathBuf)));
+  }
+  if (!target) {
+    for (int i = 0; i < 64; ++i) {
+      char pathBuf[2048] = "";
+      ReaProject* p = EnumProjects_ptr(i, pathBuf, static_cast<int>(sizeof(pathBuf)));
+      if (!p) break;
+      const std::string pid = std::to_string(reinterpret_cast<std::uintptr_t>(p));
+      const std::string ppath = normalizeSlashes(pathBuf ? pathBuf : "");
+      const std::string pname = nativeBasenameNoRpp(ppath);
+      if ((!idValue.empty() && idValue == pid) || (!pathValue.empty() && pathValue == ppath) || (!nameValue.empty() && nameValue == pname)) {
+        target = p;
+        break;
+      }
+    }
+  }
+  if (!target) return false;
+  SelectProjectInstance_ptr(target);
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
 static void nativeHandleClient(native_socket_t client)
 {
   const std::string req = nativeReadHttpRequest(client);
@@ -2212,24 +2350,20 @@ static void nativeHandleClient(native_socket_t client)
       if (commandType == "app_heartbeat") {
         g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::now();
       }
-      if (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx") {
-        std::string selected = nativeJsonExtractString(commandBody, "selectedRegionId");
-        if (selected.empty()) selected = nativeJsonExtractString(commandBody, "songId");
-        if (selected.empty()) selected = nativeJsonExtractString(commandBody, "regionId");
-        if (selected.empty()) selected = nativeJsonExtractString(commandBody, "id");
-        if (!selected.empty()) {
-          std::lock_guard<std::mutex> lock(g_nativeMutex);
-          g_nativePremixSelectedSongId = selected;
+
+      const bool premixCommandRemoved = (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx" || commandType == "premix_set_volume" || commandType == "premix_toggle_mute" || commandType == "premix_toggle_fx");
+      const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
+
+      if (!handledByNative && !premixCommandRemoved) {
+        std::lock_guard<std::mutex> lock(g_nativeMutex);
+        if (g_nativeCommandQueue.size() > 200) g_nativeCommandQueue.pop_front();
+        g_nativeCommandQueue.push_back(commandBody);
+        g_nativeCommandHistory.push_back(commandBody);
+        if (g_nativeCommandHistory.size() > 120) {
+          g_nativeCommandHistory.erase(g_nativeCommandHistory.begin(), g_nativeCommandHistory.begin() + static_cast<long>(g_nativeCommandHistory.size() - 120));
         }
+        ++g_nativeCommandSequence;
       }
-      std::lock_guard<std::mutex> lock(g_nativeMutex);
-      if (g_nativeCommandQueue.size() > 200) g_nativeCommandQueue.pop_front();
-      g_nativeCommandQueue.push_back(commandBody);
-      g_nativeCommandHistory.push_back(commandBody);
-      if (g_nativeCommandHistory.size() > 120) {
-        g_nativeCommandHistory.erase(g_nativeCommandHistory.begin(), g_nativeCommandHistory.begin() + static_cast<long>(g_nativeCommandHistory.size() - 120));
-      }
-      ++g_nativeCommandSequence;
       g_nativeForceStateBuild.store(true);
     }
     body = nativeHttpResponse(200, "{\"ok\":true,\"nativeBridge\":true}");
@@ -2412,6 +2546,10 @@ static bool loadApi(reaper_plugin_info_t* rec)
   TakeFX_GetEnabled_ptr = reinterpret_cast<TakeFX_GetEnabled_t>(rec->GetFunc("TakeFX_GetEnabled"));
   TakeFX_SetEnabled_ptr = reinterpret_cast<TakeFX_SetEnabled_t>(rec->GetFunc("TakeFX_SetEnabled"));
   GetMediaTrackInfo_Value_ptr = reinterpret_cast<GetMediaTrackInfo_Value_t>(rec->GetFunc("GetMediaTrackInfo_Value"));
+  SetMediaTrackInfo_Value_ptr = reinterpret_cast<SetMediaTrackInfo_Value_t>(rec->GetFunc("SetMediaTrackInfo_Value"));
+  SelectProjectInstance_ptr = reinterpret_cast<SelectProjectInstance_t>(rec->GetFunc("SelectProjectInstance"));
+  TrackList_AdjustWindows_ptr = reinterpret_cast<TrackList_AdjustWindows_t>(rec->GetFunc("TrackList_AdjustWindows"));
+  UpdateArrange_ptr = reinterpret_cast<UpdateArrange_t>(rec->GetFunc("UpdateArrange"));
   GetTrackGUID_ptr = reinterpret_cast<GetTrackGUID_t>(rec->GetFunc("GetTrackGUID"));
   guidToString_ptr = reinterpret_cast<guidToString_t>(rec->GetFunc("guidToString"));
 
