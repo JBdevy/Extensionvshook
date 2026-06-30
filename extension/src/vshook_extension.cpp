@@ -1329,6 +1329,7 @@ static double g_nativeSelectedStart = 0.0;
 static double g_nativeSelectedEnd = 0.0;
 static std::string g_nativeSelectedMarkerId;
 static std::string g_nativeArmedMarkerId;
+static std::chrono::steady_clock::time_point g_nativeArmedMarkerSetAt;
 static double g_nativeSelectedMarkerPos = 0.0;
 
 static std::string nativeSongToJson(const NativeSongWindow& item, int index)
@@ -1967,7 +1968,9 @@ static void nativeRebuildState(bool forceSnapshot)
     // FIX48: quando o playhead chega no marker engatilhado, o app nao deve ficar piscando.
     // A extensao limpa o armado assim que a reproducao alcança o alvo.
     if (playing && !g_nativeArmedMarkerId.empty() && g_nativeSelectedMarkerPos > 0.0 && playPos >= (g_nativeSelectedMarkerPos - 0.0005)) {
-      g_nativeArmedMarkerId.clear();
+      const bool markerArmGraceDone = g_nativeArmedMarkerSetAt.time_since_epoch().count() == 0 ||
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_nativeArmedMarkerSetAt).count() >= 1300;
+      if (markerArmGraceDone) g_nativeArmedMarkerId.clear();
     }
     luaLiveRaw = g_nativeLuaLiveFragment;
   }
@@ -2592,6 +2595,7 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
     {
       std::lock_guard<std::mutex> lock(g_nativeMutex);
       g_nativeArmedMarkerId.clear();
+      g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
       g_nativeSelectedMarkerId = foundNext ? nextId : std::string();
       g_nativeSelectedMarkerPos = foundNext ? nextPos : 0.0;
     }
@@ -2613,8 +2617,8 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     g_nativeSelectedMarkerId = markerId;
     g_nativeSelectedMarkerPos = markerPos;
-    if (type == "marker_go" || type == "trigger_marker") g_nativeArmedMarkerId = markerId;
-    if (type == "marker_select" || type == "select_marker") g_nativeArmedMarkerId.clear();
+    if (type == "marker_go" || type == "trigger_marker") { g_nativeArmedMarkerId = markerId; g_nativeArmedMarkerSetAt = std::chrono::steady_clock::now(); }
+    if (type == "marker_select" || type == "select_marker") { g_nativeArmedMarkerId.clear(); g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point(); }
   }
 
   // FIX47: primeiro toque no App Diretor apenas seleciona o marker (amarelo).
