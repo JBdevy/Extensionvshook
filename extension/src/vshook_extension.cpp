@@ -1327,6 +1327,9 @@ static std::string g_nativeSelectedId;
 static std::string g_nativeSelectedTab;
 static double g_nativeSelectedStart = 0.0;
 static double g_nativeSelectedEnd = 0.0;
+static std::string g_nativeSelectedMarkerId;
+static std::string g_nativeArmedMarkerId;
+static double g_nativeSelectedMarkerPos = 0.0;
 
 static std::string nativeSongToJson(const NativeSongWindow& item, int index)
 {
@@ -2030,6 +2033,10 @@ static void nativeRebuildState(bool forceSnapshot)
     json << ",\"selectedSongId\":" << (!g_nativeSelectedId.empty() ? nativeJsonString(g_nativeSelectedId) : std::string("null"));
     json << ",\"selectedStartPos\":" << nativeNumber(g_nativeSelectedStart);
     json << ",\"selectedEndPos\":" << nativeNumber(g_nativeSelectedEnd);
+    json << ",\"selectedMarkerId\":" << (g_nativeSelectedMarkerId.empty() ? std::string("null") : nativeJsonString(g_nativeSelectedMarkerId));
+    json << ",\"armedMarkerId\":" << (g_nativeArmedMarkerId.empty() ? std::string("null") : nativeJsonString(g_nativeArmedMarkerId));
+    json << ",\"markerGoId\":" << (g_nativeArmedMarkerId.empty() ? std::string("null") : nativeJsonString(g_nativeArmedMarkerId));
+    json << ",\"selectedMarkerPos\":" << nativeNumber(g_nativeSelectedMarkerPos);
     json << ",\"selectionUpdatedAt\":" << nativeJsonString(nowIso);
   }
   // Native premix vem por ultimo para sobrepor qualquer fragmento antigo do Lua.
@@ -2481,6 +2488,136 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
   return false;
 }
 
+
+static bool nativeParseMarkerNumberFromId(const std::string& rawId, int& numberOut)
+{
+  std::string id = nativeTrim(rawId);
+  if (id.empty()) return false;
+  if ((id[0] == 'm' || id[0] == 'M') && id.size() > 1) id = id.substr(1);
+  if (!nativeLooksNumeric(id)) return false;
+  numberOut = std::atoi(id.c_str());
+  return numberOut != 0;
+}
+
+static bool nativeFindMarkerByCommandId(ReaProject* project, const std::string& rawId, double& posOut, std::string& idOut)
+{
+  if (!project || !CountProjectMarkers_ptr || !EnumProjectMarkers3_ptr) return false;
+  int wantedNumber = 0;
+  const bool hasWantedNumber = nativeParseMarkerNumberFromId(rawId, wantedNumber);
+  const std::string wantedId = nativeTrim(rawId);
+  int markerCount = 0;
+  int regionCount = 0;
+  int total = CountProjectMarkers_ptr(project, &markerCount, &regionCount);
+  if (total <= 0) total = markerCount + regionCount;
+  double bestPos = 0.0;
+  std::string bestId;
+  bool found = false;
+  for (int i = 0; i < total; ++i) {
+    int isRegion = 0;
+    double pos = 0.0;
+    double end = 0.0;
+    const char* name = nullptr;
+    int number = 0;
+    int color = 0;
+    if (!EnumProjectMarkers3_ptr(project, i, &isRegion, &pos, &end, &name, &number, &color)) continue;
+    if (isRegion) continue;
+    const std::string markerId = std::string("m") + std::to_string(number);
+    if ((hasWantedNumber && number == wantedNumber) || (!wantedId.empty() && markerId == wantedId)) {
+      bestPos = pos;
+      bestId = markerId;
+      found = true;
+      break;
+    }
+  }
+  if (!found) return false;
+  posOut = bestPos;
+  idOut = bestId;
+  return true;
+}
+
+static bool nativeFindNextMarkerAfterPlayCursor(ReaProject* project, double& posOut, std::string& idOut)
+{
+  if (!project || !CountProjectMarkers_ptr || !EnumProjectMarkers3_ptr) return false;
+  const double playPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : 0.0;
+  int markerCount = 0;
+  int regionCount = 0;
+  int total = CountProjectMarkers_ptr(project, &markerCount, &regionCount);
+  if (total <= 0) total = markerCount + regionCount;
+  bool found = false;
+  double bestPos = 0.0;
+  int bestNumber = 0;
+  for (int i = 0; i < total; ++i) {
+    int isRegion = 0;
+    double pos = 0.0;
+    double end = 0.0;
+    const char* name = nullptr;
+    int number = 0;
+    int color = 0;
+    if (!EnumProjectMarkers3_ptr(project, i, &isRegion, &pos, &end, &name, &number, &color)) continue;
+    if (isRegion) continue;
+    if (pos < playPos - 0.0005) continue;
+    if (!found || pos < bestPos) {
+      found = true;
+      bestPos = pos;
+      bestNumber = number;
+    }
+  }
+  if (!found) return false;
+  posOut = bestPos;
+  idOut = std::string("m") + std::to_string(bestNumber);
+  return true;
+}
+
+static bool nativeApplyMarkerCommand(const std::string& commandBody)
+{
+  const std::string type = nativeJsonExtractString(commandBody, "type");
+  if (type != "marker_select" && type != "select_marker" && type != "marker_go" && type != "trigger_marker" &&
+      type != "marker_cancel" && type != "escape_key" && type != "esc" && type != "key_escape") {
+    return false;
+  }
+  if (!EnumProjects_ptr) return false;
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project) return false;
+
+  if (type == "marker_cancel" || type == "escape_key" || type == "esc" || type == "key_escape") {
+    double nextPos = 0.0;
+    std::string nextId;
+    const bool foundNext = nativeFindNextMarkerAfterPlayCursor(project, nextPos, nextId);
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      g_nativeArmedMarkerId.clear();
+      g_nativeSelectedMarkerId = foundNext ? nextId : std::string();
+      g_nativeSelectedMarkerPos = foundNext ? nextPos : 0.0;
+    }
+    if (foundNext && SetEditCurPos2_ptr) SetEditCurPos2_ptr(project, nextPos, true, false);
+    if (UpdateArrange_ptr) UpdateArrange_ptr();
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  std::string idValue = nativeJsonExtractString(commandBody, "markerId");
+  if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "selectedMarkerId");
+  if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "targetId");
+  if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "id");
+  double markerPos = 0.0;
+  std::string markerId;
+  if (!nativeFindMarkerByCommandId(project, idValue, markerPos, markerId)) return false;
+
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativeSelectedMarkerId = markerId;
+    g_nativeSelectedMarkerPos = markerPos;
+    if (type == "marker_go" || type == "trigger_marker") g_nativeArmedMarkerId = markerId;
+    if (type == "marker_select" || type == "select_marker") g_nativeArmedMarkerId.clear();
+  }
+
+  if (SetEditCurPos2_ptr) SetEditCurPos2_ptr(project, markerPos, true, false);
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
 static bool nativeSelectProjectFromCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
@@ -2541,7 +2678,7 @@ static void nativeHandleClient(native_socket_t client)
       }
 
       const bool premixCommandRemoved = (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx" || commandType == "premix_set_volume" || commandType == "premix_toggle_mute" || commandType == "premix_toggle_fx");
-      const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
+      const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeApplyMarkerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
 
       if (!handledByNative && !premixCommandRemoved) {
         std::lock_guard<std::mutex> lock(g_nativeMutex);
