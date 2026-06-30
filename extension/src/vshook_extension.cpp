@@ -1964,6 +1964,11 @@ static void nativeRebuildState(bool forceSnapshot)
   std::string luaLiveRaw;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
+    // FIX48: quando o playhead chega no marker engatilhado, o app nao deve ficar piscando.
+    // A extensao limpa o armado assim que a reproducao alcança o alvo.
+    if (playing && !g_nativeArmedMarkerId.empty() && g_nativeSelectedMarkerPos > 0.0 && playPos >= (g_nativeSelectedMarkerPos - 0.0005)) {
+      g_nativeArmedMarkerId.clear();
+    }
     luaLiveRaw = g_nativeLuaLiveFragment;
   }
   if (GetExtState_ptr) {
@@ -2590,7 +2595,7 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
       g_nativeSelectedMarkerId = foundNext ? nextId : std::string();
       g_nativeSelectedMarkerPos = foundNext ? nextPos : 0.0;
     }
-    if (foundNext && SetEditCurPos2_ptr) SetEditCurPos2_ptr(project, nextPos, true, false);
+    if (foundNext && SetEditCurPos2_ptr) SetEditCurPos2_ptr(project, nextPos, true, true);
     if (UpdateArrange_ptr) UpdateArrange_ptr();
     g_nativeForceStateBuild.store(true);
     return true;
@@ -2615,7 +2620,7 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
   // FIX47: primeiro toque no App Diretor apenas seleciona o marker (amarelo).
   // Só marker_go/trigger_marker confirma o engatilhamento e move o cursor de edição.
   if ((type == "marker_go" || type == "trigger_marker") && SetEditCurPos2_ptr) {
-    SetEditCurPos2_ptr(project, markerPos, true, false);
+    SetEditCurPos2_ptr(project, markerPos, true, true);
   }
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
