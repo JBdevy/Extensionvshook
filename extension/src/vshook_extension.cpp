@@ -1412,6 +1412,7 @@ static std::string g_nativeSelectedMarkerId;
 static std::string g_nativeArmedMarkerId;
 static std::chrono::steady_clock::time_point g_nativeArmedMarkerSetAt;
 static double g_nativeSelectedMarkerPos = 0.0;
+static double g_nativeArmedMarkerStartPlayPos = 0.0;
 
 static std::vector<NativeSongWindow> g_nativeActivePlaylistItems;
 static bool g_nativeAutoplayEnabled = false;
@@ -2513,12 +2514,18 @@ static void nativeRebuildState(bool forceSnapshot)
       // FIX68: nao usa o cursor de edicao para limpar o pisca verde.
       // O comando marker_go move o cursor de edicao imediatamente, mas o visual
       // do Diretor deve continuar piscando ate o cursor de reproducao chegar no alvo.
-      const bool playReached = playing && std::fabs(playPos - g_nativeSelectedMarkerPos) <= 0.075;
       const bool hasGraceElapsed = g_nativeArmedMarkerSetAt.time_since_epoch().count() != 0 &&
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_nativeArmedMarkerSetAt).count() >= 150;
+      const double target = g_nativeSelectedMarkerPos;
+      const double origin = g_nativeArmedMarkerStartPlayPos;
+      const bool nearTarget = playing && std::fabs(playPos - target) <= 0.120;
+      const bool forwardCrossed = playing && origin <= target && playPos >= target - 0.080;
+      const bool backwardCrossed = playing && origin > target && playPos <= target + 0.080;
+      const bool playReached = nearTarget || forwardCrossed || backwardCrossed;
       if (playReached && hasGraceElapsed) {
         g_nativeArmedMarkerId.clear();
         g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
+        g_nativeArmedMarkerStartPlayPos = 0.0;
       }
     }
     luaLiveRaw = g_nativeLuaLiveFragment;
@@ -3105,7 +3112,9 @@ static bool nativeShouldMirrorCommandToLua(const std::string& commandType)
 {
   return commandType == "autoplay_toggle" || commandType == "auto_toggle" || commandType == "director_auto_toggle" || commandType == "autoplay_set" || commandType == "auto_set" ||
          commandType == "auto_bloco_toggle" || commandType == "at_bl_toggle" || commandType == "atbl_toggle" || commandType == "director_at_bl_toggle" || commandType == "auto_bloco_set" || commandType == "at_bl_set" ||
-         commandType == "loop_toggle" || commandType == "loop_set" || commandType == "director_loop_toggle";
+         commandType == "loop_toggle" || commandType == "loop_set" || commandType == "director_loop_toggle" ||
+         commandType == "timer_toggle" || commandType == "timer_start" || commandType == "timer_stop" || commandType == "timer_stop_reset" || commandType == "timer_reset" || commandType == "timer_set_mode" || commandType == "timer_config" ||
+         commandType == "set_page" || commandType == "set_active_playlist";
 }
 
 static void nativeMirrorCommandToLuaIfNeeded(const std::string& commandType, const std::string& commandBody)
@@ -3372,6 +3381,7 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
       std::lock_guard<std::mutex> lock(g_nativeMutex);
       g_nativeArmedMarkerId.clear();
       g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
+      g_nativeArmedMarkerStartPlayPos = 0.0;
       g_nativeSelectedMarkerId = foundNext ? nextId : std::string();
       g_nativeSelectedMarkerPos = foundNext ? nextPos : 0.0;
     }
@@ -3393,8 +3403,8 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     g_nativeSelectedMarkerId = markerId;
     g_nativeSelectedMarkerPos = markerPos;
-    if (type == "marker_go" || type == "trigger_marker") { g_nativeArmedMarkerId = markerId; g_nativeArmedMarkerSetAt = std::chrono::steady_clock::now(); }
-    if (type == "marker_select" || type == "select_marker") { g_nativeArmedMarkerId.clear(); g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point(); }
+    if (type == "marker_go" || type == "trigger_marker") { g_nativeArmedMarkerId = markerId; g_nativeArmedMarkerSetAt = std::chrono::steady_clock::now(); g_nativeArmedMarkerStartPlayPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : 0.0; }
+    if (type == "marker_select" || type == "select_marker") { g_nativeArmedMarkerId.clear(); g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point(); g_nativeArmedMarkerStartPlayPos = 0.0; }
   }
 
   // FIX47: primeiro toque no App Diretor apenas seleciona o marker (amarelo).
