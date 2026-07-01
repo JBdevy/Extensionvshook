@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = -DNOMINMAX -DSWELL_PROVIDED_BY_APP -DWIN32_LEAN_AND_MEAN -Dreaper_vshook_EXPORTS
 
-CXX_INCLUDES = -I/mnt/data/work_newlogic/ext/VSHookwinmac/extension/sdk -I/mnt/data/work_newlogic/ext/VSHookwinmac/extension/WDL -I/mnt/data/work_newlogic/ext/VSHookwinmac/extension/WDL/swell
+CXX_INCLUDES = -I/mnt/data/fix66/VSHookwinmac/extension/sdk -I/mnt/data/fix66/VSHookwinmac/extension/WDL -I/mnt/data/fix66/VSHookwinmac/extension/WDL/swell
 
 CXX_FLAGS = -std=gnu++17 -fPIC -fvisibility=default
 

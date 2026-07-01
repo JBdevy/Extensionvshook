@@ -2551,12 +2551,48 @@ static void nativeRebuildState(bool forceSnapshot)
     autoplayEnabled = g_nativeAutoplayEnabled;
     autoBlocoEnabled = g_nativeAutoBlocoEnabled;
   }
-  if (queuedSongId.empty() && !luaQueuedSongId.empty()) queuedSongId = luaQueuedSongId;
-  if (queuedPlaylistSongId.empty() && !luaQueuedPlaylistSongId.empty()) queuedPlaylistSongId = luaQueuedPlaylistSongId;
-  if (queuedRegionNumber == 0 && nativeLooksNumeric(luaQueuedRegionNumber)) queuedRegionNumber = std::atoi(luaQueuedRegionNumber.c_str());
-  if (queuedRegionNumber == 0 && nativeLooksNumeric(queuedSongId)) queuedRegionNumber = std::atoi(queuedSongId.c_str());
-  if (queuedStart <= 0.0 && nativeLooksNumeric(luaQueuedStartPos)) queuedStart = std::atof(luaQueuedStartPos.c_str());
-  if (queuedEnd <= 0.0 && nativeLooksNumeric(luaQueuedEndPos)) queuedEnd = std::atof(luaQueuedEndPos.c_str());
+
+  // FIX66: fila criada pelo Lua precisa aparecer no app dos Musicos.
+  // O Lua publica apenas um fragmento minimo; a extensao resolve esse fragmento
+  // contra a lista ativa para entregar ids/start/end no mesmo formato da fila nativa.
+  if (queuedSongId.empty()) {
+    double luaStart = nativeLooksNumeric(luaQueuedStartPos) ? std::atof(luaQueuedStartPos.c_str()) : 0.0;
+    double luaEnd = nativeLooksNumeric(luaQueuedEndPos) ? std::atof(luaQueuedEndPos.c_str()) : 0.0;
+    const NativeSongWindow* luaQueueSong = nullptr;
+    double bestLuaQueueScore = 1e99;
+    auto scanLuaQueueList = [&](const std::vector<NativeSongWindow>& list) {
+      for (const auto& item : list) {
+        if (item.isBlock) continue;
+        const bool idMatch = nativeSongIdMatches(item, luaQueuedSongId) || nativeSongIdMatches(item, luaQueuedPlaylistSongId) || nativeSongIdMatches(item, luaQueuedRegionNumber);
+        const bool hasRange = luaStart > 0.0 || luaEnd > 0.0;
+        const double score = std::fabs(item.start - luaStart) + std::fabs(item.end - luaEnd);
+        if (hasRange && (idMatch || luaQueuedSongId.empty()) && score < bestLuaQueueScore) {
+          luaQueueSong = &item;
+          bestLuaQueueScore = score;
+        } else if (!luaQueueSong && idMatch) {
+          luaQueueSong = &item;
+        }
+      }
+    };
+    scanLuaQueueList(activePlaylistItems);
+    scanLuaQueueList(songs);
+
+    if (luaQueueSong) {
+      queuedSongId = luaQueueSong->id;
+      queuedPlaylistSongId = luaQueueSong->playlistEntryId.empty() ? luaQueueSong->id : luaQueueSong->playlistEntryId;
+      queuedRegionNumber = luaQueueSong->sourceNumber;
+      queuedStart = luaQueueSong->start;
+      queuedEnd = luaQueueSong->end;
+    } else {
+      if (!luaQueuedSongId.empty()) queuedSongId = luaQueuedSongId;
+      if (!luaQueuedPlaylistSongId.empty()) queuedPlaylistSongId = luaQueuedPlaylistSongId;
+      if (nativeLooksNumeric(luaQueuedRegionNumber)) queuedRegionNumber = std::atoi(luaQueuedRegionNumber.c_str());
+      if (queuedRegionNumber == 0 && nativeLooksNumeric(queuedSongId)) queuedRegionNumber = std::atoi(queuedSongId.c_str());
+      if (nativeLooksNumeric(luaQueuedStartPos)) queuedStart = std::atof(luaQueuedStartPos.c_str());
+      if (nativeLooksNumeric(luaQueuedEndPos)) queuedEnd = std::atof(luaQueuedEndPos.c_str());
+    }
+  }
+  if (queuedPlaylistSongId.empty() && !queuedSongId.empty()) queuedPlaylistSongId = queuedSongId;
   const bool loopActive = nativeIsRepeatEnabled(activeProject);
 
   std::ostringstream json;
@@ -3073,6 +3109,23 @@ static bool nativeApplyLoopCommand(const std::string& commandBody)
   return true;
 }
 
+
+static bool nativeShouldMirrorCommandToLua(const std::string& commandType)
+{
+  return commandType == "autoplay_toggle" || commandType == "auto_toggle" || commandType == "autoplay_set" || commandType == "auto_set" ||
+         commandType == "auto_bloco_toggle" || commandType == "at_bl_toggle" || commandType == "atbl_toggle" || commandType == "auto_bloco_set" || commandType == "at_bl_set" ||
+         commandType == "loop_toggle" || commandType == "loop_set";
+}
+
+static void nativeMirrorCommandToLuaIfNeeded(const std::string& commandType, const std::string& commandBody)
+{
+  if (!nativeShouldMirrorCommandToLua(commandType)) return;
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  if (g_nativeCommandQueue.size() > 200) g_nativeCommandQueue.pop_front();
+  g_nativeCommandQueue.push_back(commandBody);
+  ++g_nativeCommandSequence;
+}
+
 static bool nativeApplySelectionCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
@@ -3439,6 +3492,10 @@ static void nativeHandleClient(native_socket_t client)
 
       const bool premixCommandRemoved = (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx" || commandType == "premix_set_volume" || commandType == "premix_toggle_mute" || commandType == "premix_toggle_fx");
       const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplyQueueCommand(commandBody) || nativeApplyAutoCommand(commandBody) || nativeApplyLoopCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeApplyMarkerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
+
+      // FIX66: a extensao continua sendo o motor, mas o Lua tambem precisa refletir
+      // Auto, AT/BL e Loop na interface local quando o comando veio do App Diretor.
+      if (handledByNative) nativeMirrorCommandToLuaIfNeeded(commandType, commandBody);
 
       if (!handledByNative && !premixCommandRemoved) {
         std::lock_guard<std::mutex> lock(g_nativeMutex);
