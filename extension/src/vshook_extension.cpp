@@ -3279,8 +3279,82 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
   }
 
   if (wantsStop && !wantsPlay) {
+    // FIX77: Stop no Diretor precisa deixar a seleção pronta para o próximo Play.
+    // Se existe fila manual/auto, a seleção nativa vai para a música da fila antes
+    // de limpar a fila. Sem fila, preserva a música parada como seleção.
+    std::string stopSelectionId = nativeJsonExtractString(commandBody, "stopSelectionTargetId");
+    if (stopSelectionId.empty()) stopSelectionId = nativeJsonExtractString(commandBody, "queuedSelectionId");
+    if (stopSelectionId.empty()) stopSelectionId = nativeJsonExtractString(commandBody, "nextSelectionId");
+    std::string stopSelectionTab = nativeJsonExtractString(commandBody, "stopSelectionTargetTab");
+    if (stopSelectionTab.empty()) stopSelectionTab = nativeJsonExtractString(commandBody, "activeTab");
+    std::string stopStartValue = nativeJsonExtractString(commandBody, "stopSelectionStartPos");
+    if (stopStartValue.empty()) stopStartValue = nativeJsonExtractString(commandBody, "selectedStartPos");
+    std::string stopEndValue = nativeJsonExtractString(commandBody, "stopSelectionEndPos");
+    if (stopEndValue.empty()) stopEndValue = nativeJsonExtractString(commandBody, "selectedEndPos");
+    double stopStartPos = nativeLooksNumeric(stopStartValue) ? std::atof(stopStartValue.c_str()) : 0.0;
+    double stopEndPos = nativeLooksNumeric(stopEndValue) ? std::atof(stopEndValue.c_str()) : 0.0;
+
+    std::string queuedId;
+    double queuedStart = 0.0;
+    double queuedEnd = 0.0;
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      queuedId = g_nativeQueuedSongId.empty() ? g_nativeQueuedPlaylistSongId : g_nativeQueuedSongId;
+      queuedStart = g_nativeQueuedStart;
+      queuedEnd = g_nativeQueuedEnd;
+    }
+
+    if (stopSelectionId.empty() && !queuedId.empty()) {
+      stopSelectionId = queuedId;
+      stopStartPos = queuedStart;
+      stopEndPos = queuedEnd;
+      if (stopSelectionTab.empty()) stopSelectionTab = "playlist";
+    }
+    if (stopSelectionId.empty()) {
+      stopSelectionId = nativeJsonExtractString(commandBody, "targetId");
+      if (stopSelectionId.empty()) stopSelectionId = nativeJsonExtractString(commandBody, "songId");
+      if (stopSelectionId.empty()) stopSelectionId = nativeJsonExtractString(commandBody, "id");
+    }
+    if (stopSelectionTab != "regions") stopSelectionTab = "playlist";
+
     Main_OnCommand_ptr(1016, 0); // Transport: Stop
-    { std::lock_guard<std::mutex> lock(g_nativeMutex); nativeClearQueuedSongLocked(); }
+
+    double finalSelectionStart = stopStartPos;
+    double finalSelectionEnd = stopEndPos;
+    bool hasFinalSelection = false;
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      if (!stopSelectionId.empty()) {
+        const NativeSongWindow* selectedSong = nativeFindSongForCommand(stopSelectionId, stopStartPos, stopEndPos);
+        if (selectedSong) {
+          g_nativeSelectedId = selectedSong->id;
+          g_nativeSelectedTab = stopSelectionTab;
+          g_nativeSelectedStart = selectedSong->start;
+          g_nativeSelectedEnd = selectedSong->end;
+          finalSelectionStart = selectedSong->start;
+          finalSelectionEnd = selectedSong->end;
+          hasFinalSelection = true;
+        } else {
+          g_nativeSelectedId = stopSelectionId;
+          g_nativeSelectedTab = stopSelectionTab;
+          g_nativeSelectedStart = stopStartPos;
+          g_nativeSelectedEnd = stopEndPos;
+          finalSelectionStart = stopStartPos;
+          finalSelectionEnd = stopEndPos;
+          hasFinalSelection = true;
+        }
+      }
+      nativeClearQueuedSongLocked();
+      g_nativeQueueHandoffPlayId.clear();
+      g_nativeQueueHandoffStart = 0.0;
+      g_nativeQueueHandoffEnd = 0.0;
+      g_nativeQueueHandoffProtectUntil = std::chrono::steady_clock::time_point();
+    }
+
+    if (hasFinalSelection && SetEditCurPos2_ptr && finalSelectionStart >= 0.0) {
+      SetEditCurPos2_ptr(project, finalSelectionStart, true, false);
+    }
+    if (UpdateArrange_ptr) UpdateArrange_ptr();
     g_nativeForceStateBuild.store(true);
     return true;
   }
