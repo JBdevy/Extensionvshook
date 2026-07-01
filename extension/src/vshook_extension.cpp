@@ -2506,13 +2506,16 @@ static void nativeRebuildState(bool forceSnapshot)
   std::string luaLiveRaw;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
-    // FIX48: quando o playhead chega no marker engatilhado, o app nao deve ficar piscando.
-    // A extensao limpa o armado assim que a reproducao alcança o alvo.
+    // FIX67: marker engatilhado precisa aparecer verde/piscando no front,
+    // mas deve limpar quando o seek realmente chegou no alvo. Mantem um hold curto
+    // para o Diretor receber ao menos um snapshot com markerGoId ativo.
     if (!g_nativeArmedMarkerId.empty() && g_nativeSelectedMarkerPos > 0.0) {
       const double cursorPos = GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(activeProject) : playPos;
       const bool playReached = playing && playPos >= (g_nativeSelectedMarkerPos - 0.0005);
       const bool cursorReached = std::fabs(cursorPos - g_nativeSelectedMarkerPos) <= 0.002;
-      if (playReached || cursorReached) {
+      const bool hasGraceElapsed = g_nativeArmedMarkerSetAt.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_nativeArmedMarkerSetAt).count() >= 650;
+      if ((playReached || cursorReached) && hasGraceElapsed) {
         g_nativeArmedMarkerId.clear();
         g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
       }
@@ -3057,10 +3060,12 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
 static bool nativeApplyAutoCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
-  if (type != "autoplay_toggle" && type != "auto_bloco_toggle") return false;
+  const bool isAuto = (type == "autoplay_toggle" || type == "auto_toggle" || type == "director_auto_toggle" || type == "autoplay_set" || type == "auto_set");
+  const bool isAtBl = (type == "auto_bloco_toggle" || type == "at_bl_toggle" || type == "atbl_toggle" || type == "director_at_bl_toggle" || type == "auto_bloco_set" || type == "at_bl_set");
+  if (!isAuto && !isAtBl) return false;
 
   std::string desired = nativeJsonExtractString(commandBody, "desiredState");
-  if (type == "autoplay_toggle") {
+  if (isAuto) {
     std::string specific = nativeJsonExtractString(commandBody, "desiredAutoplay");
     if (!specific.empty()) desired = specific;
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -3072,6 +3077,8 @@ static bool nativeApplyAutoCommand(const std::string& commandBody)
   }
 
   std::string specific = nativeJsonExtractString(commandBody, "desiredAutoBloco");
+  if (specific.empty()) specific = nativeJsonExtractString(commandBody, "desiredAtBl");
+  if (specific.empty()) specific = nativeJsonExtractString(commandBody, "desiredATBL");
   if (!specific.empty()) desired = specific;
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   const bool next = desired.empty() ? !g_nativeAutoBlocoEnabled : nativeBoolFromText(desired, g_nativeAutoBlocoEnabled);
@@ -3083,13 +3090,19 @@ static bool nativeApplyAutoCommand(const std::string& commandBody)
 static bool nativeApplyLoopCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
-  if (type != "loop_toggle") return false;
+  if (type != "loop_toggle" && type != "loop_set" && type != "director_loop_toggle") return false;
 
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
   if (!project) return true;
 
-  if (nativeIsRepeatEnabled(project)) {
+  std::string desiredText = nativeJsonExtractString(commandBody, "desiredLoop");
+  if (desiredText.empty()) desiredText = nativeJsonExtractString(commandBody, "desiredState");
+  if (desiredText.empty()) desiredText = nativeJsonExtractString(commandBody, "enabled");
+  const bool current = nativeIsRepeatEnabled(project);
+  const bool desired = desiredText.empty() ? !current : nativeBoolFromText(desiredText, current);
+
+  if (!desired) {
     nativeClearLoopTimeRange(project);
     nativeSetRepeatEnabled(project, false);
     if (UpdateArrange_ptr) UpdateArrange_ptr();
@@ -3097,24 +3110,28 @@ static bool nativeApplyLoopCommand(const std::string& commandBody)
     return true;
   }
 
-  const double playPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : 0.0;
-  double start = 0.0;
-  double end = 0.0;
-  if (nativeFindTransitionLoopRange(project, playPos, start, end)) {
-    nativeSetLoopTimeRange(project, start, end);
-    nativeSetRepeatEnabled(project, true);
-    if (UpdateArrange_ptr) UpdateArrange_ptr();
-    g_nativeForceStateBuild.store(true);
+  if (!current) {
+    const double playPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : 0.0;
+    double start = 0.0;
+    double end = 0.0;
+    if (nativeFindTransitionLoopRange(project, playPos, start, end)) {
+      nativeSetLoopTimeRange(project, start, end);
+      nativeSetRepeatEnabled(project, true);
+    } else {
+      nativeSetRepeatEnabled(project, true);
+    }
   }
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+  g_nativeForceStateBuild.store(true);
   return true;
 }
 
 
 static bool nativeShouldMirrorCommandToLua(const std::string& commandType)
 {
-  return commandType == "autoplay_toggle" || commandType == "auto_toggle" || commandType == "autoplay_set" || commandType == "auto_set" ||
-         commandType == "auto_bloco_toggle" || commandType == "at_bl_toggle" || commandType == "atbl_toggle" || commandType == "auto_bloco_set" || commandType == "at_bl_set" ||
-         commandType == "loop_toggle" || commandType == "loop_set";
+  return commandType == "autoplay_toggle" || commandType == "auto_toggle" || commandType == "director_auto_toggle" || commandType == "autoplay_set" || commandType == "auto_set" ||
+         commandType == "auto_bloco_toggle" || commandType == "at_bl_toggle" || commandType == "atbl_toggle" || commandType == "director_at_bl_toggle" || commandType == "auto_bloco_set" || commandType == "at_bl_set" ||
+         commandType == "loop_toggle" || commandType == "loop_set" || commandType == "director_loop_toggle";
 }
 
 static void nativeMirrorCommandToLuaIfNeeded(const std::string& commandType, const std::string& commandBody)
