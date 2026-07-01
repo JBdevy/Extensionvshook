@@ -2,18 +2,18 @@ VS Hook Loader | Hook Developer
 
 Esta extensao adiciona no menu Extensions:
 
-- VS Hook Pro
-- VS Hook Basic
-- Iniciar VS Hook Pro junto com o REAPER
-- Iniciar VS Hook Basic junto com o REAPER
-- Iniciar VS Hook Pro junto com ESTE projeto
-- Iniciar VS Hook Basic junto com ESTE projeto
+- VS Hook Beta
+- VS Hook Estable
+- Iniciar VS Hook Beta junto com o REAPER
+- Iniciar VS Hook Estable junto com o REAPER
+- Iniciar VS Hook Beta junto com ESTE projeto
+- Iniciar VS Hook Estable junto com ESTE projeto
 
 Regras:
 
-- Pro e Basic sao exclusivos: ao abrir um, a extensao fecha o outro se ele estiver aberto.
+- Beta e Estable sao exclusivos: ao abrir um, a extensao fecha o outro se ele estiver aberto.
 - A extensao tambem guarda o ultimo modo aberto na sessao para fechar o anterior mesmo quando o REAPER nao reporta corretamente o toggle do defer script.
-- As opcoes de iniciar junto com o REAPER sao exclusivas: quando Pro esta ativo, Basic fica desativado; quando Basic esta ativo, Pro fica desativado.
+- As opcoes de iniciar junto com o REAPER sao exclusivas: quando Beta esta ativo, Estable fica desativado; quando Estable esta ativo, Beta fica desativado.
 - As opcoes de iniciar junto com ESTE projeto tambem sao exclusivas.
 - Iniciar junto com o REAPER e iniciar junto com ESTE projeto tambem sao exclusivos entre si: marcou um, o outro e desmarcado.
 - A opcao ativa usa a marcacao nativa do menu do REAPER, sem letra V no texto.
@@ -24,12 +24,12 @@ Regras:
 Scripts esperados:
 
 Windows:
-- C:/Users/Public/VS Hook APP/VS Hook Pro.lua
-- C:/Users/Public/VS Hook APP/VS Hook Basic.lua
+- C:/Users/Public/VS Hook APP/VS Hook Beta.lua
+- C:/Users/Public/VS Hook APP/VS Hook Estable.lua
 
 macOS:
-- REAPER/Scripts/VS Hook APP/VS Hook Pro.lua
-- REAPER/Scripts/VS Hook APP/VS Hook Basic.lua
+- REAPER/Scripts/VS Hook APP/VS Hook Beta.lua
+- REAPER/Scripts/VS Hook APP/VS Hook Estable.lua
 
 APIs nativas mantidas:
 

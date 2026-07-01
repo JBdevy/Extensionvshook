@@ -203,17 +203,17 @@ struct AutoOpenEntry {
 
 static ScriptEntry g_scripts[] = {
   {
-    { 0, "VSHOOKRUN", "VS Hook Pro", nullptr },
-    "VS Hook Pro",
-    "VS Hook Pro.lua",
-    "pro",
+    { 0, "VSHOOKRUNBETA", "VS Hook Beta", nullptr },
+    "VS Hook Beta",
+    "VS Hook Beta.lua",
+    "beta",
     true
   },
   {
-    { 0, "VSHOOKRUNBASIC", "VS Hook Basic", nullptr },
-    "VS Hook Basic",
-    "VS Hook Basic.lua",
-    "basic",
+    { 0, "VSHOOKRUNESTABLE", "VS Hook Estable", nullptr },
+    "VS Hook Estable",
+    "VS Hook Estable.lua",
+    "estable",
     true
   }
 };
@@ -236,27 +236,27 @@ struct State {
 
 static AutoOpenEntry g_autoOpenEntries[] = {
   {
-    { 0, "VSHOOKAUTOPRO", "Iniciar VS Hook Pro junto com o REAPER", nullptr },
-    "Iniciar VS Hook Pro junto com o REAPER",
-    "pro"
+    { 0, "VSHOOKAUTOBETA", "Iniciar VS Hook Beta junto com o REAPER", nullptr },
+    "Iniciar VS Hook Beta junto com o REAPER",
+    "beta"
   },
   {
-    { 0, "VSHOOKAUTOBASIC", "Iniciar VS Hook Basic junto com o REAPER", nullptr },
-    "Iniciar VS Hook Basic junto com o REAPER",
-    "basic"
+    { 0, "VSHOOKAUTOESTABLE", "Iniciar VS Hook Estable junto com o REAPER", nullptr },
+    "Iniciar VS Hook Estable junto com o REAPER",
+    "estable"
   }
 };
 
 static AutoOpenEntry g_projectAutoOpenEntries[] = {
   {
-    { 0, "VSHOOKPROJECTAUTOPRO", "Iniciar VS Hook Pro junto com ESTE projeto", nullptr },
-    "Iniciar VS Hook Pro junto com ESTE projeto",
-    "pro"
+    { 0, "VSHOOKPROJECTAUTOBETA", "Iniciar VS Hook Beta junto com ESTE projeto", nullptr },
+    "Iniciar VS Hook Beta junto com ESTE projeto",
+    "beta"
   },
   {
-    { 0, "VSHOOKPROJECTAUTOBASIC", "Iniciar VS Hook Basic junto com ESTE projeto", nullptr },
-    "Iniciar VS Hook Basic junto com ESTE projeto",
-    "basic"
+    { 0, "VSHOOKPROJECTAUTOESTABLE", "Iniciar VS Hook Estable junto com ESTE projeto", nullptr },
+    "Iniciar VS Hook Estable junto com ESTE projeto",
+    "estable"
   }
 };
 
@@ -616,7 +616,7 @@ static void runScript(ScriptEntry& script, bool toggleIfAlreadyOpen = true)
   if (script.autoOpenMode) {
     // Clique manual no mesmo modo funciona como toggle: se ele ja era o ultimo
     // aberto, considera que o usuario quis fechar e limpa a memoria.
-    // Na troca Pro -> Basic / Basic -> Pro, closeOtherScripts ja fechou o outro
+    // Na troca Beta -> Estable / Estable -> Beta, closeOtherScripts ja fechou o outro
     // e aqui registramos o novo modo ativo.
     if (toggleIfAlreadyOpen && consideredOpen) {
       g_state.lastLaunchedMode.clear();
@@ -639,10 +639,10 @@ static std::string getAutoOpenMode()
   }
 
   // Compatibilidade com instalacoes antigas: se o usuario ja tinha
-  // "Abrir VS Hook junto com o REAPER" ativo, a extensao nova assume Pro.
+  // "Abrir VS Hook junto com o REAPER" ativo, a extensao nova assume Estable.
   const char* legacy = GetExtState_ptr(kExtStateSection, kLegacyAutoOpenKey);
   if (legacy && std::strcmp(legacy, "1") == 0) {
-    return "pro";
+    return "estable";
   }
 
   return std::string();
@@ -659,8 +659,8 @@ static void setAutoOpenModeRaw(const char* mode, bool showError)
 
   SetExtState_ptr(kExtStateSection, kAutoOpenModeKey, mode ? mode : "", true);
 
-  // Desliga a chave antiga para ela nao religar o Pro depois que o usuario
-  // escolher Basic ou desativar o auto-inicio.
+  // Desliga a chave antiga para ela nao religar um modo antigo depois que o usuario
+  // escolher Beta, Estable ou desativar o auto-inicio.
   SetExtState_ptr(kExtStateSection, kLegacyAutoOpenKey, "0", true);
 }
 
@@ -671,7 +671,7 @@ static void setAutoOpenMode(const char* mode)
 
 static bool isAutoOpenModeValue(const std::string& mode)
 {
-  return mode == "pro" || mode == "basic";
+  return mode == "beta" || mode == "estable";
 }
 
 static ReaProject* getCurrentProject(char* pathOut, int pathOutSize)
@@ -971,7 +971,7 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 
   // Insere de tras para frente porque cada item entra na posicao 0.
   // Ordem final no menu:
-  // VS Hook Pro / VS Hook Basic
+  // VS Hook Beta / VS Hook Estable
   // separador / auto-inicio com REAPER / separador / auto-inicio deste projeto.
   for (int i = static_cast<int>(sizeof(g_projectAutoOpenEntries) / sizeof(g_projectAutoOpenEntries[0])) - 1; i >= 0; --i) {
     if (g_projectAutoOpenEntries[i].commandId == 0) continue;
