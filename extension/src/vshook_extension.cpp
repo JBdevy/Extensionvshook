@@ -2510,12 +2510,13 @@ static void nativeRebuildState(bool forceSnapshot)
     // mas deve limpar quando o seek realmente chegou no alvo. Mantem um hold curto
     // para o Diretor receber ao menos um snapshot com markerGoId ativo.
     if (!g_nativeArmedMarkerId.empty() && g_nativeSelectedMarkerPos > 0.0) {
-      const double cursorPos = GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(activeProject) : playPos;
+      // FIX68: nao usa o cursor de edicao para limpar o pisca verde.
+      // O comando marker_go move o cursor de edicao imediatamente, mas o visual
+      // do Diretor deve continuar piscando ate o cursor de reproducao chegar no alvo.
       const bool playReached = playing && playPos >= (g_nativeSelectedMarkerPos - 0.0005);
-      const bool cursorReached = std::fabs(cursorPos - g_nativeSelectedMarkerPos) <= 0.002;
       const bool hasGraceElapsed = g_nativeArmedMarkerSetAt.time_since_epoch().count() != 0 &&
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_nativeArmedMarkerSetAt).count() >= 650;
-      if ((playReached || cursorReached) && hasGraceElapsed) {
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_nativeArmedMarkerSetAt).count() >= 150;
+      if (playReached && hasGraceElapsed) {
         g_nativeArmedMarkerId.clear();
         g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
       }
@@ -3141,6 +3142,7 @@ static void nativeMirrorCommandToLuaIfNeeded(const std::string& commandType, con
   if (g_nativeCommandQueue.size() > 200) g_nativeCommandQueue.pop_front();
   g_nativeCommandQueue.push_back(commandBody);
   ++g_nativeCommandSequence;
+  g_nativeForceStateBuild.store(true);
 }
 
 static bool nativeApplySelectionCommand(const std::string& commandBody)
