@@ -2644,6 +2644,19 @@ static bool nativeFindNextMarkerAfterPlayCursor(ReaProject* project, double& pos
   return true;
 }
 
+
+static void nativeMoveEditCursorAndSeek(ReaProject* project, double pos, bool seekPlayback)
+{
+  if (!SetEditCurPos2_ptr || pos < 0.0) return;
+  // Primeiro move de fato o cursor de edição. Em alguns setups, chamar apenas com seek=true
+  // faz o playback buscar, mas a linha visual do cursor de edição não acompanha.
+  SetEditCurPos2_ptr(project, pos, true, false);
+  if (seekPlayback) {
+    SetEditCurPos2_ptr(project, pos, true, true);
+  }
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+}
+
 static bool nativeApplyMarkerCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
@@ -2667,7 +2680,7 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
       g_nativeSelectedMarkerId = foundNext ? nextId : std::string();
       g_nativeSelectedMarkerPos = foundNext ? nextPos : 0.0;
     }
-    if (foundNext && SetEditCurPos2_ptr) SetEditCurPos2_ptr(project, nextPos, true, true);
+    if (foundNext) nativeMoveEditCursorAndSeek(project, nextPos, true);
     if (UpdateArrange_ptr) UpdateArrange_ptr();
     g_nativeForceStateBuild.store(true);
     return true;
@@ -2691,10 +2704,11 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
 
   // FIX47: primeiro toque no App Diretor apenas seleciona o marker (amarelo).
   // Só marker_go/trigger_marker confirma o engatilhamento e move o cursor de edição.
-  if ((type == "marker_go" || type == "trigger_marker") && SetEditCurPos2_ptr) {
-    SetEditCurPos2_ptr(project, markerPos, true, true);
+  if (type == "marker_go" || type == "trigger_marker") {
+    nativeMoveEditCursorAndSeek(project, markerPos, true);
+  } else if (UpdateArrange_ptr) {
+    UpdateArrange_ptr();
   }
-  if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
   return true;
 }
