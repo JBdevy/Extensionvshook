@@ -2513,7 +2513,7 @@ static void nativeRebuildState(bool forceSnapshot)
       // FIX68: nao usa o cursor de edicao para limpar o pisca verde.
       // O comando marker_go move o cursor de edicao imediatamente, mas o visual
       // do Diretor deve continuar piscando ate o cursor de reproducao chegar no alvo.
-      const bool playReached = playing && playPos >= (g_nativeSelectedMarkerPos - 0.0005);
+      const bool playReached = playing && std::fabs(playPos - g_nativeSelectedMarkerPos) <= 0.075;
       const bool hasGraceElapsed = g_nativeArmedMarkerSetAt.time_since_epoch().count() != 0 &&
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_nativeArmedMarkerSetAt).count() >= 150;
       if (playReached && hasGraceElapsed) {
@@ -3093,38 +3093,11 @@ static bool nativeApplyLoopCommand(const std::string& commandBody)
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "loop_toggle" && type != "loop_set" && type != "director_loop_toggle") return false;
 
-  char pathBuf[2048] = "";
-  ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
-  if (!project) return true;
-
-  std::string desiredText = nativeJsonExtractString(commandBody, "desiredLoop");
-  if (desiredText.empty()) desiredText = nativeJsonExtractString(commandBody, "desiredState");
-  if (desiredText.empty()) desiredText = nativeJsonExtractString(commandBody, "enabled");
-  const bool current = nativeIsRepeatEnabled(project);
-  const bool desired = desiredText.empty() ? !current : nativeBoolFromText(desiredText, current);
-
-  if (!desired) {
-    nativeClearLoopTimeRange(project);
-    nativeSetRepeatEnabled(project, false);
-    if (UpdateArrange_ptr) UpdateArrange_ptr();
-    g_nativeForceStateBuild.store(true);
-    return true;
-  }
-
-  if (!current) {
-    const double playPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : 0.0;
-    double start = 0.0;
-    double end = 0.0;
-    if (nativeFindTransitionLoopRange(project, playPos, start, end)) {
-      nativeSetLoopTimeRange(project, start, end);
-      nativeSetRepeatEnabled(project, true);
-    } else {
-      nativeSetRepeatEnabled(project, true);
-    }
-  }
-  if (UpdateArrange_ptr) UpdateArrange_ptr();
-  g_nativeForceStateBuild.store(true);
-  return true;
+  // FIX69: Loop volta a ser responsabilidade do Lua.
+  // O Lua ja possui a regra correta: so arma loop entre marker anterior e marker seguinte;
+  // nao arma entre inicio de regiao -> marker nem marker -> final de regiao.
+  // Retornando false, o comando entra na fila nativa e o Lua executa o proprio handler.
+  return false;
 }
 
 
@@ -3510,13 +3483,14 @@ static void nativeHandleClient(native_socket_t client)
       }
 
       const bool premixCommandRemoved = (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx" || commandType == "premix_set_volume" || commandType == "premix_toggle_mute" || commandType == "premix_toggle_fx");
+      const bool tunerCommandRemoved = (commandType == "tuner_focus" || commandType == "set_tuner_visibility" || commandType == "tuner_adjust" || commandType == "tuner_reset");
       const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplyQueueCommand(commandBody) || nativeApplyAutoCommand(commandBody) || nativeApplyLoopCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeApplyMarkerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
 
       // FIX66: a extensao continua sendo o motor, mas o Lua tambem precisa refletir
       // Auto, AT/BL e Loop na interface local quando o comando veio do App Diretor.
       if (handledByNative) nativeMirrorCommandToLuaIfNeeded(commandType, commandBody);
 
-      if (!handledByNative && !premixCommandRemoved) {
+      if (!handledByNative && !premixCommandRemoved && !tunerCommandRemoved) {
         std::lock_guard<std::mutex> lock(g_nativeMutex);
         if (g_nativeCommandQueue.size() > 200) g_nativeCommandQueue.pop_front();
         g_nativeCommandQueue.push_back(commandBody);
