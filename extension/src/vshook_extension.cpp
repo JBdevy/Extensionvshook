@@ -1426,6 +1426,13 @@ static int g_nativeQueuedPlaylistIndex = 0;
 static bool g_nativeQueuedManual = false;
 static std::string g_nativeQueuedSeekSignature;
 static std::string g_nativeLastAutoQueueForPlayingId;
+// FIX74: quando a fila nativa faz seek 1s antes do fim, o Lua/autostop antigo pode
+// tentar parar logo depois. Mantemos uma pequena janela de proteção para garantir
+// que a música da fila continue tocando após o seek.
+static std::string g_nativeQueueHandoffPlayId;
+static double g_nativeQueueHandoffStart = 0.0;
+static double g_nativeQueueHandoffEnd = 0.0;
+static std::chrono::steady_clock::time_point g_nativeQueueHandoffProtectUntil;
 
 static std::string nativeSongToJson(const NativeSongWindow& item, int index)
 {
@@ -2172,6 +2179,15 @@ static void nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   }
 
   SetEditCurPos2_ptr(project, queuedStart, true, true);
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativeQueueHandoffPlayId = queuedId;
+    g_nativeQueueHandoffStart = queuedStart;
+    g_nativeQueueHandoffEnd = queuedEnd;
+    g_nativeQueueHandoffProtectUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+  }
+  // FIX74: o seek ja faz a transição, mas garantimos estado PLAY depois dele.
+  if (Main_OnCommand_ptr) Main_OnCommand_ptr(1007, 0); // Transport: Play
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
 }
@@ -2451,6 +2467,48 @@ static std::string nativeBuildPremixJson(ReaProject* project, const std::vector<
   return "{\"available\":false,\"enabled\":false,\"mode\":\"disabled\",\"songs\":[],\"tracks\":[],\"groups\":[]}";
 }
 
+
+// FIX74: se a fila nativa chegou no alvo e algum estado antigo parou o transporte
+// logo depois, religamos o Play apenas dentro da janela de proteção e somente dentro
+// da região alvo. Isso evita a música começar e parar após o seek.
+static void nativeProtectQueueHandoffPlayback(ReaProject* project, int& playState, double& playPos)
+{
+  if (!project || !Main_OnCommand_ptr) return;
+  std::string handoffId;
+  double handoffStart = 0.0;
+  double handoffEnd = 0.0;
+  bool shouldProtect = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (!g_nativeQueueHandoffPlayId.empty() && g_nativeQueueHandoffProtectUntil.time_since_epoch().count() != 0) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now <= g_nativeQueueHandoffProtectUntil) {
+        handoffId = g_nativeQueueHandoffPlayId;
+        handoffStart = g_nativeQueueHandoffStart;
+        handoffEnd = g_nativeQueueHandoffEnd;
+        shouldProtect = true;
+      } else {
+        g_nativeQueueHandoffPlayId.clear();
+        g_nativeQueueHandoffStart = 0.0;
+        g_nativeQueueHandoffEnd = 0.0;
+        g_nativeQueueHandoffProtectUntil = std::chrono::steady_clock::time_point();
+      }
+    }
+  }
+  if (!shouldProtect || handoffEnd <= handoffStart + 0.0005) return;
+  if (!GetPlayPositionEx_ptr) return;
+  playPos = GetPlayPositionEx_ptr(project);
+  const bool insideTarget = playPos >= handoffStart - 0.050 && playPos < handoffEnd - 0.050;
+  if (!insideTarget) return;
+  const bool playing = ((playState & 1) == 1) || ((playState & 4) == 4);
+  if (!playing) {
+    Main_OnCommand_ptr(1007, 0); // Transport: Play
+    if (GetPlayStateEx_ptr) playState = GetPlayStateEx_ptr(project);
+    if (GetPlayPositionEx_ptr) playPos = GetPlayPositionEx_ptr(project);
+    g_nativeForceStateBuild.store(true);
+  }
+}
+
 static void nativeRebuildState(bool forceSnapshot)
 {
   if (!EnumProjects_ptr) return;
@@ -2467,8 +2525,9 @@ static void nativeRebuildState(bool forceSnapshot)
   std::vector<NativeSongWindow> songs = nativeCollectProjectSongs(activeProject, markersJson);
 
   int playState = GetPlayStateEx_ptr ? GetPlayStateEx_ptr(activeProject) : 0;
+  double playPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(activeProject) : 0.0;
+  nativeProtectQueueHandoffPlayback(activeProject, playState, playPos);
   const bool playing = (playState & 1) == 1 || (playState & 4) == 4;
-  const double playPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(activeProject) : 0.0;
   std::string playingName;
   double songStart = 0.0;
   double songEnd = 0.0;
@@ -2523,7 +2582,10 @@ static void nativeRebuildState(bool forceSnapshot)
       const bool backwardCrossed = playing && origin > target && playPos <= target + 0.080;
       const bool playReached = nearTarget || forwardCrossed || backwardCrossed;
       if (playReached && hasGraceElapsed) {
+        // FIX73: ao chegar no alvo, limpa tambem a selecao amarela do marker.
         g_nativeArmedMarkerId.clear();
+        g_nativeSelectedMarkerId.clear();
+        g_nativeSelectedMarkerPos = 0.0;
         g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
         g_nativeArmedMarkerStartPlayPos = 0.0;
       }
@@ -3374,18 +3436,16 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
   if (!project) return false;
 
   if (type == "marker_cancel" || type == "escape_key" || type == "esc" || type == "key_escape") {
-    double nextPos = 0.0;
-    std::string nextId;
-    const bool foundNext = nativeFindNextMarkerAfterPlayCursor(project, nextPos, nextId);
+    // FIX73: cancelar deve limpar completamente o marker armado/selecionado.
+    // Nao seleciona nem busca automaticamente o proximo marker, para nao deixar amarelo preso no Diretor.
     {
       std::lock_guard<std::mutex> lock(g_nativeMutex);
       g_nativeArmedMarkerId.clear();
+      g_nativeSelectedMarkerId.clear();
+      g_nativeSelectedMarkerPos = 0.0;
       g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
       g_nativeArmedMarkerStartPlayPos = 0.0;
-      g_nativeSelectedMarkerId = foundNext ? nextId : std::string();
-      g_nativeSelectedMarkerPos = foundNext ? nextPos : 0.0;
     }
-    if (foundNext) nativeMoveEditCursorAndSeek(project, nextPos, true);
     if (UpdateArrange_ptr) UpdateArrange_ptr();
     g_nativeForceStateBuild.store(true);
     return true;
