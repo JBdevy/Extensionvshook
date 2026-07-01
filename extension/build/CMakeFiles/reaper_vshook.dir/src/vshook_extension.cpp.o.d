@@ -1,9 +1,9 @@
 CMakeFiles/reaper_vshook.dir/src/vshook_extension.cpp.o: \
- /mnt/data/fix51_work/ext/VSHookwinmac/extension/src/vshook_extension.cpp \
+ /mnt/data/work_newlogic/ext/VSHookwinmac/extension/src/vshook_extension.cpp \
  /usr/include/stdc-predef.h \
- /mnt/data/fix51_work/ext/VSHookwinmac/extension/sdk/reaper_plugin.h \
- /mnt/data/fix51_work/ext/VSHookwinmac/extension/sdk/../WDL/swell/swell.h \
- /mnt/data/fix51_work/ext/VSHookwinmac/extension/sdk/../WDL/swell/swell-types.h \
+ /mnt/data/work_newlogic/ext/VSHookwinmac/extension/sdk/reaper_plugin.h \
+ /mnt/data/work_newlogic/ext/VSHookwinmac/extension/sdk/../WDL/swell/swell.h \
+ /mnt/data/work_newlogic/ext/VSHookwinmac/extension/sdk/../WDL/swell/swell-types.h \
  /usr/include/c++/14/stdlib.h /usr/include/c++/14/cstdlib \
  /usr/include/x86_64-linux-gnu/c++/14/bits/c++config.h \
  /usr/include/x86_64-linux-gnu/c++/14/bits/os_defines.h \
@@ -49,7 +49,6 @@ CMakeFiles/reaper_vshook.dir/src/vshook_extension.cpp.o: \
  /usr/include/x86_64-linux-gnu/bits/atomic_wide_counter.h \
  /usr/include/x86_64-linux-gnu/bits/struct_mutex.h \
  /usr/include/x86_64-linux-gnu/bits/struct_rwlock.h /usr/include/alloca.h \
- /usr/include/x86_64-linux-gnu/bits/stdlib-bsearch.h \
  /usr/include/x86_64-linux-gnu/bits/stdlib-float.h \
  /usr/include/c++/14/bits/std_abs.h /usr/include/stdio.h \
  /usr/lib/gcc/x86_64-linux-gnu/14/include/stdarg.h \
@@ -60,8 +59,7 @@ CMakeFiles/reaper_vshook.dir/src/vshook_extension.cpp.o: \
  /usr/include/x86_64-linux-gnu/bits/types/FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_FILE.h \
  /usr/include/x86_64-linux-gnu/bits/types/cookie_io_functions_t.h \
- /usr/include/x86_64-linux-gnu/bits/stdio_lim.h \
- /usr/include/x86_64-linux-gnu/bits/stdio.h /usr/include/string.h \
+ /usr/include/x86_64-linux-gnu/bits/stdio_lim.h /usr/include/string.h \
  /usr/include/strings.h /usr/include/unistd.h \
  /usr/include/x86_64-linux-gnu/bits/posix_opt.h \
  /usr/include/x86_64-linux-gnu/bits/environments.h \
@@ -91,7 +89,7 @@ CMakeFiles/reaper_vshook.dir/src/vshook_extension.cpp.o: \
  /usr/include/x86_64-linux-gnu/bits/wchar.h \
  /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
  /usr/include/x86_64-linux-gnu/bits/stdint-least.h \
- /mnt/data/fix51_work/ext/VSHookwinmac/extension/sdk/../WDL/swell/swell-functions.h \
+ /mnt/data/work_newlogic/ext/VSHookwinmac/extension/sdk/../WDL/swell/swell-functions.h \
  /usr/include/pthread.h /usr/include/sched.h \
  /usr/include/x86_64-linux-gnu/bits/sched.h \
  /usr/include/linux/sched/types.h \
