@@ -53,6 +53,7 @@ using CountProjectMarkers_t = int (*)(ReaProject*, int*, int*);
 using EnumProjectMarkers3_t = int (*)(ReaProject*, int, bool*, double*, double*, const char**, int*, int*);
 using GetPlayStateEx_t = int (*)(ReaProject*);
 using GetPlayPositionEx_t = double (*)(ReaProject*);
+using GetCursorPositionEx_t = double (*)(ReaProject*);
 using GetSet_LoopTimeRange2_t = void (*)(ReaProject*, bool, bool, double*, double*, bool);
 using GetSetRepeatEx_t = int (*)(ReaProject*, int);
 
@@ -67,6 +68,10 @@ using SetMediaItemInfo_Value_t = bool (*)(MediaItem*, const char*, double);
 using GetSetMediaItemInfo_String_t = bool (*)(MediaItem*, const char*, char*, bool);
 using GetActiveTake_t = MediaItem_Take* (*)(MediaItem*);
 using GetTakeName_t = const char* (*)(MediaItem_Take*);
+using GetSetMediaItemTakeInfo_String_t = bool (*)(MediaItem_Take*, const char*, char*, bool);
+using GetMediaItemTakeInfo_Value_t = double (*)(MediaItem_Take*, const char*);
+using GetMediaItemTake_Source_t = PCM_source* (*)(MediaItem_Take*);
+using GetMediaSourceFileName_t = bool (*)(PCM_source*, char*, int);
 using TakeFX_GetCount_t = int (*)(MediaItem_Take*);
 using TakeFX_GetEnabled_t = bool (*)(MediaItem_Take*, int);
 using TakeFX_SetEnabled_t = void (*)(MediaItem_Take*, int, bool);
@@ -97,6 +102,7 @@ static CountProjectMarkers_t CountProjectMarkers_ptr = nullptr;
 static EnumProjectMarkers3_t EnumProjectMarkers3_ptr = nullptr;
 static GetPlayStateEx_t GetPlayStateEx_ptr = nullptr;
 static GetPlayPositionEx_t GetPlayPositionEx_ptr = nullptr;
+static GetCursorPositionEx_t GetCursorPositionEx_ptr = nullptr;
 static GetSet_LoopTimeRange2_t GetSet_LoopTimeRange2_ptr = nullptr;
 static GetSetRepeatEx_t GetSetRepeatEx_ptr = nullptr;
 
@@ -111,6 +117,10 @@ static SetMediaItemInfo_Value_t SetMediaItemInfo_Value_ptr = nullptr;
 static GetSetMediaItemInfo_String_t GetSetMediaItemInfo_String_ptr = nullptr;
 static GetActiveTake_t GetActiveTake_ptr = nullptr;
 static GetTakeName_t GetTakeName_ptr = nullptr;
+static GetSetMediaItemTakeInfo_String_t GetSetMediaItemTakeInfo_String_ptr = nullptr;
+static GetMediaItemTakeInfo_Value_t GetMediaItemTakeInfo_Value_ptr = nullptr;
+static GetMediaItemTake_Source_t GetMediaItemTake_Source_ptr = nullptr;
+static GetMediaSourceFileName_t GetMediaSourceFileName_ptr = nullptr;
 static TakeFX_GetCount_t TakeFX_GetCount_ptr = nullptr;
 static TakeFX_GetEnabled_t TakeFX_GetEnabled_ptr = nullptr;
 static TakeFX_SetEnabled_t TakeFX_SetEnabled_ptr = nullptr;
@@ -1631,6 +1641,188 @@ static std::vector<NativeSongWindow> nativeCollectProjectSongs(ReaProject* proje
   return songs;
 }
 
+
+static std::string nativeUpperAscii(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c){ return static_cast<char>(std::toupper(c)); });
+  return value;
+}
+
+static MediaTrack* nativeFindTrackByExactName(ReaProject* project, const std::string& wantedName, int* trackIndexOut = nullptr)
+{
+  if (trackIndexOut) *trackIndexOut = -1;
+  if (!project || !CountTracks_ptr || !GetTrack_ptr || !GetTrackName_ptr) return nullptr;
+  const std::string wanted = nativeUpperAscii(nativeTrim(wantedName));
+  const int count = CountTracks_ptr(project);
+  for (int i = 0; i < count; ++i) {
+    MediaTrack* tr = GetTrack_ptr(project, i);
+    if (!tr) continue;
+    char nameBuf[512] = {0};
+    if (!GetTrackName_ptr(tr, nameBuf, static_cast<int>(sizeof(nameBuf)))) continue;
+    if (nativeUpperAscii(nativeTrim(nameBuf)) == wanted) {
+      if (trackIndexOut) *trackIndexOut = i;
+      return tr;
+    }
+  }
+  return nullptr;
+}
+
+static std::string nativeReadMediaItemNotes(MediaItem* item)
+{
+  if (!item || !GetSetMediaItemInfo_String_ptr) return std::string();
+  std::string buf(65536, '\0');
+  if (!GetSetMediaItemInfo_String_ptr(item, "P_NOTES", buf.data(), false)) return std::string();
+  const size_t n = buf.find('\0');
+  if (n != std::string::npos) buf.resize(n);
+  return nativeTrim(buf);
+}
+
+static std::string nativeReadTakeText(MediaItem_Take* take)
+{
+  if (!take) return std::string();
+  if (GetSetMediaItemTakeInfo_String_ptr) {
+    std::string buf(65536, '\0');
+    if (GetSetMediaItemTakeInfo_String_ptr(take, "P_NAME", buf.data(), false)) {
+      const size_t n = buf.find('\0');
+      if (n != std::string::npos) buf.resize(n);
+      buf = nativeTrim(buf);
+      if (!buf.empty()) return buf;
+    }
+  }
+  if (GetTakeName_ptr) {
+    const char* name = GetTakeName_ptr(take);
+    if (name && *name) return nativeTrim(name);
+  }
+  return std::string();
+}
+
+static std::string nativeReadItemTelepromptText(MediaItem* item)
+{
+  if (!item) return std::string();
+  const std::string notes = nativeReadMediaItemNotes(item);
+  if (!notes.empty()) return notes;
+  MediaItem_Take* take = GetActiveTake_ptr ? GetActiveTake_ptr(item) : nullptr;
+  return nativeReadTakeText(take);
+}
+
+static std::string nativeReadTakeSourcePath(MediaItem_Take* take)
+{
+  if (!take || !GetMediaItemTake_Source_ptr || !GetMediaSourceFileName_ptr) return std::string();
+  PCM_source* source = GetMediaItemTake_Source_ptr(take);
+  if (!source) return std::string();
+  char buf[4096] = {0};
+  if (!GetMediaSourceFileName_ptr(source, buf, static_cast<int>(sizeof(buf)))) return std::string();
+  return std::string(buf);
+}
+
+static std::string nativeFileExtensionLower(const std::string& path)
+{
+  const size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos || dot + 1 >= path.size()) return std::string();
+  std::string ext = path.substr(dot + 1);
+  std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+  return ext;
+}
+
+static std::string nativeDetectTelepromptMediaType(const std::string& path)
+{
+  const std::string ext = nativeFileExtensionLower(path);
+  if (ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp" || ext == "gif" || ext == "bmp") return "image";
+  if (ext == "mp4" || ext == "mov" || ext == "m4v" || ext == "webm" || ext == "mkv" || ext == "avi") return "video";
+  return "text";
+}
+
+static MediaItem* nativeFindCurrentItemOnTrack(MediaTrack* track, double pos, int* itemIndexOut = nullptr, double* itemStartOut = nullptr, double* itemEndOut = nullptr)
+{
+  if (itemIndexOut) *itemIndexOut = -1;
+  if (itemStartOut) *itemStartOut = 0.0;
+  if (itemEndOut) *itemEndOut = 0.0;
+  if (!track || !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr || !GetMediaItemInfo_Value_ptr) return nullptr;
+  const int count = GetTrackNumMediaItems_ptr(track);
+  for (int i = 0; i < count; ++i) {
+    MediaItem* item = GetTrackMediaItem_ptr(track, i);
+    if (!item) continue;
+    const double itemStart = GetMediaItemInfo_Value_ptr(item, "D_POSITION");
+    const double itemLen = std::max(0.0, GetMediaItemInfo_Value_ptr(item, "D_LENGTH"));
+    const double itemEnd = itemStart + itemLen;
+    if (pos >= itemStart - 0.0005 && pos < itemEnd - 0.0005) {
+      if (itemIndexOut) *itemIndexOut = i;
+      if (itemStartOut) *itemStartOut = itemStart;
+      if (itemEndOut) *itemEndOut = itemEnd;
+      return item;
+    }
+  }
+  return nullptr;
+}
+
+static std::string nativeFindSongNameAtPosition(const std::vector<NativeSongWindow>& songs, double pos, const std::string& fallback)
+{
+  for (const auto& s : songs) {
+    if (s.isBlock) continue;
+    if (pos >= s.start - 0.0005 && pos < s.end - 0.0005 && !s.name.empty()) return s.name;
+  }
+  return fallback;
+}
+
+static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std::vector<NativeSongWindow>& songs, int slot, const std::string& trackName, bool transportPlaying, double playPos, const std::string& playingName)
+{
+  const double pos = (transportPlaying && GetPlayPositionEx_ptr) ? playPos : (GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(project) : playPos);
+  int trackIndex = -1;
+  MediaTrack* track = nativeFindTrackByExactName(project, trackName, &trackIndex);
+  int itemIndex = -1;
+  double itemStart = 0.0;
+  double itemEnd = 0.0;
+  MediaItem* item = nativeFindCurrentItemOnTrack(track, pos, &itemIndex, &itemStart, &itemEnd);
+  MediaItem_Take* take = item && GetActiveTake_ptr ? GetActiveTake_ptr(item) : nullptr;
+  const std::string mediaPath = nativeReadTakeSourcePath(take);
+  const std::string mediaExt = nativeFileExtensionLower(mediaPath);
+  const std::string mediaType = nativeDetectTelepromptMediaType(mediaPath);
+  std::string text = (mediaType == "image" || mediaType == "video") ? std::string() : nativeReadItemTelepromptText(item);
+  const double itemLength = std::max(0.0, itemEnd - itemStart);
+  double mediaOffset = 0.0;
+  double mediaPlayrate = 1.0;
+  if (take && GetMediaItemTakeInfo_Value_ptr) {
+    mediaOffset = std::max(0.0, GetMediaItemTakeInfo_Value_ptr(take, "D_STARTOFFS"));
+    mediaPlayrate = GetMediaItemTakeInfo_Value_ptr(take, "D_PLAYRATE");
+    if (mediaPlayrate <= 0.0) mediaPlayrate = 1.0;
+  }
+  double mediaCurrentTime = 0.0;
+  if (mediaType == "image" || mediaType == "video") {
+    mediaCurrentTime = mediaOffset + (std::max(0.0, pos - itemStart) * mediaPlayrate);
+  }
+  const std::string songName = nativeFindSongNameAtPosition(songs, pos, playingName);
+  std::ostringstream out;
+  out << "{";
+  out << "\"source\":\"vs_hook_extension\",";
+  out << "\"slot\":" << slot << ",";
+  out << "\"updatedAt\":" << nativeJsonString(nativeIsoNow()) << ",";
+  out << "\"song\":" << nativeJsonString(songName) << ",";
+  out << "\"songName\":" << nativeJsonString(songName) << ",";
+  out << "\"currentSongName\":" << nativeJsonString(songName) << ",";
+  out << "\"trackName\":" << nativeJsonString(trackName) << ",";
+  out << "\"trackFound\":" << (track ? "true" : "false") << ",";
+  out << "\"trackIndex\":" << trackIndex << ",";
+  out << "\"itemFound\":" << (item ? "true" : "false") << ",";
+  out << "\"itemIndex\":" << itemIndex << ",";
+  out << "\"itemGuid\":\"\",";
+  out << "\"itemStart\":" << nativeNumber(itemStart) << ",";
+  out << "\"itemEnd\":" << nativeNumber(itemEnd) << ",";
+  out << "\"position\":" << nativeNumber(pos) << ",";
+  out << "\"playing\":" << (transportPlaying ? "true" : "false") << ",";
+  out << "\"telepromptType\":" << nativeJsonString(mediaType) << ",";
+  out << "\"mediaType\":" << nativeJsonString(mediaType) << ",";
+  out << "\"mediaPath\":" << nativeJsonString(mediaPath) << ",";
+  out << "\"mediaExt\":" << nativeJsonString(mediaExt) << ",";
+  out << "\"mediaCurrentTime\":" << nativeNumber(mediaCurrentTime) << ",";
+  out << "\"mediaOffset\":" << nativeNumber(mediaOffset) << ",";
+  out << "\"mediaPlayrate\":" << nativeNumber(mediaPlayrate) << ",";
+  out << "\"itemLength\":" << nativeNumber(itemLength) << ",";
+  out << "\"lyricsText\":" << nativeJsonString(text) << ",";
+  out << "\"lyrics\":" << nativeJsonString(text);
+  out << "}";
+  return out.str();
+}
+
 static std::string nativeBuildRegionsJson(const std::vector<NativeSongWindow>& songs)
 {
   std::ostringstream oss;
@@ -2297,6 +2489,16 @@ static void nativeRebuildState(bool forceSnapshot)
   nativeMaintainQueueAutomation(activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems);
   const std::string mixerJson = nativeBuildMixerJson(activeProject);
   const std::string premixJson = nativeBuildPremixJson(activeProject, songs);
+  const std::string tp1Json = nativeBuildTelepromptStateJson(activeProject, songs, 1, "TELEPROMPT1", playing, playPos, playingName);
+  const std::string tp2Json = nativeBuildTelepromptStateJson(activeProject, songs, 2, "TELEPROMPT2", playing, playPos, playingName);
+  const std::string tp1LyricsText = nativeJsonExtractString(tp1Json, "lyricsText");
+  const std::string tp1SongName = nativeJsonExtractString(tp1Json, "songName");
+  const std::string tp1MediaType = nativeJsonExtractString(tp1Json, "mediaType");
+  const std::string tp1UpdatedAt = nativeJsonExtractString(tp1Json, "updatedAt");
+  const std::string tp2LyricsText = nativeJsonExtractString(tp2Json, "lyricsText");
+  const std::string tp2SongName = nativeJsonExtractString(tp2Json, "songName");
+  const std::string tp2MediaType = nativeJsonExtractString(tp2Json, "mediaType");
+  const std::string tp2UpdatedAt = nativeJsonExtractString(tp2Json, "updatedAt");
   const std::string nowIso = nativeIsoNow();
   const bool appActive = g_nativeLastDirectorHeartbeat.time_since_epoch().count() != 0 &&
     std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - g_nativeLastDirectorHeartbeat).count() < 12;
@@ -2306,14 +2508,18 @@ static void nativeRebuildState(bool forceSnapshot)
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     // FIX48: quando o playhead chega no marker engatilhado, o app nao deve ficar piscando.
     // A extensao limpa o armado assim que a reproducao alcança o alvo.
-    if (playing && !g_nativeArmedMarkerId.empty() && g_nativeSelectedMarkerPos > 0.0 && playPos >= (g_nativeSelectedMarkerPos - 0.0005)) {
-      const bool markerArmGraceDone = g_nativeArmedMarkerSetAt.time_since_epoch().count() == 0 ||
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_nativeArmedMarkerSetAt).count() >= 1300;
-      if (markerArmGraceDone) g_nativeArmedMarkerId.clear();
+    if (!g_nativeArmedMarkerId.empty() && g_nativeSelectedMarkerPos > 0.0) {
+      const double cursorPos = GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(activeProject) : playPos;
+      const bool playReached = playing && playPos >= (g_nativeSelectedMarkerPos - 0.0005);
+      const bool cursorReached = std::fabs(cursorPos - g_nativeSelectedMarkerPos) <= 0.002;
+      if (playReached || cursorReached) {
+        g_nativeArmedMarkerId.clear();
+        g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
+      }
     }
     luaLiveRaw = g_nativeLuaLiveFragment;
   }
-  if (GetExtState_ptr) {
+  if (luaLiveRaw.empty() && GetExtState_ptr) {
     const char* extLuaLive = GetExtState_ptr(kNativeExtStateSection, kNativeLuaLiveExtKey);
     if (extLuaLive && *extLuaLive) luaLiveRaw = extLuaLive;
   }
@@ -2323,6 +2529,10 @@ static void nativeRebuildState(bool forceSnapshot)
   if (luaQueuedPlaylistSongId == "null") luaQueuedPlaylistSongId.clear();
   std::string luaQueuedRegionNumber = nativeJsonExtractString(luaLiveRaw, "queuedRegionNumber");
   if (luaQueuedRegionNumber == "null") luaQueuedRegionNumber.clear();
+  std::string luaQueuedStartPos = nativeJsonExtractString(luaLiveRaw, "queuedStartPos");
+  if (luaQueuedStartPos == "null") luaQueuedStartPos.clear();
+  std::string luaQueuedEndPos = nativeJsonExtractString(luaLiveRaw, "queuedEndPos");
+  if (luaQueuedEndPos == "null") luaQueuedEndPos.clear();
 
   std::string queuedSongId;
   std::string queuedPlaylistSongId;
@@ -2344,6 +2554,9 @@ static void nativeRebuildState(bool forceSnapshot)
   if (queuedSongId.empty() && !luaQueuedSongId.empty()) queuedSongId = luaQueuedSongId;
   if (queuedPlaylistSongId.empty() && !luaQueuedPlaylistSongId.empty()) queuedPlaylistSongId = luaQueuedPlaylistSongId;
   if (queuedRegionNumber == 0 && nativeLooksNumeric(luaQueuedRegionNumber)) queuedRegionNumber = std::atoi(luaQueuedRegionNumber.c_str());
+  if (queuedRegionNumber == 0 && nativeLooksNumeric(queuedSongId)) queuedRegionNumber = std::atoi(queuedSongId.c_str());
+  if (queuedStart <= 0.0 && nativeLooksNumeric(luaQueuedStartPos)) queuedStart = std::atof(luaQueuedStartPos.c_str());
+  if (queuedEnd <= 0.0 && nativeLooksNumeric(luaQueuedEndPos)) queuedEnd = std::atof(luaQueuedEndPos.c_str());
   const bool loopActive = nativeIsRepeatEnabled(activeProject);
 
   std::ostringstream json;
@@ -2407,7 +2620,27 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"queuedPlaylistSongId\":" << (queuedPlaylistSongId.empty() ? (queuedSongId.empty() ? std::string("null") : nativeJsonString(queuedSongId)) : nativeJsonString(queuedPlaylistSongId)) << ",";
   json << "\"queuedRegionNumber\":" << (queuedRegionNumber == 0 ? std::string("null") : nativeJsonString(std::to_string(queuedRegionNumber))) << ",";
   json << "\"queuedStartPos\":" << nativeNumber(queuedStart) << ",";
-  json << "\"queuedEndPos\":" << nativeNumber(queuedEnd);
+  json << "\"queuedEndPos\":" << nativeNumber(queuedEnd) << ",";
+  json << "\"tp1\":" << tp1Json << ",";
+  json << "\"tp2\":" << tp2Json << ",";
+  json << "\"tp1LyricsText\":" << nativeJsonString(tp1LyricsText) << ",";
+  json << "\"tp1Lyrics\":" << nativeJsonString(tp1LyricsText) << ",";
+  json << "\"telepromptTp1Lyrics\":" << nativeJsonString(tp1LyricsText) << ",";
+  json << "\"telepromptTp1Text\":" << nativeJsonString(tp1LyricsText) << ",";
+  json << "\"tp1SongName\":" << nativeJsonString(tp1SongName) << ",";
+  json << "\"telepromptTp1SongName\":" << nativeJsonString(tp1SongName) << ",";
+  json << "\"tp1MediaType\":" << nativeJsonString(tp1MediaType.empty() ? std::string("text") : tp1MediaType) << ",";
+  json << "\"telepromptTp1MediaType\":" << nativeJsonString(tp1MediaType.empty() ? std::string("text") : tp1MediaType) << ",";
+  json << "\"tp1UpdatedAt\":" << nativeJsonString(tp1UpdatedAt) << ",";
+  json << "\"tp2LyricsText\":" << nativeJsonString(tp2LyricsText) << ",";
+  json << "\"tp2Lyrics\":" << nativeJsonString(tp2LyricsText) << ",";
+  json << "\"telepromptTp2Lyrics\":" << nativeJsonString(tp2LyricsText) << ",";
+  json << "\"telepromptTp2Text\":" << nativeJsonString(tp2LyricsText) << ",";
+  json << "\"tp2SongName\":" << nativeJsonString(tp2SongName) << ",";
+  json << "\"telepromptTp2SongName\":" << nativeJsonString(tp2SongName) << ",";
+  json << "\"tp2MediaType\":" << nativeJsonString(tp2MediaType.empty() ? std::string("text") : tp2MediaType) << ",";
+  json << "\"telepromptTp2MediaType\":" << nativeJsonString(tp2MediaType.empty() ? std::string("text") : tp2MediaType) << ",";
+  json << "\"tp2UpdatedAt\":" << nativeJsonString(tp2UpdatedAt);
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     json << ",\"selectedPlaylistSongId\":" << ((g_nativeSelectedTab == "playlist" && !g_nativeSelectedId.empty()) ? nativeJsonString(g_nativeSelectedId) : std::string("null"));
@@ -3384,6 +3617,7 @@ static bool loadApi(reaper_plugin_info_t* rec)
   EnumProjectMarkers3_ptr = reinterpret_cast<EnumProjectMarkers3_t>(rec->GetFunc("EnumProjectMarkers3"));
   GetPlayStateEx_ptr = reinterpret_cast<GetPlayStateEx_t>(rec->GetFunc("GetPlayStateEx"));
   GetPlayPositionEx_ptr = reinterpret_cast<GetPlayPositionEx_t>(rec->GetFunc("GetPlayPositionEx"));
+  GetCursorPositionEx_ptr = reinterpret_cast<GetCursorPositionEx_t>(rec->GetFunc("GetCursorPositionEx"));
   GetSet_LoopTimeRange2_ptr = reinterpret_cast<GetSet_LoopTimeRange2_t>(rec->GetFunc("GetSet_LoopTimeRange2"));
   GetSetRepeatEx_ptr = reinterpret_cast<GetSetRepeatEx_t>(rec->GetFunc("GetSetRepeatEx"));
   CountTracks_ptr = reinterpret_cast<CountTracks_t>(rec->GetFunc("CountTracks"));
@@ -3397,6 +3631,10 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetSetMediaItemInfo_String_ptr = reinterpret_cast<GetSetMediaItemInfo_String_t>(rec->GetFunc("GetSetMediaItemInfo_String"));
   GetActiveTake_ptr = reinterpret_cast<GetActiveTake_t>(rec->GetFunc("GetActiveTake"));
   GetTakeName_ptr = reinterpret_cast<GetTakeName_t>(rec->GetFunc("GetTakeName"));
+  GetSetMediaItemTakeInfo_String_ptr = reinterpret_cast<GetSetMediaItemTakeInfo_String_t>(rec->GetFunc("GetSetMediaItemTakeInfo_String"));
+  GetMediaItemTakeInfo_Value_ptr = reinterpret_cast<GetMediaItemTakeInfo_Value_t>(rec->GetFunc("GetMediaItemTakeInfo_Value"));
+  GetMediaItemTake_Source_ptr = reinterpret_cast<GetMediaItemTake_Source_t>(rec->GetFunc("GetMediaItemTake_Source"));
+  GetMediaSourceFileName_ptr = reinterpret_cast<GetMediaSourceFileName_t>(rec->GetFunc("GetMediaSourceFileName"));
   TakeFX_GetCount_ptr = reinterpret_cast<TakeFX_GetCount_t>(rec->GetFunc("TakeFX_GetCount"));
   TakeFX_GetEnabled_ptr = reinterpret_cast<TakeFX_GetEnabled_t>(rec->GetFunc("TakeFX_GetEnabled"));
   TakeFX_SetEnabled_ptr = reinterpret_cast<TakeFX_SetEnabled_t>(rec->GetFunc("TakeFX_SetEnabled"));
