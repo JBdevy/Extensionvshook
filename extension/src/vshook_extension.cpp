@@ -2675,6 +2675,11 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"transportProtectionEnabled\":" << (getTransportProtectionEnabled() ? "true" : "false") << ",";
   json << "\"bridgeVersion\":2,";
   json << "\"connected\":true,";
+  // FIX81: expõe para o Lua quando o app do Diretor está ativo.
+  // O Lua usa este sinal para mostrar a janela grande de bloqueio local.
+  json << "\"appActive\":" << (appActive ? "true" : "false") << ",";
+  json << "\"directorAppActive\":" << (appActive ? "true" : "false") << ",";
+  json << "\"directorActive\":" << (appActive ? "true" : "false") << ",";
   json << "\"updatedAt\":" << nativeJsonString(nowIso) << ",";
   json << "\"heartbeatAt\":" << nativeJsonString(nowIso) << ",";
   json << "\"lastHeartbeatAt\":" << nativeJsonString(nowIso) << ",";
@@ -3607,8 +3612,9 @@ static void nativeHandleClient(native_socket_t client)
     const std::string commandBody = nativeTrim(nativeRequestBody(req));
     if (!commandBody.empty()) {
       const std::string commandType = nativeJsonExtractString(commandBody, "type");
-      if (commandType == "app_heartbeat") {
+      if (commandType == "app_heartbeat" || commandType == "director_heartbeat" || commandType == "heartbeat") {
         g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::now();
+        g_nativeForceStateBuild.store(true);
       }
 
       if (commandType == "transport_protection_set" || commandType == "protection_set" || commandType == "play_protection_set") {
