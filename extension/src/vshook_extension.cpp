@@ -1403,6 +1403,8 @@ struct NativeSongWindow {
 static std::vector<NativeSongWindow> g_nativeSongWindows;
 static bool g_nativeCurrentTransportPlaying = false;
 static std::string g_nativeCurrentPlayingId;
+static double g_nativeCurrentSongStart = 0.0;
+static double g_nativeCurrentSongEnd = 0.0;
 static double g_nativeCurrentPlayPosition = 0.0;
 static std::string g_nativeSelectedId;
 static std::string g_nativeSelectedTab;
@@ -2539,6 +2541,8 @@ static void nativeRebuildState(bool forceSnapshot)
 
   g_nativeCurrentTransportPlaying = playing;
   g_nativeCurrentPlayingId = playingId;
+  g_nativeCurrentSongStart = songStart;
+  g_nativeCurrentSongEnd = songEnd;
   g_nativeCurrentPlayPosition = playPos;
 
   const std::string regionsJson = nativeBuildRegionsJson(songs);
@@ -2562,6 +2566,12 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string nowIso = nativeIsoNow();
   const bool appActive = g_nativeLastDirectorHeartbeat.time_since_epoch().count() != 0 &&
     std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - g_nativeLastDirectorHeartbeat).count() < 12;
+  // FIX83: publica também em ExtState para o Lua mostrar a tela grande mesmo
+  // se a chamada direta VS_Hook_Native_GetState ainda não estiver disponível.
+  if (SetExtState_ptr) {
+    SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", appActive ? "1" : "0", false);
+    SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
+  }
 
   std::string luaLiveRaw;
   {
@@ -3315,6 +3325,20 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
       stopEndPos = queuedEnd;
       if (stopSelectionTab.empty()) stopSelectionTab = "playlist";
     }
+    // FIX83: se a fila automática ainda não entrou no estado nativo, calcula o próximo
+    // item da playlist ativa no momento do Stop. Isso cobre Auto ligado e evita
+    // ficar selecionado na música que acabou de parar.
+    if (stopSelectionId.empty()) {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      const int currentIndex = nativeFindCurrentIndexInActivePlaylist(g_nativeActivePlaylistItems, g_nativeCurrentPlayingId, g_nativeCurrentSongStart, g_nativeCurrentSongEnd);
+      const NativeSongWindow* nextAuto = nativeResolveNextAutoQueueTarget(g_nativeActivePlaylistItems, currentIndex, g_nativeAutoBlocoEnabled);
+      if (nextAuto && nativeSongIsPlayable(*nextAuto)) {
+        stopSelectionId = nextAuto->id;
+        stopStartPos = nextAuto->start;
+        stopEndPos = nextAuto->end;
+        if (stopSelectionTab.empty()) stopSelectionTab = "playlist";
+      }
+    }
     if (stopSelectionId.empty()) {
       stopSelectionId = nativeJsonExtractString(commandBody, "targetId");
       if (stopSelectionId.empty()) stopSelectionId = nativeJsonExtractString(commandBody, "songId");
@@ -3614,6 +3638,18 @@ static void nativeHandleClient(native_socket_t client)
       const std::string commandType = nativeJsonExtractString(commandBody, "type");
       if (commandType == "app_heartbeat" || commandType == "director_heartbeat" || commandType == "heartbeat") {
         g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::now();
+        if (SetExtState_ptr) {
+          SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "1", false);
+          SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
+        }
+        g_nativeForceStateBuild.store(true);
+      }
+      if (commandType == "director_logout_ack" || commandType == "director_logout" || commandType == "app_logout") {
+        g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::time_point();
+        if (SetExtState_ptr) {
+          SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "0", false);
+          SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
+        }
         g_nativeForceStateBuild.store(true);
       }
 
