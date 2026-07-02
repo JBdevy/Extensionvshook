@@ -145,6 +145,12 @@ static bool g_transportProtectionBypass = false;
 static std::chrono::steady_clock::time_point g_transportProtectionLastTap;
 static const int kTransportProtectionWindowMs = 420;
 static const int kReaperTransportPlayStopCommandId = 40044;
+static const int kReaperTransportStopCommandId = 1016;
+
+// FIX101: qualquer comando manual de transporte deve cancelar a protecao de handoff da fila.
+// Sem isso, se a fila manual acabou de entrar e o usuario aperta Stop, a extensao
+// entende a parada como falha de transicao e religa o Play, reiniciando a musica.
+static void nativeCancelQueueHandoffProtection();
 
 static bool getTransportProtectionEnabled()
 {
@@ -165,6 +171,9 @@ static void toggleTransportProtectionMode()
 
 static bool handleProtectedTransportCommand(int command)
 {
+  if (command == kReaperTransportPlayStopCommandId || command == kReaperTransportStopCommandId) {
+    nativeCancelQueueHandoffProtection();
+  }
   if (g_transportProtectionBypass) return false;
   if (command != kReaperTransportPlayStopCommandId) return false;
   if (!getTransportProtectionEnabled()) return false;
@@ -1442,6 +1451,20 @@ static double g_nativeQueueHandoffStart = 0.0;
 static double g_nativeQueueHandoffEnd = 0.0;
 static std::chrono::steady_clock::time_point g_nativeQueueHandoffProtectUntil;
 
+static void nativeCancelQueueHandoffProtectionLocked()
+{
+  g_nativeQueueHandoffPlayId.clear();
+  g_nativeQueueHandoffStart = 0.0;
+  g_nativeQueueHandoffEnd = 0.0;
+  g_nativeQueueHandoffProtectUntil = std::chrono::steady_clock::time_point();
+}
+
+static void nativeCancelQueueHandoffProtection()
+{
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  nativeCancelQueueHandoffProtectionLocked();
+}
+
 static std::string nativeSongToJson(const NativeSongWindow& item, int index)
 {
   const double duration = std::max(0.0, item.end - item.start);
@@ -2524,10 +2547,7 @@ static void nativeProtectQueueHandoffPlayback(ReaProject* project, int& playStat
         handoffEnd = g_nativeQueueHandoffEnd;
         shouldProtect = true;
       } else {
-        g_nativeQueueHandoffPlayId.clear();
-        g_nativeQueueHandoffStart = 0.0;
-        g_nativeQueueHandoffEnd = 0.0;
-        g_nativeQueueHandoffProtectUntil = std::chrono::steady_clock::time_point();
+        nativeCancelQueueHandoffProtectionLocked();
       }
     }
   }
@@ -3426,6 +3446,11 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
     }
     if (stopSelectionTab != "regions") stopSelectionTab = "playlist";
 
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      nativeCancelQueueHandoffProtectionLocked();
+    }
+
     Main_OnCommand_ptr(1016, 0); // Transport: Stop
 
     double finalSelectionStart = stopStartPos;
@@ -3454,10 +3479,7 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
         }
       }
       nativeClearQueuedSongLocked();
-      g_nativeQueueHandoffPlayId.clear();
-      g_nativeQueueHandoffStart = 0.0;
-      g_nativeQueueHandoffEnd = 0.0;
-      g_nativeQueueHandoffProtectUntil = std::chrono::steady_clock::time_point();
+      nativeCancelQueueHandoffProtectionLocked();
     }
 
     if (hasFinalSelection && SetEditCurPos2_ptr && finalSelectionStart >= 0.0) {
