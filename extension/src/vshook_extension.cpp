@@ -72,7 +72,7 @@ using GetTakeName_t = const char* (*)(MediaItem_Take*);
 using GetSetMediaItemTakeInfo_String_t = bool (*)(MediaItem_Take*, const char*, char*, bool);
 using GetMediaItemTakeInfo_Value_t = double (*)(MediaItem_Take*, const char*);
 using GetMediaItemTake_Source_t = PCM_source* (*)(MediaItem_Take*);
-using GetMediaSourceFileName_t = bool (*)(PCM_source*, char*, int);
+using GetMediaSourceFileName_t = void (*)(PCM_source*, char*, int);
 using TakeFX_GetCount_t = int (*)(MediaItem_Take*);
 using TakeFX_GetEnabled_t = bool (*)(MediaItem_Take*, int);
 using TakeFX_SetEnabled_t = void (*)(MediaItem_Take*, int, bool);
@@ -1751,8 +1751,22 @@ static std::string nativeReadTakeSourcePath(MediaItem_Take* take)
   PCM_source* source = GetMediaItemTake_Source_ptr(take);
   if (!source) return std::string();
   char buf[4096] = {0};
-  if (!GetMediaSourceFileName_ptr(source, buf, static_cast<int>(sizeof(buf)))) return std::string();
-  return std::string(buf);
+  GetMediaSourceFileName_ptr(source, buf, static_cast<int>(sizeof(buf)));
+  return nativeTrim(std::string(buf));
+}
+
+static std::string nativeUrlEncode(const std::string& value)
+{
+  std::ostringstream out;
+  out << std::uppercase << std::hex;
+  for (unsigned char c : value) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      out << static_cast<char>(c);
+    } else {
+      out << '%' << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+    }
+  }
+  return out.str();
 }
 
 static std::string nativeFileExtensionLower(const std::string& path)
@@ -1820,10 +1834,22 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
     const bool labelLooksLikePath = takeLabel.find('/') != std::string::npos || takeLabel.find('\\') != std::string::npos || takeLabel.find(':') != std::string::npos;
     if (labelLooksLikePath) mediaPath = takeLabel;
   }
-  const std::string mediaProbe = mediaPath.empty() ? takeLabel : mediaPath;
-  const std::string mediaExt = nativeFileExtensionLower(mediaProbe);
-  const std::string mediaType = nativeDetectTelepromptMediaType(mediaProbe);
-  std::string text = (mediaType == "image" || mediaType == "video") ? std::string() : nativeReadItemTelepromptText(item);
+  // FIX104: Teleprompt do Hook Center usa sempre o caminho real do source.
+  // Nome de take/arquivo sem caminho não deve virar mídia nem aparecer como letra.
+  const std::string mediaExt = nativeFileExtensionLower(mediaPath);
+  const std::string mediaType = mediaPath.empty() ? std::string("text") : nativeDetectTelepromptMediaType(mediaPath);
+  std::string text;
+  if (mediaType == "image" || mediaType == "video") {
+    text = std::string();
+  } else {
+    text = nativeReadItemTelepromptText(item);
+    const bool textLooksOnlyLikeMediaFileName = !text.empty()
+      && text.find('/') == std::string::npos
+      && text.find('\\') == std::string::npos
+      && text.find(':') == std::string::npos
+      && (nativeDetectTelepromptMediaType(text) == "image" || nativeDetectTelepromptMediaType(text) == "video");
+    if (textLooksOnlyLikeMediaFileName) text.clear();
+  }
   const double itemLength = std::max(0.0, itemEnd - itemStart);
   double mediaOffset = 0.0;
   double mediaPlayrate = 1.0;
@@ -1858,6 +1884,7 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   out << "\"telepromptType\":" << nativeJsonString(mediaType) << ",";
   out << "\"mediaType\":" << nativeJsonString(mediaType) << ",";
   out << "\"mediaPath\":" << nativeJsonString(mediaPath) << ",";
+  out << "\"mediaUrl\":" << nativeJsonString(mediaPath.empty() ? std::string() : std::string("/media?path=") + nativeUrlEncode(mediaPath)) << ",";
   out << "\"mediaExt\":" << nativeJsonString(mediaExt) << ",";
   out << "\"mediaCurrentTime\":" << nativeNumber(mediaCurrentTime) << ",";
   out << "\"mediaOffset\":" << nativeNumber(mediaOffset) << ",";
@@ -2852,6 +2879,8 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"telepromptTp1MediaType\":" << nativeJsonString(tp1MediaType.empty() ? std::string("text") : tp1MediaType) << ",";
   json << "\"tp1MediaPath\":" << nativeJsonString(tp1MediaPath) << ",";
   json << "\"telepromptTp1MediaPath\":" << nativeJsonString(tp1MediaPath) << ",";
+  json << "\"tp1MediaUrl\":" << nativeJsonString(tp1MediaPath.empty() ? std::string() : std::string("/media?path=") + nativeUrlEncode(tp1MediaPath)) << ",";
+  json << "\"telepromptTp1MediaUrl\":" << nativeJsonString(tp1MediaPath.empty() ? std::string() : std::string("/media?path=") + nativeUrlEncode(tp1MediaPath)) << ",";
   json << "\"tp1MediaExt\":" << nativeJsonString(tp1MediaExt) << ",";
   json << "\"tp1MediaCurrentTime\":" << (tp1MediaCurrentTime.empty() ? std::string("0") : tp1MediaCurrentTime) << ",";
   json << "\"tp1MediaOffset\":" << (tp1MediaOffset.empty() ? std::string("0") : tp1MediaOffset) << ",";
@@ -2867,6 +2896,8 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"telepromptTp2MediaType\":" << nativeJsonString(tp2MediaType.empty() ? std::string("text") : tp2MediaType) << ",";
   json << "\"tp2MediaPath\":" << nativeJsonString(tp2MediaPath) << ",";
   json << "\"telepromptTp2MediaPath\":" << nativeJsonString(tp2MediaPath) << ",";
+  json << "\"tp2MediaUrl\":" << nativeJsonString(tp2MediaPath.empty() ? std::string() : std::string("/media?path=") + nativeUrlEncode(tp2MediaPath)) << ",";
+  json << "\"telepromptTp2MediaUrl\":" << nativeJsonString(tp2MediaPath.empty() ? std::string() : std::string("/media?path=") + nativeUrlEncode(tp2MediaPath)) << ",";
   json << "\"tp2MediaExt\":" << nativeJsonString(tp2MediaExt) << ",";
   json << "\"tp2MediaCurrentTime\":" << (tp2MediaCurrentTime.empty() ? std::string("0") : tp2MediaCurrentTime) << ",";
   json << "\"tp2MediaOffset\":" << (tp2MediaOffset.empty() ? std::string("0") : tp2MediaOffset) << ",";
