@@ -2087,7 +2087,13 @@ static void nativeSetQueuedSongLocked(const NativeSongWindow& song, bool manual)
   g_nativeQueuedPlaylistIndex = song.playlistOrder;
   g_nativeQueuedManual = manual;
   g_nativeQueuedSeekSignature.clear();
-  if (!manual) g_nativeLastAutoQueueForPlayingId = g_nativeCurrentPlayingId;
+  if (manual) {
+    // FIX100: intervencao manual cancela a fila automatica atual. O Auto volta
+    // a calcular a proxima somente depois que esta fila manual entrar em playback.
+    g_nativeLastAutoQueueForPlayingId.clear();
+  } else {
+    g_nativeLastAutoQueueForPlayingId = g_nativeCurrentPlayingId;
+  }
 }
 
 static int nativeFindCurrentIndexInActivePlaylist(const std::vector<NativeSongWindow>& items, const std::string& playingId, double songStart, double songEnd)
@@ -2118,6 +2124,28 @@ static const NativeSongWindow* nativeResolveNextAutoQueueTarget(const std::vecto
     if (autoBlocoEnabled && crossedBlock) return nullptr;
     return &candidate;
   }
+  return nullptr;
+}
+
+// FIX100: a fila manual precisa ganhar da fila automatica.
+// O Lua sabe a posicao real do item no repertorio; a extensao agora usa essa
+// posicao antes de cair no fallback por id/start/end. Sem isso, com Auto ligado,
+// a extensao podia continuar usando a proxima musica sequencial que ela ja tinha
+// armado automaticamente.
+static const NativeSongWindow* nativeFindActivePlaylistSongByOrderLocked(int playlistOrder)
+{
+  if (playlistOrder <= 0) return nullptr;
+
+  for (const auto& item : g_nativeActivePlaylistItems) {
+    if (!nativeSongIsPlayable(item)) continue;
+    if (item.playlistOrder == playlistOrder) return &item;
+  }
+
+  if (playlistOrder <= static_cast<int>(g_nativeActivePlaylistItems.size())) {
+    const NativeSongWindow& item = g_nativeActivePlaylistItems[static_cast<size_t>(playlistOrder - 1)];
+    if (nativeSongIsPlayable(item)) return &item;
+  }
+
   return nullptr;
 }
 
@@ -3148,6 +3176,24 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
   if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "selectedRegionId");
   if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "id");
 
+  const std::string sourceValue = nativeLower(nativeJsonExtractString(commandBody, "source"));
+  const std::string roleValue = nativeLower(nativeJsonExtractString(commandBody, "role"));
+  const std::string clientRoleValue = nativeLower(nativeJsonExtractString(commandBody, "clientRole"));
+  const bool fromLua = sourceValue == "vshook_lua" || roleValue == "lua" || clientRoleValue == "lua";
+
+  std::string playlistOrderValue = nativeJsonExtractString(commandBody, "playlistItemIndex");
+  if (playlistOrderValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "playlistSongIndex");
+  if (playlistOrderValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "playlistOrder");
+  if (playlistOrderValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "selectedPlaylistIndex");
+  if (playlistOrderValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "songIndex");
+  if (playlistOrderValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "index");
+  if (playlistOrderValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "order");
+  // O Lua FIX99 envia playlistIndex como indice do item selecionado no repertorio.
+  // Para clientes externos, playlistIndex pode significar o ID do repertorio; por isso
+  // so confiamos nele quando o comando vem do Lua ou quando nao veio nenhum id.
+  if (playlistOrderValue.empty() && (fromLua || idValue.empty())) playlistOrderValue = nativeJsonExtractString(commandBody, "playlistIndex");
+  const int playlistOrder = nativeLooksNumeric(playlistOrderValue) ? std::atoi(playlistOrderValue.c_str()) : 0;
+
   std::string startValue = nativeJsonExtractString(commandBody, "selectedStartPos");
   if (startValue.empty()) startValue = nativeJsonExtractString(commandBody, "startPos");
   if (startValue.empty()) startValue = nativeJsonExtractString(commandBody, "start_pos");
@@ -3158,14 +3204,16 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
   const double endPos = nativeLooksNumeric(endValue) ? std::atof(endValue.c_str()) : 0.0;
 
   std::lock_guard<std::mutex> lock(g_nativeMutex);
-  const NativeSongWindow* song = nativeFindSongForCommand(idValue, startPos, endPos);
+  const NativeSongWindow* song = nativeFindActivePlaylistSongByOrderLocked(playlistOrder);
+  if (!song) song = nativeFindSongForCommand(idValue, startPos, endPos);
   if (!song || !nativeSongIsPlayable(*song)) return true;
 
   if (!g_nativeCurrentPlayingId.empty() && song->id == g_nativeCurrentPlayingId) {
     nativeClearQueuedSongLocked();
-  } else if (!g_nativeQueuedSongId.empty() && g_nativeQueuedSongId == song->id) {
+  } else if (!g_nativeQueuedSongId.empty() && g_nativeQueuedSongId == song->id && g_nativeQueuedManual) {
     nativeClearQueuedSongLocked();
   } else {
+    // FIX100: qualquer fila manual valida substitui a fila automatica vigente.
     nativeSetQueuedSongLocked(*song, true);
   }
   g_nativeForceStateBuild.store(true);
@@ -3355,18 +3403,20 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
       stopEndPos = queuedEnd;
       if (stopSelectionTab.empty()) stopSelectionTab = "playlist";
     }
-    // FIX83: se a fila automática ainda não entrou no estado nativo, calcula o próximo
-    // item da playlist ativa no momento do Stop. Isso cobre Auto ligado e evita
-    // ficar selecionado na música que acabou de parar.
+    // FIX83/FIX100: calcula o proximo automatico no Stop somente se o Auto da
+    // extensao estiver ligado e nao existir fila manual. Sem esse guarda, o Stop
+    // parecia Auto ligado mesmo quando o usuario estava intervindo manualmente.
     if (stopSelectionId.empty()) {
       std::lock_guard<std::mutex> lock(g_nativeMutex);
-      const int currentIndex = nativeFindCurrentIndexInActivePlaylist(g_nativeActivePlaylistItems, g_nativeCurrentPlayingId, g_nativeCurrentSongStart, g_nativeCurrentSongEnd);
-      const NativeSongWindow* nextAuto = nativeResolveNextAutoQueueTarget(g_nativeActivePlaylistItems, currentIndex, g_nativeAutoBlocoEnabled);
-      if (nextAuto && nativeSongIsPlayable(*nextAuto)) {
-        stopSelectionId = nextAuto->id;
-        stopStartPos = nextAuto->start;
-        stopEndPos = nextAuto->end;
-        if (stopSelectionTab.empty()) stopSelectionTab = "playlist";
+      if (g_nativeAutoplayEnabled && !g_nativeQueuedManual) {
+        const int currentIndex = nativeFindCurrentIndexInActivePlaylist(g_nativeActivePlaylistItems, g_nativeCurrentPlayingId, g_nativeCurrentSongStart, g_nativeCurrentSongEnd);
+        const NativeSongWindow* nextAuto = nativeResolveNextAutoQueueTarget(g_nativeActivePlaylistItems, currentIndex, g_nativeAutoBlocoEnabled);
+        if (nextAuto && nativeSongIsPlayable(*nextAuto)) {
+          stopSelectionId = nextAuto->id;
+          stopStartPos = nextAuto->start;
+          stopEndPos = nextAuto->end;
+          if (stopSelectionTab.empty()) stopSelectionTab = "playlist";
+        }
       }
     }
     if (stopSelectionId.empty()) {
