@@ -1823,44 +1823,130 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   const double pos = (transportPlaying && GetPlayPositionEx_ptr) ? playPos : (GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(project) : playPos);
   int trackIndex = -1;
   MediaTrack* track = nativeFindTrackByExactName(project, trackName, &trackIndex);
-  int itemIndex = -1;
-  double itemStart = 0.0;
-  double itemEnd = 0.0;
-  MediaItem* item = nativeFindCurrentItemOnTrack(track, pos, &itemIndex, &itemStart, &itemEnd);
-  MediaItem_Take* take = item && GetActiveTake_ptr ? GetActiveTake_ptr(item) : nullptr;
-  std::string mediaPath = nativeReadTakeSourcePath(take);
-  const std::string takeLabel = nativeReadTakeText(take);
-  if (mediaPath.empty() && !takeLabel.empty()) {
-    const bool labelLooksLikePath = takeLabel.find('/') != std::string::npos || takeLabel.find('\\') != std::string::npos || takeLabel.find(':') != std::string::npos;
-    if (labelLooksLikePath) mediaPath = takeLabel;
+
+  // FIX105: resolve todos os itens ativos na mesma posição da pista TELEPROMPT.
+  // Regra de prioridade na mesma posição:
+  // 1) texto/letra continua visível por cima;
+  // 2) vídeo ganha de imagem;
+  // 3) imagem entra se não houver vídeo.
+  bool itemFound = false;
+  int chosenItemIndex = -1;
+  double chosenItemStart = 0.0;
+  double chosenItemEnd = 0.0;
+
+  int chosenMediaPriority = 0; // 0 nenhum, 1 imagem, 2 vídeo
+  int chosenMediaIndex = -1;
+  double chosenMediaStart = 0.0;
+  double chosenMediaEnd = 0.0;
+  double chosenMediaOffset = 0.0;
+  double chosenMediaPlayrate = 1.0;
+  std::string mediaPath;
+  std::string mediaType = "text";
+  std::string mediaExt;
+
+  std::vector<std::string> textParts;
+  int chosenTextIndex = -1;
+  double chosenTextStart = 0.0;
+  double chosenTextEnd = 0.0;
+
+  auto appendTextPart = [&](const std::string& value) {
+    const std::string clean = nativeTrim(value);
+    if (clean.empty()) return;
+    for (const auto& existing : textParts) {
+      if (existing == clean) return;
+    }
+    textParts.push_back(clean);
+  };
+
+  auto labelLooksLikePath = [](const std::string& value) -> bool {
+    return value.find('/') != std::string::npos || value.find('\\') != std::string::npos || value.find(':') != std::string::npos;
+  };
+
+  if (track && GetTrackNumMediaItems_ptr && GetTrackMediaItem_ptr && GetMediaItemInfo_Value_ptr) {
+    const int count = GetTrackNumMediaItems_ptr(track);
+    for (int i = 0; i < count; ++i) {
+      MediaItem* currentItem = GetTrackMediaItem_ptr(track, i);
+      if (!currentItem) continue;
+      const double itemStart = GetMediaItemInfo_Value_ptr(currentItem, "D_POSITION");
+      const double itemLen = std::max(0.0, GetMediaItemInfo_Value_ptr(currentItem, "D_LENGTH"));
+      const double itemEnd = itemStart + itemLen;
+      if (pos < itemStart - 0.0005 || pos >= itemEnd - 0.0005) continue;
+
+      itemFound = true;
+      if (chosenItemIndex < 0) {
+        chosenItemIndex = i;
+        chosenItemStart = itemStart;
+        chosenItemEnd = itemEnd;
+      }
+
+      MediaItem_Take* currentTake = currentItem && GetActiveTake_ptr ? GetActiveTake_ptr(currentItem) : nullptr;
+      std::string currentMediaPath = nativeReadTakeSourcePath(currentTake);
+      const std::string takeLabel = nativeReadTakeText(currentTake);
+      if (currentMediaPath.empty() && !takeLabel.empty() && labelLooksLikePath(takeLabel)) {
+        currentMediaPath = takeLabel;
+      }
+
+      const std::string currentMediaType = currentMediaPath.empty() ? std::string("text") : nativeDetectTelepromptMediaType(currentMediaPath);
+      const int currentPriority = currentMediaType == "video" ? 2 : (currentMediaType == "image" ? 1 : 0);
+
+      std::string currentText = nativeReadItemTelepromptText(currentItem);
+      const bool textLooksOnlyLikeMediaFileName = !currentText.empty()
+        && currentText.find('/') == std::string::npos
+        && currentText.find('\\') == std::string::npos
+        && currentText.find(':') == std::string::npos
+        && (nativeDetectTelepromptMediaType(currentText) == "image" || nativeDetectTelepromptMediaType(currentText) == "video");
+      if (textLooksOnlyLikeMediaFileName) currentText.clear();
+      if (!nativeTrim(currentText).empty()) {
+        appendTextPart(currentText);
+        if (chosenTextIndex < 0) {
+          chosenTextIndex = i;
+          chosenTextStart = itemStart;
+          chosenTextEnd = itemEnd;
+        }
+      }
+
+      if (currentPriority > 0 && (currentPriority > chosenMediaPriority || (currentPriority == chosenMediaPriority && i >= chosenMediaIndex))) {
+        chosenMediaPriority = currentPriority;
+        chosenMediaIndex = i;
+        chosenMediaStart = itemStart;
+        chosenMediaEnd = itemEnd;
+        mediaPath = currentMediaPath;
+        mediaType = currentMediaType;
+        mediaExt = nativeFileExtensionLower(mediaPath);
+        chosenMediaOffset = 0.0;
+        chosenMediaPlayrate = 1.0;
+        if (currentTake && GetMediaItemTakeInfo_Value_ptr) {
+          chosenMediaOffset = std::max(0.0, GetMediaItemTakeInfo_Value_ptr(currentTake, "D_STARTOFFS"));
+          chosenMediaPlayrate = GetMediaItemTakeInfo_Value_ptr(currentTake, "D_PLAYRATE");
+          if (chosenMediaPlayrate <= 0.0) chosenMediaPlayrate = 1.0;
+        }
+      }
+    }
   }
-  // FIX104: Teleprompt do Hook Center usa sempre o caminho real do source.
-  // Nome de take/arquivo sem caminho não deve virar mídia nem aparecer como letra.
-  const std::string mediaExt = nativeFileExtensionLower(mediaPath);
-  const std::string mediaType = mediaPath.empty() ? std::string("text") : nativeDetectTelepromptMediaType(mediaPath);
+
+  if (chosenMediaPriority > 0) {
+    chosenItemIndex = chosenMediaIndex;
+    chosenItemStart = chosenMediaStart;
+    chosenItemEnd = chosenMediaEnd;
+  } else if (chosenTextIndex >= 0) {
+    chosenItemIndex = chosenTextIndex;
+    chosenItemStart = chosenTextStart;
+    chosenItemEnd = chosenTextEnd;
+    mediaType = "text";
+    mediaPath.clear();
+    mediaExt.clear();
+  }
+
   std::string text;
-  if (mediaType == "image" || mediaType == "video") {
-    text = std::string();
-  } else {
-    text = nativeReadItemTelepromptText(item);
-    const bool textLooksOnlyLikeMediaFileName = !text.empty()
-      && text.find('/') == std::string::npos
-      && text.find('\\') == std::string::npos
-      && text.find(':') == std::string::npos
-      && (nativeDetectTelepromptMediaType(text) == "image" || nativeDetectTelepromptMediaType(text) == "video");
-    if (textLooksOnlyLikeMediaFileName) text.clear();
+  for (size_t i = 0; i < textParts.size(); ++i) {
+    if (i > 0) text += "\n";
+    text += textParts[i];
   }
-  const double itemLength = std::max(0.0, itemEnd - itemStart);
-  double mediaOffset = 0.0;
-  double mediaPlayrate = 1.0;
-  if (take && GetMediaItemTakeInfo_Value_ptr) {
-    mediaOffset = std::max(0.0, GetMediaItemTakeInfo_Value_ptr(take, "D_STARTOFFS"));
-    mediaPlayrate = GetMediaItemTakeInfo_Value_ptr(take, "D_PLAYRATE");
-    if (mediaPlayrate <= 0.0) mediaPlayrate = 1.0;
-  }
+
+  const double itemLength = std::max(0.0, chosenItemEnd - chosenItemStart);
   double mediaCurrentTime = 0.0;
-  if (mediaType == "image" || mediaType == "video") {
-    mediaCurrentTime = mediaOffset + (std::max(0.0, pos - itemStart) * mediaPlayrate);
+  if (chosenMediaPriority > 0) {
+    mediaCurrentTime = chosenMediaOffset + (std::max(0.0, pos - chosenMediaStart) * chosenMediaPlayrate);
   }
   const std::string songName = nativeFindSongNameAtPosition(songs, pos, playingName);
   std::ostringstream out;
@@ -1874,11 +1960,11 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   out << "\"trackName\":" << nativeJsonString(trackName) << ",";
   out << "\"trackFound\":" << (track ? "true" : "false") << ",";
   out << "\"trackIndex\":" << trackIndex << ",";
-  out << "\"itemFound\":" << (item ? "true" : "false") << ",";
-  out << "\"itemIndex\":" << itemIndex << ",";
+  out << "\"itemFound\":" << (itemFound ? "true" : "false") << ",";
+  out << "\"itemIndex\":" << chosenItemIndex << ",";
   out << "\"itemGuid\":\"\",";
-  out << "\"itemStart\":" << nativeNumber(itemStart) << ",";
-  out << "\"itemEnd\":" << nativeNumber(itemEnd) << ",";
+  out << "\"itemStart\":" << nativeNumber(chosenItemStart) << ",";
+  out << "\"itemEnd\":" << nativeNumber(chosenItemEnd) << ",";
   out << "\"position\":" << nativeNumber(pos) << ",";
   out << "\"playing\":" << (transportPlaying ? "true" : "false") << ",";
   out << "\"telepromptType\":" << nativeJsonString(mediaType) << ",";
@@ -1887,9 +1973,10 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   out << "\"mediaUrl\":" << nativeJsonString(mediaPath.empty() ? std::string() : std::string("/media?path=") + nativeUrlEncode(mediaPath)) << ",";
   out << "\"mediaExt\":" << nativeJsonString(mediaExt) << ",";
   out << "\"mediaCurrentTime\":" << nativeNumber(mediaCurrentTime) << ",";
-  out << "\"mediaOffset\":" << nativeNumber(mediaOffset) << ",";
-  out << "\"mediaPlayrate\":" << nativeNumber(mediaPlayrate) << ",";
+  out << "\"mediaOffset\":" << nativeNumber(chosenMediaOffset) << ",";
+  out << "\"mediaPlayrate\":" << nativeNumber(chosenMediaPlayrate) << ",";
   out << "\"itemLength\":" << nativeNumber(itemLength) << ",";
+  out << "\"overlayText\":" << nativeJsonString(text) << ",";
   out << "\"lyricsText\":" << nativeJsonString(text) << ",";
   out << "\"lyrics\":" << nativeJsonString(text);
   out << "}";
