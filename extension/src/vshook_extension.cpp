@@ -1293,6 +1293,12 @@ static bool nativeTakeAnyFxEnabled(MediaItem* item)
   return false;
 }
 
+static std::string nativeLower(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
 static std::string nativeJsonExtractString(const std::string& json, const std::string& key)
 {
   const std::string pat = std::string("\"") + key + "\"";
@@ -2678,6 +2684,13 @@ static void nativeRebuildState(bool forceSnapshot)
   if (queuedPlaylistSongId.empty() && !queuedSongId.empty()) queuedPlaylistSongId = queuedSongId;
   const bool loopActive = nativeIsRepeatEnabled(activeProject);
 
+  std::string directorLogoutToken;
+  if (GetExtState_ptr) {
+    const char* logoutReq = GetExtState_ptr(kNativeExtStateSection, "DIRECTOR_LOGOUT_REQUEST_V1");
+    if (logoutReq && *logoutReq) directorLogoutToken = logoutReq;
+  }
+  const bool directorLogoutRequested = !directorLogoutToken.empty();
+
   std::ostringstream json;
   json << "{";
   json << "\"ok\":true,";
@@ -2690,6 +2703,12 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"appActive\":" << (appActive ? "true" : "false") << ",";
   json << "\"directorAppActive\":" << (appActive ? "true" : "false") << ",";
   json << "\"directorActive\":" << (appActive ? "true" : "false") << ",";
+  json << "\"forceDirectorLogout\":" << (directorLogoutRequested ? "true" : "false") << ",";
+  json << "\"directorLogoutRequested\":" << (directorLogoutRequested ? "true" : "false") << ",";
+  json << "\"logoutDirector\":" << (directorLogoutRequested ? "true" : "false") << ",";
+  json << "\"appLogoutTarget\":" << nativeJsonString(directorLogoutRequested ? "director" : "") << ",";
+  json << "\"logoutTarget\":" << nativeJsonString(directorLogoutRequested ? "director" : "") << ",";
+  json << "\"directorLogoutToken\":" << nativeJsonString(directorLogoutToken) << ",";
   json << "\"updatedAt\":" << nativeJsonString(nowIso) << ",";
   json << "\"heartbeatAt\":" << nativeJsonString(nowIso) << ",";
   json << "\"lastHeartbeatAt\":" << nativeJsonString(nowIso) << ",";
@@ -3636,7 +3655,11 @@ static void nativeHandleClient(native_socket_t client)
     const std::string commandBody = nativeTrim(nativeRequestBody(req));
     if (!commandBody.empty()) {
       const std::string commandType = nativeJsonExtractString(commandBody, "type");
-      if (commandType == "app_heartbeat" || commandType == "director_heartbeat" || commandType == "heartbeat") {
+      const std::string commandRole = nativeLower(nativeJsonExtractString(commandBody, "role"));
+      const std::string commandClientRole = nativeLower(nativeJsonExtractString(commandBody, "clientRole"));
+      const std::string commandAppRole = nativeLower(nativeJsonExtractString(commandBody, "appRole"));
+      const bool commandIsDirectorRole = commandRole == "director" || commandRole == "diretor" || commandClientRole == "director" || commandClientRole == "diretor" || commandAppRole == "director" || commandAppRole == "diretor";
+      if (commandType == "director_enter" || commandType == "director_active" || commandType == "director_heartbeat" || ((commandType == "app_heartbeat" || commandType == "heartbeat") && commandIsDirectorRole)) {
         g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::now();
         if (SetExtState_ptr) {
           SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "1", false);
@@ -3649,6 +3672,8 @@ static void nativeHandleClient(native_socket_t client)
         if (SetExtState_ptr) {
           SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "0", false);
           SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
+          SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_LOGOUT_REQUEST_V1", "", false);
+          SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_LOGOUT_REQUEST_AT_V1", "", false);
         }
         g_nativeForceStateBuild.store(true);
       }
