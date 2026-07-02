@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <cstdio>
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -1813,9 +1814,15 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   double itemEnd = 0.0;
   MediaItem* item = nativeFindCurrentItemOnTrack(track, pos, &itemIndex, &itemStart, &itemEnd);
   MediaItem_Take* take = item && GetActiveTake_ptr ? GetActiveTake_ptr(item) : nullptr;
-  const std::string mediaPath = nativeReadTakeSourcePath(take);
-  const std::string mediaExt = nativeFileExtensionLower(mediaPath);
-  const std::string mediaType = nativeDetectTelepromptMediaType(mediaPath);
+  std::string mediaPath = nativeReadTakeSourcePath(take);
+  const std::string takeLabel = nativeReadTakeText(take);
+  if (mediaPath.empty() && !takeLabel.empty()) {
+    const bool labelLooksLikePath = takeLabel.find('/') != std::string::npos || takeLabel.find('\\') != std::string::npos || takeLabel.find(':') != std::string::npos;
+    if (labelLooksLikePath) mediaPath = takeLabel;
+  }
+  const std::string mediaProbe = mediaPath.empty() ? takeLabel : mediaPath;
+  const std::string mediaExt = nativeFileExtensionLower(mediaProbe);
+  const std::string mediaType = nativeDetectTelepromptMediaType(mediaProbe);
   std::string text = (mediaType == "image" || mediaType == "video") ? std::string() : nativeReadItemTelepromptText(item);
   const double itemLength = std::max(0.0, itemEnd - itemStart);
   double mediaOffset = 0.0;
@@ -2612,10 +2619,20 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string tp1LyricsText = nativeJsonExtractString(tp1Json, "lyricsText");
   const std::string tp1SongName = nativeJsonExtractString(tp1Json, "songName");
   const std::string tp1MediaType = nativeJsonExtractString(tp1Json, "mediaType");
+  const std::string tp1MediaPath = nativeJsonExtractString(tp1Json, "mediaPath");
+  const std::string tp1MediaExt = nativeJsonExtractString(tp1Json, "mediaExt");
+  const std::string tp1MediaCurrentTime = nativeJsonExtractString(tp1Json, "mediaCurrentTime");
+  const std::string tp1MediaOffset = nativeJsonExtractString(tp1Json, "mediaOffset");
+  const std::string tp1MediaPlayrate = nativeJsonExtractString(tp1Json, "mediaPlayrate");
   const std::string tp1UpdatedAt = nativeJsonExtractString(tp1Json, "updatedAt");
   const std::string tp2LyricsText = nativeJsonExtractString(tp2Json, "lyricsText");
   const std::string tp2SongName = nativeJsonExtractString(tp2Json, "songName");
   const std::string tp2MediaType = nativeJsonExtractString(tp2Json, "mediaType");
+  const std::string tp2MediaPath = nativeJsonExtractString(tp2Json, "mediaPath");
+  const std::string tp2MediaExt = nativeJsonExtractString(tp2Json, "mediaExt");
+  const std::string tp2MediaCurrentTime = nativeJsonExtractString(tp2Json, "mediaCurrentTime");
+  const std::string tp2MediaOffset = nativeJsonExtractString(tp2Json, "mediaOffset");
+  const std::string tp2MediaPlayrate = nativeJsonExtractString(tp2Json, "mediaPlayrate");
   const std::string tp2UpdatedAt = nativeJsonExtractString(tp2Json, "updatedAt");
   const std::string nowIso = nativeIsoNow();
   const bool appActive = g_nativeLastDirectorHeartbeat.time_since_epoch().count() != 0 &&
@@ -2833,6 +2850,12 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"telepromptTp1SongName\":" << nativeJsonString(tp1SongName) << ",";
   json << "\"tp1MediaType\":" << nativeJsonString(tp1MediaType.empty() ? std::string("text") : tp1MediaType) << ",";
   json << "\"telepromptTp1MediaType\":" << nativeJsonString(tp1MediaType.empty() ? std::string("text") : tp1MediaType) << ",";
+  json << "\"tp1MediaPath\":" << nativeJsonString(tp1MediaPath) << ",";
+  json << "\"telepromptTp1MediaPath\":" << nativeJsonString(tp1MediaPath) << ",";
+  json << "\"tp1MediaExt\":" << nativeJsonString(tp1MediaExt) << ",";
+  json << "\"tp1MediaCurrentTime\":" << (tp1MediaCurrentTime.empty() ? std::string("0") : tp1MediaCurrentTime) << ",";
+  json << "\"tp1MediaOffset\":" << (tp1MediaOffset.empty() ? std::string("0") : tp1MediaOffset) << ",";
+  json << "\"tp1MediaPlayrate\":" << (tp1MediaPlayrate.empty() ? std::string("1") : tp1MediaPlayrate) << ",";
   json << "\"tp1UpdatedAt\":" << nativeJsonString(tp1UpdatedAt) << ",";
   json << "\"tp2LyricsText\":" << nativeJsonString(tp2LyricsText) << ",";
   json << "\"tp2Lyrics\":" << nativeJsonString(tp2LyricsText) << ",";
@@ -2842,6 +2865,12 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"telepromptTp2SongName\":" << nativeJsonString(tp2SongName) << ",";
   json << "\"tp2MediaType\":" << nativeJsonString(tp2MediaType.empty() ? std::string("text") : tp2MediaType) << ",";
   json << "\"telepromptTp2MediaType\":" << nativeJsonString(tp2MediaType.empty() ? std::string("text") : tp2MediaType) << ",";
+  json << "\"tp2MediaPath\":" << nativeJsonString(tp2MediaPath) << ",";
+  json << "\"telepromptTp2MediaPath\":" << nativeJsonString(tp2MediaPath) << ",";
+  json << "\"tp2MediaExt\":" << nativeJsonString(tp2MediaExt) << ",";
+  json << "\"tp2MediaCurrentTime\":" << (tp2MediaCurrentTime.empty() ? std::string("0") : tp2MediaCurrentTime) << ",";
+  json << "\"tp2MediaOffset\":" << (tp2MediaOffset.empty() ? std::string("0") : tp2MediaOffset) << ",";
+  json << "\"tp2MediaPlayrate\":" << (tp2MediaPlayrate.empty() ? std::string("1") : tp2MediaPlayrate) << ",";
   json << "\"tp2UpdatedAt\":" << nativeJsonString(tp2UpdatedAt);
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -3722,6 +3751,184 @@ static bool nativeSelectProjectFromCommand(const std::string& commandBody)
   return true;
 }
 
+
+static std::string nativeRequestTarget(const std::string& req)
+{
+  const size_t sp1 = req.find(' ');
+  if (sp1 == std::string::npos) return "/";
+  const size_t sp2 = req.find(' ', sp1 + 1);
+  if (sp2 == std::string::npos) return "/";
+  return req.substr(sp1 + 1, sp2 - sp1 - 1);
+}
+
+static int nativeHexValue(char c)
+{
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+static std::string nativeUrlDecode(const std::string& value)
+{
+  std::string out;
+  out.reserve(value.size());
+  for (size_t i = 0; i < value.size(); ++i) {
+    const char c = value[i];
+    if (c == '%' && i + 2 < value.size()) {
+      const int hi = nativeHexValue(value[i + 1]);
+      const int lo = nativeHexValue(value[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(c == '+' ? ' ' : c);
+  }
+  return out;
+}
+
+static std::string nativeQueryParam(const std::string& target, const std::string& key)
+{
+  const size_t q = target.find('?');
+  if (q == std::string::npos) return std::string();
+  const std::string query = target.substr(q + 1);
+  size_t pos = 0;
+  while (pos <= query.size()) {
+    size_t amp = query.find('&', pos);
+    if (amp == std::string::npos) amp = query.size();
+    const std::string part = query.substr(pos, amp - pos);
+    const size_t eq = part.find('=');
+    const std::string k = nativeUrlDecode(eq == std::string::npos ? part : part.substr(0, eq));
+    if (k == key) return nativeUrlDecode(eq == std::string::npos ? std::string() : part.substr(eq + 1));
+    if (amp >= query.size()) break;
+    pos = amp + 1;
+  }
+  return std::string();
+}
+
+static std::string nativeMimeTypeForPath(const std::string& path)
+{
+  const std::string ext = nativeFileExtensionLower(path);
+  if (ext == "png") return "image/png";
+  if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+  if (ext == "webp") return "image/webp";
+  if (ext == "gif") return "image/gif";
+  if (ext == "bmp") return "image/bmp";
+  if (ext == "svg") return "image/svg+xml";
+  if (ext == "mp4" || ext == "m4v") return "video/mp4";
+  if (ext == "mov") return "video/quicktime";
+  if (ext == "webm") return "video/webm";
+  if (ext == "mkv") return "video/x-matroska";
+  if (ext == "avi") return "video/x-msvideo";
+  return "application/octet-stream";
+}
+
+static bool nativeReadBinaryFile(const std::string& path, std::string& out)
+{
+  out.clear();
+  if (path.empty()) return false;
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return false;
+  std::fseek(f, 0, SEEK_END);
+  const long size = std::ftell(f);
+  if (size < 0) { std::fclose(f); return false; }
+  std::fseek(f, 0, SEEK_SET);
+  out.resize(static_cast<size_t>(size));
+  if (size > 0) {
+    const size_t got = std::fread(&out[0], 1, static_cast<size_t>(size), f);
+    if (got != static_cast<size_t>(size)) { std::fclose(f); out.clear(); return false; }
+  }
+  std::fclose(f);
+  return true;
+}
+
+static std::string nativeHttpBinaryResponse(int status, const std::string& body, const std::string& contentType)
+{
+  std::ostringstream res;
+  res << "HTTP/1.1 " << status << (status == 200 ? " OK" : " ERROR") << "\r\n";
+  res << "Content-Type: " << contentType << "\r\n";
+  res << "Access-Control-Allow-Origin: *\r\n";
+  res << "Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n";
+  res << "Access-Control-Allow-Headers: Content-Type,Range\r\n";
+  res << "Accept-Ranges: bytes\r\n";
+  res << "Cache-Control: no-store\r\n";
+  res << "Connection: close\r\n";
+  res << "Content-Length: " << body.size() << "\r\n\r\n";
+  std::string header = res.str();
+  header.append(body);
+  return header;
+}
+
+static std::string nativeHttpBinaryRangeResponse(const std::string& body, const std::string& contentType, size_t totalSize, size_t start, size_t end)
+{
+  std::ostringstream res;
+  res << "HTTP/1.1 206 Partial Content\r\n";
+  res << "Content-Type: " << contentType << "\r\n";
+  res << "Access-Control-Allow-Origin: *\r\n";
+  res << "Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n";
+  res << "Access-Control-Allow-Headers: Content-Type,Range\r\n";
+  res << "Accept-Ranges: bytes\r\n";
+  res << "Content-Range: bytes " << start << "-" << end << "/" << totalSize << "\r\n";
+  res << "Cache-Control: no-store\r\n";
+  res << "Connection: close\r\n";
+  res << "Content-Length: " << body.size() << "\r\n\r\n";
+  std::string header = res.str();
+  header.append(body);
+  return header;
+}
+
+static bool nativeParseByteRange(const std::string& req, size_t totalSize, size_t& startOut, size_t& endOut)
+{
+  if (totalSize == 0) return false;
+  const std::string lowerReq = nativeLower(req);
+  size_t p = lowerReq.find("range:");
+  if (p == std::string::npos) return false;
+  size_t lineEnd = lowerReq.find('\n', p);
+  std::string line = lowerReq.substr(p, lineEnd == std::string::npos ? std::string::npos : lineEnd - p);
+  size_t b = line.find("bytes=");
+  if (b == std::string::npos) return false;
+  b += 6;
+  size_t dash = line.find('-', b);
+  if (dash == std::string::npos) return false;
+  const std::string a = nativeTrim(line.substr(b, dash - b));
+  size_t epos = dash + 1;
+  size_t comma = line.find(',', epos);
+  const std::string z = nativeTrim(line.substr(epos, comma == std::string::npos ? std::string::npos : comma - epos));
+  if (a.empty()) return false;
+  size_t start = static_cast<size_t>(std::strtoull(a.c_str(), nullptr, 10));
+  size_t end = z.empty() ? (totalSize - 1) : static_cast<size_t>(std::strtoull(z.c_str(), nullptr, 10));
+  if (start >= totalSize) return false;
+  if (end >= totalSize) end = totalSize - 1;
+  if (end < start) return false;
+  startOut = start;
+  endOut = end;
+  return true;
+}
+
+static std::string nativeBuildTpMediaResponse(const std::string& req)
+{
+  const std::string target = nativeRequestTarget(req);
+  std::string mediaPath = nativeQueryParam(target, "path");
+  if (mediaPath.empty()) mediaPath = nativeQueryParam(target, "file");
+  if (mediaPath.empty()) {
+    return nativeHttpResponse(400, "{\"ok\":false,\"error\":\"missing_media_path\"}");
+  }
+  mediaPath = nativeTrim(mediaPath);
+  std::string data;
+  if (!nativeReadBinaryFile(mediaPath, data)) {
+    return nativeHttpResponse(404, "{\"ok\":false,\"error\":\"media_not_found\"}");
+  }
+  const std::string mime = nativeMimeTypeForPath(mediaPath);
+  size_t start = 0;
+  size_t end = 0;
+  if (nativeParseByteRange(req, data.size(), start, end)) {
+    return nativeHttpBinaryRangeResponse(data.substr(start, end - start + 1), mime, data.size(), start, end);
+  }
+  return nativeHttpBinaryResponse(200, data, mime);
+}
+
 static void nativeHandleClient(native_socket_t client)
 {
   const std::string req = nativeReadHttpRequest(client);
@@ -3731,6 +3938,8 @@ static void nativeHandleClient(native_socket_t client)
 
   if (nativeStartsWith(req, "OPTIONS ")) {
     body = nativeHttpResponse(200, "{}", "application/json; charset=utf-8");
+  } else if (path == "/media" || path == "/tp-media" || path == "/teleprompt-media") {
+    body = nativeBuildTpMediaResponse(req);
   } else if (path == "/state" || path == "/state.json" || path == "/snapshot" || path == "/projects" || path == "/projects.json") {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     body = nativeHttpResponse(200, g_nativeStateJson.empty() ? std::string("{\"ok\":false,\"connected\":false}") : g_nativeStateJson);
