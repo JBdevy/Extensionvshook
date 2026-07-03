@@ -39,6 +39,7 @@ namespace vshook {
 using plugin_register_t = int (*)(const char*, void*);
 using plugin_getapi_t = void* (*)(const char*);
 using ShowMessageBox_t = int (*)(const char*, const char*, int);
+using GetMainHwnd_t = HWND (*)();
 using GetResourcePath_t = const char* (*)();
 using Main_OnCommand_t = void (*)(int, int);
 using GetToggleCommandState_t = int (*)(int);
@@ -88,6 +89,7 @@ using guidToString_t = void (*)(const GUID*, char*);
 static plugin_register_t plugin_register_ptr = nullptr;
 static plugin_getapi_t plugin_getapi_ptr = nullptr;
 static ShowMessageBox_t ShowMessageBox_ptr = nullptr;
+static GetMainHwnd_t GetMainHwnd_ptr = nullptr;
 static GetResourcePath_t GetResourcePath_ptr = nullptr;
 static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
 static GetToggleCommandState_t GetToggleCommandState_ptr = nullptr;
@@ -308,13 +310,27 @@ static std::string wideToUtf8Fallback(const void* data)
 }
 #endif
 
+static HWND getReaperMainHwndForClipboard()
+{
+  return GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
+}
+
 static bool VS_Hook_SetClipboard(const char* text)
 {
-  const std::string value = text ? text : "";
+  const char* value = text ? text : "";
 
 #ifdef _WIN32
-  const std::wstring wide = utf8ToWide(value);
-  const size_t bytes = (wide.size() + 1) * sizeof(wchar_t);
+  // Mesmo caminho do SWS/CF_SetClipboard: UTF-8 -> CF_UNICODETEXT e
+  // OpenClipboard usando o HWND principal do REAPER.
+  int length = MultiByteToWideChar(CP_UTF8, 0, value, -1, nullptr, 0);
+  UINT codepage = CP_UTF8;
+  if (length <= 0) {
+    codepage = CP_ACP;
+    length = MultiByteToWideChar(codepage, 0, value, -1, nullptr, 0);
+  }
+  if (length <= 0) return false;
+
+  const size_t bytes = static_cast<size_t>(length) * sizeof(wchar_t);
   HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
   if (!mem) return false;
 
@@ -324,25 +340,27 @@ static bool VS_Hook_SetClipboard(const char* text)
     return false;
   }
 
-  std::memcpy(locked, wide.c_str(), bytes);
+  MultiByteToWideChar(codepage, 0, value, -1, static_cast<wchar_t*>(locked), length);
   GlobalUnlock(mem);
 
-  if (!OpenClipboard(nullptr)) {
+  if (!OpenClipboard(getReaperMainHwndForClipboard())) {
     GlobalFree(mem);
     return false;
   }
 
+  bool ok = false;
   EmptyClipboard();
-  if (!SetClipboardData(CF_UNICODETEXT, mem)) {
-    CloseClipboard();
-    GlobalFree(mem);
-    return false;
+  if (SetClipboardData(CF_UNICODETEXT, mem)) {
+    // O clipboard assume a posse do HGLOBAL quando SetClipboardData tem sucesso.
+    mem = nullptr;
+    ok = true;
   }
-
   CloseClipboard();
-  return true;
+  if (mem) GlobalFree(mem);
+  return ok;
 #else
-  const size_t bytes = value.size() + 1;
+  // Mesmo caminho do SWS no SWELL: UTF-8 bruto em CF_TEXT com owner do REAPER.
+  const size_t bytes = std::strlen(value) + 1;
   HANDLE mem = GlobalAlloc(GMEM_MOVEABLE, static_cast<int>(bytes));
   if (!mem) return false;
 
@@ -352,17 +370,20 @@ static bool VS_Hook_SetClipboard(const char* text)
     return false;
   }
 
-  std::memcpy(locked, value.c_str(), bytes);
+  std::memcpy(locked, value, bytes);
   GlobalUnlock(mem);
 
-  if (!OpenClipboard(nullptr)) {
+  if (!OpenClipboard(getReaperMainHwndForClipboard())) {
     GlobalFree(mem);
     return false;
   }
 
   EmptyClipboard();
   SetClipboardData(CF_TEXT, mem);
+  // No SWELL, SetClipboardData pode ser void. Segue o mesmo padrao do SWS.
+  mem = nullptr;
   CloseClipboard();
+  if (mem) GlobalFree(mem);
   return true;
 #endif
 }
@@ -372,7 +393,7 @@ static bool VS_Hook_GetClipboard(char* buf, int bufSize)
   if (!buf || bufSize <= 0) return false;
   buf[0] = '\0';
 
-  if (!OpenClipboard(nullptr)) return false;
+  if (!OpenClipboard(getReaperMainHwndForClipboard())) return false;
 
 #ifdef _WIN32
   HANDLE mem = GetClipboardData(CF_UNICODETEXT);
@@ -4516,6 +4537,7 @@ static bool loadApi(reaper_plugin_info_t* rec)
 
   plugin_getapi_ptr = reinterpret_cast<plugin_getapi_t>(rec->GetFunc("plugin_getapi"));
   ShowMessageBox_ptr = reinterpret_cast<ShowMessageBox_t>(rec->GetFunc("ShowMessageBox"));
+  GetMainHwnd_ptr = reinterpret_cast<GetMainHwnd_t>(rec->GetFunc("GetMainHwnd"));
   GetResourcePath_ptr = reinterpret_cast<GetResourcePath_t>(rec->GetFunc("GetResourcePath"));
   Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
   GetToggleCommandState_ptr = reinterpret_cast<GetToggleCommandState_t>(rec->GetFunc("GetToggleCommandState"));
