@@ -1442,6 +1442,7 @@ static double g_nativeQueuedStart = 0.0;
 static double g_nativeQueuedEnd = 0.0;
 static int g_nativeQueuedPlaylistIndex = 0;
 static bool g_nativeQueuedManual = false;
+static int g_nativePreviewMode = 0;
 static std::string g_nativeQueuedSeekSignature;
 static std::string g_nativeLastAutoQueueForPlayingId;
 // FIX74: quando a fila nativa faz seek 1s antes do fim, o Lua/autostop antigo pode
@@ -2948,6 +2949,11 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"currentSongProgress\":" << nativeNumber(progress, 6) << ",";
   json << "\"autoplayEnabled\":" << (autoplayEnabled ? "true" : "false") << ",";
   json << "\"autoBlocoEnabled\":" << (autoBlocoEnabled ? "true" : "false") << ",";
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    json << "\"previewMode\":" << g_nativePreviewMode << ",";
+    json << "\"previewActive\":" << (g_nativePreviewMode > 0 ? "true" : "false") << ",";
+  }
   json << "\"loopActive\":" << (loopActive ? "true" : "false") << ",";
   json << "\"queuedSongId\":" << (queuedSongId.empty() ? std::string("null") : nativeJsonString(queuedSongId)) << ",";
   json << "\"queuedPlaylistSongId\":" << (queuedPlaylistSongId.empty() ? (queuedSongId.empty() ? std::string("null") : nativeJsonString(queuedSongId)) : nativeJsonString(queuedPlaylistSongId)) << ",";
@@ -3413,6 +3419,47 @@ static bool nativeApplyAutoCommand(const std::string& commandBody)
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   const bool next = desired.empty() ? !g_nativeAutoBlocoEnabled : nativeBoolFromText(desired, g_nativeAutoBlocoEnabled);
   g_nativeAutoBlocoEnabled = next;
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
+
+static int nativeClampPreviewMode(int value)
+{
+  if (value < 1 || value > 3) return 0;
+  return value;
+}
+
+static bool nativeApplyPreviewCommand(const std::string& commandBody)
+{
+  const std::string type = nativeJsonExtractString(commandBody, "type");
+  if (type != "preview_set" && type != "preview_toggle" && type != "preview_clear") return false;
+
+  if (type == "preview_clear") {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativePreviewMode = 0;
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  std::string slotValue = nativeJsonExtractString(commandBody, "previewIndex");
+  if (slotValue.empty()) slotValue = nativeJsonExtractString(commandBody, "previewMode");
+  if (slotValue.empty()) slotValue = nativeJsonExtractString(commandBody, "previewSlot");
+  if (slotValue.empty()) slotValue = nativeJsonExtractString(commandBody, "slot");
+  if (slotValue.empty()) slotValue = nativeJsonExtractString(commandBody, "index");
+  const int slot = nativeClampPreviewMode(nativeLooksNumeric(slotValue) ? std::atoi(slotValue.c_str()) : 0);
+
+  std::string desired = nativeJsonExtractString(commandBody, "desiredState");
+  if (desired.empty()) desired = nativeJsonExtractString(commandBody, "enabled");
+  if (desired.empty()) desired = nativeJsonExtractString(commandBody, "active");
+
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  if (type == "preview_toggle") {
+    g_nativePreviewMode = (slot > 0 && g_nativePreviewMode != slot) ? slot : 0;
+  } else {
+    const bool wantOn = desired.empty() ? (slot > 0) : nativeBoolFromText(desired, slot > 0);
+    g_nativePreviewMode = (wantOn && slot > 0) ? slot : 0;
+  }
   g_nativeForceStateBuild.store(true);
   return true;
 }
@@ -4107,7 +4154,7 @@ static void nativeHandleClient(native_socket_t client)
 
       const bool premixCommandRemoved = (commandType == "premix_item_focus_song" || commandType == "premix_focus_song" || commandType == "premix_item_set_volume" || commandType == "premix_item_toggle_mute" || commandType == "premix_item_toggle_fx" || commandType == "premix_set_volume" || commandType == "premix_toggle_mute" || commandType == "premix_toggle_fx");
       const bool tunerCommandRemoved = (commandType == "tuner_focus" || commandType == "set_tuner_visibility" || commandType == "tuner_adjust" || commandType == "tuner_reset");
-      const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplyQueueCommand(commandBody) || nativeApplyAutoCommand(commandBody) || nativeApplyLoopCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeApplyMarkerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
+      const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplyQueueCommand(commandBody) || nativeApplyAutoCommand(commandBody) || nativeApplyPreviewCommand(commandBody) || nativeApplyLoopCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeApplyMarkerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
 
       // FIX66: a extensao continua sendo o motor, mas o Lua tambem precisa refletir
       // Auto, AT/BL e Loop na interface local quando o comando veio do App Diretor.
