@@ -3775,9 +3775,17 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
       nativeCancelQueueHandoffProtectionLocked();
     }
 
+    const bool stopHasQueuedSelection = (!queuedId.empty() && queuedEnd > queuedStart + 0.0005 && queuedStart >= 0.0);
+
     Main_OnCommand_ptr(1016, 0); // Transport: Stop
-    if (stopNoSeek && SetEditCurPos2_ptr && editCursorBeforeStop >= 0.0) {
-      SetEditCurPos2_ptr(project, editCursorBeforeStop, false, false);
+    if (stopNoSeek && SetEditCurPos2_ptr) {
+      // Stop no-seek sem fila preserva o cursor. Stop com fila precisa deixar a música
+      // da fila pronta para o próximo Play, sem cair no fallback 0 quando não há fila.
+      if (stopHasQueuedSelection) {
+        SetEditCurPos2_ptr(project, queuedStart, true, false);
+      } else if (editCursorBeforeStop >= 0.0) {
+        SetEditCurPos2_ptr(project, editCursorBeforeStop, false, false);
+      }
     }
 
     double finalSelectionStart = stopStartPos;
