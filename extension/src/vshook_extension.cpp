@@ -322,30 +322,26 @@ static void VS_Hook_SetClipboard(const char* text)
   const char* buf = text ? text : "";
 
 #ifdef _WIN32
+  // Mesmo caminho do SWS CF_SetClipboard: entrada UTF-8 -> CF_UNICODETEXT.
   const int length = MultiByteToWideChar(CP_UTF8, 0, buf, -1, nullptr, 0);
   if (length <= 0) return;
   const size_t size = static_cast<size_t>(length) * sizeof(wchar_t);
 #else
+  // No SWELL/macOS o SWS usa CF_TEXT redefinido como SWELL__CF_TEXT.
   const size_t size = std::strlen(buf) + 1;
 #endif
 
   HANDLE mem = GlobalAlloc(GMEM_MOVEABLE, size);
   if (!mem) return;
 
-  void* locked = GlobalLock(mem);
-  if (!locked) {
-    GlobalFree(mem);
-    return;
-  }
-
 #ifdef _WIN32
-  MultiByteToWideChar(CP_UTF8, 0, buf, -1, static_cast<wchar_t*>(locked), length);
+  MultiByteToWideChar(CP_UTF8, 0, buf, -1,
+    static_cast<wchar_t*>(GlobalLock(mem)), length);
 #else
-  std::memcpy(locked, buf, size);
+  std::memcpy(GlobalLock(mem), buf, size);
 #endif
   GlobalUnlock(mem);
 
-  // Mesma lógica do SWS CF_SetClipboard: janela principal do REAPER e SetClipboardData direto.
   OpenClipboard(GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr);
   EmptyClipboard();
 #ifdef _WIN32
@@ -354,6 +350,16 @@ static void VS_Hook_SetClipboard(const char* text)
   SetClipboardData(CF_TEXT, mem);
 #endif
   CloseClipboard();
+}
+
+// REAPER só expõe corretamente para Lua quando a API também registra APIvararg_*.
+// Foi isso que faltava: o SWS registra API_CF_SetClipboard + APIvararg_CF_SetClipboard.
+static void* VS_Hook_SetClipboard_vararg(void** arglist, int numparms)
+{
+  const char* value = "";
+  if (arglist && numparms > 0 && arglist[0]) value = static_cast<const char*>(arglist[0]);
+  VS_Hook_SetClipboard(value);
+  return nullptr;
 }
 
 static bool VS_Hook_GetClipboard(char* buf, int bufSize)
@@ -421,6 +427,7 @@ static bool registerClipboardApi()
 
   bool ok = true;
   ok = (plugin_register_ptr("API_VS_Hook_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard)) != 0) && ok;
+  ok = (plugin_register_ptr("APIvararg_VS_Hook_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard_vararg)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_SetClipboard", reinterpret_cast<void*>(g_apiDefSetClipboard)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_GetClipboard", reinterpret_cast<void*>(&VS_Hook_GetClipboard)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_GetClipboard", reinterpret_cast<void*>(g_apiDefGetClipboard)) != 0) && ok;
@@ -431,6 +438,7 @@ static bool registerClipboardApi()
   if (!plugin_getapi_ptr || plugin_getapi_ptr("CF_SetClipboard") == nullptr) {
     cfAliasOk = (plugin_register_ptr("API_CF_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard)) != 0);
     if (cfAliasOk) {
+      plugin_register_ptr("APIvararg_CF_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard_vararg));
       plugin_register_ptr("APIdef_CF_SetClipboard", reinterpret_cast<void*>(g_apiDefCFSetClipboard));
     }
   }
@@ -446,12 +454,14 @@ static void unregisterClipboardApi()
 
   if (g_state.cfSetClipboardAliasRegistered) {
     plugin_register_ptr("-APIdef_CF_SetClipboard", reinterpret_cast<void*>(g_apiDefCFSetClipboard));
+    plugin_register_ptr("-APIvararg_CF_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard_vararg));
     plugin_register_ptr("-API_CF_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard));
     g_state.cfSetClipboardAliasRegistered = false;
   }
   plugin_register_ptr("-APIdef_VS_Hook_GetClipboard", reinterpret_cast<void*>(g_apiDefGetClipboard));
   plugin_register_ptr("-API_VS_Hook_GetClipboard", reinterpret_cast<void*>(&VS_Hook_GetClipboard));
   plugin_register_ptr("-APIdef_VS_Hook_SetClipboard", reinterpret_cast<void*>(g_apiDefSetClipboard));
+  plugin_register_ptr("-APIvararg_VS_Hook_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard_vararg));
   plugin_register_ptr("-API_VS_Hook_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard));
   g_state.apiRegistered = false;
 }
