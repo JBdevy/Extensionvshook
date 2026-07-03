@@ -3663,6 +3663,7 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "play_start" && type != "play" && type != "play_stop" && type != "stop" &&
+      type != "play_stop_no_seek" && type != "transport_stop_no_seek" &&
       type != "play_toggle" && type != "director_play_button" && type != "play_button" &&
       type != "director_play_no_seek" && type != "director_stop_no_seek") {
     return false;
@@ -3685,7 +3686,8 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
   bool wantsPlay = false;
   bool wantsStop = false;
   if (type == "play_start" || type == "play" || type == "director_play_no_seek") wantsPlay = true;
-  if (type == "play_stop" || type == "stop" || type == "director_stop_no_seek") wantsStop = true;
+  if (type == "play_stop" || type == "stop" || type == "director_stop_no_seek" ||
+      type == "play_stop_no_seek" || type == "transport_stop_no_seek") wantsStop = true;
   if (desired == "true" || desired == "1" || desired == "play" || desired == "playing" || desired == "on") wantsPlay = true;
   if (desired == "false" || desired == "0" || desired == "stop" || desired == "stopped" || desired == "off") wantsStop = true;
   if (type == "play_toggle" || type == "director_play_button" || type == "play_button") {
@@ -3696,6 +3698,22 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
   }
 
   if (wantsStop && !wantsPlay) {
+    std::string stopNoSeekValue = nativeJsonExtractString(commandBody, "noSeek");
+    std::string stopTransportOnlyValue = nativeJsonExtractString(commandBody, "transportOnly");
+    std::string stopPreserveCursorValue = nativeJsonExtractString(commandBody, "preserveCursor");
+    std::string stopNoPositionValue = nativeJsonExtractString(commandBody, "noPosition");
+    std::string stopPreventFallbackZeroValue = nativeJsonExtractString(commandBody, "preventFallbackZero");
+    const bool stopNoSeek = (type == "director_stop_no_seek" || type == "play_stop_no_seek" || type == "transport_stop_no_seek" ||
+      nativeBoolFromText(stopNoSeekValue, false) || nativeBoolFromText(stopTransportOnlyValue, false) ||
+      nativeBoolFromText(stopPreserveCursorValue, false) || nativeBoolFromText(stopNoPositionValue, false) ||
+      nativeBoolFromText(stopPreventFallbackZeroValue, false));
+    const double editCursorBeforeStop = (stopNoSeek && GetCursorPositionEx_ptr) ? GetCursorPositionEx_ptr(project) : -1.0;
+
+    // FIX102: Stop no-seek vindo do Diretor/Bridge é transporte puro.
+    // A extensão não pode transformar ausência de alvo em id do comando nem em posição 0.
+    // O comando "id" do envelope HTTP é UUID do comando, não id de música.
+    // Também preserva o cursor de edição ao redor do Main_OnCommand(1016), porque o Stop
+    // do REAPER pode voltar o cursor para o início da reprodução dependendo das prefs.
     // FIX77: Stop no Diretor precisa deixar a seleção pronta para o próximo Play.
     // Se existe fila manual/auto, a seleção nativa vai para a música da fila antes
     // de limpar a fila. Sem fila, preserva a música parada como seleção.
@@ -3743,10 +3761,12 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
         }
       }
     }
-    if (stopSelectionId.empty()) {
+    if (stopSelectionId.empty() && !stopNoSeek) {
       stopSelectionId = nativeJsonExtractString(commandBody, "targetId");
       if (stopSelectionId.empty()) stopSelectionId = nativeJsonExtractString(commandBody, "songId");
-      if (stopSelectionId.empty()) stopSelectionId = nativeJsonExtractString(commandBody, "id");
+      if (stopSelectionId.empty()) stopSelectionId = nativeJsonExtractString(commandBody, "selectedPlaylistSongId");
+      if (stopSelectionId.empty()) stopSelectionId = nativeJsonExtractString(commandBody, "selectedRegionId");
+      // Não usar "id" aqui: em comando nativo ele é o id do comando, não da música.
     }
     if (stopSelectionTab != "regions") stopSelectionTab = "playlist";
 
@@ -3756,6 +3776,9 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
     }
 
     Main_OnCommand_ptr(1016, 0); // Transport: Stop
+    if (stopNoSeek && SetEditCurPos2_ptr && editCursorBeforeStop >= 0.0) {
+      SetEditCurPos2_ptr(project, editCursorBeforeStop, false, false);
+    }
 
     double finalSelectionStart = stopStartPos;
     double finalSelectionEnd = stopEndPos;
@@ -3772,7 +3795,7 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
           finalSelectionStart = selectedSong->start;
           finalSelectionEnd = selectedSong->end;
           hasFinalSelection = true;
-        } else {
+        } else if (!stopNoSeek || stopStartPos > 0.0 || stopEndPos > 0.0) {
           g_nativeSelectedId = stopSelectionId;
           g_nativeSelectedTab = stopSelectionTab;
           g_nativeSelectedStart = stopStartPos;
@@ -3786,7 +3809,7 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
       nativeCancelQueueHandoffProtectionLocked();
     }
 
-    if (hasFinalSelection && SetEditCurPos2_ptr && finalSelectionStart >= 0.0) {
+    if (!stopNoSeek && hasFinalSelection && SetEditCurPos2_ptr && finalSelectionStart >= 0.0) {
       SetEditCurPos2_ptr(project, finalSelectionStart, true, false);
     }
     if (UpdateArrange_ptr) UpdateArrange_ptr();
