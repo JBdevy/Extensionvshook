@@ -2053,6 +2053,48 @@ static std::string nativeBuildRegionsJson(const std::vector<NativeSongWindow>& s
   return oss.str();
 }
 
+static double nativeRawDurationSec(const NativeSongWindow& item)
+{
+  return std::max(0.0, item.end - item.start);
+}
+
+static double nativeComputeRegionsTotalSec(const std::vector<NativeSongWindow>& songs)
+{
+  double total = 0.0;
+  for (const auto& s : songs) {
+    if (s.isBlock || s.isHashChild) continue;
+    total += nativeRawDurationSec(s);
+  }
+  return total;
+}
+
+static double nativeComputePlaylistTotalSec(const std::vector<NativeSongWindow>& items)
+{
+  double total = 0.0;
+  std::string activeParentId;
+  for (const auto& item : items) {
+    if (item.isBlock) {
+      activeParentId.clear();
+      continue;
+    }
+    if (item.isHashParent) {
+      activeParentId = item.id;
+      total += nativeRawDurationSec(item);
+      continue;
+    }
+    if (item.isHashChild) {
+      if (item.parentId.empty() || item.parentId != activeParentId) {
+        activeParentId.clear();
+        total += nativeRawDurationSec(item);
+      }
+      continue;
+    }
+    activeParentId.clear();
+    total += nativeRawDurationSec(item);
+  }
+  return total;
+}
+
 static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vector<NativeSongWindow>& projectSongs, int& activePlaylistIndexOut, std::string& activePlaylistNameOut, std::vector<NativeSongWindow>* activeItemsOut = nullptr)
 {
   activePlaylistIndexOut = 1;
@@ -2775,10 +2817,12 @@ static void nativeRebuildState(bool forceSnapshot)
   g_nativeCurrentPlayPosition = playPos;
 
   const std::string regionsJson = nativeBuildRegionsJson(songs);
+  const double regionsTotalSec = nativeComputeRegionsTotalSec(songs);
   int activePlaylistIndex = 1;
   std::string activePlaylistName = "Músicas";
   std::vector<NativeSongWindow> activePlaylistItems;
   const std::string playlistsJson = nativeBuildPlaylistsJson(activeProject, songs, activePlaylistIndex, activePlaylistName, &activePlaylistItems);
+  const double activePlaylistTotalSec = nativeComputePlaylistTotalSec(activePlaylistItems);
   nativeMaintainQueueAutomation(activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems);
   const std::string mixerJson = nativeBuildMixerJson(activeProject);
   const std::string premixJson = nativeBuildPremixJson(activeProject, songs);
@@ -3003,6 +3047,15 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"activePlaylistName\":" << nativeJsonString(activePlaylistName) << ",";
   json << "\"activePlaylistId\":" << nativeJsonString(std::to_string(activePlaylistIndex)) << ",";
   json << "\"currentPlaylistIndex\":" << activePlaylistIndex << ",";
+  json << "\"activePlaylistTotalSec\":" << nativeNumber(activePlaylistTotalSec) << ",";
+  json << "\"currentPlaylistTotalSec\":" << nativeNumber(activePlaylistTotalSec) << ",";
+  json << "\"playlistTotalSec\":" << nativeNumber(activePlaylistTotalSec) << ",";
+  json << "\"totalPlaylistSec\":" << nativeNumber(activePlaylistTotalSec) << ",";
+  json << "\"regionsTotalSec\":" << nativeNumber(regionsTotalSec) << ",";
+  json << "\"totalRegionsSec\":" << nativeNumber(regionsTotalSec) << ",";
+  json << "\"musicasTotalSec\":" << nativeNumber(regionsTotalSec) << ",";
+  json << "\"totalMusicasSec\":" << nativeNumber(regionsTotalSec) << ",";
+
   json << "\"playing\":" << (playing && !playingId.empty() ? "true" : "false") << ",";
   json << "\"isPlaying\":" << (playing && !playingId.empty() ? "true" : "false") << ",";
   json << "\"transportPlaying\":" << (playing ? "true" : "false") << ",";
