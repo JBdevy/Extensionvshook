@@ -1193,6 +1193,59 @@ static std::string nativeNumber(double v, int precision = 6)
   return oss.str();
 }
 
+
+static bool nativeParseDouble(const std::string& raw, double& out)
+{
+  const std::string value = nativeTrim(raw);
+  if (value.empty() || value == "null") return false;
+  char* end = nullptr;
+  const double parsed = std::strtod(value.c_str(), &end);
+  if (end == value.c_str()) return false;
+  while (end && *end) {
+    if (*end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') return false;
+    ++end;
+  }
+  if (!std::isfinite(parsed)) return false;
+  out = parsed;
+  return true;
+}
+
+static std::string nativeNumberFromJsonText(const std::string& raw, double fallback = 0.0, int precision = 6)
+{
+  double value = fallback;
+  nativeParseDouble(raw, value);
+  return nativeNumber(value, precision);
+}
+
+static std::string nativeNormalizeTimerMode(std::string mode)
+{
+  mode = nativeTrim(mode);
+  std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+  if (mode == "local_time" || mode == "localtime" || mode == "local" ||
+      mode == "horario_local" || mode == "hora_local" || mode == "clock" || mode == "relogio") {
+    return "local_time";
+  }
+  if (mode == "countdown" || mode == "regressive" || mode == "regressivo" || mode == "down") {
+    return "countdown";
+  }
+  return "progressive";
+}
+
+static std::string nativeFormatTimerTextFromSeconds(double seconds)
+{
+  if (!std::isfinite(seconds) || seconds < 0.0) seconds = 0.0;
+  int total = static_cast<int>(std::floor(seconds + 0.0001));
+  const int maxTotal = (99 * 3600) + (59 * 60) + 59;
+  if (total > maxTotal) total = maxTotal;
+  const int h = total / 3600;
+  const int m = (total % 3600) / 60;
+  const int s = total % 60;
+  char buf[16] = "";
+  std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+  return std::string(buf);
+}
+
+
 static std::string nativeHexByte(double value)
 {
   int n = static_cast<int>(std::round(std::max(0.0, std::min(1.0, value)) * 255.0));
@@ -2803,6 +2856,34 @@ static void nativeRebuildState(bool forceSnapshot)
   std::string luaQueuedEndPos = nativeJsonExtractString(luaLiveRaw, "queuedEndPos");
   if (luaQueuedEndPos == "null") luaQueuedEndPos.clear();
 
+  std::string luaTimerRunning = nativeJsonExtractString(luaLiveRaw, "timerRunning");
+  if (luaTimerRunning.empty()) luaTimerRunning = nativeJsonExtractString(luaLiveRaw, "timerActive");
+  if (luaTimerRunning.empty()) luaTimerRunning = nativeJsonExtractString(luaLiveRaw, "timerEnabled");
+  std::string luaTimerMode = nativeNormalizeTimerMode(nativeJsonExtractString(luaLiveRaw, "timerMode"));
+  std::string luaTimerType = nativeNormalizeTimerMode(nativeJsonExtractString(luaLiveRaw, "timerType"));
+  if (luaTimerMode == "progressive" && luaTimerType != "progressive") luaTimerMode = luaTimerType;
+  if (luaTimerType == "progressive" && luaTimerMode != "progressive") luaTimerType = luaTimerMode;
+  std::string luaTimerStartedAt = nativeJsonExtractString(luaLiveRaw, "timerStartedAt");
+  std::string luaTimerStartedAtMs = nativeJsonExtractString(luaLiveRaw, "timerStartedAtMs");
+  if (luaTimerStartedAt.empty()) luaTimerStartedAt = luaTimerStartedAtMs;
+  if (luaTimerStartedAtMs.empty()) luaTimerStartedAtMs = luaTimerStartedAt;
+  std::string luaTimerAccumulatedSec = nativeJsonExtractString(luaLiveRaw, "timerAccumulatedSec");
+  std::string luaTimerTargetSec = nativeJsonExtractString(luaLiveRaw, "timerTargetSec");
+  if (luaTimerTargetSec.empty()) luaTimerTargetSec = nativeJsonExtractString(luaLiveRaw, "timerCountdownStartSec");
+  std::string luaTimerElapsedSec = nativeJsonExtractString(luaLiveRaw, "timerElapsedSec");
+  std::string luaTimerDisplaySec = nativeJsonExtractString(luaLiveRaw, "timerDisplaySec");
+  if (luaTimerDisplaySec.empty()) luaTimerDisplaySec = luaTimerElapsedSec;
+  std::string luaTimerDisplayText = nativeJsonExtractString(luaLiveRaw, "timerDisplayText");
+  if (luaTimerDisplayText.empty()) luaTimerDisplayText = nativeJsonExtractString(luaLiveRaw, "timerText");
+  std::string luaTimerLocalTimeText = nativeJsonExtractString(luaLiveRaw, "timerLocalTimeText");
+  if (luaTimerLocalTimeText.empty() && luaTimerMode == "local_time") luaTimerLocalTimeText = luaTimerDisplayText;
+
+  double luaTimerDisplaySecValue = 0.0;
+  nativeParseDouble(luaTimerDisplaySec, luaTimerDisplaySecValue);
+  if (luaTimerDisplayText.empty()) luaTimerDisplayText = nativeFormatTimerTextFromSeconds(luaTimerDisplaySecValue);
+  if (luaTimerMode == "local_time" && !luaTimerLocalTimeText.empty()) luaTimerDisplayText = luaTimerLocalTimeText;
+  const bool luaTimerIsRunning = nativeBoolFromText(luaTimerRunning, false);
+
   std::string queuedSongId;
   std::string queuedPlaylistSongId;
   int queuedRegionNumber = 0;
@@ -2948,6 +3029,35 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"remainingSec\":" << nativeNumber(remaining) << ",";
   json << "\"currentSongProgress\":" << nativeNumber(progress, 6) << ",";
   json << "\"autoplayEnabled\":" << (autoplayEnabled ? "true" : "false") << ",";
+  json << "\"timerRunning\":" << (luaTimerIsRunning ? "true" : "false") << ",";
+  json << "\"timerActive\":" << (luaTimerIsRunning ? "true" : "false") << ",";
+  json << "\"timerEnabled\":" << (luaTimerIsRunning ? "true" : "false") << ",";
+  json << "\"timerMode\":" << nativeJsonString(luaTimerMode) << ",";
+  json << "\"timerType\":" << nativeJsonString(luaTimerMode) << ",";
+  json << "\"timerStartedAt\":" << nativeNumberFromJsonText(luaTimerStartedAt, 0.0) << ",";
+  json << "\"timerStartedAtMs\":" << nativeNumberFromJsonText(luaTimerStartedAtMs, 0.0) << ",";
+  json << "\"timerAccumulatedSec\":" << nativeNumberFromJsonText(luaTimerAccumulatedSec, 0.0) << ",";
+  json << "\"timerTargetSec\":" << nativeNumberFromJsonText(luaTimerTargetSec, 0.0) << ",";
+  json << "\"timerCountdownStartSec\":" << nativeNumberFromJsonText(luaTimerTargetSec, 0.0) << ",";
+  json << "\"timerElapsedSec\":" << nativeNumberFromJsonText(luaTimerElapsedSec, luaTimerDisplaySecValue) << ",";
+  json << "\"timerDisplaySec\":" << nativeNumberFromJsonText(luaTimerDisplaySec, luaTimerDisplaySecValue) << ",";
+  json << "\"timerDisplayText\":" << nativeJsonString(luaTimerDisplayText) << ",";
+  json << "\"timerText\":" << nativeJsonString(luaTimerDisplayText) << ",";
+  json << "\"timerLocalTimeText\":" << nativeJsonString(luaTimerLocalTimeText) << ",";
+  json << "\"timer\":{";
+  json << "\"running\":" << (luaTimerIsRunning ? "true" : "false") << ",";
+  json << "\"active\":" << (luaTimerIsRunning ? "true" : "false") << ",";
+  json << "\"mode\":" << nativeJsonString(luaTimerMode) << ",";
+  json << "\"type\":" << nativeJsonString(luaTimerMode) << ",";
+  json << "\"startedAt\":" << nativeNumberFromJsonText(luaTimerStartedAt, 0.0) << ",";
+  json << "\"startedAtMs\":" << nativeNumberFromJsonText(luaTimerStartedAtMs, 0.0) << ",";
+  json << "\"accumulatedSec\":" << nativeNumberFromJsonText(luaTimerAccumulatedSec, 0.0) << ",";
+  json << "\"targetSec\":" << nativeNumberFromJsonText(luaTimerTargetSec, 0.0) << ",";
+  json << "\"elapsedSec\":" << nativeNumberFromJsonText(luaTimerElapsedSec, luaTimerDisplaySecValue) << ",";
+  json << "\"displaySec\":" << nativeNumberFromJsonText(luaTimerDisplaySec, luaTimerDisplaySecValue) << ",";
+  json << "\"displayText\":" << nativeJsonString(luaTimerDisplayText) << ",";
+  json << "\"localTimeText\":" << nativeJsonString(luaTimerLocalTimeText);
+  json << "},";
   json << "\"autoBlocoEnabled\":" << (autoBlocoEnabled ? "true" : "false") << ",";
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
