@@ -34,6 +34,12 @@
   #include <unistd.h>
 #endif
 
+#ifndef _WIN32
+// Igual ao wrapper do SWS: em SWELL, CF_TEXT precisa usar o formato registrado.
+#undef CF_TEXT
+#define CF_TEXT RegisterClipboardFormat("SWELL__CF_TEXT")
+#endif
+
 namespace vshook {
 
 using plugin_register_t = int (*)(const char*, void*);
@@ -238,6 +244,7 @@ struct State {
   bool menuHookRegistered = false;
   bool timerRegistered = false;
   bool apiRegistered = false;
+  bool cfSetClipboardAliasRegistered = false;
   int startupTimerTicks = 0;
   int projectStableTicks = 0;
   bool didGlobalStartupAutoOpen = false;
@@ -312,33 +319,34 @@ static std::string wideToUtf8Fallback(const void* data)
 
 static void VS_Hook_SetClipboard(const char* text)
 {
-  const char* value = text ? text : "";
+  const char* buf = text ? text : "";
 
 #ifdef _WIN32
-  const int length = MultiByteToWideChar(CP_UTF8, 0, value, -1, nullptr, 0);
+  const int length = MultiByteToWideChar(CP_UTF8, 0, buf, -1, nullptr, 0);
   if (length <= 0) return;
   const size_t size = static_cast<size_t>(length) * sizeof(wchar_t);
 #else
-  const size_t size = std::strlen(value) + 1;
+  const size_t size = std::strlen(buf) + 1;
 #endif
 
   HANDLE mem = GlobalAlloc(GMEM_MOVEABLE, size);
   if (!mem) return;
 
+  void* locked = GlobalLock(mem);
+  if (!locked) {
+    GlobalFree(mem);
+    return;
+  }
+
 #ifdef _WIN32
-  void* locked = GlobalLock(mem);
-  if (!locked) { GlobalFree(mem); return; }
-  MultiByteToWideChar(CP_UTF8, 0, value, -1, static_cast<wchar_t*>(locked), length);
+  MultiByteToWideChar(CP_UTF8, 0, buf, -1, static_cast<wchar_t*>(locked), length);
 #else
-  void* locked = GlobalLock(mem);
-  if (!locked) { GlobalFree(mem); return; }
-  std::memcpy(locked, value, size);
+  std::memcpy(locked, buf, size);
 #endif
   GlobalUnlock(mem);
 
-  // Mesmo padrão do SWS CF_SetClipboard: HWND principal do REAPER, EmptyClipboard e SetClipboardData direto.
-  HWND hwnd = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
-  OpenClipboard(hwnd);
+  // Mesma lógica do SWS CF_SetClipboard: janela principal do REAPER e SetClipboardData direto.
+  OpenClipboard(GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr);
   EmptyClipboard();
 #ifdef _WIN32
   SetClipboardData(CF_UNICODETEXT, mem);
@@ -404,6 +412,9 @@ static char g_apiDefSetClipboard[] =
 static char g_apiDefGetClipboard[] =
   "bool\0char*,int\0textOutNeedBig,textOutNeedBig_sz\0Read text from the system clipboard using the VS Hook extension.";
 
+static char g_apiDefCFSetClipboard[] =
+  "void\0const char*\0str\0Write the given string into the system clipboard.";
+
 static bool registerClipboardApi()
 {
   if (!plugin_register_ptr) return false;
@@ -414,6 +425,17 @@ static bool registerClipboardApi()
   ok = (plugin_register_ptr("API_VS_Hook_GetClipboard", reinterpret_cast<void*>(&VS_Hook_GetClipboard)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_GetClipboard", reinterpret_cast<void*>(g_apiDefGetClipboard)) != 0) && ok;
 
+  // Alias compatível com SWS. Se o SWS já existir, não derruba o registro principal do VS Hook.
+  // Isso permite que Lua antigo que chama reaper.CF_SetClipboard use a nossa implementação.
+  bool cfAliasOk = false;
+  if (!plugin_getapi_ptr || plugin_getapi_ptr("CF_SetClipboard") == nullptr) {
+    cfAliasOk = (plugin_register_ptr("API_CF_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard)) != 0);
+    if (cfAliasOk) {
+      plugin_register_ptr("APIdef_CF_SetClipboard", reinterpret_cast<void*>(g_apiDefCFSetClipboard));
+    }
+  }
+  g_state.cfSetClipboardAliasRegistered = cfAliasOk;
+
   g_state.apiRegistered = ok;
   return ok;
 }
@@ -422,6 +444,11 @@ static void unregisterClipboardApi()
 {
   if (!plugin_register_ptr || !g_state.apiRegistered) return;
 
+  if (g_state.cfSetClipboardAliasRegistered) {
+    plugin_register_ptr("-APIdef_CF_SetClipboard", reinterpret_cast<void*>(g_apiDefCFSetClipboard));
+    plugin_register_ptr("-API_CF_SetClipboard", reinterpret_cast<void*>(&VS_Hook_SetClipboard));
+    g_state.cfSetClipboardAliasRegistered = false;
+  }
   plugin_register_ptr("-APIdef_VS_Hook_GetClipboard", reinterpret_cast<void*>(g_apiDefGetClipboard));
   plugin_register_ptr("-API_VS_Hook_GetClipboard", reinterpret_cast<void*>(&VS_Hook_GetClipboard));
   plugin_register_ptr("-APIdef_VS_Hook_SetClipboard", reinterpret_cast<void*>(g_apiDefSetClipboard));
