@@ -41,8 +41,3 @@ Build macOS corrigido:
 - x86_64 e compilado com deployment target 10.13 para clientes macOS 10.x Intel.
 - arm64 e compilado com deployment target 11.0 para Apple Silicon.
 - O universal final e criado com lipo, seguindo a mesma ideia da SWS: target por arquitetura antes de juntar.
-
-Atualizacao clipboard:
-- VS_Hook_SetClipboard agora usa o mesmo modelo do SWS/CF_SetClipboard:
-  OpenClipboard(GetMainHwnd()), CF_UNICODETEXT no Windows e CF_TEXT via SWELL no macOS.
-- API Lua mantida: reaper.VS_Hook_SetClipboard(text).

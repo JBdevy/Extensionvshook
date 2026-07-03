@@ -310,82 +310,42 @@ static std::string wideToUtf8Fallback(const void* data)
 }
 #endif
 
-static HWND getReaperMainHwndForClipboard()
-{
-  return GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
-}
-
-static bool VS_Hook_SetClipboard(const char* text)
+static void VS_Hook_SetClipboard(const char* text)
 {
   const char* value = text ? text : "";
 
 #ifdef _WIN32
-  // Mesmo caminho do SWS/CF_SetClipboard: UTF-8 -> CF_UNICODETEXT e
-  // OpenClipboard usando o HWND principal do REAPER.
-  int length = MultiByteToWideChar(CP_UTF8, 0, value, -1, nullptr, 0);
-  UINT codepage = CP_UTF8;
-  if (length <= 0) {
-    codepage = CP_ACP;
-    length = MultiByteToWideChar(codepage, 0, value, -1, nullptr, 0);
-  }
-  if (length <= 0) return false;
-
-  const size_t bytes = static_cast<size_t>(length) * sizeof(wchar_t);
-  HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-  if (!mem) return false;
-
-  void* locked = GlobalLock(mem);
-  if (!locked) {
-    GlobalFree(mem);
-    return false;
-  }
-
-  MultiByteToWideChar(codepage, 0, value, -1, static_cast<wchar_t*>(locked), length);
-  GlobalUnlock(mem);
-
-  if (!OpenClipboard(getReaperMainHwndForClipboard())) {
-    GlobalFree(mem);
-    return false;
-  }
-
-  bool ok = false;
-  EmptyClipboard();
-  if (SetClipboardData(CF_UNICODETEXT, mem)) {
-    // O clipboard assume a posse do HGLOBAL quando SetClipboardData tem sucesso.
-    mem = nullptr;
-    ok = true;
-  }
-  CloseClipboard();
-  if (mem) GlobalFree(mem);
-  return ok;
+  const int length = MultiByteToWideChar(CP_UTF8, 0, value, -1, nullptr, 0);
+  if (length <= 0) return;
+  const size_t size = static_cast<size_t>(length) * sizeof(wchar_t);
 #else
-  // Mesmo caminho do SWS no SWELL: UTF-8 bruto em CF_TEXT com owner do REAPER.
-  const size_t bytes = std::strlen(value) + 1;
-  HANDLE mem = GlobalAlloc(GMEM_MOVEABLE, static_cast<int>(bytes));
-  if (!mem) return false;
+  const size_t size = std::strlen(value) + 1;
+#endif
 
+  HANDLE mem = GlobalAlloc(GMEM_MOVEABLE, size);
+  if (!mem) return;
+
+#ifdef _WIN32
   void* locked = GlobalLock(mem);
-  if (!locked) {
-    GlobalFree(mem);
-    return false;
-  }
-
-  std::memcpy(locked, value, bytes);
+  if (!locked) { GlobalFree(mem); return; }
+  MultiByteToWideChar(CP_UTF8, 0, value, -1, static_cast<wchar_t*>(locked), length);
+#else
+  void* locked = GlobalLock(mem);
+  if (!locked) { GlobalFree(mem); return; }
+  std::memcpy(locked, value, size);
+#endif
   GlobalUnlock(mem);
 
-  if (!OpenClipboard(getReaperMainHwndForClipboard())) {
-    GlobalFree(mem);
-    return false;
-  }
-
+  // Mesmo padrão do SWS CF_SetClipboard: HWND principal do REAPER, EmptyClipboard e SetClipboardData direto.
+  HWND hwnd = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
+  OpenClipboard(hwnd);
   EmptyClipboard();
+#ifdef _WIN32
+  SetClipboardData(CF_UNICODETEXT, mem);
+#else
   SetClipboardData(CF_TEXT, mem);
-  // No SWELL, SetClipboardData pode ser void. Segue o mesmo padrao do SWS.
-  mem = nullptr;
-  CloseClipboard();
-  if (mem) GlobalFree(mem);
-  return true;
 #endif
+  CloseClipboard();
 }
 
 static bool VS_Hook_GetClipboard(char* buf, int bufSize)
@@ -393,7 +353,7 @@ static bool VS_Hook_GetClipboard(char* buf, int bufSize)
   if (!buf || bufSize <= 0) return false;
   buf[0] = '\0';
 
-  if (!OpenClipboard(getReaperMainHwndForClipboard())) return false;
+  if (!OpenClipboard(nullptr)) return false;
 
 #ifdef _WIN32
   HANDLE mem = GetClipboardData(CF_UNICODETEXT);
@@ -439,7 +399,7 @@ static bool VS_Hook_GetClipboard(char* buf, int bufSize)
 }
 
 static char g_apiDefSetClipboard[] =
-  "bool\0const char*\0text\0Write text into the system clipboard using the VS Hook extension.";
+  "void\0const char*\0text\0Write text into the system clipboard using the VS Hook extension.";
 
 static char g_apiDefGetClipboard[] =
   "bool\0char*,int\0textOutNeedBig,textOutNeedBig_sz\0Read text from the system clipboard using the VS Hook extension.";
