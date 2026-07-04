@@ -54,10 +54,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /mnt/data/fix66/VSHookwinmac/extension
+CMAKE_SOURCE_DIR = /mnt/data/fix_safe_appativo/VSHookwinmac/extension
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /mnt/data/fix66/VSHookwinmac/extension/build
+CMAKE_BINARY_DIR = /mnt/data/fix_safe_appativo/VSHookwinmac/extension/build
 
 #=============================================================================
 # Directory level rules for the build root directory
@@ -85,14 +85,14 @@ clean: CMakeFiles/reaper_vshook.dir/clean
 CMakeFiles/reaper_vshook.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/reaper_vshook.dir/build.make CMakeFiles/reaper_vshook.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/reaper_vshook.dir/build.make CMakeFiles/reaper_vshook.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/mnt/data/fix66/VSHookwinmac/extension/build/CMakeFiles --progress-num=1,2 "Built target reaper_vshook"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/mnt/data/fix_safe_appativo/VSHookwinmac/extension/build/CMakeFiles --progress-num=1,2 "Built target reaper_vshook"
 .PHONY : CMakeFiles/reaper_vshook.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/reaper_vshook.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/data/fix66/VSHookwinmac/extension/build/CMakeFiles 2
+	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/data/fix_safe_appativo/VSHookwinmac/extension/build/CMakeFiles 2
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/reaper_vshook.dir/all
-	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/data/fix66/VSHookwinmac/extension/build/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/data/fix_safe_appativo/VSHookwinmac/extension/build/CMakeFiles 0
 .PHONY : CMakeFiles/reaper_vshook.dir/rule
 
 # Convenience name for target.
@@ -102,7 +102,7 @@ reaper_vshook: CMakeFiles/reaper_vshook.dir/rule
 # codegen rule for target.
 CMakeFiles/reaper_vshook.dir/codegen:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/reaper_vshook.dir/build.make CMakeFiles/reaper_vshook.dir/codegen
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/mnt/data/fix66/VSHookwinmac/extension/build/CMakeFiles --progress-num=1,2 "Finished codegen for target reaper_vshook"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/mnt/data/fix_safe_appativo/VSHookwinmac/extension/build/CMakeFiles --progress-num=1,2 "Finished codegen for target reaper_vshook"
 .PHONY : CMakeFiles/reaper_vshook.dir/codegen
 
 # clean rule for target.

@@ -263,6 +263,11 @@ struct State {
   bool pcAccessOverride = false;
 } g_state;
 
+// APP ATIVO: nunca executar Main_OnCommand/AddRemoveReaScript a partir da thread HTTP.
+// O app apenas pede a troca; o timer da extensao aplica na thread principal do REAPER.
+static std::atomic<bool> g_appActiveOpenRequested{false};
+static std::chrono::steady_clock::time_point g_lastAppActiveTransition;
+
 static AutoOpenEntry g_autoOpenEntries[] = {
   {
     { 0, "VSHOOKAUTOBETA", "Iniciar VS Hook Beta junto com o REAPER", nullptr },
@@ -712,8 +717,20 @@ static std::string detectRunningVsHookMode()
 
 static void openAppActiveScreenForDirector()
 {
+  // Esta funcao so pode rodar na thread principal do REAPER.
+  // O handler HTTP deve chamar requestAppActiveScreenForDirector(), nao esta funcao.
   if (g_state.pcAccessOverride) return;
-  if (g_state.appActiveScreenOpen) return;
+
+  const auto now = std::chrono::steady_clock::now();
+  if (g_lastAppActiveTransition.time_since_epoch().count() != 0 &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastAppActiveTransition).count() < 2500) {
+    return;
+  }
+
+  ScriptEntry* appActiveScript = findScriptByAutoOpenModeAny("app_active");
+  if (!appActiveScript) return;
+
+  if (g_state.appActiveScreenOpen && isScriptRunning(*appActiveScript)) return;
 
   const std::string runningMode = detectRunningVsHookMode();
   if (!runningMode.empty()) {
@@ -722,13 +739,23 @@ static void openAppActiveScreenForDirector()
     g_state.modeBeforeDirectorApp = g_state.lastLaunchedMode;
   }
 
-  ScriptEntry* appActiveScript = findScriptByAutoOpenModeAny("app_active");
-  if (!appActiveScript) return;
-
   // runScript fecha Beta/Estable antes de abrir APP ATIVO porque todos os scripts
   // fazem parte de g_scripts. Isso evita duas janelas GFX pesadas ao mesmo tempo.
   runScript(*appActiveScript, false);
   g_state.appActiveScreenOpen = true;
+  g_lastAppActiveTransition = now;
+}
+
+static void requestAppActiveScreenForDirector()
+{
+  // Thread-safe: pode ser chamado pelo servidor HTTP. Nao chama nenhuma API do REAPER.
+  g_appActiveOpenRequested.store(true);
+}
+
+static void processAppActiveScreenRequestsOnMainThread()
+{
+  if (!g_appActiveOpenRequested.exchange(false)) return;
+  openAppActiveScreenForDirector();
 }
 
 static void requestDirectorLogoutFromPcResume()
@@ -762,6 +789,7 @@ static bool resumePcAccessFromAppActiveScreen()
   if (!target) return false;
 
   runScript(*target, false);
+  g_lastAppActiveTransition = std::chrono::steady_clock::now();
   return true;
 }
 
@@ -1200,6 +1228,7 @@ static std::chrono::steady_clock::time_point g_nativeLastLiveBuild;
 static std::chrono::steady_clock::time_point g_nativeLastSnapshotBuild;
 static bool g_nativeWinsockStarted = false;
 static std::atomic<bool> g_nativeForceStateBuild{false};
+
 
 static std::string nativeJsonEscape(const std::string& value)
 {
@@ -4464,7 +4493,7 @@ static void nativeHandleClient(native_socket_t client)
             SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "1", false);
             SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
           }
-          openAppActiveScreenForDirector();
+          requestAppActiveScreenForDirector();
         } else if (SetExtState_ptr) {
           SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "0", false);
           SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
@@ -4618,6 +4647,7 @@ static void stopNativeBridgeServer()
 static void startupTimer()
 {
   nativeBridgeTick();
+  processAppActiveScreenRequestsOnMainThread();
   ++g_state.startupTimerTicks;
 
   const std::string projectSignature = getCurrentProjectSignature();
@@ -4869,6 +4899,7 @@ static void shutdown()
   g_state.autoOpenedProjectSignature.clear();
   g_state.lastLaunchedMode.clear();
   g_state.modeBeforeDirectorApp.clear();
+  g_appActiveOpenRequested.store(false);
   g_state.appActiveScreenOpen = false;
   g_state.pcAccessOverride = false;
   g_state.initialized = false;

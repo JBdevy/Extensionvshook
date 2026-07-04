@@ -1,4 +1,4 @@
-# Install script for directory: /mnt/data/fix66/VSHookwinmac/extension
+# Install script for directory: /mnt/data/fix_safe_appativo/VSHookwinmac/extension
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -45,7 +45,7 @@ endif()
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
 if(CMAKE_INSTALL_LOCAL_ONLY)
-  file(WRITE "/mnt/data/fix66/VSHookwinmac/extension/build/install_local_manifest.txt"
+  file(WRITE "/mnt/data/fix_safe_appativo/VSHookwinmac/extension/build/install_local_manifest.txt"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")
 endif()
 if(CMAKE_INSTALL_COMPONENT)
@@ -61,6 +61,6 @@ else()
 endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
-  file(WRITE "/mnt/data/fix66/VSHookwinmac/extension/build/${CMAKE_INSTALL_MANIFEST}"
+  file(WRITE "/mnt/data/fix_safe_appativo/VSHookwinmac/extension/build/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")
 endif()

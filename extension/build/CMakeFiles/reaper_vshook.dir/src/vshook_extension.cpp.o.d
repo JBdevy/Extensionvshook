@@ -1,9 +1,9 @@
 CMakeFiles/reaper_vshook.dir/src/vshook_extension.cpp.o: \
- /mnt/data/fix66/VSHookwinmac/extension/src/vshook_extension.cpp \
+ /mnt/data/fix_safe_appativo/VSHookwinmac/extension/src/vshook_extension.cpp \
  /usr/include/stdc-predef.h \
- /mnt/data/fix66/VSHookwinmac/extension/sdk/reaper_plugin.h \
- /mnt/data/fix66/VSHookwinmac/extension/sdk/../WDL/swell/swell.h \
- /mnt/data/fix66/VSHookwinmac/extension/sdk/../WDL/swell/swell-types.h \
+ /mnt/data/fix_safe_appativo/VSHookwinmac/extension/sdk/reaper_plugin.h \
+ /mnt/data/fix_safe_appativo/VSHookwinmac/extension/sdk/../WDL/swell/swell.h \
+ /mnt/data/fix_safe_appativo/VSHookwinmac/extension/sdk/../WDL/swell/swell-types.h \
  /usr/include/c++/14/stdlib.h /usr/include/c++/14/cstdlib \
  /usr/include/x86_64-linux-gnu/c++/14/bits/c++config.h \
  /usr/include/x86_64-linux-gnu/c++/14/bits/os_defines.h \
@@ -89,7 +89,7 @@ CMakeFiles/reaper_vshook.dir/src/vshook_extension.cpp.o: \
  /usr/include/x86_64-linux-gnu/bits/wchar.h \
  /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
  /usr/include/x86_64-linux-gnu/bits/stdint-least.h \
- /mnt/data/fix66/VSHookwinmac/extension/sdk/../WDL/swell/swell-functions.h \
+ /mnt/data/fix_safe_appativo/VSHookwinmac/extension/sdk/../WDL/swell/swell-functions.h \
  /usr/include/pthread.h /usr/include/sched.h \
  /usr/include/x86_64-linux-gnu/bits/sched.h \
  /usr/include/linux/sched/types.h \
