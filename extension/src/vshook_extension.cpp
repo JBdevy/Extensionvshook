@@ -730,7 +730,15 @@ static void openAppActiveScreenForDirector()
   ScriptEntry* appActiveScript = findScriptByAutoOpenModeAny("app_active");
   if (!appActiveScript) return;
 
-  if (g_state.appActiveScreenOpen && isScriptRunning(*appActiveScript)) return;
+  // Nao confia apenas em GetToggleCommandStateEx para script defer/gfx:
+  // em alguns setups ele volta 0 mesmo com o APP ATIVO rodando.
+  // Se chamarmos Main_OnCommand de novo, o REAPER abre o popup
+  // "ReaScript task control". Portanto, depois que a extensao abriu
+  // o APP ATIVO, tratamos como aberto ate haver retomada/logout.
+  if (g_state.appActiveScreenOpen ||
+      (!g_state.lastLaunchedMode.empty() && g_state.lastLaunchedMode == "app_active")) {
+    return;
+  }
 
   const std::string runningMode = detectRunningVsHookMode();
   if (!runningMode.empty()) {
@@ -756,6 +764,31 @@ static void processAppActiveScreenRequestsOnMainThread()
 {
   if (!g_appActiveOpenRequested.exchange(false)) return;
   openAppActiveScreenForDirector();
+}
+
+static bool resumePcAccessFromAppActiveScreen();
+
+static void processPcResumeRequestFromAppActiveOnMainThread()
+{
+  // Fallback seguro para o botao Retomar Acesso no PC.
+  // O APP ATIVO.lua pode pedir a retomada por ExtState quando a API direta
+  // ainda nao estiver visivel no Lua. Essa leitura roda no timer da extensao,
+  // na thread principal do REAPER.
+  if (!GetExtState_ptr) return;
+
+  const char* raw = GetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "PC_RESUME_REQUEST_V1");
+  const std::string token = raw ? raw : "";
+  if (token.empty()) return;
+
+  static std::string s_lastPcResumeToken;
+  if (token == s_lastPcResumeToken) return;
+  s_lastPcResumeToken = token;
+
+  if (SetExtState_ptr) {
+    SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "PC_RESUME_REQUEST_V1", "", false);
+  }
+
+  resumePcAccessFromAppActiveScreen();
 }
 
 static void requestDirectorLogoutFromPcResume()
@@ -4647,6 +4680,7 @@ static void stopNativeBridgeServer()
 static void startupTimer()
 {
   nativeBridgeTick();
+  processPcResumeRequestFromAppActiveOnMainThread();
   processAppActiveScreenRequestsOnMainThread();
   ++g_state.startupTimerTicks;
 

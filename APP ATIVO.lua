@@ -90,11 +90,20 @@ end
 local function resume_pc_access()
   resume_requested = true
 
+  -- Caminho direto pela API da extensao, quando ela estiver visivel no Lua.
   if reaper and reaper.VS_Hook_Native_ResumePcAccess then
     local ok, result = pcall(reaper.VS_Hook_Native_ResumePcAccess)
     if ok and result then
       return true
     end
+  end
+
+  -- Fallback leve: o script nao tenta controlar o REAPER. Ele apenas deixa
+  -- um pedido para a extensao ler no timer dela, na thread principal.
+  if reaper and reaper.SetExtState then
+    local token = "pc_resume_" .. tostring(math.floor(now_time() * 1000))
+    reaper.SetExtState("VS_HOOK_NATIVE_BRIDGE", "PC_RESUME_REQUEST_V1", token, false)
+    return true
   end
 
   resume_requested = false
