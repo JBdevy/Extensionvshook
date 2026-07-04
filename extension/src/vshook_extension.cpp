@@ -233,6 +233,13 @@ static ScriptEntry g_scripts[] = {
     "VS Hook Estable.lua",
     "estable",
     true
+  },
+  {
+    { 0, "VSHOOKAPPACTIVE", "APP ATIVO", nullptr },
+    "APP ATIVO",
+    "APP ATIVO.lua",
+    "app_active",
+    false
   }
 };
 
@@ -251,6 +258,9 @@ struct State {
   std::string activeProjectSignature;
   std::string autoOpenedProjectSignature;
   std::string lastLaunchedMode;
+  std::string modeBeforeDirectorApp;
+  bool appActiveScreenOpen = false;
+  bool pcAccessOverride = false;
 } g_state;
 
 static AutoOpenEntry g_autoOpenEntries[] = {
@@ -573,6 +583,19 @@ static bool ensureScriptRegistered(ScriptEntry& script)
   return true;
 }
 
+
+static void registerScriptInActionListIfPresent(ScriptEntry& script)
+{
+  if (script.scriptCommandId != 0) return;
+  if (!AddRemoveReaScript_ptr) return;
+  if (!resolveScriptPath(script)) return;
+
+  const int commandId = AddRemoveReaScript_ptr(true, 0, script.scriptPath.c_str(), true);
+  if (commandId != 0) {
+    script.scriptCommandId = commandId;
+  }
+}
+
 static int getScriptToggleState(const ScriptEntry& script)
 {
   if (script.scriptCommandId == 0) return 0;
@@ -652,6 +675,94 @@ static void runScript(ScriptEntry& script, bool toggleIfAlreadyOpen = true)
       g_state.lastLaunchedMode = script.autoOpenMode;
     }
   }
+}
+
+
+static bool isVsHookRunMode(const std::string& mode)
+{
+  return mode == "beta" || mode == "estable";
+}
+
+static ScriptEntry* findScriptByAutoOpenModeAny(const char* mode)
+{
+  if (!mode || !*mode) return nullptr;
+  for (ScriptEntry& script : g_scripts) {
+    if (script.autoOpenMode && std::strcmp(script.autoOpenMode, mode) == 0) {
+      return &script;
+    }
+  }
+  return nullptr;
+}
+
+static std::string detectRunningVsHookMode()
+{
+  for (ScriptEntry& script : g_scripts) {
+    if (!script.autoOpenMode) continue;
+    const std::string mode = script.autoOpenMode;
+    if (!isVsHookRunMode(mode)) continue;
+    if (isScriptRunning(script)) return mode;
+  }
+
+  if (isVsHookRunMode(g_state.lastLaunchedMode)) {
+    return g_state.lastLaunchedMode;
+  }
+
+  return std::string();
+}
+
+static void openAppActiveScreenForDirector()
+{
+  if (g_state.pcAccessOverride) return;
+  if (g_state.appActiveScreenOpen) return;
+
+  const std::string runningMode = detectRunningVsHookMode();
+  if (!runningMode.empty()) {
+    g_state.modeBeforeDirectorApp = runningMode;
+  } else if (g_state.modeBeforeDirectorApp.empty() && isVsHookRunMode(g_state.lastLaunchedMode)) {
+    g_state.modeBeforeDirectorApp = g_state.lastLaunchedMode;
+  }
+
+  ScriptEntry* appActiveScript = findScriptByAutoOpenModeAny("app_active");
+  if (!appActiveScript) return;
+
+  // runScript fecha Beta/Estable antes de abrir APP ATIVO porque todos os scripts
+  // fazem parte de g_scripts. Isso evita duas janelas GFX pesadas ao mesmo tempo.
+  runScript(*appActiveScript, false);
+  g_state.appActiveScreenOpen = true;
+}
+
+static void requestDirectorLogoutFromPcResume()
+{
+  if (!SetExtState_ptr) return;
+
+  const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  const std::string token = std::string("pc_resume_") + std::to_string(static_cast<long long>(nowMs));
+
+  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "DIRECTOR_LOGOUT_REQUEST_V1", token.c_str(), false);
+  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "DIRECTOR_LOGOUT_REQUEST_AT_V1", std::to_string(static_cast<long long>(nowMs)).c_str(), false);
+  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "DIRECTOR_LOGOUT_COMMAND_V1", "director_force_logout", false);
+  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "DIRECTOR_LOGOUT_TARGET_V1", "director", false);
+  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "DIRECTOR_ACTIVE_V1", "0", false);
+  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
+}
+
+static bool resumePcAccessFromAppActiveScreen()
+{
+  g_state.pcAccessOverride = true;
+  g_state.appActiveScreenOpen = false;
+  requestDirectorLogoutFromPcResume();
+
+  std::string mode = g_state.modeBeforeDirectorApp;
+  if (!isVsHookRunMode(mode)) {
+    mode = isVsHookRunMode(g_state.lastLaunchedMode) ? g_state.lastLaunchedMode : std::string("estable");
+  }
+
+  ScriptEntry* target = findScriptByAutoOpenModeAny(mode.c_str());
+  if (!target) return false;
+
+  runScript(*target, false);
+  return true;
 }
 
 static ReaProject* getCurrentProject(char* pathOut, int pathOutSize);
@@ -989,6 +1100,7 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
       setMenuCommandChecked(hMenu, entry.commandId, projectAutoMode == entry.autoOpenMode);
     }
     for (ScriptEntry& script : g_scripts) {
+      if (!script.showInExtensionsMenu) continue;
       setMenuCommandChecked(hMenu, script.commandId, script.commandId != 0 && isScriptRunning(script));
     }
     setMenuCommandChecked(hMenu, g_transportProtectionCommandId, getTransportProtectionEnabled());
@@ -2872,8 +2984,6 @@ static void nativeRebuildState(bool forceSnapshot)
   if (SetExtState_ptr) {
     SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", appActive ? "1" : "0", false);
     SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
-    SetExtState_ptr(kNativeExtStateSection, "AUTOPLAY_ENABLED_V1", g_nativeAutoplayEnabled ? "1" : "0", false);
-    SetExtState_ptr(kNativeExtStateSection, "AUTO_BLOCO_ENABLED_V1", g_nativeAutoBlocoEnabled ? "1" : "0", false);
   }
 
   std::string luaLiveRaw;
@@ -3245,52 +3355,6 @@ static void nativeBridgeTick()
   nativeRebuildState(snapshotDue);
 }
 
-// ==========================================================
-// VS Hook 2.9 - Auto controlado pela extensao
-// ----------------------------------------------------------
-// O Lua nao executa mais a logica de AutoPlay. Ele apenas pede
-// liga/desliga para a extensao e consulta um estado leve para
-// acender/apagar o botao Auto.
-// ==========================================================
-static bool VS_Hook_Native_GetAutoplayEnabled()
-{
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-  return g_nativeAutoplayEnabled;
-}
-
-static bool VS_Hook_Native_SetAutoplayEnabled(bool enabled)
-{
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-  const bool next = enabled ? true : false;
-  if (g_nativeAutoplayEnabled == next) {
-    g_nativeForceStateBuild.store(true);
-    return true;
-  }
-  g_nativeAutoplayEnabled = next;
-  if (!g_nativeAutoplayEnabled && !g_nativeQueuedManual) nativeClearQueuedSongLocked();
-  g_nativeForceStateBuild.store(true);
-  return true;
-}
-
-static bool VS_Hook_Native_SetAutoplayText(const char* enabledText)
-{
-  const std::string value = nativeLower(nativeTrim(enabledText ? enabledText : ""));
-  if (value.empty() || value == "toggle") {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    g_nativeAutoplayEnabled = !g_nativeAutoplayEnabled;
-    if (!g_nativeAutoplayEnabled && !g_nativeQueuedManual) nativeClearQueuedSongLocked();
-    g_nativeForceStateBuild.store(true);
-    return true;
-  }
-  const bool next = (value == "1" || value == "true" || value == "on" || value == "yes" || value == "sim");
-  return VS_Hook_Native_SetAutoplayEnabled(next);
-}
-
-static bool VS_Hook_Native_ToggleAutoplay()
-{
-  return VS_Hook_Native_SetAutoplayText("toggle");
-}
-
 static bool VS_Hook_Native_PullCommand(char* buf, int bufSize)
 {
   if (!buf || bufSize <= 0) return false;
@@ -3322,20 +3386,25 @@ static bool VS_Hook_Native_GetState(char* buf, int bufSize)
   return true;
 }
 
+static bool VS_Hook_Native_ResumePcAccess()
+{
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::time_point();
+  }
+  const bool ok = resumePcAccessFromAppActiveScreen();
+  g_nativeForceStateBuild.store(true);
+  return ok;
+}
+
 static char g_apiDefNativePullCommand[] =
   "bool\0char*,int\0commandJsonOutNeedBig,commandJsonOutNeedBig_sz\0Pull one pending VS Hook command from the native bridge.";
 static char g_apiDefNativeSetLuaState[] =
   "bool\0const char*\0jsonFragment\0Send small Lua-only live state fields to the VS Hook native bridge.";
 static char g_apiDefNativeGetState[] =
   "bool\0char*,int\0stateJsonOutNeedBig,stateJsonOutNeedBig_sz\0Read the current VS Hook native bridge state.";
-static char g_apiDefNativeGetAutoplayEnabled[] =
-  "bool\0\0\0Read the VS Hook native Autoplay state.";
-static char g_apiDefNativeSetAutoplayEnabled[] =
-  "bool\0bool\0enabled\0Set the VS Hook native Autoplay state.";
-static char g_apiDefNativeSetAutoplayText[] =
-  "bool\0const char*\0enabledText\0Set or toggle the VS Hook native Autoplay state using text: 1,0,true,false,toggle.";
-static char g_apiDefNativeToggleAutoplay[] =
-  "bool\0\0\0Toggle the VS Hook native Autoplay state.";
+static char g_apiDefNativeResumePcAccess[] =
+  "bool\0\0\0Resume VS Hook access on the PC and reopen the VS Hook script closed by APP ATIVO.";
 
 static bool registerNativeBridgeApi()
 {
@@ -3347,28 +3416,16 @@ static bool registerNativeBridgeApi()
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(g_apiDefNativeSetLuaState)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_Native_GetState", reinterpret_cast<void*>(&VS_Hook_Native_GetState)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_GetState", reinterpret_cast<void*>(g_apiDefNativeGetState)) != 0) && ok;
-  ok = (plugin_register_ptr("API_VS_Hook_Native_GetAutoplayEnabled", reinterpret_cast<void*>(&VS_Hook_Native_GetAutoplayEnabled)) != 0) && ok;
-  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_GetAutoplayEnabled", reinterpret_cast<void*>(g_apiDefNativeGetAutoplayEnabled)) != 0) && ok;
-  ok = (plugin_register_ptr("API_VS_Hook_Native_SetAutoplayEnabled", reinterpret_cast<void*>(&VS_Hook_Native_SetAutoplayEnabled)) != 0) && ok;
-  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetAutoplayEnabled", reinterpret_cast<void*>(g_apiDefNativeSetAutoplayEnabled)) != 0) && ok;
-  ok = (plugin_register_ptr("API_VS_Hook_Native_SetAutoplayText", reinterpret_cast<void*>(&VS_Hook_Native_SetAutoplayText)) != 0) && ok;
-  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetAutoplayText", reinterpret_cast<void*>(g_apiDefNativeSetAutoplayText)) != 0) && ok;
-  ok = (plugin_register_ptr("API_VS_Hook_Native_ToggleAutoplay", reinterpret_cast<void*>(&VS_Hook_Native_ToggleAutoplay)) != 0) && ok;
-  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_ToggleAutoplay", reinterpret_cast<void*>(g_apiDefNativeToggleAutoplay)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_Native_ResumePcAccess", reinterpret_cast<void*>(&VS_Hook_Native_ResumePcAccess)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_ResumePcAccess", reinterpret_cast<void*>(g_apiDefNativeResumePcAccess)) != 0) && ok;
   return ok;
 }
 
 static void unregisterNativeBridgeApi()
 {
   if (!plugin_register_ptr) return;
-  plugin_register_ptr("-APIdef_VS_Hook_Native_ToggleAutoplay", reinterpret_cast<void*>(g_apiDefNativeToggleAutoplay));
-  plugin_register_ptr("-API_VS_Hook_Native_ToggleAutoplay", reinterpret_cast<void*>(&VS_Hook_Native_ToggleAutoplay));
-  plugin_register_ptr("-APIdef_VS_Hook_Native_SetAutoplayText", reinterpret_cast<void*>(g_apiDefNativeSetAutoplayText));
-  plugin_register_ptr("-API_VS_Hook_Native_SetAutoplayText", reinterpret_cast<void*>(&VS_Hook_Native_SetAutoplayText));
-  plugin_register_ptr("-APIdef_VS_Hook_Native_SetAutoplayEnabled", reinterpret_cast<void*>(g_apiDefNativeSetAutoplayEnabled));
-  plugin_register_ptr("-API_VS_Hook_Native_SetAutoplayEnabled", reinterpret_cast<void*>(&VS_Hook_Native_SetAutoplayEnabled));
-  plugin_register_ptr("-APIdef_VS_Hook_Native_GetAutoplayEnabled", reinterpret_cast<void*>(g_apiDefNativeGetAutoplayEnabled));
-  plugin_register_ptr("-API_VS_Hook_Native_GetAutoplayEnabled", reinterpret_cast<void*>(&VS_Hook_Native_GetAutoplayEnabled));
+  plugin_register_ptr("-APIdef_VS_Hook_Native_ResumePcAccess", reinterpret_cast<void*>(g_apiDefNativeResumePcAccess));
+  plugin_register_ptr("-API_VS_Hook_Native_ResumePcAccess", reinterpret_cast<void*>(&VS_Hook_Native_ResumePcAccess));
   plugin_register_ptr("-APIdef_VS_Hook_Native_GetState", reinterpret_cast<void*>(g_apiDefNativeGetState));
   plugin_register_ptr("-API_VS_Hook_Native_GetState", reinterpret_cast<void*>(&VS_Hook_Native_GetState));
   plugin_register_ptr("-APIdef_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(g_apiDefNativeSetLuaState));
@@ -3732,10 +3789,9 @@ static bool nativeApplyLoopCommand(const std::string& commandBody)
 
 static bool nativeShouldMirrorCommandToLua(const std::string& commandType)
 {
-  // VS Hook 2.9: Auto/AT-BL agora pertencem a extensao. O Lua nao deve receber
-  // esses comandos, nem para refletir visualmente; ele consulta a API leve
-  // VS_Hook_Native_GetAutoplayEnabled para acender/apagar o botao.
-  return commandType == "loop_toggle" || commandType == "loop_set" || commandType == "director_loop_toggle" ||
+  return commandType == "autoplay_toggle" || commandType == "auto_toggle" || commandType == "director_auto_toggle" || commandType == "autoplay_set" || commandType == "auto_set" ||
+         commandType == "auto_bloco_toggle" || commandType == "at_bl_toggle" || commandType == "atbl_toggle" || commandType == "director_at_bl_toggle" || commandType == "auto_bloco_set" || commandType == "at_bl_set" ||
+         commandType == "loop_toggle" || commandType == "loop_set" || commandType == "director_loop_toggle" ||
          commandType == "timer_toggle" || commandType == "timer_start" || commandType == "timer_stop" || commandType == "timer_stop_reset" || commandType == "timer_reset" || commandType == "timer_set_mode" || commandType == "timer_config" ||
          commandType == "set_page" || commandType == "set_active_playlist";
 }
@@ -4402,15 +4458,23 @@ static void nativeHandleClient(native_socket_t client)
       const std::string commandAppRole = nativeLower(nativeJsonExtractString(commandBody, "appRole"));
       const bool commandIsDirectorRole = commandRole == "director" || commandRole == "diretor" || commandClientRole == "director" || commandClientRole == "diretor" || commandAppRole == "director" || commandAppRole == "diretor";
       if (commandType == "director_enter" || commandType == "director_active" || commandType == "director_heartbeat" || ((commandType == "app_heartbeat" || commandType == "heartbeat") && commandIsDirectorRole)) {
-        g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::now();
-        if (SetExtState_ptr) {
-          SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "1", false);
+        if (!g_state.pcAccessOverride) {
+          g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::now();
+          if (SetExtState_ptr) {
+            SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "1", false);
+            SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
+          }
+          openAppActiveScreenForDirector();
+        } else if (SetExtState_ptr) {
+          SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "0", false);
           SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
         }
         g_nativeForceStateBuild.store(true);
       }
       if (commandType == "director_force_logout_ack" || commandType == "director_logout_ack" || commandType == "director_logout" || commandType == "app_logout") {
         g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::time_point();
+        g_state.pcAccessOverride = false;
+        g_state.appActiveScreenOpen = false;
         if (SetExtState_ptr) {
           SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "0", false);
           SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
@@ -4441,8 +4505,8 @@ static void nativeHandleClient(native_socket_t client)
       const bool tunerCommandRemoved = (commandType == "tuner_focus" || commandType == "set_tuner_visibility" || commandType == "tuner_adjust" || commandType == "tuner_reset");
       const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplyQueueCommand(commandBody) || nativeApplyAutoCommand(commandBody) || nativeApplyPreviewCommand(commandBody) || nativeApplyLoopCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeApplyMarkerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
 
-      // VS Hook 2.9: comandos nativos que ainda pertencem ao Lua podem ser espelhados.
-      // Auto/AT-BL ficam exclusivamente na extensao e nao voltam para o Lua.
+      // FIX66: a extensao continua sendo o motor, mas o Lua tambem precisa refletir
+      // Auto, AT/BL e Loop na interface local quando o comando veio do App Diretor.
       if (handledByNative) nativeMirrorCommandToLuaIfNeeded(commandType, commandBody);
 
       if (!handledByNative && !premixCommandRemoved && !tunerCommandRemoved) {
@@ -4693,6 +4757,15 @@ static void initialize()
     hasRegisteredAction = true;
   }
 
+  // Registra scripts ocultos no Action List quando o arquivo ja existe.
+  // APP ATIVO nao aparece no menu Extensions, mas precisa ter command id pronto
+  // para a extensao poder executa-lo quando o App Diretor assumir o controle.
+  for (ScriptEntry& script : g_scripts) {
+    if (!script.showInExtensionsMenu) {
+      registerScriptInActionListIfPresent(script);
+    }
+  }
+
   registerClipboardApi();
   registerNativeBridgeApi();
   startNativeBridgeServer();
@@ -4795,6 +4868,9 @@ static void shutdown()
   g_state.activeProjectSignature.clear();
   g_state.autoOpenedProjectSignature.clear();
   g_state.lastLaunchedMode.clear();
+  g_state.modeBeforeDirectorApp.clear();
+  g_state.appActiveScreenOpen = false;
+  g_state.pcAccessOverride = false;
   g_state.initialized = false;
 }
 
