@@ -2872,6 +2872,8 @@ static void nativeRebuildState(bool forceSnapshot)
   if (SetExtState_ptr) {
     SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", appActive ? "1" : "0", false);
     SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
+    SetExtState_ptr(kNativeExtStateSection, "AUTOPLAY_ENABLED_V1", g_nativeAutoplayEnabled ? "1" : "0", false);
+    SetExtState_ptr(kNativeExtStateSection, "AUTO_BLOCO_ENABLED_V1", g_nativeAutoBlocoEnabled ? "1" : "0", false);
   }
 
   std::string luaLiveRaw;
@@ -3243,6 +3245,52 @@ static void nativeBridgeTick()
   nativeRebuildState(snapshotDue);
 }
 
+// ==========================================================
+// VS Hook 2.9 - Auto controlado pela extensao
+// ----------------------------------------------------------
+// O Lua nao executa mais a logica de AutoPlay. Ele apenas pede
+// liga/desliga para a extensao e consulta um estado leve para
+// acender/apagar o botao Auto.
+// ==========================================================
+static bool VS_Hook_Native_GetAutoplayEnabled()
+{
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  return g_nativeAutoplayEnabled;
+}
+
+static bool VS_Hook_Native_SetAutoplayEnabled(bool enabled)
+{
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  const bool next = enabled ? true : false;
+  if (g_nativeAutoplayEnabled == next) {
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+  g_nativeAutoplayEnabled = next;
+  if (!g_nativeAutoplayEnabled && !g_nativeQueuedManual) nativeClearQueuedSongLocked();
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
+static bool VS_Hook_Native_SetAutoplayText(const char* enabledText)
+{
+  const std::string value = nativeLower(nativeTrim(enabledText ? enabledText : ""));
+  if (value.empty() || value == "toggle") {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativeAutoplayEnabled = !g_nativeAutoplayEnabled;
+    if (!g_nativeAutoplayEnabled && !g_nativeQueuedManual) nativeClearQueuedSongLocked();
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+  const bool next = (value == "1" || value == "true" || value == "on" || value == "yes" || value == "sim");
+  return VS_Hook_Native_SetAutoplayEnabled(next);
+}
+
+static bool VS_Hook_Native_ToggleAutoplay()
+{
+  return VS_Hook_Native_SetAutoplayText("toggle");
+}
+
 static bool VS_Hook_Native_PullCommand(char* buf, int bufSize)
 {
   if (!buf || bufSize <= 0) return false;
@@ -3280,6 +3328,14 @@ static char g_apiDefNativeSetLuaState[] =
   "bool\0const char*\0jsonFragment\0Send small Lua-only live state fields to the VS Hook native bridge.";
 static char g_apiDefNativeGetState[] =
   "bool\0char*,int\0stateJsonOutNeedBig,stateJsonOutNeedBig_sz\0Read the current VS Hook native bridge state.";
+static char g_apiDefNativeGetAutoplayEnabled[] =
+  "bool\0\0\0Read the VS Hook native Autoplay state.";
+static char g_apiDefNativeSetAutoplayEnabled[] =
+  "bool\0bool\0enabled\0Set the VS Hook native Autoplay state.";
+static char g_apiDefNativeSetAutoplayText[] =
+  "bool\0const char*\0enabledText\0Set or toggle the VS Hook native Autoplay state using text: 1,0,true,false,toggle.";
+static char g_apiDefNativeToggleAutoplay[] =
+  "bool\0\0\0Toggle the VS Hook native Autoplay state.";
 
 static bool registerNativeBridgeApi()
 {
@@ -3291,12 +3347,28 @@ static bool registerNativeBridgeApi()
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(g_apiDefNativeSetLuaState)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_Native_GetState", reinterpret_cast<void*>(&VS_Hook_Native_GetState)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_GetState", reinterpret_cast<void*>(g_apiDefNativeGetState)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_Native_GetAutoplayEnabled", reinterpret_cast<void*>(&VS_Hook_Native_GetAutoplayEnabled)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_GetAutoplayEnabled", reinterpret_cast<void*>(g_apiDefNativeGetAutoplayEnabled)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_Native_SetAutoplayEnabled", reinterpret_cast<void*>(&VS_Hook_Native_SetAutoplayEnabled)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetAutoplayEnabled", reinterpret_cast<void*>(g_apiDefNativeSetAutoplayEnabled)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_Native_SetAutoplayText", reinterpret_cast<void*>(&VS_Hook_Native_SetAutoplayText)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetAutoplayText", reinterpret_cast<void*>(g_apiDefNativeSetAutoplayText)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_Native_ToggleAutoplay", reinterpret_cast<void*>(&VS_Hook_Native_ToggleAutoplay)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_ToggleAutoplay", reinterpret_cast<void*>(g_apiDefNativeToggleAutoplay)) != 0) && ok;
   return ok;
 }
 
 static void unregisterNativeBridgeApi()
 {
   if (!plugin_register_ptr) return;
+  plugin_register_ptr("-APIdef_VS_Hook_Native_ToggleAutoplay", reinterpret_cast<void*>(g_apiDefNativeToggleAutoplay));
+  plugin_register_ptr("-API_VS_Hook_Native_ToggleAutoplay", reinterpret_cast<void*>(&VS_Hook_Native_ToggleAutoplay));
+  plugin_register_ptr("-APIdef_VS_Hook_Native_SetAutoplayText", reinterpret_cast<void*>(g_apiDefNativeSetAutoplayText));
+  plugin_register_ptr("-API_VS_Hook_Native_SetAutoplayText", reinterpret_cast<void*>(&VS_Hook_Native_SetAutoplayText));
+  plugin_register_ptr("-APIdef_VS_Hook_Native_SetAutoplayEnabled", reinterpret_cast<void*>(g_apiDefNativeSetAutoplayEnabled));
+  plugin_register_ptr("-API_VS_Hook_Native_SetAutoplayEnabled", reinterpret_cast<void*>(&VS_Hook_Native_SetAutoplayEnabled));
+  plugin_register_ptr("-APIdef_VS_Hook_Native_GetAutoplayEnabled", reinterpret_cast<void*>(g_apiDefNativeGetAutoplayEnabled));
+  plugin_register_ptr("-API_VS_Hook_Native_GetAutoplayEnabled", reinterpret_cast<void*>(&VS_Hook_Native_GetAutoplayEnabled));
   plugin_register_ptr("-APIdef_VS_Hook_Native_GetState", reinterpret_cast<void*>(g_apiDefNativeGetState));
   plugin_register_ptr("-API_VS_Hook_Native_GetState", reinterpret_cast<void*>(&VS_Hook_Native_GetState));
   plugin_register_ptr("-APIdef_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(g_apiDefNativeSetLuaState));
@@ -3660,9 +3732,10 @@ static bool nativeApplyLoopCommand(const std::string& commandBody)
 
 static bool nativeShouldMirrorCommandToLua(const std::string& commandType)
 {
-  return commandType == "autoplay_toggle" || commandType == "auto_toggle" || commandType == "director_auto_toggle" || commandType == "autoplay_set" || commandType == "auto_set" ||
-         commandType == "auto_bloco_toggle" || commandType == "at_bl_toggle" || commandType == "atbl_toggle" || commandType == "director_at_bl_toggle" || commandType == "auto_bloco_set" || commandType == "at_bl_set" ||
-         commandType == "loop_toggle" || commandType == "loop_set" || commandType == "director_loop_toggle" ||
+  // VS Hook 2.9: Auto/AT-BL agora pertencem a extensao. O Lua nao deve receber
+  // esses comandos, nem para refletir visualmente; ele consulta a API leve
+  // VS_Hook_Native_GetAutoplayEnabled para acender/apagar o botao.
+  return commandType == "loop_toggle" || commandType == "loop_set" || commandType == "director_loop_toggle" ||
          commandType == "timer_toggle" || commandType == "timer_start" || commandType == "timer_stop" || commandType == "timer_stop_reset" || commandType == "timer_reset" || commandType == "timer_set_mode" || commandType == "timer_config" ||
          commandType == "set_page" || commandType == "set_active_playlist";
 }
@@ -4368,8 +4441,8 @@ static void nativeHandleClient(native_socket_t client)
       const bool tunerCommandRemoved = (commandType == "tuner_focus" || commandType == "set_tuner_visibility" || commandType == "tuner_adjust" || commandType == "tuner_reset");
       const bool handledByNative = nativeApplyMixerCommand(commandBody) || nativeApplyQueueCommand(commandBody) || nativeApplyAutoCommand(commandBody) || nativeApplyPreviewCommand(commandBody) || nativeApplyLoopCommand(commandBody) || nativeApplySelectionCommand(commandBody) || nativeApplyTransportCommand(commandBody) || nativeApplyMarkerCommand(commandBody) || nativeSelectProjectFromCommand(commandBody);
 
-      // FIX66: a extensao continua sendo o motor, mas o Lua tambem precisa refletir
-      // Auto, AT/BL e Loop na interface local quando o comando veio do App Diretor.
+      // VS Hook 2.9: comandos nativos que ainda pertencem ao Lua podem ser espelhados.
+      // Auto/AT-BL ficam exclusivamente na extensao e nao voltam para o Lua.
       if (handledByNative) nativeMirrorCommandToLuaIfNeeded(commandType, commandBody);
 
       if (!handledByNative && !premixCommandRemoved && !tunerCommandRemoved) {
