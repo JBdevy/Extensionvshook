@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdio>
+#include <fstream>
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -52,6 +53,8 @@ using GetToggleCommandState_t = int (*)(int);
 using GetToggleCommandStateEx_t = int (*)(int, int);
 using AddExtensionsMainMenu_t = bool (*)();
 using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
+using NamedCommandLookup_t = int (*)(const char*);
+using ReverseNamedCommandLookup_t = const char* (*)(int);
 using GetExtState_t = const char* (*)(const char*, const char*);
 using SetExtState_t = void (*)(const char*, const char*, const char*, bool);
 using EnumProjects_t = ReaProject* (*)(int, char*, int);
@@ -102,6 +105,8 @@ static GetToggleCommandState_t GetToggleCommandState_ptr = nullptr;
 static GetToggleCommandStateEx_t GetToggleCommandStateEx_ptr = nullptr;
 static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
+static NamedCommandLookup_t NamedCommandLookup_ptr = nullptr;
+static ReverseNamedCommandLookup_t ReverseNamedCommandLookup_ptr = nullptr;
 static GetExtState_t GetExtState_ptr = nullptr;
 static SetExtState_t SetExtState_ptr = nullptr;
 static EnumProjects_t EnumProjects_ptr = nullptr;
@@ -557,9 +562,110 @@ static bool resolveScriptPath(ScriptEntry& script)
   return false;
 }
 
+static std::string normalizeActionPathForMatch(std::string value)
+{
+  std::replace(value.begin(), value.end(), '\\', '/');
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+static std::string readTextFile(const std::string& path)
+{
+  std::ifstream file(path, std::ios::in | std::ios::binary);
+  if (!file) return std::string();
+  std::ostringstream oss;
+  oss << file.rdbuf();
+  return oss.str();
+}
+
+static int lookupNamedCommandToken(const std::string& token)
+{
+  if (!NamedCommandLookup_ptr || token.empty()) return 0;
+  const std::string withUnderscore = token[0] == '_' ? token : ("_" + token);
+  int commandId = NamedCommandLookup_ptr(withUnderscore.c_str());
+  if (commandId == 0 && token[0] != '_') commandId = NamedCommandLookup_ptr(token.c_str());
+  return commandId;
+}
+
+static std::string extractReaScriptTokenFromLine(const std::string& line)
+{
+  size_t pos = line.find("RS");
+  while (pos != std::string::npos) {
+    const bool startsToken = pos == 0 || !(std::isalnum(static_cast<unsigned char>(line[pos - 1])) || line[pos - 1] == '_');
+    if (startsToken) {
+      size_t end = pos + 2;
+      while (end < line.size() && (std::isalnum(static_cast<unsigned char>(line[end])) || line[end] == '_')) ++end;
+      if (end > pos + 2) return line.substr(pos, end - pos);
+    }
+    pos = line.find("RS", pos + 2);
+  }
+  return std::string();
+}
+
+static int findExistingReaScriptCommandInKeyboardIni(const ScriptEntry& script)
+{
+  if (!NamedCommandLookup_ptr || !GetResourcePath_ptr) return 0;
+  const char* resourcePath = GetResourcePath_ptr();
+  if (!resourcePath || !*resourcePath) return 0;
+
+  const std::string kbPath = joinPath(resourcePath, "reaper-kb.ini");
+  const std::string text = readTextFile(kbPath);
+  if (text.empty()) return 0;
+
+  const std::string wantedFile = normalizeActionPathForMatch(script.fileName ? script.fileName : "");
+  const std::string wantedPath = normalizeActionPathForMatch(script.scriptPath);
+  std::istringstream lines(text);
+  std::string line;
+  while (std::getline(lines, line)) {
+    const std::string normalizedLine = normalizeActionPathForMatch(line);
+    const bool matchesFile = !wantedFile.empty() && normalizedLine.find(wantedFile) != std::string::npos;
+    const bool matchesPath = !wantedPath.empty() && normalizedLine.find(wantedPath) != std::string::npos;
+    if (!matchesFile && !matchesPath) continue;
+
+    const std::string token = extractReaScriptTokenFromLine(line);
+    const int commandId = lookupNamedCommandToken(token);
+    if (commandId != 0) return commandId;
+  }
+
+  return 0;
+}
+
+static void rememberScriptNamedCommand(const ScriptEntry& script)
+{
+  if (!SetExtState_ptr || !ReverseNamedCommandLookup_ptr || script.scriptCommandId == 0 || !script.fileName) return;
+  const char* named = ReverseNamedCommandLookup_ptr(script.scriptCommandId);
+  if (!named || !*named) return;
+  SetExtState_ptr("VSHookLoader", (std::string("ReaScriptNamedCommand.") + script.fileName).c_str(), named, true);
+}
+
+static int findRememberedScriptCommand(const ScriptEntry& script)
+{
+  if (!GetExtState_ptr || !NamedCommandLookup_ptr || !script.fileName) return 0;
+  const char* named = GetExtState_ptr("VSHookLoader", (std::string("ReaScriptNamedCommand.") + script.fileName).c_str());
+  if (!named || !*named) return 0;
+  return lookupNamedCommandToken(named);
+}
+
+static int findExistingReaScriptCommand(ScriptEntry& script)
+{
+  int commandId = findRememberedScriptCommand(script);
+  if (commandId != 0) return commandId;
+  if (script.scriptPath.empty()) resolveScriptPath(script);
+  commandId = findExistingReaScriptCommandInKeyboardIni(script);
+  if (commandId != 0) return commandId;
+  return 0;
+}
+
 static bool ensureScriptRegistered(ScriptEntry& script)
 {
   if (script.scriptCommandId != 0) {
+    return true;
+  }
+
+  const int existingCommandId = findExistingReaScriptCommand(script);
+  if (existingCommandId != 0) {
+    script.scriptCommandId = existingCommandId;
+    rememberScriptNamedCommand(script);
     return true;
   }
 
@@ -578,13 +684,16 @@ static bool ensureScriptRegistered(ScriptEntry& script)
     return false;
   }
 
-  const int commandId = AddRemoveReaScript_ptr(true, 0, script.scriptPath.c_str(), true);
+  // Nao use commit=true aqui: regravar reaper-kb.ini ao "garantir" registro
+  // pode apagar atalhos do usuario para ReaScripts ja existentes.
+  const int commandId = AddRemoveReaScript_ptr(true, 0, script.scriptPath.c_str(), false);
   if (commandId == 0) {
     showDiagnostic(std::string("REAPER nao conseguiu registrar o script:\n") + script.scriptPath);
     return false;
   }
 
   script.scriptCommandId = commandId;
+  rememberScriptNamedCommand(script);
   return true;
 }
 
@@ -592,12 +701,21 @@ static bool ensureScriptRegistered(ScriptEntry& script)
 static void registerScriptInActionListIfPresent(ScriptEntry& script)
 {
   if (script.scriptCommandId != 0) return;
+
+  const int existingCommandId = findExistingReaScriptCommand(script);
+  if (existingCommandId != 0) {
+    script.scriptCommandId = existingCommandId;
+    rememberScriptNamedCommand(script);
+    return;
+  }
+
   if (!AddRemoveReaScript_ptr) return;
   if (!resolveScriptPath(script)) return;
 
-  const int commandId = AddRemoveReaScript_ptr(true, 0, script.scriptPath.c_str(), true);
+  const int commandId = AddRemoveReaScript_ptr(true, 0, script.scriptPath.c_str(), false);
   if (commandId != 0) {
     script.scriptCommandId = commandId;
+    rememberScriptNamedCommand(script);
   }
 }
 
@@ -4742,6 +4860,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetToggleCommandStateEx_ptr = reinterpret_cast<GetToggleCommandStateEx_t>(rec->GetFunc("GetToggleCommandStateEx"));
   AddExtensionsMainMenu_ptr = reinterpret_cast<AddExtensionsMainMenu_t>(rec->GetFunc("AddExtensionsMainMenu"));
   AddRemoveReaScript_ptr = reinterpret_cast<AddRemoveReaScript_t>(rec->GetFunc("AddRemoveReaScript"));
+  NamedCommandLookup_ptr = reinterpret_cast<NamedCommandLookup_t>(rec->GetFunc("NamedCommandLookup"));
+  ReverseNamedCommandLookup_ptr = reinterpret_cast<ReverseNamedCommandLookup_t>(rec->GetFunc("ReverseNamedCommandLookup"));
   GetExtState_ptr = reinterpret_cast<GetExtState_t>(rec->GetFunc("GetExtState"));
   SetExtState_ptr = reinterpret_cast<SetExtState_t>(rec->GetFunc("SetExtState"));
   EnumProjects_ptr = reinterpret_cast<EnumProjects_t>(rec->GetFunc("EnumProjects"));
