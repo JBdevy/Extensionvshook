@@ -1,0 +1,22 @@
+TUNER NATIVO NA EXTENSAO
+
+A extensao agora replica a logica do Tuner do Lua:
+
+- Le e grava os offsets no projeto em:
+  CHATGPT_REGION_PLAYLIST / TUNER_OFFSETS_V1
+- Usa a mesma chave do Lua: numero original da regiao/musica.
+- Limita o ajuste entre -12 e +12 semitons.
+- Aplica o valor nas pistas cujo nome comeca com #.
+- Procura o FX ReaPitch e o parametro Shift (semitones) da mesma forma do Lua.
+- Ao iniciar uma musica, aplica automaticamente o Tuner salvo daquela musica.
+- Publica tunerKey e tunerValue em cada musica do state nativo.
+- Aceita comandos nativos para o futuro modal do App Diretor:
+    tuner_adjust: delta +1 ou -1
+    tuner_set: value/semitones
+    tuner_reset
+- tuner_focus e set_tuner_visibility sao consumidos sem devolver para o Lua.
+
+O Lua atual pode continuar funcionando como esta. Ele e a extensao compartilham o mesmo
+ProjExtState do projeto, portanto os valores ja salvos pelo Lua continuam compativeis.
+
+Depois, o App Diretor podera usar os comandos da extensao diretamente.

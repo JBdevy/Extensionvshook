@@ -1,0 +1,1 @@
+A extensão publica os itens da música selecionada no estado Premix e processa volume/mute diretamente nos MediaItems.

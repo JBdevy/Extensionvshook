@@ -1,0 +1,7 @@
+1. Extraia o ZIP.
+2. Rode Compilar_DLL.bat.
+3. O arquivo gerado fica na mesma pasta do BAT:
+   reaper_vshook.dll
+
+O BAT tenta carregar automaticamente o ambiente do Visual Studio.
+Se der erro de compilador, rode pelo x64 Native Tools Command Prompt for VS.

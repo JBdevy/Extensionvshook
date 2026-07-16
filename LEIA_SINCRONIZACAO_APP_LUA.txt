@@ -1,0 +1,20 @@
+SINCRONIZAÇÃO LUA <-> EXTENSÃO <-> APP DIRETOR
+
+A extensão passa a intermediar:
+- Fila de espera
+- Auto
+- AT/BL
+- AutoStop
+- Tuner por música
+
+Quando o Lua está ativo:
+- o Lua executa as lógicas locais;
+- publica alterações pontuais para a extensão;
+- a extensão mantém o estado para o App Diretor.
+
+Quando o App Diretor está ativo:
+- a extensão executa e guarda os estados;
+- ao devolver o controle, incrementa RESUME_REVISION_V1;
+- o Lua lê tudo uma única vez na retomada.
+
+Não há leitura pesada contínua de JSON. O Lua apenas verifica owner/revision no heartbeat leve já existente.

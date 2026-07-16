@@ -5,6 +5,8 @@ Este script nao controla o VS Hook. Ele apenas mostra o bloqueio local e chama a
 para retomar o acesso no PC quando o usuario clicar no botao.
 ]]
 
+if reaper and reaper.set_action_options then reaper.set_action_options(5) end
+
 local TITLE = "APP ATIVO | Hook Developer"
 local WINDOW_SECTION = "JBKEYS_VSHOOK_APP_ACTIVE_WINDOW"
 local DOCK_KEY = "DOCKSTATE_V1"
@@ -20,6 +22,7 @@ local DEFAULT_DOCK = 513
 local mouse_last_down = false
 local resume_requested = false
 local resume_error_until = 0
+local resume_close_at = nil
 
 local function now_time()
   return reaper and reaper.time_precise and reaper.time_precise() or os.clock()
@@ -87,26 +90,37 @@ local function draw_button(x, y, w, h, label, hot)
   draw_text_center(label, x, y, w, h, 0.05, 0.05, 0.05, 17)
 end
 
+local function finish_app_active_after_resume_request()
+  save_window_state()
+  if gfx and gfx.quit then gfx.quit() end
+end
+
 local function resume_pc_access()
   resume_requested = true
 
-  -- Caminho direto pela API da extensao, quando ela estiver visivel no Lua.
+  -- O clique neste botao inicia toda a retomada:
+  -- 1) pede logout do App Diretor;
+  -- 2) a extensao restaura exatamente o Lua que havia sido fechado;
+  -- 3) esta tela APP ATIVO se encerra logo depois de entregar o pedido.
   if reaper and reaper.VS_Hook_Native_ResumePcAccess then
     local ok, result = pcall(reaper.VS_Hook_Native_ResumePcAccess)
     if ok and result then
+      resume_close_at = now_time() + 0.08
       return true
     end
   end
 
-  -- Fallback leve: o script nao tenta controlar o REAPER. Ele apenas deixa
-  -- um pedido para a extensao ler no timer dela, na thread principal.
+  -- Fallback: deixa o pedido para o timer principal da extensao.
+  -- O ExtState continua disponivel mesmo depois desta tela ser fechada.
   if reaper and reaper.SetExtState then
     local token = "pc_resume_" .. tostring(math.floor(now_time() * 1000))
     reaper.SetExtState("VS_HOOK_NATIVE_BRIDGE", "PC_RESUME_REQUEST_V1", token, false)
+    resume_close_at = now_time() + 0.12
     return true
   end
 
   resume_requested = false
+  resume_close_at = nil
   resume_error_until = now_time() + 3.0
   return false
 end
@@ -159,10 +173,30 @@ local function draw_ui()
 end
 
 local function main()
+  if resume_close_at and now_time() >= resume_close_at then
+    finish_app_active_after_resume_request()
+    return
+  end
+
+  if reaper and reaper.GetExtState then
+    local mode = tostring(reaper.GetExtState("VS_HOOK_SCRIPT_CONTROL", "CLOSE_MODE_V1") or "")
+    local token = tostring(reaper.GetExtState("VS_HOOK_SCRIPT_CONTROL", "CLOSE_TOKEN_V1") or "")
+    if token ~= "" and (mode == "app_active" or mode == "all") then
+      save_window_state()
+      if gfx and gfx.quit then gfx.quit() end
+      return
+    end
+  end
+
   local char = gfx.getchar()
   if char < 0 then
     save_window_state()
     return
+  end
+
+  -- Enter executa exatamente a mesma retomada do botao.
+  if (char == 13 or char == 10) and not resume_requested then
+    resume_pc_access()
   end
 
   draw_ui()

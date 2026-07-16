@@ -1,0 +1,19 @@
+AJUSTES — EXTENSÃO / APP DIRETOR
+
+1. PlayProtection removido da extensão
+- Removido do menu Extensions.
+- Removida a action VSHOOKPROTECTION.
+- Removidos estado, comando HTTP e lógica de toque duplo da extensão.
+- Mantida apenas a interceptação técnica de Stop necessária para preparar a música da fila para o próximo Play.
+
+2. Entrada no App Diretor com transporte parado
+- Ao receber director_enter, se não houver música tocando, a extensão limpa a fila antiga em cache.
+
+3. Stop do App Diretor
+- O Stop mantém a música aguardando selecionada/pronta para Play.
+- Depois disso, limpa a fila na extensão e publica o estado vazio imediatamente.
+
+4. Troca de repertório
+- A extensão agora processa select_playlist nativamente.
+- Grava LAST_PLAYLIST_NAME_V1 no projeto, usando a mesma fonte de estado do Lua.
+- O repertório escolhido não volta mais ao anterior depois do estado otimista expirar.

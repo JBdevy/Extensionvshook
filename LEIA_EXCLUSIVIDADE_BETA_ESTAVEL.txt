@@ -1,0 +1,9 @@
+CORREÇÃO DE EXCLUSIVIDADE — VS HOOK BETA / ESTÁVEL
+
+- Apenas uma versão pode permanecer aberta.
+- Ao clicar em Estável com o Beta aberto, o Beta é encerrado primeiro.
+- Ao clicar em Beta com o Estável aberto, o Estável é encerrado primeiro.
+- A nova versão só abre depois que a janela anterior realmente fechou.
+- O menu Extensions mostra a marca de ativo em somente uma versão.
+- A extensão não usa mais os dois estados antigos de toggle como fonte simultânea.
+- APP ATIVO continua participando da mesma troca exclusiva.

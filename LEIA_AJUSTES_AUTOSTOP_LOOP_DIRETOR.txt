@@ -1,0 +1,6 @@
+AJUSTES EXTENSAO
+
+- AutoStop do App Diretor passa a ser persistido e espelhado para o estado do Lua.
+- Enquanto o Diretor esta ativo, estado antigo do Lua nao sobrescreve o AutoStop da extensao.
+- Comandos de AutoStop entram no espelhamento nativo para o Lua.
+- Estado do loop publica loopRegionName e loopSourceType quando o trecho comeca no inicio da regiao.

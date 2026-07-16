@@ -1,0 +1,5 @@
+Ajustes 2026-07-11:
+- Enter no APP ATIVO retoma o acesso no PC.
+- Extensao intercepta ESC, R, L e Enter fora do foco do VS Hook.
+- Lua recebe esses atalhos pelo mesmo fluxo do teclado local.
+- Lua reabre sincronizado ao timer vivo da extensao.
