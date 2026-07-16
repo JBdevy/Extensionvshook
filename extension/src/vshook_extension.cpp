@@ -1,4 +1,6 @@
+#ifndef SWELL_PROVIDED_BY_APP
 #define SWELL_PROVIDED_BY_APP
+#endif
 #include "reaper_plugin.h"
 #include <cstdlib>
 #include <cstring>
@@ -1621,7 +1623,7 @@ static std::string getCurrentProjectSignature()
   ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
 
   std::ostringstream oss;
-  oss << reinterpret_cast<std::uintptr_t>(project) << "|" << normalizeSlashes(path ? path : "");
+  oss << reinterpret_cast<std::uintptr_t>(project) << "|" << normalizeSlashes(path);
   return oss.str();
 }
 
@@ -3482,7 +3484,7 @@ static std::string nativeBuildProjectsJson(ReaProject* activeProject, std::strin
     char pathBuf[2048] = "";
     ReaProject* project = EnumProjects_ptr(i, pathBuf, static_cast<int>(sizeof(pathBuf)));
     if (!project) break;
-    const std::string projectPath = normalizeSlashes(pathBuf ? pathBuf : "");
+    const std::string projectPath = normalizeSlashes(pathBuf);
     std::string projectName = nativeBasenameNoRpp(projectPath);
     if (projectName.empty()) projectName = std::string("Projeto ") + std::to_string(i + 1);
     const bool active = project == activeProject;
@@ -5751,8 +5753,13 @@ static void nativeAppActiveSaveWindowState()
 
   RECT windowRect{0, 0, 0, 0};
   RECT clientRect{0, 0, 0, 0};
-  if (!GetWindowRect(g_nativeAppActivePanelHwnd, &windowRect) ||
-      !GetClientRect(g_nativeAppActivePanelHwnd, &clientRect)) return;
+  if (!GetWindowRect(g_nativeAppActivePanelHwnd, &windowRect)) return;
+#ifdef _WIN32
+  if (!GetClientRect(g_nativeAppActivePanelHwnd, &clientRect)) return;
+#else
+  // No SWELL/macOS GetClientRect retorna void, ao contrario da API Win32.
+  GetClientRect(g_nativeAppActivePanelHwnd, &clientRect);
+#endif
 
   nativeAppActiveWriteWindowInt("DOCKSTATE_V1", 0);
   nativeAppActiveWriteWindowInt("WINDOW_X_V1", windowRect.left);
@@ -6184,8 +6191,14 @@ static void nativePaintAppActivePanel(HWND hwnd)
     for (size_t i = 0; i < g_nativeAppActivePanelModel.rows.size(); ++i) {
       if (g_nativeAppActivePanelModel.rows[i].block) { hasBlock = true; break; }
     }
+#ifdef _WIN32
     const int rowsClipState = SaveDC(dc);
     IntersectClipRect(dc, listRect.left + 2, listInnerTop, listRect.right - 7, listInnerBottom);
+#else
+    const RECT rowsClipRect{listRect.left + 2, listInnerTop, listRect.right - 7, listInnerBottom};
+    SWELL_PushClipRegion(dc);
+    SWELL_SetClipRegion(dc, &rowsClipRect);
+#endif
     const int endRow = std::min(rowCount, g_nativeAppActiveListFirstRow + visibleRows + 1);
     for (int i = g_nativeAppActiveListFirstRow; i < endRow; ++i) {
       const NativeAppActivePanelModel::Row& row = g_nativeAppActivePanelModel.rows[static_cast<size_t>(i)];
@@ -6270,7 +6283,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
         }
       }
     }
+#ifdef _WIN32
     if (rowsClipState != 0) RestoreDC(dc, rowsClipState);
+#else
+    SWELL_PopClipRegion(dc);
+#endif
 
     if (maxScrollPixels > 0) {
       const int trackTop = listInnerTop + 1;
@@ -7479,7 +7496,7 @@ static std::string nativeMultiLoopProjectStorageKey()
 {
   char path[2048] = "";
   ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
-  std::string identity = normalizeSlashes(path ? path : "");
+  std::string identity = normalizeSlashes(path);
   if (identity.empty()) identity = std::string("unsaved|") + std::to_string(reinterpret_cast<std::uintptr_t>(project));
   uint32_t hash = 2166136261u;
   for (unsigned char ch : identity) { hash ^= ch; hash *= 16777619u; }
@@ -8138,8 +8155,8 @@ static void nativeRebuildState(bool forceSnapshot)
   std::string activeProjectPath;
   int activeProjectIndex = 0;
   const std::string projectsJson = nativeBuildProjectsJson(activeProject, activeProjectName, activeProjectPath, activeProjectIndex);
-  if (activeProjectName.empty()) activeProjectName = nativeBasenameNoRpp(activePathBuf ? activePathBuf : "");
-  if (activeProjectPath.empty()) activeProjectPath = normalizeSlashes(activePathBuf ? activePathBuf : "");
+  if (activeProjectName.empty()) activeProjectName = nativeBasenameNoRpp(activePathBuf);
+  if (activeProjectPath.empty()) activeProjectPath = normalizeSlashes(activePathBuf);
 
   // O estado vivo continua em 220 ms, mas a estrutura pesada so e refeita
   // quando o projeto realmente muda ou um comando pede atualizacao. Isso evita
@@ -10923,7 +10940,7 @@ static bool nativeSelectProjectFromCommand(const std::string& commandBody)
       ReaProject* p = EnumProjects_ptr(i, pathBuf, static_cast<int>(sizeof(pathBuf)));
       if (!p) break;
       const std::string pid = std::to_string(reinterpret_cast<std::uintptr_t>(p));
-      const std::string ppath = normalizeSlashes(pathBuf ? pathBuf : "");
+      const std::string ppath = normalizeSlashes(pathBuf);
       const std::string pname = nativeBasenameNoRpp(ppath);
       if ((!idValue.empty() && idValue == pid) || (!pathValue.empty() && pathValue == ppath) || (!nameValue.empty() && nameValue == pname)) {
         target = p;
