@@ -1,9 +1,0 @@
-PREMIX APP DIRETOR - REGIAO PAI POR MARKERS INTERNOS
-
-A tela Premix agora reconhece como regiao pai qualquer regiao que contenha markers internos de musica.
-Cada marker interno valido vira uma musica da lista dividida do Premix.
-Markers iniciados por $, * ou ! nao criam musica-filho.
-Os itens de audio sao separados pelo ponto onde cada item comeca.
-
-CORREÇÃO V4
-O comando vindo do cabeçalho do App Diretor agora pode exigir posição explícita. A extensão não substitui mais o início do marker pela região mais próxima.

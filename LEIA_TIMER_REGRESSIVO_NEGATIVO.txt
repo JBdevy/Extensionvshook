@@ -1,7 +1,0 @@
-AJUSTE NATIVO DO CRONÔMETRO REGRESSIVO
-
-- O modo permanece countdown/regressivo depois de chegar a zero.
-- timerDisplaySec passa a publicar valores negativos durante o atraso.
-- timerDisplayText usa o formato - 00:00:00.
-- O estado também publica timerExpired, timerOverrun, timerNegative e timerOverrunSec.
-- Parar e retomar depois de zero preserva o valor negativo; reset continua zerando normalmente.

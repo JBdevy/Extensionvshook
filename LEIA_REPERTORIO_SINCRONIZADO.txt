@@ -1,4 +1,0 @@
-CORREÇÃO — REPERTÓRIO DO APP IGUAL AO LUA
-
-A extensão agora processa sort_playlist_by_number diretamente no PLAYLISTS_DB_V3.
-Os blocos permanecem fixos e apenas as linhas de música são reorganizadas pelo source_number.

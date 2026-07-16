@@ -1,1 +1,0 @@
-A extensão agora calcula o trecho de Loop pelos limites da música atual e markers internos, igual à lógica do Lua. Também publica início, fim e nomes dos limites para o App Diretor.

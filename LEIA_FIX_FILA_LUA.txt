@@ -1,8 +1,0 @@
-FIX FILA LUA -> EXTENSAO / PREVIEW TP
-
-- O Lua publica apenas o estado visual da fila por ExtState leve.
-- Enquanto o heartbeat do Lua estiver ativo, a extensao nao executa Auto, AT/BL, AutoStop, handoff ou seek da fila.
-- A extensao continua publicando queuedSongId/queuedPlaylistSongId para o Hook Center e Teleprompt.
-- Ao fechar o Lua, o heartbeat expira e a extensao limpa a fila espelhada antes de voltar ao modo nativo.
-
-IMPORTANTE: recompile a DLL/dylib usando os scripts/workflows do projeto. Binaries antigos foram removidos deste ZIP para evitar instalar uma versao sem o patch.

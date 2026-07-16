@@ -1,8 +1,0 @@
-TEMPO TOTAL DA EXTENSÃO IGUAL AO LUA
-
-- Repertórios: soma apenas músicas não-bloco do repertório ativo.
-- Músicas: soma as regiões da aba Músicas.
-- Filhos de regiões com -- nunca entram no total, pois o pai já cobre esse tempo.
-- Usa start/end brutos.
-- Arredonda apenas o total final com +0,5.
-- Publica os segundos brutos e o texto HH:MM:SS para o App Diretor.

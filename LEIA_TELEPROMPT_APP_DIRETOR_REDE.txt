@@ -1,5 +1,0 @@
-TELEPROMPT APP DIRETOR - EXTENSÃO
-
-- Estado nativo publica TP1 e TP2, incluindo texto, mídia, tempo e playrate.
-- /media, /tp-media e /teleprompt-media aceitam Range Requests.
-- A leitura de vídeo agora carrega somente o intervalo de bytes solicitado.

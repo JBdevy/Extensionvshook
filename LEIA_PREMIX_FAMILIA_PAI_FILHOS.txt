@@ -1,6 +1,0 @@
-PREMIX NATIVO - REGIÃO PAI E FILHOS
-
-- A extensão aceita a região pai como escopo do Premix.
-- Publica seções separadas para os filhos da região pai.
-- Cada item é associado ao filho pelo ponto de início do item, igual ao Lua.
-- Volume e mute continuam sendo aplicados diretamente no MediaItem correspondente.
