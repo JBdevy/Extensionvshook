@@ -1939,6 +1939,8 @@ static const char* kNativeAutoplayExtKey = "AUTOPLAY_ENABLED_V1";
 static const char* kNativeAutoStopExtKey = "AUTO_STOP_ENABLED_V1";
 static const char* kNativeNormalStopExtKey = "NORMAL_STOP_ENABLED_V1";
 static const char* kNativeAutoBlocoExtKey = "AUTO_BLOCO_ENABLED_V1";
+static const char* kLuaTimerCommandKey = "TIMER_COMMAND_V1";
+static const char* kLuaTimerCommandTokenKey = "TIMER_COMMAND_TOKEN_V1";
 static const char* kLuaControlHeartbeatKey = "LUA_CONTROL_HEARTBEAT_V1";
 static const char* kLuaQueueSyncSeqKey = "LUA_QUEUE_SYNC_SEQ_V1";
 static const char* kLuaQueueActiveKey = "LUA_QUEUE_ACTIVE_V1";
@@ -2103,8 +2105,8 @@ static bool g_nativeTimerResetToZero = false;
 static std::chrono::steady_clock::time_point g_nativeTimerStartedAtSteady;
 static std::chrono::system_clock::time_point g_nativeTimerStartedAtSystem;
 
-// Declarada antes das APIs ReaScript para o Lua poder entregar comandos do
-// cronometro diretamente a extensao, sem depender de shell/curl no macOS.
+// Ponto unico usado tanto pelos comandos do App do Diretor quanto pelo canal
+// ExtState do Lua. O cronometro e sempre aplicado pela extensao.
 static bool nativeApplyTimerCommand(const std::string& commandBody);
 
 
@@ -10112,6 +10114,22 @@ static bool nativeApplyTimerCommand(const std::string& commandBody)
   return true;
 }
 
+static void nativeProcessLuaTimerCommandOnMainThread()
+{
+  if (!GetExtState_ptr || !SetExtState_ptr) return;
+  const char* tokenRaw = GetExtState_ptr(kNativeExtStateSection, kLuaTimerCommandTokenKey);
+  const std::string token = tokenRaw ? tokenRaw : "";
+  if (token.empty()) return;
+
+  const char* commandRaw = GetExtState_ptr(kNativeExtStateSection, kLuaTimerCommandKey);
+  const std::string command = commandRaw ? commandRaw : "";
+  // Limpa antes de aplicar para que o mesmo token nunca seja executado duas
+  // vezes, mesmo que a acao nativa force uma nova construcao de estado.
+  SetExtState_ptr(kNativeExtStateSection, kLuaTimerCommandTokenKey, "", false);
+  SetExtState_ptr(kNativeExtStateSection, kLuaTimerCommandKey, "", false);
+  if (!command.empty()) nativeApplyTimerCommand(command);
+}
+
 
 static bool nativeShouldMirrorCommandToLua(const std::string& commandType)
 {
@@ -11746,6 +11764,7 @@ static void startupTimer()
   // nem Lua ativo, nenhum atalho, transporte, loop, fila ou varredura pesada do
   // projeto e executado pela extensao. A descoberta leve de abas fica ativa.
   nativeRefreshLuaControlHeartbeatFromExtState();
+  nativeProcessLuaTimerCommandOnMainThread();
   nativePollAppActiveEnterKey();
 #ifndef _WIN32
   nativePollAppActiveMouseClick();
