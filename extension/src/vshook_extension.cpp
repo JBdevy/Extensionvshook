@@ -6439,6 +6439,19 @@ static void nativePaintAppActivePanel(HWND hwnd)
   EndPaint(hwnd, &ps);
 }
 
+static void nativeAppActiveResumeFromUi()
+{
+#ifdef _WIN32
+  // Mantém o fluxo já validado no Windows.
+  resumePcAccessFromAppActiveScreen();
+#else
+  // No SWELL/macOS, não fecha o dialog nem relança o Lua dentro do callback
+  // de mouse/teclado. Agenda para o timer principal da extensão, na mesma rota
+  // thread-safe usada pela API de retomada.
+  g_pcResumeRequested.store(true);
+#endif
+}
+
 static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
   switch (message) {
@@ -6453,11 +6466,16 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_SIZE:
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
+#ifdef _WIN32
     case WM_LBUTTONUP: {
+#else
+    // SWELL entrega de forma mais consistente o clique de dialogs no mouse-down.
+    case WM_LBUTTONDOWN: {
+#endif
       const POINT point{static_cast<short>(lParam & 0xffff), static_cast<short>((lParam >> 16) & 0xffff)};
       if (g_nativeAppActiveResumeConfirmOpen) {
         if (PtInRect(&g_nativeAppActiveResumeConfirmYesRect, point)) {
-          resumePcAccessFromAppActiveScreen();
+          nativeAppActiveResumeFromUi();
         } else if (PtInRect(&g_nativeAppActiveResumeConfirmNoRect, point)) {
           g_nativeAppActiveResumeConfirmOpen = false;
           InvalidateRect(hwnd, nullptr, FALSE);
@@ -6473,7 +6491,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_KEYDOWN:
       if (wParam == VK_RETURN) {
         if (g_nativeAppActiveResumeConfirmOpen) {
-          resumePcAccessFromAppActiveScreen();
+          nativeAppActiveResumeFromUi();
         } else {
           g_nativeAppActiveResumeConfirmOpen = true;
           InvalidateRect(hwnd, nullptr, FALSE);
@@ -11675,6 +11693,12 @@ static void startupTimer()
   // director_enter que acorda a extensao tambem chega por essa fila.
   nativeProcessHttpCommandsOnMainThread();
   nativeUpdateTrackMetersOnMainThread();
+#ifndef _WIN32
+  // A tela APP ATIVO pode continuar aberta depois que o heartbeat do Diretor
+  // cair. No Mac, o clique é agendado; portanto ele precisa ser consumido mesmo
+  // quando runtimeActive já ficou falso.
+  processPcResumeRequestFromAppActiveOnMainThread();
+#endif
   const bool runtimeActive = nativeIsRuntimeControlActive();
   if (runtimeActive) {
     const bool runtimeJustActivated = !g_nativeRuntimeWasActive;
@@ -11696,7 +11720,9 @@ static void startupTimer()
     nativeBridgeTick();
     nativeRefreshAppActivePanelModel();
     nativeProcessMultiLoopsOnMainThread();
+#ifdef _WIN32
     processPcResumeRequestFromAppActiveOnMainThread();
+#endif
     processAppActiveScreenRequestsOnMainThread();
   } else if (g_nativeRuntimeWasActive) {
     g_nativeRuntimeWasActive = false;
