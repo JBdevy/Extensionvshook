@@ -5885,13 +5885,9 @@ static void nativeAppActiveDrawBlackShadow(HDC dc, const RECT& rect)
     return;
   }
 #endif
-  // Fallback SWELL: cobre dois de cada tres pixels para manter a sombra forte
-  // sem exigir APIs graficas extras no macOS.
-  for (int y = rect.top; y < rect.bottom; y += 3) {
-    const LONG lineBottom = std::min<LONG>(rect.bottom, static_cast<LONG>(y + 2));
-    RECT line{rect.left, y, rect.right, lineBottom};
-    nativeAppActiveFillRect(dc, line, RGB(0, 0, 0));
-  }
+  // No SWELL/macOS o preenchimento intercalado produzia listras visiveis,
+  // principalmente em telas Retina. Usa uma camada escura continua.
+  nativeAppActiveFillRect(dc, rect, RGB(3, 5, 8));
 }
 
 static void nativeAppActiveDrawText(HDC dc, const std::string& text, RECT rect, UINT flags, COLORREF color, HFONT font)
