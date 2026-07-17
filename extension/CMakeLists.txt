@@ -21,7 +21,7 @@ if(APPLE)
   endif()
 endif()
 
-project(reaper_vshook_loader LANGUAGES CXX)
+project(reaper_vshook_loader VERSION 3.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,6 +44,7 @@ target_include_directories(reaper_vshook PRIVATE
 )
 
 target_compile_definitions(reaper_vshook PRIVATE
+  VSHOOK_EXTENSION_VERSION="${PROJECT_VERSION}"
   SWELL_PROVIDED_BY_APP
   WIN32_LEAN_AND_MEAN
   NOMINMAX

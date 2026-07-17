@@ -345,6 +345,7 @@ struct NativeAppActivePanelModel {
   bool autoplayEnabled = false;
   bool autoBlocoEnabled = false;
   bool autoStopEnabled = true;
+  bool normalStopEnabled = true;
   bool timerRunning = false;
   bool timerVisible = false;
   bool timerExpired = false;
@@ -880,27 +881,6 @@ static void registerScriptInActionListIfPresent(ScriptEntry& script)
   if (commandId != 0) {
     script.scriptCommandId = commandId;
     rememberScriptNamedCommand(script);
-  }
-}
-
-static void unregisterLegacyAppActiveLuaScript()
-{
-  if (!AddRemoveReaScript_ptr) return;
-  for (ScriptEntry& script : g_scripts) {
-    const std::string mode = script.autoOpenMode ? script.autoOpenMode : "";
-    if (mode != "app_active") continue;
-    const std::vector<std::string> candidates = buildScriptCandidates(script.fileName);
-    for (size_t i = 0; i < candidates.size(); ++i) {
-      // Remove inclusive registros deixados por versoes antigas. A janela atual
-      // e 100% nativa e nao executa mais APP ATIVO.lua.
-      AddRemoveReaScript_ptr(false, 0, candidates[i].c_str(), true);
-    }
-    script.scriptCommandId = 0;
-    script.scriptPath.clear();
-    if (SetExtState_ptr && script.fileName) {
-      SetExtState_ptr("VSHookLoader",
-        (std::string("ReaScriptNamedCommand.") + script.fileName).c_str(), "", true);
-    }
   }
 }
 
@@ -1957,6 +1937,7 @@ static const char* kDirectorAuthRevisionKey = "DIRECTOR_AUTH_REVISION_V1";
 static const char* kNativeCommandsExtKey = "COMMANDS_JSON_V1";
 static const char* kNativeAutoplayExtKey = "AUTOPLAY_ENABLED_V1";
 static const char* kNativeAutoStopExtKey = "AUTO_STOP_ENABLED_V1";
+static const char* kNativeNormalStopExtKey = "NORMAL_STOP_ENABLED_V1";
 static const char* kNativeAutoBlocoExtKey = "AUTO_BLOCO_ENABLED_V1";
 static const char* kLuaControlHeartbeatKey = "LUA_CONTROL_HEARTBEAT_V1";
 static const char* kLuaQueueSyncSeqKey = "LUA_QUEUE_SYNC_SEQ_V1";
@@ -1972,6 +1953,7 @@ static const char* kLuaStateSyncSeqKey = "LUA_STATE_SYNC_SEQ_V1";
 static const char* kLuaAutoplayStateKey = "LUA_AUTOPLAY_STATE_V1";
 static const char* kLuaAutoBlocoStateKey = "LUA_AUTOBLOCO_STATE_V1";
 static const char* kLuaAutoStopStateKey = "LUA_AUTOSTOP_STATE_V1";
+static const char* kLuaNormalStopStateKey = "LUA_NORMAL_STOP_STATE_V1";
 static const char* kLuaStopPauseStateKey = "LUA_STOP_PAUSE_STATE_V1";
 static const char* kLuaFamilyDrawersIdsKey = "LUA_FAMILY_DRAWERS_OPEN_IDS_V1";
 static const char* kLuaDrawerOutlineEnabledKey = "LUA_DRAWER_OUTLINE_ENABLED_V1";
@@ -1988,6 +1970,7 @@ static const char* kSharedQueueEndKey = "SHARED_QUEUE_END_V1";
 static const char* kSharedQueueManualKey = "SHARED_QUEUE_MANUAL_V1";
 static const char* kSharedQueueKindKey = "SHARED_QUEUE_KIND_V1";
 static const char* kSharedAutoStopKey = "SHARED_AUTOSTOP_ENABLED_V1";
+static const char* kSharedNormalStopKey = "SHARED_NORMAL_STOP_ENABLED_V1";
 static const char* kSharedStopPauseKey = "SHARED_STOP_PAUSE_ENABLED_V1";
 static const char* kSharedFamilyDrawersIdsKey = "SHARED_FAMILY_DRAWERS_OPEN_IDS_V1";
 static const char* kSharedFamilyDrawersOwnerKey = "SHARED_FAMILY_DRAWERS_OWNER_V1";
@@ -1995,6 +1978,7 @@ static const char* kSharedFamilyDrawersRevisionKey = "SHARED_FAMILY_DRAWERS_REVI
 static const char* kLuaWindowExtStateSection = "JBKEYS_VSLIVE_WINDOW";
 static const char* kLuaWindowAutoplayKey = "AUTOPLAY_ENABLED_V1";
 static const char* kLuaWindowAutoBlocoKey = "AUTOBLOCO_V1";
+static const char* kLuaWindowNormalStopKey = "NORMAL_STOP_ENABLED_V1";
 static const char* kLuaWindowPreviewKey = "TP_PREVIEW_ACTIVE_V1";
 static const char* kLuaWindowMultiLoopKey = "MULTILOOPS_NEW_STATE_V1";
 static const char* kNativeMultiLoopProjectSection = "VS_HOOK_MULTILOOPS";
@@ -2807,6 +2791,7 @@ static std::vector<NativeSongWindow> g_nativeActivePlaylistItems;
 static bool g_nativeAutoplayEnabled = false;
 static bool g_nativeAutoBlocoEnabled = false;
 static bool g_nativeAutoStopEnabled = true;
+static bool g_nativeNormalStopEnabled = true;
 static bool g_nativeAutomationSettingsLoaded = false;
 static std::string g_nativeQueuedSongId;
 static std::string g_nativeQueuedPlaylistSongId;
@@ -2883,9 +2868,11 @@ static double g_nativeMultiLoopPausedPlayPos = 0.0;
 static double g_nativeMultiLoopPausedEditPos = 0.0;
 static bool g_nativeMultiLoopBypassActive = false;
 static std::string g_nativeMultiLoopBypassSongKey;
-static double g_nativeMultiLoopBypassLastPos = 0.0;
-static double g_nativeMultiLoopBypassMaxEnd = 0.0;
 static std::vector<NativeMultiLoopTrackRestore> g_nativeMultiLoopBypassVolumeBaseline;
+static std::string g_nativeMultiLoopBypassWarningPairKey;
+static std::string g_nativeMultiLoopBypassWarningSongKey;
+static double g_nativeMultiLoopBypassWarningStartPos = 0.0;
+static constexpr double kNativeMultiLoopBypassWarningLeadSec = 4.0;
 static std::string g_nativeQueuedSeekSignature;
 static std::string g_nativeLastAutoQueueForPlayingId;
 // FIX74: quando a fila nativa faz seek 1s antes do fim, o Lua/autostop antigo pode
@@ -2912,6 +2899,13 @@ static void nativeLoadAutomationSettingsOnceLocked()
     if (autoValue && *autoValue) g_nativeAutoplayEnabled = nativeBoolFromText(autoValue, g_nativeAutoplayEnabled);
     const char* autoStop = GetExtState_ptr(kNativeExtStateSection, kNativeAutoStopExtKey);
     if (autoStop && *autoStop) g_nativeAutoStopEnabled = nativeBoolFromText(autoStop, g_nativeAutoStopEnabled);
+    const char* nativeNormalStop = GetExtState_ptr(kNativeExtStateSection, kNativeNormalStopExtKey);
+    const char* luaNormalStop = (!nativeNormalStop || !*nativeNormalStop)
+      ? GetExtState_ptr(kLuaWindowExtStateSection, kLuaWindowNormalStopKey) : nullptr;
+    const char* normalStopValue = (nativeNormalStop && *nativeNormalStop) ? nativeNormalStop : luaNormalStop;
+    if (normalStopValue && *normalStopValue) {
+      g_nativeNormalStopEnabled = nativeBoolFromText(normalStopValue, g_nativeNormalStopEnabled);
+    }
     const char* nativeAutoBloco = GetExtState_ptr(kNativeExtStateSection, kNativeAutoBlocoExtKey);
     const char* luaAutoBloco = GetExtState_ptr(kLuaWindowExtStateSection, kLuaWindowAutoBlocoKey);
     // AUTOBLOCO_V1 e o estado historico do Lua e ganha na primeira migracao.
@@ -2946,6 +2940,15 @@ static void nativeSaveAutoStopEnabledLocked()
   SetExtState_ptr(kLuaWindowExtStateSection, "AUTOSTOP_ENABLED_V1", value, true);
 }
 
+static void nativeSaveNormalStopEnabledLocked()
+{
+  if (!SetExtState_ptr) return;
+  const char* value = g_nativeNormalStopEnabled ? "1" : "0";
+  SetExtState_ptr(kNativeExtStateSection, kNativeNormalStopExtKey, value, true);
+  SetExtState_ptr(kNativeExtStateSection, kSharedNormalStopKey, value, false);
+  SetExtState_ptr(kLuaWindowExtStateSection, kLuaWindowNormalStopKey, value, true);
+}
+
 static void nativeSaveAutoBlocoEnabledLocked()
 {
   if (!SetExtState_ptr) return;
@@ -2973,6 +2976,9 @@ static void nativePublishSharedControlStateLocked()
   SetExtState_ptr(kNativeExtStateSection, kNativeAutoStopExtKey, g_nativeAutoStopEnabled ? "1" : "0", true);
   SetExtState_ptr(kNativeExtStateSection, "AUTOSTOP_ENABLED_V1", g_nativeAutoStopEnabled ? "1" : "0", true);
   SetExtState_ptr(kNativeExtStateSection, kSharedAutoStopKey, g_nativeAutoStopEnabled ? "1" : "0", false);
+  SetExtState_ptr(kNativeExtStateSection, kNativeNormalStopExtKey, g_nativeNormalStopEnabled ? "1" : "0", true);
+  SetExtState_ptr(kNativeExtStateSection, kSharedNormalStopKey, g_nativeNormalStopEnabled ? "1" : "0", false);
+  SetExtState_ptr(kLuaWindowExtStateSection, kLuaWindowNormalStopKey, g_nativeNormalStopEnabled ? "1" : "0", true);
   SetExtState_ptr(kNativeExtStateSection, kSharedStopPauseKey, g_stopPauseModeEnabled.load() ? "1" : "0", false);
   SetExtState_ptr(kNativeExtStateSection, kSharedQueueActiveKey, g_nativeQueuedSongId.empty() ? "0" : "1", false);
   SetExtState_ptr(kNativeExtStateSection, kSharedQueueIdKey, g_nativeQueuedSongId.c_str(), false);
@@ -3547,6 +3553,7 @@ static void nativePublishStandbyDiscoveryState()
   json << "\"ok\":true,";
   json << "\"nativeBridge\":true,";
   json << "\"bridgeVersion\":2,";
+  json << "\"extensionVersion\":" << nativeJsonString(VSHOOK_EXTENSION_VERSION) << ",";
   json << "\"connected\":true,";
   json << "\"standby\":true,";
   json << "\"runtimeControlActive\":false,";
@@ -5065,6 +5072,38 @@ static bool nativeStopTransportAndPrepareExplicitSelection(ReaProject* project, 
 {
   if (!Main_OnCommand_ptr) return false;
 
+  bool normalStopEnabled = true;
+  bool hasQueuedStopTarget = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    nativeLoadAutomationSettingsOnceLocked();
+    normalStopEnabled = g_nativeNormalStopEnabled;
+    hasQueuedStopTarget =
+      (!g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) ||
+      (!g_nativeAutoBlocoTargetSongId.empty() && g_nativeAutoBlocoTargetEnd > g_nativeAutoBlocoTargetStart + 0.0005);
+    nativeCancelQueueHandoffProtectionLocked();
+  }
+
+  // No controle pelo App nao existe a excecao de selecao azul por setas do Lua.
+  // A fila, porem, sempre tem prioridade: Normal Stop puro so vale quando nao
+  // existe musica aguardando nem alvo explicito enviado pelo Diretor.
+  const bool hasExplicitStopTarget = !explicitSelectionId.empty()
+    || explicitEndPos > explicitStartPos + 0.0005;
+  if (normalStopEnabled && !hasQueuedStopTarget && !hasExplicitStopTarget) {
+    Main_OnCommand_ptr(1016, 0); // Transport: Stop
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      nativeClearAllQueueStateLocked();
+      nativeClearAutoBlocoTargetLocked();
+      nativePublishStopReadyTargetLocked("", "", 0.0, 0.0, 0);
+      nativeBumpSharedRevisionLocked("director");
+      g_nativeSuppressStoppedTransitionPrepareUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
+    }
+    if (UpdateArrange_ptr) UpdateArrange_ptr();
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
   std::string stopSelectionId;
   std::string stopSelectionTab;
   double stopStartPos = 0.0;
@@ -5264,6 +5303,7 @@ static void nativeSyncControlStateFromLuaExtState()
   const char* autoRaw = GetExtState_ptr(kNativeExtStateSection, kLuaAutoplayStateKey);
   const char* atblRaw = GetExtState_ptr(kNativeExtStateSection, kLuaAutoBlocoStateKey);
   const char* stopRaw = GetExtState_ptr(kNativeExtStateSection, kLuaAutoStopStateKey);
+  const char* normalStopRaw = GetExtState_ptr(kNativeExtStateSection, kLuaNormalStopStateKey);
   const char* stopPauseRaw = GetExtState_ptr(kNativeExtStateSection, kLuaStopPauseStateKey);
   const char* drawerIdsRaw = GetExtState_ptr(kNativeExtStateSection, kLuaFamilyDrawersIdsKey);
   std::map<std::string, bool> luaOpenDrawers;
@@ -5276,6 +5316,8 @@ static void nativeSyncControlStateFromLuaExtState()
   g_nativeAutoBlocoEnabled = nativeBoolFromText(atblRaw ? atblRaw : "", g_nativeAutoBlocoEnabled);
   if (!g_nativeAutoplayEnabled) nativeClearAutoBlocoTargetLocked();
   g_nativeAutoStopEnabled = nativeBoolFromText(stopRaw ? stopRaw : "", g_nativeAutoStopEnabled);
+  g_nativeNormalStopEnabled = nativeBoolFromText(
+    normalStopRaw ? normalStopRaw : "", g_nativeNormalStopEnabled);
   g_stopPauseModeEnabled.store(nativeBoolFromText(stopPauseRaw ? stopPauseRaw : "", g_stopPauseModeEnabled.load()));
   if (luaOpenDrawers != g_nativeDirectorOpenFamilyDrawers || g_nativeFamilyDrawersOwner != "lua") {
     g_nativeDirectorOpenFamilyDrawers = std::move(luaOpenDrawers);
@@ -5287,6 +5329,7 @@ static void nativeSyncControlStateFromLuaExtState()
   nativeSaveAutoplayEnabledLocked();
   nativeSaveAutoBlocoEnabledLocked();
   nativeSaveAutoStopEnabledLocked();
+  nativeSaveNormalStopEnabledLocked();
   nativePublishSharedControlStateLocked();
   g_nativeForceStateBuild.store(true);
 }
@@ -5608,6 +5651,7 @@ static void nativeMaintainAutoStop(
   std::string currentPlayingId = playingId;
   double currentSongStart = songStart;
   double currentSongEnd = songEnd;
+  bool normalStopEnabled = true;
 
   // Musicas-filhos continuam pertencendo ao mesmo bloco continuo do pai.
   // Mesmo quando o filho e uma regiao real da segunda ruler lane, nunca usa
@@ -5656,6 +5700,7 @@ static void nativeMaintainAutoStop(
       g_nativeAutoStopLastStoppedSignature.clear();
       return;
     }
+    normalStopEnabled = g_nativeNormalStopEnabled;
     if (g_nativeQueuedManual && !g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) {
       return;
     }
@@ -5669,6 +5714,27 @@ static void nativeMaintainAutoStop(
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     if (g_nativeAutoStopLastStoppedSignature == stopSignature) return;
     g_nativeAutoStopLastStoppedSignature = stopSignature;
+  }
+
+  // Normal Stop no App segue a mesma configuracao do Lua, mas sem a excecao
+  // da selecao azul: termina a musica e envia apenas o Stop padrao do REAPER.
+  if (normalStopEnabled) {
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      nativeCancelQueueHandoffProtectionLocked();
+    }
+    Main_OnCommand_ptr(1016, 0); // Transport: Stop
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      nativeClearAllQueueStateLocked();
+      nativeClearAutoBlocoTargetLocked();
+      nativePublishStopReadyTargetLocked("", "", 0.0, 0.0, 0);
+      g_nativeSuppressStoppedTransitionPrepareUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
+      nativeBumpSharedRevisionLocked("director");
+    }
+    if (UpdateArrange_ptr) UpdateArrange_ptr();
+    g_nativeForceStateBuild.store(true);
+    return;
   }
 
   const NativeSongWindow* target = nativeResolveAutoStopTarget(activeItems, currentPlayingId, currentSongStart, currentSongEnd);
@@ -6582,6 +6648,7 @@ static void nativeRefreshAppActivePanelModel()
     next.autoplayEnabled = g_nativeAutoplayEnabled;
     next.autoBlocoEnabled = g_nativeAutoBlocoEnabled;
     next.autoStopEnabled = g_nativeAutoStopEnabled;
+    next.normalStopEnabled = g_nativeNormalStopEnabled;
     next.timerRunning = g_nativeTimerRunning;
     next.timerMode = nativeNormalizeTimerMode(g_nativeTimerMode);
     next.timerVisible = next.timerRunning || next.timerMode == "local_time";
@@ -6727,6 +6794,7 @@ static void nativeRefreshAppActivePanelModel()
     next.autoplayEnabled != g_nativeAppActivePanelModel.autoplayEnabled ||
     next.autoBlocoEnabled != g_nativeAppActivePanelModel.autoBlocoEnabled ||
     next.autoStopEnabled != g_nativeAppActivePanelModel.autoStopEnabled ||
+    next.normalStopEnabled != g_nativeAppActivePanelModel.normalStopEnabled ||
     next.timerRunning != g_nativeAppActivePanelModel.timerRunning ||
     next.timerVisible != g_nativeAppActivePanelModel.timerVisible ||
     next.timerExpired != g_nativeAppActivePanelModel.timerExpired ||
@@ -7801,15 +7869,109 @@ static void nativeCaptureMultiLoopTracks(ReaProject* project, const NativeMultiL
 static void nativeProcessMultiLoops(ReaProject* project, const std::vector<NativeSongWindow>& songs, bool playing, double playPos, const std::string& playingId, double songStart, double songEnd)
 {
   nativeLoadMultiLoopState();
+
+  // BY e um toggle global do Multiloops. Pode ser ligado mesmo com o transporte
+  // parado e permanece ligado ate o proximo comando explicito de toggle/OFF.
+  int bypassRequest = g_nativeMultiLoopBypassRequest.exchange(-1);
+  // O Lua pode nao enxergar as APIs ReaScript exportadas em alguns ciclos de
+  // retomada do PC. Esta rota ExtState e um pedido de estado unico: a extensao
+  // consome, limpa e continua sendo a unica executora do Multiloops.
+  if (GetExtState_ptr && SetExtState_ptr) {
+    const char* rawRequest = GetExtState_ptr(
+      "VS_HOOK_NATIVE_BRIDGE", "MULTILOOP_BYPASS_REQUEST_V1");
+    if (rawRequest && (rawRequest[0] == '0' || rawRequest[0] == '1')) {
+      bypassRequest = rawRequest[0] == '1' ? 1 : 0;
+      SetExtState_ptr(
+        "VS_HOOK_NATIVE_BRIDGE", "MULTILOOP_BYPASS_REQUEST_V1", "", false);
+    }
+  }
+  if (bypassRequest >= 0) {
+    bool enableBypass = bypassRequest == 1;
+    if (bypassRequest == 2) enableBypass = !g_nativeMultiLoopBypassActive;
+
+    if (enableBypass != g_nativeMultiLoopBypassActive) {
+      if (enableBypass) {
+        // Se o BY for ligado com um Multiloop ja armado, desarma apenas o loop
+        // pertencente ao Multiloops e restaura imediatamente Fader/Mute/Solo.
+        if (g_nativeMultiLoopActivePair.valid) {
+          nativeSetRepeatEnabled(project, false);
+          nativeClearLoopTimeRange(project);
+        }
+        nativeRestoreMultiLoopTracks();
+        nativeRestoreMultiLoopBypassVolumes(true);
+        g_nativeMultiLoopActivePair = NativeMultiLoopPair();
+        g_nativeMultiLoopDisarmedPairKey.clear();
+        g_nativeMultiLoopBypassActive = true;
+        g_nativeMultiLoopBypassSongKey.clear();
+      } else {
+        g_nativeMultiLoopBypassActive = false;
+        g_nativeMultiLoopBypassSongKey.clear();
+        g_nativeMultiLoopBypassVolumeBaseline.clear();
+        g_nativeMultiLoopBypassWarningPairKey.clear();
+        g_nativeMultiLoopBypassWarningSongKey.clear();
+        g_nativeMultiLoopBypassWarningStartPos = 0.0;
+      }
+      g_nativeForceStateBuild.store(true);
+    }
+  }
+
   if (!playing || playingId.empty()) {
     if (g_nativeMultiLoopActivePair.valid || !g_nativeMultiLoopRestore.empty() || !g_nativeMultiLoopFadeTracks.empty()) nativeRestoreMultiLoopTracks();
     nativeRestoreMultiLoopBypassVolumes(true);
     g_nativeMultiLoopActivePair = NativeMultiLoopPair(); g_nativeMultiLoopDisarmedPairKey.clear();
-    g_nativeMultiLoopBypassActive = false;
-    g_nativeMultiLoopBypassSongKey.clear();
-    g_nativeMultiLoopBypassRequest.store(-1);
+    g_nativeMultiLoopBypassWarningPairKey.clear();
+    g_nativeMultiLoopBypassWarningSongKey.clear();
+    g_nativeMultiLoopBypassWarningStartPos = 0.0;
     return;
   }
+
+  // Com BY ligado nenhum Multiloop chega ao pre-fade, Mute/Solo ou armamento.
+  if (g_nativeMultiLoopBypassActive) {
+    // Publica para o App Diretor somente o proximo primeiro marker de um slot
+    // realmente habilitado. O tablet usa esse alvo para avisar quatro segundos antes.
+    const NativeSongWindow* bypassSong = nullptr;
+    for (const auto& item : songs) if (!item.isBlock && item.id == playingId) { bypassSong = &item; break; }
+    std::string warningSongKey = bypassSong ? nativeMultiLoopSongKey(*bypassSong) : std::string();
+    if (warningSongKey.empty() && g_nativeMultiLoopFocusStart <= songStart + 0.001 && g_nativeMultiLoopFocusEnd >= songEnd - 0.001) {
+      warningSongKey = g_nativeMultiLoopFocusKey;
+    }
+    NativeMultiLoopPair warningPair;
+    const auto warningStateIt = g_nativeMultiLoopStates.find(warningSongKey);
+    if (warningStateIt != g_nativeMultiLoopStates.end()) {
+      const NativeMultiLoopSongState& warningState = warningStateIt->second;
+      for (int slot = 0; slot < 2; ++slot) if (warningState.loop[slot]) {
+        const NativeMultiLoopPair pair = nativeFindMultiLoopPair(project, warningSongKey, songStart, songEnd, slot);
+        const double remaining = pair.start - playPos;
+        if (pair.valid && remaining >= -0.0005 && remaining <= kNativeMultiLoopBypassWarningLeadSec + 0.0005
+            && (!warningPair.valid || pair.start < warningPair.start)) warningPair = pair;
+      }
+    }
+    if (warningPair.valid) {
+      g_nativeMultiLoopBypassWarningPairKey = warningPair.key;
+      g_nativeMultiLoopBypassWarningSongKey = warningSongKey;
+      g_nativeMultiLoopBypassWarningStartPos = warningPair.start;
+    } else {
+      g_nativeMultiLoopBypassWarningPairKey.clear();
+      g_nativeMultiLoopBypassWarningSongKey.clear();
+      g_nativeMultiLoopBypassWarningStartPos = 0.0;
+    }
+    if (g_nativeMultiLoopActivePair.valid) {
+      nativeSetRepeatEnabled(project, false);
+      nativeClearLoopTimeRange(project);
+    }
+    if (g_nativeMultiLoopActivePair.valid || !g_nativeMultiLoopRestore.empty() || !g_nativeMultiLoopFadeTracks.empty()) {
+      nativeRestoreMultiLoopTracks();
+    }
+    nativeRestoreMultiLoopBypassVolumes(true);
+    g_nativeMultiLoopActivePair = NativeMultiLoopPair();
+    g_nativeMultiLoopDisarmedPairKey.clear();
+    return;
+  }
+
+  g_nativeMultiLoopBypassWarningPairKey.clear();
+  g_nativeMultiLoopBypassWarningSongKey.clear();
+  g_nativeMultiLoopBypassWarningStartPos = 0.0;
+
   const NativeSongWindow* song = nullptr;
   for (const auto& item : songs) if (!item.isBlock && item.id == playingId) { song = &item; break; }
   std::string songKey = song ? nativeMultiLoopSongKey(*song) : std::string();
@@ -7819,101 +7981,15 @@ static void nativeProcessMultiLoops(ReaProject* project, const std::vector<Nativ
     if (g_nativeMultiLoopActivePair.valid || !g_nativeMultiLoopRestore.empty() || !g_nativeMultiLoopFadeTracks.empty()) nativeRestoreMultiLoopTracks();
     nativeRestoreMultiLoopBypassVolumes(true);
     g_nativeMultiLoopActivePair = NativeMultiLoopPair();
-    g_nativeMultiLoopBypassActive = false;
-    g_nativeMultiLoopBypassSongKey.clear();
     g_nativeMultiLoopBypassVolumeBaseline.clear();
-    g_nativeMultiLoopBypassRequest.store(-1);
     return;
   }
   const NativeMultiLoopSongState& state = stateIt->second;
   std::vector<NativeMultiLoopPair> enabledPairs;
-  std::vector<NativeMultiLoopPair> bypassEligiblePairs;
   for (int slot = 0; slot < 2; ++slot) if (state.loop[slot]) {
     const NativeMultiLoopPair pair = nativeFindMultiLoopPair(project, songKey, songStart, songEnd, slot);
     if (!pair.valid) continue;
     enabledPairs.push_back(pair);
-    if (playPos < pair.end - 0.0005) bypassEligiblePairs.push_back(pair);
-  }
-
-  const int bypassRequest = g_nativeMultiLoopBypassRequest.exchange(-1);
-  if (bypassRequest >= 0) {
-    bool enableBypass = bypassRequest == 1;
-    if (bypassRequest == 2) enableBypass = !(g_nativeMultiLoopBypassActive && g_nativeMultiLoopBypassSongKey == songKey);
-    if (enableBypass && !bypassEligiblePairs.empty()) {
-      g_nativeMultiLoopBypassActive = true;
-      g_nativeMultiLoopBypassSongKey = songKey;
-      g_nativeMultiLoopBypassLastPos = playPos;
-      g_nativeMultiLoopBypassMaxEnd = 0.0;
-      for (const NativeMultiLoopPair& eligiblePair : bypassEligiblePairs) {
-        g_nativeMultiLoopBypassMaxEnd = std::max(g_nativeMultiLoopBypassMaxEnd, eligiblePair.end);
-      }
-      g_nativeMultiLoopBypassVolumeBaseline.clear();
-      // Guarda um volume limpo por pista. Se o Auto Fader ja estiver ativo,
-      // o snapshot dele substitui o valor reduzido observado neste frame.
-      for (const NativeMultiLoopPair& enabledPair : bypassEligiblePairs) {
-        for (const auto& entry : state.tracks[enabledPair.slot]) {
-          if (!entry.second.autoFader) continue;
-          MediaTrack* track = nativeFindTrackByGuid(project, entry.first);
-          if (!track || !GetMediaTrackInfo_Value_ptr) continue;
-          bool exists = false;
-          for (const auto& saved : g_nativeMultiLoopBypassVolumeBaseline) if (saved.guid == entry.first) { exists = true; break; }
-          if (!exists) {
-            NativeMultiLoopTrackRestore saved;
-            saved.track = track; saved.guid = entry.first; saved.volume = GetMediaTrackInfo_Value_ptr(track, "D_VOL");
-            g_nativeMultiLoopBypassVolumeBaseline.push_back(saved);
-          }
-        }
-      }
-      for (const auto& fadeSaved : g_nativeMultiLoopFadeTracks) {
-        bool replaced = false;
-        for (auto& saved : g_nativeMultiLoopBypassVolumeBaseline) if (saved.guid == fadeSaved.guid) {
-          saved.track = fadeSaved.track; saved.volume = fadeSaved.volume; replaced = true; break;
-        }
-        if (!replaced) g_nativeMultiLoopBypassVolumeBaseline.push_back(fadeSaved);
-      }
-      if (g_nativeMultiLoopActivePair.valid && g_nativeMultiLoopActivePair.songKey == songKey) {
-        nativeSetRepeatEnabled(project, false);
-        nativeClearLoopTimeRange(project);
-        g_nativeMultiLoopActivePair = NativeMultiLoopPair();
-      }
-      // Cancela o Auto Fader e desfaz Mute/Solo no mesmo frame.
-      nativeRestoreMultiLoopTracks();
-      nativeRestoreMultiLoopBypassVolumes(false);
-    } else if (!enableBypass) {
-      // O processamento abaixo recalcula imediatamente o ponto correto do fade
-      // ou rearma o par caso o cursor ja esteja dentro dele.
-      g_nativeMultiLoopBypassActive = false;
-      g_nativeMultiLoopBypassSongKey.clear();
-      g_nativeMultiLoopBypassVolumeBaseline.clear();
-      // OFF dentro do intervalo: aplica imediatamente o estado que existiria
-      // sem o bypass (Auto Fader em zero e preset Mute/Solo ativo).
-      for (const NativeMultiLoopPair& pair : bypassEligiblePairs) {
-        if (playPos >= pair.start - 0.0005 && playPos < pair.end - 0.0005) {
-          nativeCaptureMultiLoopTracks(project, pair);
-          nativeSetLoopTimeRange(project, pair.start, pair.end);
-          nativeSetRepeatEnabled(project, true);
-          g_nativeMultiLoopActivePair = pair;
-          break;
-        }
-      }
-    }
-    g_nativeForceStateBuild.store(true);
-  }
-
-  if (g_nativeMultiLoopBypassActive) {
-    const bool sameSong = g_nativeMultiLoopBypassSongKey == songKey;
-    const bool movedBack = playPos < (g_nativeMultiLoopBypassLastPos - 0.05);
-    const bool passedPairs = g_nativeMultiLoopBypassMaxEnd > 0.0 && playPos > (g_nativeMultiLoopBypassMaxEnd + 0.0005);
-    if (!sameSong || movedBack || passedPairs) {
-      nativeRestoreMultiLoopBypassVolumes(true);
-      g_nativeMultiLoopBypassActive = false;
-      g_nativeMultiLoopBypassSongKey.clear();
-      g_nativeMultiLoopBypassVolumeBaseline.clear();
-      g_nativeForceStateBuild.store(true);
-    } else {
-      g_nativeMultiLoopBypassLastPos = playPos;
-      return;
-    }
   }
 
   NativeMultiLoopPair active;
@@ -7975,11 +8051,26 @@ static void nativePublishMultiLoopBypassState()
   static bool initialized = false;
   static bool lastActive = false;
   static std::string lastSongKey;
-  if (initialized && lastActive == g_nativeMultiLoopBypassActive && lastSongKey == g_nativeMultiLoopBypassSongKey) return;
+  const std::string desiredActive = g_nativeMultiLoopBypassActive ? "1" : "0";
+  std::string publishedActive;
+  std::string publishedSongKey;
+  if (GetExtState_ptr) {
+    const char* activeRaw = GetExtState_ptr(
+      "VS_HOOK_NATIVE_BRIDGE", "MULTILOOP_BYPASS_ACTIVE_V1");
+    publishedActive = activeRaw ? activeRaw : "";
+    const char* songRaw = GetExtState_ptr(
+      "VS_HOOK_NATIVE_BRIDGE", "MULTILOOP_BYPASS_SONG_KEY_V1");
+    publishedSongKey = songRaw ? songRaw : "";
+  }
+  if (initialized
+      && lastActive == g_nativeMultiLoopBypassActive
+      && lastSongKey == g_nativeMultiLoopBypassSongKey
+      && publishedActive == desiredActive
+      && publishedSongKey == (g_nativeMultiLoopBypassActive ? g_nativeMultiLoopBypassSongKey : std::string())) return;
   initialized = true;
   lastActive = g_nativeMultiLoopBypassActive;
   lastSongKey = g_nativeMultiLoopBypassSongKey;
-  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "MULTILOOP_BYPASS_ACTIVE_V1", g_nativeMultiLoopBypassActive ? "1" : "0", false);
+  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "MULTILOOP_BYPASS_ACTIVE_V1", desiredActive.c_str(), false);
   SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "MULTILOOP_BYPASS_SONG_KEY_V1", g_nativeMultiLoopBypassActive ? g_nativeMultiLoopBypassSongKey.c_str() : "", false);
 }
 
@@ -8031,9 +8122,6 @@ static void nativeProcessMultiLoopsOnMainThread()
       nativeRestoreMultiLoopBypassVolumes(true);
       g_nativeMultiLoopActivePair = NativeMultiLoopPair();
       g_nativeMultiLoopDisarmedPairKey.clear();
-      g_nativeMultiLoopBypassActive = false;
-      g_nativeMultiLoopBypassSongKey.clear();
-      g_nativeMultiLoopBypassRequest.store(-1);
     }
   }
   std::string playingName;
@@ -8055,14 +8143,19 @@ static std::string nativeBuildMultiLoopsJson(ReaProject* project)
   const int changeCount = (project && GetProjectStateChangeCount_ptr) ? GetProjectStateChangeCount_ptr(project) : -1;
   std::ostringstream signature;
   signature << project << "|" << changeCount << "|" << g_nativeMultiLoopFocusId << "|" << g_nativeMultiLoopFocusKey << "|"
-            << std::fixed << std::setprecision(6) << g_nativeMultiLoopFocusStart << "|" << g_nativeMultiLoopFocusEnd << "|" << g_nativeMultiLoopRaw
-            << "|" << (bypassActiveForState ? 1 : 0) << "|" << bypassSongKeyForState;
+             << std::fixed << std::setprecision(6) << g_nativeMultiLoopFocusStart << "|" << g_nativeMultiLoopFocusEnd << "|" << g_nativeMultiLoopRaw
+            << "|" << (bypassActiveForState ? 1 : 0) << "|" << bypassSongKeyForState
+            << "|" << g_nativeMultiLoopBypassWarningPairKey << "|" << g_nativeMultiLoopBypassWarningSongKey
+            << "|" << g_nativeMultiLoopBypassWarningStartPos;
   if (signature.str() == cachedSignature && !cachedJson.empty()) return cachedJson;
   if (g_nativeMultiLoopFocusKey.empty()) {
     cachedSignature = signature.str();
     std::ostringstream emptyOut;
     emptyOut << "{\"songId\":\"\",\"songKey\":\"\",\"songName\":\"\",\"bypassActive\":" << (bypassActiveForState ? "true" : "false")
              << ",\"bypassSongKey\":" << nativeJsonString(bypassSongKeyForState)
+             << ",\"bypassWarningKey\":" << nativeJsonString(g_nativeMultiLoopBypassWarningPairKey)
+             << ",\"bypassWarningSongKey\":" << nativeJsonString(g_nativeMultiLoopBypassWarningSongKey)
+             << ",\"bypassWarningStartPos\":" << nativeNumber(g_nativeMultiLoopBypassWarningStartPos)
              << ",\"loop1Enabled\":false,\"loop2Enabled\":false,\"ms1Enabled\":false,\"ms2Enabled\":false,\"loop1Available\":false,\"loop2Available\":false,\"fade1Sec\":3,\"fade2Sec\":3,\"tracks\":[]}";
     cachedJson = emptyOut.str();
     return cachedJson;
@@ -8100,6 +8193,9 @@ static std::string nativeBuildMultiLoopsJson(ReaProject* project)
       << ",\"songName\":" << nativeJsonString(g_nativeMultiLoopFocusName) << ",\"startPos\":" << nativeNumber(g_nativeMultiLoopFocusStart)
       << ",\"endPos\":" << nativeNumber(g_nativeMultiLoopFocusEnd)
       << ",\"bypassActive\":" << (bypassActiveForState ? "true" : "false") << ",\"bypassSongKey\":" << nativeJsonString(bypassSongKeyForState)
+      << ",\"bypassWarningKey\":" << nativeJsonString(g_nativeMultiLoopBypassWarningPairKey)
+      << ",\"bypassWarningSongKey\":" << nativeJsonString(g_nativeMultiLoopBypassWarningSongKey)
+      << ",\"bypassWarningStartPos\":" << nativeNumber(g_nativeMultiLoopBypassWarningStartPos)
       << ",\"loop1Enabled\":" << (state.loop[0] ? "true" : "false") << ",\"loop2Enabled\":" << (state.loop[1] ? "true" : "false")
       << ",\"ms1Enabled\":" << (state.ms[0] && state.loop[0] ? "true" : "false") << ",\"ms2Enabled\":" << (state.ms[1] && state.loop[1] ? "true" : "false")
       << ",\"loop1Available\":" << (pair1.valid ? "true" : "false") << ",\"loop2Available\":" << (pair2.valid ? "true" : "false")
@@ -8405,6 +8501,7 @@ static void nativeRebuildState(bool forceSnapshot)
   bool autoplayEnabled = false;
   bool autoBlocoEnabled = false;
   bool autoStopEnabled = true;
+  bool normalStopEnabled = true;
   bool timerRunning = false;
   std::string timerMode = "progressive";
   double timerStartedAtMs = 0.0;
@@ -8436,6 +8533,7 @@ static void nativeRebuildState(bool forceSnapshot)
     autoplayEnabled = g_nativeAutoplayEnabled;
     autoBlocoEnabled = g_nativeAutoBlocoEnabled;
     autoStopEnabled = g_nativeAutoStopEnabled;
+    normalStopEnabled = g_nativeNormalStopEnabled;
     timerRunning = g_nativeTimerRunning;
     timerMode = g_nativeTimerMode;
     timerStartedAtMs = timerRunning ? nativeTimerEpochMs(g_nativeTimerStartedAtSystem) : 0.0;
@@ -8508,6 +8606,7 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"ok\":true,";
   json << "\"nativeBridge\":true,";
   json << "\"bridgeVersion\":2,";
+  json << "\"extensionVersion\":" << nativeJsonString(VSHOOK_EXTENSION_VERSION) << ",";
   json << "\"connected\":true,";
   json << "\"directorAuthEnabled\":" << (directorAuthEnabled ? "true" : "false") << ",";
   json << "\"authEnabled\":" << (directorAuthEnabled ? "true" : "false") << ",";
@@ -8613,6 +8712,8 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"autostopEnabled\":" << (autoStopEnabled ? "true" : "false") << ",";
   json << "\"auto_stop_enabled\":" << (autoStopEnabled ? "true" : "false") << ",";
   json << "\"autoStop\":" << (autoStopEnabled ? "true" : "false") << ",";
+  json << "\"normalStopEnabled\":" << (normalStopEnabled ? "true" : "false") << ",";
+  json << "\"normal_stop_enabled\":" << (normalStopEnabled ? "true" : "false") << ",";
   json << "\"timerRunning\":" << (timerRunning ? "true" : "false") << ",";
   json << "\"timerActive\":" << (timerRunning ? "true" : "false") << ",";
   json << "\"timerEnabled\":" << (timerRunning ? "true" : "false") << ",";
@@ -8951,6 +9052,13 @@ static bool VS_Hook_Native_ToggleMultiLoopBypass()
   return true;
 }
 
+static bool VS_Hook_Native_SetMultiLoopBypass(bool enabled)
+{
+  g_nativeMultiLoopBypassRequest.store(enabled ? 1 : 0);
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
 static char g_apiDefNativePullCommand[] =
   "bool\0char*,int\0commandJsonOutNeedBig,commandJsonOutNeedBig_sz\0Pull one pending VS Hook command from the native bridge.";
 static char g_apiDefNativeSetLuaState[] =
@@ -8972,7 +9080,9 @@ static char g_apiDefNativeSetManualQueueByPlaylistOrder[] =
 static char g_apiDefNativeArmAutoQueueFromPlaylistOrder[] =
   "bool\0int\0currentPlaylistOrder\0Arm the next automatic VS Hook queue target from the active playlist order.";
 static char g_apiDefNativeToggleMultiLoopBypass[] =
-  "bool\0\0\0Toggle the temporary Multiloops bypass for the current playback pass.";
+  "bool\0\0\0Toggle the global Multiloops bypass until explicitly toggled again.";
+static char g_apiDefNativeSetMultiLoopBypass[] =
+  "bool\0bool\0enabled\0Set the global Multiloops bypass to an explicit state.";
 
 static bool registerNativeBridgeApi()
 {
@@ -9000,12 +9110,16 @@ static bool registerNativeBridgeApi()
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_ArmAutoQueueFromPlaylistOrder", reinterpret_cast<void*>(g_apiDefNativeArmAutoQueueFromPlaylistOrder)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_Native_ToggleMultiLoopBypass", reinterpret_cast<void*>(&VS_Hook_Native_ToggleMultiLoopBypass)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_ToggleMultiLoopBypass", reinterpret_cast<void*>(g_apiDefNativeToggleMultiLoopBypass)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_Native_SetMultiLoopBypass", reinterpret_cast<void*>(&VS_Hook_Native_SetMultiLoopBypass)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetMultiLoopBypass", reinterpret_cast<void*>(g_apiDefNativeSetMultiLoopBypass)) != 0) && ok;
   return ok;
 }
 
 static void unregisterNativeBridgeApi()
 {
   if (!plugin_register_ptr) return;
+  plugin_register_ptr("-APIdef_VS_Hook_Native_SetMultiLoopBypass", reinterpret_cast<void*>(g_apiDefNativeSetMultiLoopBypass));
+  plugin_register_ptr("-API_VS_Hook_Native_SetMultiLoopBypass", reinterpret_cast<void*>(&VS_Hook_Native_SetMultiLoopBypass));
   plugin_register_ptr("-APIdef_VS_Hook_Native_ToggleMultiLoopBypass", reinterpret_cast<void*>(g_apiDefNativeToggleMultiLoopBypass));
   plugin_register_ptr("-API_VS_Hook_Native_ToggleMultiLoopBypass", reinterpret_cast<void*>(&VS_Hook_Native_ToggleMultiLoopBypass));
   plugin_register_ptr("-APIdef_VS_Hook_Native_ArmAutoQueueFromPlaylistOrder", reinterpret_cast<void*>(g_apiDefNativeArmAutoQueueFromPlaylistOrder));
@@ -10423,9 +10537,6 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
         nativeRestoreMultiLoopBypassVolumes(true);
         g_nativeMultiLoopActivePair = NativeMultiLoopPair();
         g_nativeMultiLoopDisarmedPairKey.clear();
-        g_nativeMultiLoopBypassActive = false;
-        g_nativeMultiLoopBypassSongKey.clear();
-        g_nativeMultiLoopBypassRequest.store(-1);
       }
       return ok;
     }
@@ -11522,7 +11633,6 @@ static void nativeReleaseRuntimeControlOnMainThread()
   g_globalStopBreakRequested.store(false);
   g_globalPauseRequested.store(false);
   g_globalStopPauseRequested.store(false);
-  g_nativeMultiLoopBypassRequest.store(-1);
   nativeBreakManualStopFadeout();
 
   const bool ownedLoop = g_nativeMultiLoopActivePair.valid;
@@ -11540,9 +11650,10 @@ static void nativeReleaseRuntimeControlOnMainThread()
 
   g_nativeMultiLoopActivePair = NativeMultiLoopPair();
   g_nativeMultiLoopDisarmedPairKey.clear();
-  g_nativeMultiLoopBypassActive = false;
-  g_nativeMultiLoopBypassSongKey.clear();
   g_nativeMultiLoopBypassVolumeBaseline.clear();
+  g_nativeMultiLoopBypassWarningPairKey.clear();
+  g_nativeMultiLoopBypassWarningSongKey.clear();
+  g_nativeMultiLoopBypassWarningStartPos = 0.0;
   nativeCancelQueueHandoffProtection();
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -11752,8 +11863,6 @@ static void initialize()
       hasRegisteredAction = true;
     }
   }
-
-  unregisterLegacyAppActiveLuaScript();
 
   for (ScriptEntry& script : g_scripts) {
     const std::string mode = script.autoOpenMode ? script.autoOpenMode : "";
