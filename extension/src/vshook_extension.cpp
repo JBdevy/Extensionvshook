@@ -2119,6 +2119,10 @@ static bool g_nativeTimerResetToZero = false;
 static std::chrono::steady_clock::time_point g_nativeTimerStartedAtSteady;
 static std::chrono::system_clock::time_point g_nativeTimerStartedAtSystem;
 
+// Declarada antes das APIs ReaScript para o Lua poder entregar comandos do
+// cronometro diretamente a extensao, sem depender de shell/curl no macOS.
+static bool nativeApplyTimerCommand(const std::string& commandBody);
+
 
 static std::string nativeJsonEscape(const std::string& value)
 {
@@ -8820,6 +8824,14 @@ static bool VS_Hook_Native_SetLuaState(const char* jsonFragment)
   return true;
 }
 
+static bool VS_Hook_Native_ApplyTimerCommand(const char* commandJson)
+{
+  if (!commandJson || !*commandJson) return false;
+  // ReaScripts executam na thread principal do REAPER, a mesma em que os
+  // comandos HTTP eram consumidos. Assim Windows e macOS seguem a mesma rota.
+  return nativeApplyTimerCommand(commandJson);
+}
+
 static bool VS_Hook_Native_SetActivePlaylist(const char* playlistName)
 {
   char pathBuf[2048] = "";
@@ -8943,6 +8955,8 @@ static char g_apiDefNativePullCommand[] =
   "bool\0char*,int\0commandJsonOutNeedBig,commandJsonOutNeedBig_sz\0Pull one pending VS Hook command from the native bridge.";
 static char g_apiDefNativeSetLuaState[] =
   "bool\0const char*\0jsonFragment\0Send small Lua-only live state fields to the VS Hook native bridge.";
+static char g_apiDefNativeApplyTimerCommand[] =
+  "bool\0const char*\0commandJson\0Apply a VS Hook timer command directly from ReaScript.";
 static char g_apiDefNativeSetActivePlaylist[] =
   "bool\0const char*\0playlistName\0Publish the playlist selected locally in VS Hook Lua to the native bridge.";
 static char g_apiDefNativeGetState[] =
@@ -8968,6 +8982,8 @@ static bool registerNativeBridgeApi()
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_PullCommand", reinterpret_cast<void*>(g_apiDefNativePullCommand)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(&VS_Hook_Native_SetLuaState)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(g_apiDefNativeSetLuaState)) != 0) && ok;
+  ok = (plugin_register_ptr("API_VS_Hook_Native_ApplyTimerCommand", reinterpret_cast<void*>(&VS_Hook_Native_ApplyTimerCommand)) != 0) && ok;
+  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_ApplyTimerCommand", reinterpret_cast<void*>(g_apiDefNativeApplyTimerCommand)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_Native_SetActivePlaylist", reinterpret_cast<void*>(&VS_Hook_Native_SetActivePlaylist)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetActivePlaylist", reinterpret_cast<void*>(g_apiDefNativeSetActivePlaylist)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_Native_GetState", reinterpret_cast<void*>(&VS_Hook_Native_GetState)) != 0) && ok;
@@ -9006,6 +9022,8 @@ static void unregisterNativeBridgeApi()
   plugin_register_ptr("-API_VS_Hook_Native_GetState", reinterpret_cast<void*>(&VS_Hook_Native_GetState));
   plugin_register_ptr("-APIdef_VS_Hook_Native_SetActivePlaylist", reinterpret_cast<void*>(g_apiDefNativeSetActivePlaylist));
   plugin_register_ptr("-API_VS_Hook_Native_SetActivePlaylist", reinterpret_cast<void*>(&VS_Hook_Native_SetActivePlaylist));
+  plugin_register_ptr("-APIdef_VS_Hook_Native_ApplyTimerCommand", reinterpret_cast<void*>(g_apiDefNativeApplyTimerCommand));
+  plugin_register_ptr("-API_VS_Hook_Native_ApplyTimerCommand", reinterpret_cast<void*>(&VS_Hook_Native_ApplyTimerCommand));
   plugin_register_ptr("-APIdef_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(g_apiDefNativeSetLuaState));
   plugin_register_ptr("-API_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(&VS_Hook_Native_SetLuaState));
   plugin_register_ptr("-APIdef_VS_Hook_Native_PullCommand", reinterpret_cast<void*>(g_apiDefNativePullCommand));
