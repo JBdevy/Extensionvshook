@@ -6452,6 +6452,23 @@ static void nativeAppActiveResumeFromUi()
 #endif
 }
 
+static POINT nativeAppActiveClickPoint(HWND hwnd, LPARAM lParam)
+{
+  POINT point{static_cast<short>(lParam & 0xffff), static_cast<short>((lParam >> 16) & 0xffff)};
+#ifndef _WIN32
+  // Em dialogs SWELL dockados, o lParam do mouse pode chegar na escala ou no
+  // sistema de coordenadas do container. A posicao global convertida para o
+  // cliente da janela corresponde aos retangulos usados na pintura.
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  ScreenToClient(hwnd, &cursor);
+  RECT client{};
+  GetClientRect(hwnd, &client);
+  if (PtInRect(&client, cursor)) point = cursor;
+#endif
+  return point;
+}
+
 static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
   switch (message) {
@@ -6469,10 +6486,11 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifdef _WIN32
     case WM_LBUTTONUP: {
 #else
-    // SWELL entrega de forma mais consistente o clique de dialogs no mouse-down.
-    case WM_LBUTTONDOWN: {
+    // Aceita as duas fases: a entrega varia entre janela solta e dockada no SWELL.
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP: {
 #endif
-      const POINT point{static_cast<short>(lParam & 0xffff), static_cast<short>((lParam >> 16) & 0xffff)};
+      const POINT point = nativeAppActiveClickPoint(hwnd, lParam);
       if (g_nativeAppActiveResumeConfirmOpen) {
         if (PtInRect(&g_nativeAppActiveResumeConfirmYesRect, point)) {
           nativeAppActiveResumeFromUi();
@@ -11646,6 +11664,46 @@ static void nativePollAppActiveEnterKey()
   }
 }
 
+#ifndef _WIN32
+static void nativePollAppActiveMouseClick()
+{
+  static bool mouseWasDown = false;
+  const bool mouseDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+  if (!nativeAppActivePanelIsOpen()) {
+    mouseWasDown = mouseDown;
+    return;
+  }
+  if (!mouseDown) {
+    mouseWasDown = false;
+    return;
+  }
+  if (mouseWasDown) return;
+  mouseWasDown = true;
+
+  POINT point{};
+  GetCursorPos(&point);
+  ScreenToClient(g_nativeAppActivePanelHwnd, &point);
+  RECT client{};
+  GetClientRect(g_nativeAppActivePanelHwnd, &client);
+  if (!PtInRect(&client, point)) return;
+
+  if (g_nativeAppActiveResumeConfirmOpen) {
+    if (PtInRect(&g_nativeAppActiveResumeConfirmYesRect, point)) {
+      nativeAppActiveResumeFromUi();
+    } else if (PtInRect(&g_nativeAppActiveResumeConfirmNoRect, point)) {
+      g_nativeAppActiveResumeConfirmOpen = false;
+      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    }
+    return;
+  }
+
+  if (PtInRect(&g_nativeAppActiveResumeButtonRect, point)) {
+    g_nativeAppActiveResumeConfirmOpen = true;
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
+}
+#endif
+
 static void nativeReleaseRuntimeControlOnMainThread()
 {
   g_globalStopBreakRequested.store(false);
@@ -11689,6 +11747,9 @@ static void startupTimer()
   // projeto e executado pela extensao. A descoberta leve de abas fica ativa.
   nativeRefreshLuaControlHeartbeatFromExtState();
   nativePollAppActiveEnterKey();
+#ifndef _WIN32
+  nativePollAppActiveMouseClick();
+#endif
   // A fila HTTP precisa ser consumida antes de calcular runtimeActive: o
   // director_enter que acorda a extensao tambem chega por essa fila.
   nativeProcessHttpCommandsOnMainThread();
