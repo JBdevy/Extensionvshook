@@ -205,10 +205,6 @@ static bool g_transportCommandBypass = false;
 static const int kReaperTransportPlayStopCommandId = 40044;
 static const int kReaperTransportStopCommandId = 1016;
 
-// FIX101: qualquer comando manual de transporte deve cancelar a protecao de handoff da fila.
-// Sem isso, se a fila manual acabou de entrar e o usuario aperta Stop, a extensao
-// entende a parada como falha de transicao e religa o Play, reiniciando a musica.
-static void nativeCancelQueueHandoffProtection();
 static bool nativeIsLuaControlActive();
 static bool nativeIsDirectorControlActive();
 static bool nativeIsRuntimeControlActive();
@@ -222,8 +218,6 @@ static bool handleTransportQueueStopCommand(int command)
   if (command != kReaperTransportPlayStopCommandId && command != kReaperTransportStopCommandId) return false;
   if (!nativeIsRuntimeControlActive()) return false;
   const bool luaOwnsQueueLogic = nativeIsLuaControlActive();
-
-  if (!luaOwnsQueueLogic) nativeCancelQueueHandoffProtection();
 
   // Stop/PlayStop precisa consumir a fila ANTES do REAPER limpar o transporte.
   // Esta interceptacao nao e PlayProtection: ela apenas preserva a regra da fila,
@@ -2229,13 +2223,9 @@ static std::string nativeCleanSongName(std::string name)
 {
   name = nativeTrim(name);
   if (nativeStartsWith(name, "--")) name = nativeTrim(name.substr(2));
-  // Remove prefixo numerico simples usado na interface, sem destruir nomes reais.
-  size_t i = 0;
-  while (i < name.size() && name[i] >= '0' && name[i] <= '9') ++i;
-  if (i > 0 && i < name.size() && (name[i] == '-' || name[i] == '.' || name[i] == ')' || name[i] == ' ')) {
-    while (i < name.size() && (name[i] == '-' || name[i] == '.' || name[i] == ')' || name[i] == ' ')) ++i;
-    name = nativeTrim(name.substr(i));
-  }
+  // O numero da regiao/playlist ja possui campo proprio no estado JSON.
+  // O inicio do nome precisa ser preservado: "7 Aneis" e "50 Tons", por
+  // exemplo, sao titulos reais e devem aparecer inteiros na extensao e apps.
   return name;
 }
 
@@ -2882,13 +2872,6 @@ static double g_nativeMultiLoopBypassWarningStartPos = 0.0;
 static constexpr double kNativeMultiLoopBypassWarningLeadSec = 4.0;
 static std::string g_nativeQueuedSeekSignature;
 static std::string g_nativeLastAutoQueueForPlayingId;
-// FIX74: quando a fila nativa faz seek 1s antes do fim, o Lua/autostop antigo pode
-// tentar parar logo depois. Mantemos uma pequena janela de proteção para garantir
-// que a música da fila continue tocando após o seek.
-static std::string g_nativeQueueHandoffPlayId;
-static double g_nativeQueueHandoffStart = 0.0;
-static double g_nativeQueueHandoffEnd = 0.0;
-static std::chrono::steady_clock::time_point g_nativeQueueHandoffProtectUntil;
 static std::string g_nativeAutoStopLastStoppedSignature;
 static std::string g_nativeAutoStopLastPlayingId;
 static double g_nativeAutoStopLastPlayingStart = 0.0;
@@ -3016,20 +2999,6 @@ static void nativeBumpSharedRevisionLocked(const char* owner = nullptr)
   if (owner && *owner) g_nativeControlOwner = owner;
   ++g_nativeResumeRevision;
   nativePublishSharedControlStateLocked();
-}
-
-static void nativeCancelQueueHandoffProtectionLocked()
-{
-  g_nativeQueueHandoffPlayId.clear();
-  g_nativeQueueHandoffStart = 0.0;
-  g_nativeQueueHandoffEnd = 0.0;
-  g_nativeQueueHandoffProtectUntil = std::chrono::steady_clock::time_point();
-}
-
-static void nativeCancelQueueHandoffProtection()
-{
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-  nativeCancelQueueHandoffProtectionLocked();
 }
 
 static bool nativeIsLuaControlActive()
@@ -4917,7 +4886,6 @@ static void nativeClearAllQueueStateLocked()
 {
   nativeClearQueuedSongLocked();
   nativeClearAutoBlocoTargetLocked();
-  nativeCancelQueueHandoffProtectionLocked();
   g_nativeAutoStopLastStoppedSignature.clear();
 }
 
@@ -5017,7 +4985,6 @@ static bool nativePrepareStopSelectionFromQueueOrCurrent(ReaProject* project, bo
     if (!nativeSnapshotStopTargetLocked(stopSelectionId, stopSelectionTab, stopStartPos, stopEndPos)) {
       nativeClearQueuedSongLocked();
       nativeClearAutoBlocoTargetLocked();
-      nativeCancelQueueHandoffProtectionLocked();
       g_nativeForceStateBuild.store(true);
       return false;
     }
@@ -5062,7 +5029,6 @@ static bool nativePrepareStopSelectionFromQueueOrCurrent(ReaProject* project, bo
       finalTab = g_nativeSelectedTab;
     }
     nativePublishStopReadyTargetLocked(finalId, finalTab, finalStart, finalEnd, finalPlaylistIndex);
-    nativeCancelQueueHandoffProtectionLocked();
     g_nativeAutoStopLastStoppedSignature.clear();
   }
 
@@ -5088,7 +5054,6 @@ static bool nativeStopTransportAndPrepareExplicitSelection(ReaProject* project, 
     hasQueuedStopTarget =
       (!g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) ||
       (!g_nativeAutoBlocoTargetSongId.empty() && g_nativeAutoBlocoTargetEnd > g_nativeAutoBlocoTargetStart + 0.0005);
-    nativeCancelQueueHandoffProtectionLocked();
   }
 
   // No controle pelo App nao existe a excecao de selecao azul por setas do Lua.
@@ -5129,7 +5094,6 @@ static bool nativeStopTransportAndPrepareExplicitSelection(ReaProject* project, 
       stopStartPos = explicitStartPos;
       stopEndPos = explicitEndPos;
     }
-    nativeCancelQueueHandoffProtectionLocked();
   }
 
   Main_OnCommand_ptr(1016, 0); // Transport: Stop
@@ -5394,7 +5358,6 @@ static void nativeSyncQueueFromLuaExtState(
     g_nativeQueuedKind = queueKind;
     g_nativeQueuedSeekSignature.clear();
     nativeClearAutoBlocoTargetLocked();
-    nativeCancelQueueHandoffProtectionLocked();
   } else {
     nativeClearAllQueueStateLocked();
   }
@@ -5592,16 +5555,9 @@ static void nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
     g_nativeQueuedSeekSignature = seekSignature;
   }
 
+  // Mesmo comportamento do Lua: move o cursor com seekplay=true. A propria API
+  // transfere a reproducao; nao envia Stop, Play nem qualquer protecao posterior.
   SetEditCurPos2_ptr(project, queuedStart, true, true);
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    g_nativeQueueHandoffPlayId = queuedId;
-    g_nativeQueueHandoffStart = queuedStart;
-    g_nativeQueueHandoffEnd = queuedEnd;
-    g_nativeQueueHandoffProtectUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
-  }
-  // FIX74: o seek ja faz a transição, mas garantimos estado PLAY depois dele.
-  if (Main_OnCommand_ptr) Main_OnCommand_ptr(1007, 0); // Transport: Play
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
 }
@@ -5659,6 +5615,7 @@ static void nativeMaintainAutoStop(
   double currentSongStart = songStart;
   double currentSongEnd = songEnd;
   bool normalStopEnabled = true;
+  bool hasPriorityStopTarget = false;
 
   // Musicas-filhos continuam pertencendo ao mesmo bloco continuo do pai.
   // Mesmo quando o filho e uma regiao real da segunda ruler lane, nunca usa
@@ -5708,6 +5665,12 @@ static void nativeMaintainAutoStop(
       return;
     }
     normalStopEnabled = g_nativeNormalStopEnabled;
+    // Fila automatica e passagem de bloco AT/BL sao excecoes ao Normal Stop:
+    // ao terminar a musica, o alvo precisa ficar selecionado e pronto para Play.
+    hasPriorityStopTarget =
+      (!g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) ||
+      (!g_nativeAutoBlocoTargetSongId.empty() &&
+        g_nativeAutoBlocoTargetEnd > g_nativeAutoBlocoTargetStart + 0.0005);
     if (g_nativeQueuedManual && !g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) {
       return;
     }
@@ -5723,13 +5686,9 @@ static void nativeMaintainAutoStop(
     g_nativeAutoStopLastStoppedSignature = stopSignature;
   }
 
-  // Normal Stop no App segue a mesma configuracao do Lua, mas sem a excecao
-  // da selecao azul: termina a musica e envia apenas o Stop padrao do REAPER.
-  if (normalStopEnabled) {
-    {
-      std::lock_guard<std::mutex> lock(g_nativeMutex);
-      nativeCancelQueueHandoffProtectionLocked();
-    }
+  // Normal Stop puro vale somente sem fila e sem passagem AT/BL. Esses dois
+  // alvos seguem a rotina abaixo para permanecerem prontos para o proximo Play.
+  if (normalStopEnabled && !hasPriorityStopTarget) {
     Main_OnCommand_ptr(1016, 0); // Transport: Stop
     {
       std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -5757,10 +5716,6 @@ static void nativeMaintainAutoStop(
     finalPlaylistIndex = target->playlistOrder;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    nativeCancelQueueHandoffProtectionLocked();
-  }
   Main_OnCommand_ptr(1016, 0); // Transport: Stop
 
   {
@@ -5770,7 +5725,6 @@ static void nativeMaintainAutoStop(
     g_nativeSelectedStart = finalSelectionStart;
     g_nativeSelectedEnd = finalSelectionEnd;
     nativePublishStopReadyTargetLocked(finalSelectionId, finalSelectionTab, finalSelectionStart, finalSelectionEnd, finalPlaylistIndex);
-    nativeCancelQueueHandoffProtectionLocked();
     g_nativeAutoStopLastStoppedSignature.clear();
   }
 
@@ -8323,46 +8277,6 @@ static std::string nativeBuildMultiLoopsJson(ReaProject* project)
   return cachedJson;
 }
 
-
-
-// FIX74: se a fila nativa chegou no alvo e algum estado antigo parou o transporte
-// logo depois, religamos o Play apenas dentro da janela de proteção e somente dentro
-// da região alvo. Isso evita a música começar e parar após o seek.
-static void nativeProtectQueueHandoffPlayback(ReaProject* project, int& playState, double& playPos)
-{
-  if (!project || !Main_OnCommand_ptr || nativeIsLuaControlActive()) return;
-  std::string handoffId;
-  double handoffStart = 0.0;
-  double handoffEnd = 0.0;
-  bool shouldProtect = false;
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    if (!g_nativeQueueHandoffPlayId.empty() && g_nativeQueueHandoffProtectUntil.time_since_epoch().count() != 0) {
-      const auto now = std::chrono::steady_clock::now();
-      if (now <= g_nativeQueueHandoffProtectUntil) {
-        handoffId = g_nativeQueueHandoffPlayId;
-        handoffStart = g_nativeQueueHandoffStart;
-        handoffEnd = g_nativeQueueHandoffEnd;
-        shouldProtect = true;
-      } else {
-        nativeCancelQueueHandoffProtectionLocked();
-      }
-    }
-  }
-  if (!shouldProtect || handoffEnd <= handoffStart + 0.0005) return;
-  if (!GetPlayPositionEx_ptr) return;
-  playPos = GetPlayPositionEx_ptr(project);
-  const bool insideTarget = playPos >= handoffStart - 0.050 && playPos < handoffEnd - 0.050;
-  if (!insideTarget) return;
-  const bool playing = ((playState & 1) == 1) || ((playState & 4) == 4);
-  if (!playing) {
-    Main_OnCommand_ptr(1007, 0); // Transport: Play
-    if (GetPlayStateEx_ptr) playState = GetPlayStateEx_ptr(project);
-    if (GetPlayPositionEx_ptr) playPos = GetPlayPositionEx_ptr(project);
-    g_nativeForceStateBuild.store(true);
-  }
-}
-
 static void nativeRebuildState(bool forceSnapshot)
 {
   if (!EnumProjects_ptr) return;
@@ -8436,7 +8350,6 @@ static void nativeRebuildState(bool forceSnapshot)
   int playState = GetPlayStateEx_ptr ? GetPlayStateEx_ptr(activeProject) : 0;
   double playPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(activeProject) : 0.0;
   const double editCursorPos = GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(activeProject) : playPos;
-  nativeProtectQueueHandoffPlayback(activeProject, playState, playPos);
   const bool playing = (playState & 1) == 1 || (playState & 4) == 4;
   const bool paused = (playState & 2) == 2;
   std::string playingName;
@@ -9578,7 +9491,6 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
       g_nativeQueuedKind = type == "queue_region_song" ? "regions" : "playlist";
       g_nativeQueuedSeekSignature.clear();
       nativeClearAutoBlocoTargetLocked();
-      nativeCancelQueueHandoffProtectionLocked();
       if (commandManualQueue) g_nativeLastAutoQueueForPlayingId.clear();
       else g_nativeLastAutoQueueForPlayingId = g_nativeCurrentPlayingId;
     }
@@ -10723,11 +10635,6 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
     }
     if (stopSelectionTab != "regions") stopSelectionTab = "playlist";
 
-    {
-      std::lock_guard<std::mutex> lock(g_nativeMutex);
-      nativeCancelQueueHandoffProtectionLocked();
-    }
-
     Main_OnCommand_ptr(1016, 0); // Transport: Stop
     if (stopNoSeek && SetEditCurPos2_ptr && editCursorBeforeStop >= 0.0) {
       SetEditCurPos2_ptr(project, editCursorBeforeStop, false, false);
@@ -11828,7 +11735,6 @@ static void nativeReleaseRuntimeControlOnMainThread()
   g_nativeMultiLoopBypassWarningPairKey.clear();
   g_nativeMultiLoopBypassWarningSongKey.clear();
   g_nativeMultiLoopBypassWarningStartPos = 0.0;
-  nativeCancelQueueHandoffProtection();
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     g_nativePendingSelection = NativePendingSelectionCommand{};
