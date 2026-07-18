@@ -2851,6 +2851,20 @@ static std::string g_nativeMultiLoopFocusName;
 static double g_nativeMultiLoopFocusStart = 0.0;
 static double g_nativeMultiLoopFocusEnd = 0.0;
 static uint64_t g_nativeMultiLoopPairCacheRevision = 1;
+// Mute/Solo/volume aplicados pelo runtime alteram o contador do projeto, mas
+// nao alteram regioes, markers ou repertorios. Guarda a revisao exata produzida
+// internamente; se o usuario editar algo depois dela, o contador sera diferente
+// e a reconstrucao pesada continuara acontecendo normalmente.
+static ReaProject* g_nativeLightweightMutationProject = nullptr;
+static int g_nativeLightweightMutationChangeCount = -1;
+
+static void nativeNoteLightweightProjectMutation(ReaProject* project = nullptr)
+{
+  if (!project) project = g_nativeMultiLoopProject;
+  if (!project || !GetProjectStateChangeCount_ptr) return;
+  g_nativeLightweightMutationProject = project;
+  g_nativeLightweightMutationChangeCount = GetProjectStateChangeCount_ptr(project);
+}
 static NativeMultiLoopPair g_nativeMultiLoopActivePair;
 static std::string g_nativeMultiLoopDisarmedPairKey;
 static std::vector<NativeMultiLoopTrackRestore> g_nativeMultiLoopRestore;
@@ -4384,7 +4398,9 @@ static std::string nativeFindPlayingId(const std::vector<NativeSongWindow>& song
   bool bestIsChild = false;
   for (const auto& s : songs) {
     if (s.isBlock) continue;
-    if (pos >= s.start - 0.0005 && pos < s.end - 0.0005) {
+    // Intervalo fechado no inicio e aberto no fim. Quando duas regioes estao
+    // coladas, o ponto compartilhado pertence exclusivamente a proxima musica.
+    if (pos >= s.start && pos < s.end) {
       const double len = std::max(0.0, s.end - s.start);
       // Gaveta aberta/fechada nao participa desta escolha. Prioriza sempre a
       // regiao-filha real; o menor trecho continua sendo o desempate geral.
@@ -4663,7 +4679,7 @@ static const NativeSongWindow* nativeFindPlayingFamilyChildLocked(
     const bool idMatch = !playingId.empty() &&
       (candidate.id == playingId || std::to_string(candidate.sourceNumber) == playingId || candidate.playlistEntryId == playingId);
     const bool boundsMatch = std::fabs(candidate.start - songStart) <= 0.002 && std::fabs(candidate.end - songEnd) <= 0.002;
-    const bool containsPlay = playPos >= candidate.start - 0.0005 && playPos < candidate.end - 0.0005;
+    const bool containsPlay = playPos >= candidate.start && playPos < candidate.end;
     if (!idMatch && !boundsMatch && !containsPlay) continue;
     const double length = candidate.end - candidate.start;
     if (idMatch || boundsMatch || length < bestLength) {
@@ -5674,6 +5690,14 @@ static void nativeMaintainAutoStop(
     if (g_nativeQueuedManual && !g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) {
       return;
     }
+  }
+
+  // Regioes coladas formam uma passagem continua: se outra musica comeca
+  // exatamente no fim desta, o Auto Stop nao atua nessa fronteira.
+  for (const auto& candidate : projectSongs) {
+    if (!nativeSongIsPlayable(candidate) || candidate.isHashParent) continue;
+    if (candidate.id == currentPlayingId) continue;
+    if (std::fabs(candidate.start - currentSongEnd) <= 0.002) return;
   }
 
   const double remaining = currentSongEnd - playPos;
@@ -7824,7 +7848,9 @@ static NativeMultiLoopPair nativeFindMultiLoopPair(ReaProject* project, const st
     bool isRegion = false; double pos = 0.0, end = 0.0; const char* rawName = nullptr; int number = 0, color = 0;
     if (!EnumProjectMarkers3_ptr(project, i, &isRegion, &pos, &end, &rawName, &number, &color) || isRegion) continue;
     const std::string name = nativeTrim(rawName ? rawName : "");
-    if (pos > songStart + 0.0005 && pos < songEnd - 0.0005 && nativeStartsWith(name, prefix)) points.push_back(pos);
+    // O inicio pertence a esta musica e o fim e exclusivo. Assim um *1/*2
+    // exatamente no inicio da regiao entra no par sem vazar para a anterior.
+    if (pos >= songStart && pos < songEnd && nativeStartsWith(name, prefix)) points.push_back(pos);
   }
   std::sort(points.begin(), points.end());
   if (points.size() < 2 || points[1] <= points[0] + 0.0005) { cache[cacheKey] = pair; return pair; }
@@ -7874,6 +7900,7 @@ static void nativeRestoreMultiLoopTracks()
   }
   g_nativeMultiLoopRestore.clear(); g_nativeMultiLoopFadeTracks.clear();
   g_nativeMultiLoopFadeOutActive = false; g_nativeMultiLoopFadeInActive = false;
+  nativeNoteLightweightProjectMutation();
   if (TrackList_AdjustWindows_ptr) TrackList_AdjustWindows_ptr(false);
   if (UpdateArrange_ptr) UpdateArrange_ptr();
 }
@@ -7887,6 +7914,7 @@ static void nativeRestoreMultiLoopBypassVolumes(bool clearAfter)
     }
   }
   if (clearAfter) g_nativeMultiLoopBypassVolumeBaseline.clear();
+  nativeNoteLightweightProjectMutation();
   if (TrackList_AdjustWindows_ptr) TrackList_AdjustWindows_ptr(false);
   if (UpdateArrange_ptr) UpdateArrange_ptr();
 }
@@ -7936,6 +7964,7 @@ static void nativeCaptureMultiLoopTracks(ReaProject* project, const NativeMultiL
   }
   if (TrackList_AdjustWindows_ptr) TrackList_AdjustWindows_ptr(false);
   if (UpdateArrange_ptr) UpdateArrange_ptr();
+  nativeNoteLightweightProjectMutation(project);
 }
 
 static void nativeProcessMultiLoops(ReaProject* project, const std::vector<NativeSongWindow>& songs, bool playing, double playPos, const std::string& playingId, double songStart, double songEnd)
@@ -8081,18 +8110,20 @@ static void nativeProcessMultiLoops(ReaProject* project, const std::vector<Nativ
       }
       if (!g_nativeMultiLoopFadeTracks.empty()) { g_nativeMultiLoopFadeOutActive = true; g_nativeMultiLoopFadeStart = pair.start - fadeSec; g_nativeMultiLoopFadeEnd = pair.start; }
     }
-    if (playPos >= pair.start - 0.0005 && playPos < pair.end - 0.0005) { active = pair; break; }
+    if (playPos >= pair.start && playPos < pair.end) { active = pair; break; }
     if (g_nativeMultiLoopDisarmedPairKey == pair.key && playPos > pair.end + 0.0005) g_nativeMultiLoopDisarmedPairKey.clear();
   }
   if (g_nativeMultiLoopFadeOutActive && SetMediaTrackInfo_Value_ptr) {
     const double span = std::max(0.001, g_nativeMultiLoopFadeEnd - g_nativeMultiLoopFadeStart);
     const double ratio = std::max(0.0, std::min(1.0, 1.0 - ((playPos - g_nativeMultiLoopFadeStart) / span)));
     for (auto& row : g_nativeMultiLoopFadeTracks) if (row.track) SetMediaTrackInfo_Value_ptr(row.track, "D_VOL", row.targetVolume + ((row.volume - row.targetVolume) * ratio));
+    nativeNoteLightweightProjectMutation(project);
   }
   if (g_nativeMultiLoopFadeInActive && SetMediaTrackInfo_Value_ptr) {
     const double span = std::max(0.001, g_nativeMultiLoopFadeEnd - g_nativeMultiLoopFadeStart);
     const double ratio = std::max(0.0, std::min(1.0, (playPos - g_nativeMultiLoopFadeStart) / span));
     for (auto& row : g_nativeMultiLoopFadeTracks) if (row.track) SetMediaTrackInfo_Value_ptr(row.track, "D_VOL", row.targetVolume + ((row.volume - row.targetVolume) * ratio));
+    nativeNoteLightweightProjectMutation(project);
     if (ratio >= 0.999) nativeRestoreMultiLoopTracks();
   }
   if (!active.valid) {
@@ -8318,6 +8349,18 @@ static void nativeRebuildState(bool forceSnapshot)
     : -1;
   const auto snapshotNow = std::chrono::steady_clock::now();
   const bool snapshotProjectChanged = cachedSnapshotProject != activeProject;
+  const bool onlyLightweightRuntimeMutation = !snapshotProjectChanged
+    && g_nativeLightweightMutationProject == activeProject
+    && g_nativeLightweightMutationChangeCount == projectChangeCount;
+  g_nativeLightweightMutationProject = nullptr;
+  g_nativeLightweightMutationChangeCount = -1;
+  if (onlyLightweightRuntimeMutation) {
+    // A mudanca veio do proprio Multiloops. Regioes/markers continuam validos;
+    // consome a revisao para impedir uma varredura pesada durante o audio.
+    cachedSnapshotChangeCount = projectChangeCount;
+    observedProjectChangeCount = projectChangeCount;
+    observedProjectChangeAt = snapshotNow;
+  }
   if (snapshotProjectChanged || observedProjectChangeCount != projectChangeCount) {
     observedProjectChangeCount = projectChangeCount;
     observedProjectChangeAt = snapshotNow;
@@ -8330,6 +8373,7 @@ static void nativeRebuildState(bool forceSnapshot)
     std::chrono::duration_cast<std::chrono::milliseconds>(snapshotNow - observedProjectChangeAt).count() >= 300;
   const bool rebuildSnapshot = forceSnapshot || snapshotProjectChanged || projectRevisionSettled || cachedSongs.empty();
   if (rebuildSnapshot) {
+    ++g_nativeMultiLoopPairCacheRevision;
     cachedSnapshotProject = activeProject;
     cachedSnapshotChangeCount = projectChangeCount;
     cachedSongs = nativeCollectProjectSongs(activeProject, cachedMarkersJson);
