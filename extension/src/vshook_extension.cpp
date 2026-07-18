@@ -383,9 +383,14 @@ struct NativeAppActivePanelModel {
 static HWND g_nativeAppActivePanelHwnd = nullptr;
 static bool g_nativeAppActivePanelClosing = false;
 static bool g_nativeAppActiveResumeConfirmOpen = false;
+static bool g_nativeAppActiveControlBlockedNoticeOpen = false;
 static RECT g_nativeAppActiveResumeButtonRect{0, 0, 0, 0};
 static RECT g_nativeAppActiveResumeConfirmYesRect{0, 0, 0, 0};
 static RECT g_nativeAppActiveResumeConfirmNoRect{0, 0, 0, 0};
+static RECT g_nativeAppActiveControlBlockedNoticeOkRect{0, 0, 0, 0};
+#ifndef _WIN32
+static bool g_nativeAppActiveMouseDownHandled = false;
+#endif
 static NativeAppActivePanelModel g_nativeAppActivePanelModel;
 static int g_nativeAppActiveListFirstRow = 0;
 static int g_nativeAppActiveListScrollPixels = 0;
@@ -5884,9 +5889,14 @@ static void nativeAppActiveDrawBlackShadow(HDC dc, const RECT& rect)
     DeleteDC(layer);
     return;
   }
+#else
+  // O GDI do SWELL/macOS nao oferece aqui uma composicao alfa equivalente.
+  // O preenchimento intercalado aparecia como listras em telas Retina e o
+  // preenchimento solido escondia toda a interface. Mantem o conteudo visivel;
+  // o painel continua somente leitura pela propria logica de mouse/teclado.
+  return;
 #endif
-  // No SWELL/macOS o preenchimento intercalado produzia listras visiveis,
-  // principalmente em telas Retina. Usa uma camada escura continua.
+  // Fallback raro do Windows quando AlphaBlend nao estiver disponivel.
   nativeAppActiveFillRect(dc, rect, RGB(3, 5, 8));
 }
 
@@ -6372,8 +6382,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
     }
   }
 
-  // Enquanto o Diretor controla, toda a area informativa fica sob uma sombra.
-  // O unico elemento livre e acionavel e o botao de retomar acesso ao PC.
+  // Enquanto o Diretor controla, toda a area informativa continua somente
+  // leitura. No Windows ela tambem recebe a sombra; no Mac permanece visivel.
   RECT readOnlyShadow{client.left, client.top, client.right, listRect.bottom};
   nativeAppActiveDrawBlackShadow(dc, readOnlyShadow);
 
@@ -6414,9 +6424,48 @@ static void nativePaintAppActivePanel(HWND hwnd)
       RGB(22, 163, 74), RGB(74, 222, 128), 6);
     nativeAppActiveDrawText(dc, "SIM, RETOMAR", g_nativeAppActiveResumeConfirmYesRect,
       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, RGB(255, 255, 255), labelFont);
+    g_nativeAppActiveControlBlockedNoticeOkRect = RECT{0, 0, 0, 0};
+  } else if (g_nativeAppActiveControlBlockedNoticeOpen) {
+    nativeAppActiveDrawBlackShadow(dc, client);
+    const int modalW = std::max(300, std::min(width - pad * 2, 470));
+    const int modalH = std::max(156, std::min(height - pad * 2, 188));
+    const int modalLeft = (width - modalW) / 2;
+    const int modalTop = (height - modalH) / 2;
+    RECT modal{modalLeft, modalTop, modalLeft + modalW, modalTop + modalH};
+    nativeAppActiveFillRoundRect(dc, modal, RGB(10, 16, 29), RGB(250, 204, 21), 9);
+
+    RECT noticeTitle{modal.left + 14, modal.top + 11, modal.right - 14, modal.top + 39};
+    nativeAppActiveDrawText(dc, "ACESSO BLOQUEADO", noticeTitle,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, RGB(250, 204, 21), titleFont);
+    RECT noticeLine1{modal.left + 18, noticeTitle.bottom + 3, modal.right - 18, noticeTitle.bottom + 23};
+    nativeAppActiveDrawText(dc, "Você não pode controlar o VS Hook em dois", noticeLine1,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      RGB(226, 232, 240), labelFont);
+    RECT noticeLine2{modal.left + 18, noticeLine1.bottom, modal.right - 18, noticeLine1.bottom + 20};
+    nativeAppActiveDrawText(dc, "lugares ao mesmo tempo.", noticeLine2,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      RGB(226, 232, 240), labelFont);
+    RECT noticeLine3{modal.left + 18, noticeLine2.bottom + 3, modal.right - 18, noticeLine2.bottom + 23};
+    nativeAppActiveDrawText(dc, "Para controlar pelo computador, use o botão", noticeLine3,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      RGB(226, 232, 240), labelFont);
+    RECT noticeLine4{modal.left + 18, noticeLine3.bottom, modal.right - 18, modal.bottom - 52};
+    nativeAppActiveDrawText(dc, "Retomar acesso abaixo.", noticeLine4,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      RGB(226, 232, 240), labelFont);
+
+    g_nativeAppActiveControlBlockedNoticeOkRect = RECT{
+      modal.left + 14, modal.bottom - 42, modal.right - 14, modal.bottom - 12};
+    nativeAppActiveFillRoundRect(dc, g_nativeAppActiveControlBlockedNoticeOkRect,
+      RGB(37, 99, 235), RGB(96, 165, 250), 6);
+    nativeAppActiveDrawText(dc, "ENTENDI", g_nativeAppActiveControlBlockedNoticeOkRect,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, RGB(255, 255, 255), labelFont);
+    g_nativeAppActiveResumeConfirmYesRect = RECT{0, 0, 0, 0};
+    g_nativeAppActiveResumeConfirmNoRect = RECT{0, 0, 0, 0};
   } else {
     g_nativeAppActiveResumeConfirmYesRect = RECT{0, 0, 0, 0};
     g_nativeAppActiveResumeConfirmNoRect = RECT{0, 0, 0, 0};
+    g_nativeAppActiveControlBlockedNoticeOkRect = RECT{0, 0, 0, 0};
   }
 
   DeleteObject(titleFont);
@@ -6488,7 +6537,23 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP: {
 #endif
+#ifndef _WIN32
+      // Alguns dockers SWELL entregam DOWN e UP para o mesmo clique. Processa
+      // apenas uma fase, mas continua aceitando UP quando ele vier sozinho.
+      if (message == WM_LBUTTONUP && g_nativeAppActiveMouseDownHandled) {
+        g_nativeAppActiveMouseDownHandled = false;
+        return 0;
+      }
+      if (message == WM_LBUTTONDOWN) g_nativeAppActiveMouseDownHandled = true;
+#endif
       const POINT point = nativeAppActiveClickPoint(hwnd, lParam);
+      if (g_nativeAppActiveControlBlockedNoticeOpen) {
+        if (PtInRect(&g_nativeAppActiveControlBlockedNoticeOkRect, point)) {
+          g_nativeAppActiveControlBlockedNoticeOpen = false;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+      }
       if (g_nativeAppActiveResumeConfirmOpen) {
         if (PtInRect(&g_nativeAppActiveResumeConfirmYesRect, point)) {
           nativeAppActiveResumeFromUi();
@@ -6501,12 +6566,18 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       if (PtInRect(&g_nativeAppActiveResumeButtonRect, point)) {
         g_nativeAppActiveResumeConfirmOpen = true;
         InvalidateRect(hwnd, nullptr, FALSE);
+      } else {
+        g_nativeAppActiveControlBlockedNoticeOpen = true;
+        InvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
     }
     case WM_KEYDOWN:
       if (wParam == VK_RETURN) {
-        if (g_nativeAppActiveResumeConfirmOpen) {
+        if (g_nativeAppActiveControlBlockedNoticeOpen) {
+          g_nativeAppActiveControlBlockedNoticeOpen = false;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (g_nativeAppActiveResumeConfirmOpen) {
           nativeAppActiveResumeFromUi();
         } else {
           g_nativeAppActiveResumeConfirmOpen = true;
@@ -6515,7 +6586,10 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         return 0;
       }
       if (wParam == VK_ESCAPE) {
-        if (g_nativeAppActiveResumeConfirmOpen) {
+        if (g_nativeAppActiveControlBlockedNoticeOpen) {
+          g_nativeAppActiveControlBlockedNoticeOpen = false;
+          InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (g_nativeAppActiveResumeConfirmOpen) {
           g_nativeAppActiveResumeConfirmOpen = false;
           InvalidateRect(hwnd, nullptr, FALSE);
         }
@@ -6524,6 +6598,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       break;
     case WM_CLOSE:
       if (!g_nativeAppActivePanelClosing) {
+        g_nativeAppActiveControlBlockedNoticeOpen = false;
         if (!g_nativeAppActiveResumeConfirmOpen) {
           g_nativeAppActiveResumeConfirmOpen = true;
           InvalidateRect(hwnd, nullptr, FALSE);
@@ -6601,6 +6676,10 @@ static bool nativeOpenAppActivePanel()
   g_nativeAppActivePanelHwnd = hwnd;
   g_nativeAppActivePanelClosing = false;
   g_nativeAppActiveResumeConfirmOpen = false;
+  g_nativeAppActiveControlBlockedNoticeOpen = false;
+#ifndef _WIN32
+  g_nativeAppActiveMouseDownHandled = false;
+#endif
   nativeRefreshAppActivePanelModel();
 
   if (savedDockState != 0 && DockWindowAdd_ptr) {
@@ -6630,9 +6709,14 @@ static void nativeCloseAppActivePanel()
   g_nativeAppActivePanelHwnd = nullptr;
   g_nativeAppActivePanelClosing = false;
   g_nativeAppActiveResumeConfirmOpen = false;
+  g_nativeAppActiveControlBlockedNoticeOpen = false;
+#ifndef _WIN32
+  g_nativeAppActiveMouseDownHandled = false;
+#endif
   g_nativeAppActiveResumeButtonRect = RECT{0, 0, 0, 0};
   g_nativeAppActiveResumeConfirmYesRect = RECT{0, 0, 0, 0};
   g_nativeAppActiveResumeConfirmNoRect = RECT{0, 0, 0, 0};
+  g_nativeAppActiveControlBlockedNoticeOkRect = RECT{0, 0, 0, 0};
 }
 
 static void nativeRefreshAppActivePanelModel()
