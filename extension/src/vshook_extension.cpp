@@ -398,6 +398,7 @@ static bool nativeOpenAppActivePanel();
 static void nativeCloseAppActivePanel();
 static void nativeRefreshAppActivePanelModel();
 static bool nativeGetLoopTimeRange(ReaProject* project, double& startOut, double& endOut);
+static bool nativeIsRepeatEnabled(ReaProject* project);
 static std::string nativeFindLoopBoundaryLabel(ReaProject* project, double boundaryPos);
 static std::string nativeFindLoopRegionLabel(ReaProject* project, double loopStart, double loopEnd);
 
@@ -5465,9 +5466,9 @@ static bool nativeQueuedSongIsSameAsPlayingLocked(const std::string& playingId, 
   return false;
 }
 
-static void nativeMaintainQueueAutomation(ReaProject* project, bool playing, const std::string& playingId, double playPos, double songStart, double songEnd, const std::vector<NativeSongWindow>& activeItems, const std::vector<NativeSongWindow>& projectSongs)
+static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, const std::string& playingId, double playPos, double songStart, double songEnd, const std::vector<NativeSongWindow>& activeItems, const std::vector<NativeSongWindow>& projectSongs)
 {
-  if (!project || nativeIsLuaControlActive()) return;
+  if (!project || nativeIsLuaControlActive()) return false;
 
   if (!playing || playingId.empty()) {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -5476,12 +5477,12 @@ static void nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
       nativeClearQueuedSongLocked();
       nativeClearAutoBlocoTargetLocked();
       g_nativeAutoStopLastStoppedSignature.clear();
-      return;
+      return false;
     }
     // Stop/PlayStop deve preservar a fila/Auto como alvo pronto para o próximo Play.
     // O alvo só deve ser consumido quando a música efetivamente entra em playback.
     g_nativeForceStateBuild.store(true);
-    return;
+    return false;
   }
 
   {
@@ -5547,27 +5548,26 @@ static void nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
     hasQueue = !queuedId.empty() && queuedEnd > queuedStart + 0.0005;
   }
 
-  if (!hasQueue || !SetEditCurPos2_ptr) return;
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    if (g_nativeAutoStopEnabled && !queuedManual) return;
-  }
+  if (!hasQueue || !SetEditCurPos2_ptr) return false;
+  // A fila continua armada e visivel, mas nenhum seek pode disputar o cursor
+  // enquanto qualquer Loop/Repeat estiver ativo (padrao ou Multiloops).
+  if (nativeIsRepeatEnabled(project)) return false;
   double sourceBoundaryStart = songStart;
   double sourceBoundaryEnd = songEnd;
   std::string sourceBoundaryId = playingId;
   nativeResolveQueueSourceBoundary(projectSongs, playingId, playPos, songStart, songEnd,
     sourceBoundaryStart, sourceBoundaryEnd, sourceBoundaryId);
-  if (std::fabs(queuedStart - sourceBoundaryStart) <= 0.002 && std::fabs(queuedEnd - sourceBoundaryEnd) <= 0.002) return;
+  if (std::fabs(queuedStart - sourceBoundaryStart) <= 0.002 && std::fabs(queuedEnd - sourceBoundaryEnd) <= 0.002) return false;
 
   // O seek antecipado so nasce no fim de uma regiao normal ou no fim do pai.
   // O limite individual de uma musica-filho nunca conclui a fila.
   const double remaining = sourceBoundaryEnd - playPos;
-  if (remaining <= 0.0 || remaining > 0.5) return;
+  if (remaining <= 0.0 || remaining > 0.5) return false;
 
   const std::string seekSignature = sourceBoundaryId + "->" + queuedId + "@" + nativeNumber(sourceBoundaryStart, 3) + ":" + nativeNumber(queuedStart, 3);
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
-    if (g_nativeQueuedSeekSignature == seekSignature) return;
+    if (g_nativeQueuedSeekSignature == seekSignature) return false;
     g_nativeQueuedSeekSignature = seekSignature;
   }
 
@@ -5576,6 +5576,7 @@ static void nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   SetEditCurPos2_ptr(project, queuedStart, true, true);
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
+  return true;
 }
 
 static const NativeSongWindow* nativeResolveAutoStopTarget(const std::vector<NativeSongWindow>& activeItems, const std::string& playingId, double songStart, double songEnd)
@@ -5626,6 +5627,13 @@ static void nativeMaintainAutoStop(
   const std::vector<NativeSongWindow>& projectSongs)
 {
   if (!project || !Main_OnCommand_ptr || !playing || nativeIsLuaControlActive()) return;
+  // O Repeat real cobre tanto o Loop normal quanto o Multiloops. Enquanto
+  // estiver armado, o AutoStop não pode interromper o ciclo no fim da música.
+  if (nativeIsRepeatEnabled(project)) {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativeAutoStopLastStoppedSignature.clear();
+    return;
+  }
 
   std::string currentPlayingId = playingId;
   double currentSongStart = songStart;
@@ -5701,7 +5709,9 @@ static void nativeMaintainAutoStop(
   }
 
   const double remaining = currentSongEnd - playPos;
-  if (remaining > 0.200 || remaining < -1.250) return;
+  // O AutoStop só atua depois que a região alcançou o fim real. Não antecipa
+  // o Stop em nenhum número de milissegundos.
+  if (remaining > 0.0 || remaining < -1.250) return;
 
   const std::string stopSignature = currentPlayingId + "@" + nativeNumber(currentSongStart, 3) + ":" + nativeNumber(currentSongEnd, 3);
   {
@@ -7848,9 +7858,12 @@ static NativeMultiLoopPair nativeFindMultiLoopPair(ReaProject* project, const st
     bool isRegion = false; double pos = 0.0, end = 0.0; const char* rawName = nullptr; int number = 0, color = 0;
     if (!EnumProjectMarkers3_ptr(project, i, &isRegion, &pos, &end, &rawName, &number, &color) || isRegion) continue;
     const std::string name = nativeTrim(rawName ? rawName : "");
-    // O inicio pertence a esta musica e o fim e exclusivo. Assim um *1/*2
-    // exatamente no inicio da regiao entra no par sem vazar para a anterior.
-    if (pos >= songStart && pos < songEnd && nativeStartsWith(name, prefix)) points.push_back(pos);
+    // O início pertence à música e o segundo ponto também pode fechar o par
+    // exatamente no fim da região. Isso permite um Multiloops que termina no
+    // mesmo ponto da transição para a próxima música.
+    if (pos >= songStart && pos <= songEnd + 0.0005 && nativeStartsWith(name, prefix)) {
+      points.push_back(std::fabs(pos - songEnd) <= 0.0005 ? songEnd : pos);
+    }
   }
   std::sort(points.begin(), points.end());
   if (points.size() < 2 || points[1] <= points[0] + 0.0005) { cache[cacheKey] = pair; return pair; }
@@ -8474,8 +8487,13 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string& playlistsJson = cachedPlaylistsJson;
   nativeSyncControlStateFromLuaExtState();
   nativeSyncQueueFromLuaExtState(activePlaylistItems, songs);
-  nativeMaintainQueueAutomation(activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems, songs);
-  nativeMaintainAutoStop(activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems, songs);
+  const bool queueSeekPerformed = nativeMaintainQueueAutomation(
+    activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems, songs);
+  // O snapshot deste ciclo ainda descreve a música anterior. Se a fila acabou
+  // de transferir o playback, o AutoStop só pode avaliar novamente no próximo ciclo.
+  if (!queueSeekPerformed) {
+    nativeMaintainAutoStop(activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems, songs);
+  }
   const std::string& mixerJson = cachedMixerJson;
   const std::string& premixJson = cachedPremixJson;
   const std::string multiLoopsJson = nativeBuildMultiLoopsJson(activeProject);
@@ -11827,9 +11845,11 @@ static void startupTimer()
     nativeUpdateManualStopFadeoutOnMainThread();
     nativeProcessPendingSelectionOnMainThread();
     nativeProcessEnsureReaPitchRequestOnMainThread();
+    // Arma o Multiloops antes da manutencao da fila. Assim o mesmo ciclo ja
+    // publica Repeat ativo e impede o seek da fila de disputar o cursor.
+    nativeProcessMultiLoopsOnMainThread();
     nativeBridgeTick();
     nativeRefreshAppActivePanelModel();
-    nativeProcessMultiLoopsOnMainThread();
 #ifdef _WIN32
     processPcResumeRequestFromAppActiveOnMainThread();
 #endif
