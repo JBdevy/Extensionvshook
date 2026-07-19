@@ -5562,7 +5562,9 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   // O seek antecipado so nasce no fim de uma regiao normal ou no fim do pai.
   // O limite individual de uma musica-filho nunca conclui a fila.
   const double remaining = sourceBoundaryEnd - playPos;
-  if (remaining <= 0.0 || remaining > 0.5) return false;
+  // Mesmo intervalo usado pelo Lua: prepara a passagem dois segundos antes e
+  // ainda aceita um frame atrasado por ate 250 ms, especialmente no macOS.
+  if (remaining < -0.250 || remaining > 2.0) return false;
 
   const std::string seekSignature = sourceBoundaryId + "->" + queuedId + "@" + nativeNumber(sourceBoundaryStart, 3) + ":" + nativeNumber(queuedStart, 3);
   {
@@ -5573,6 +5575,11 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
 
   // Mesmo comportamento do Lua: move o cursor com seekplay=true. A propria API
   // transfere a reproducao; nao envia Stop, Play nem qualquer protecao posterior.
+#ifdef __APPLE__
+  // No REAPER/SWELL do macOS, primeiro fixa o cursor de edicao e depois aplica
+  // o seek do transporte. Isso evita perder a passagem em alguns frames.
+  SetEditCurPos2_ptr(project, queuedStart, true, false);
+#endif
   SetEditCurPos2_ptr(project, queuedStart, true, true);
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
@@ -5640,6 +5647,7 @@ static void nativeMaintainAutoStop(
   double currentSongEnd = songEnd;
   bool normalStopEnabled = true;
   bool hasPriorityStopTarget = false;
+  bool hasAutoBlocoBoundaryTarget = false;
 
   // Musicas-filhos continuam pertencendo ao mesmo bloco continuo do pai.
   // Mesmo quando o filho e uma regiao real da segunda ruler lane, nunca usa
@@ -5684,7 +5692,12 @@ static void nativeMaintainAutoStop(
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     nativeLoadAutomationSettingsOnceLocked();
-    if (!g_nativeAutoStopEnabled) {
+    hasAutoBlocoBoundaryTarget =
+      !g_nativeAutoBlocoTargetSongId.empty() &&
+      g_nativeAutoBlocoTargetEnd > g_nativeAutoBlocoTargetStart + 0.0005;
+    // AT/BL possui a propria parada na fronteira entre blocos e independe do
+    // AutoStop, exatamente como no Lua.
+    if (!g_nativeAutoStopEnabled && !hasAutoBlocoBoundaryTarget) {
       g_nativeAutoStopLastStoppedSignature.clear();
       return;
     }
@@ -5693,8 +5706,7 @@ static void nativeMaintainAutoStop(
     // ao terminar a musica, o alvo precisa ficar selecionado e pronto para Play.
     hasPriorityStopTarget =
       (!g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) ||
-      (!g_nativeAutoBlocoTargetSongId.empty() &&
-        g_nativeAutoBlocoTargetEnd > g_nativeAutoBlocoTargetStart + 0.0005);
+      hasAutoBlocoBoundaryTarget;
     if (g_nativeQueuedManual && !g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) {
       return;
     }
@@ -5705,7 +5717,7 @@ static void nativeMaintainAutoStop(
   for (const auto& candidate : projectSongs) {
     if (!nativeSongIsPlayable(candidate) || candidate.isHashParent) continue;
     if (candidate.id == currentPlayingId) continue;
-    if (std::fabs(candidate.start - currentSongEnd) <= 0.002) return;
+    if (std::fabs(candidate.start - currentSongEnd) <= 0.002 && !hasAutoBlocoBoundaryTarget) return;
   }
 
   const double remaining = currentSongEnd - playPos;
