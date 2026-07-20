@@ -33,6 +33,7 @@
   #include <sys/stat.h>
   #include <sys/types.h>
   #include <sys/socket.h>
+  #include <sys/time.h>
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
@@ -1815,23 +1816,30 @@ static int toggleActionState(int commandId)
   return -1;
 }
 
-static void insertMenuString(HMENU hMenu, const char* text, int commandId, bool checked)
+static void appendMenuString(HMENU hMenu, const char* text, int commandId, bool checked)
 {
+  if (!hMenu || !text || commandId == 0) return;
   MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
   mi.fMask = MIIM_TYPE | MIIM_ID | MIIM_STATE;
   mi.fType = MFT_STRING;
   mi.fState = checked ? MFS_CHECKED : MFS_UNCHECKED;
   mi.dwTypeData = (char*)text;
   mi.wID = commandId;
-  InsertMenuItem(hMenu, 0, true, &mi);
+  InsertMenuItem(hMenu, GetMenuItemCount(hMenu), true, &mi);
 }
 
-static void insertMenuSeparator(HMENU hMenu)
+static void insertMenuSubMenu(HMENU hMenu, HMENU subMenu, const char* text, int position)
 {
+  if (!hMenu || !subMenu || !text) return;
   MENUITEMINFO mi = { sizeof(MENUITEMINFO), };
-  mi.fMask = MIIM_TYPE;
-  mi.fType = MFT_SEPARATOR;
-  InsertMenuItem(hMenu, 0, true, &mi);
+  mi.fMask = MIIM_SUBMENU | MIIM_TYPE | MIIM_STATE;
+  mi.fType = MFT_STRING;
+  mi.fState = MFS_ENABLED;
+  mi.hSubMenu = subMenu;
+  mi.dwTypeData = (char*)text;
+  const int itemCount = GetMenuItemCount(hMenu);
+  const int safePosition = position < 0 ? itemCount : std::min(position, itemCount);
+  InsertMenuItem(hMenu, safePosition, true, &mi);
 }
 
 static void setMenuCommandChecked(HMENU hMenu, int commandId, bool checked)
@@ -1874,44 +1882,41 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
 
   if (flag != 0) return;
 
-  // Insere de tras para frente porque cada item entra na posicao 0.
-  // Ordem final no menu:
-  // VS Hook Beta / VS Hook Estable
-  // separador / auto-inicio com REAPER / separador / auto-inicio deste projeto.
-  for (int i = static_cast<int>(sizeof(g_projectAutoOpenEntries) / sizeof(g_projectAutoOpenEntries[0])) - 1; i >= 0; --i) {
-    if (g_projectAutoOpenEntries[i].commandId == 0) continue;
-    const bool checked = projectAutoMode == g_projectAutoOpenEntries[i].autoOpenMode;
-    insertMenuString(
-      hMenu,
-      g_projectAutoOpenEntries[i].displayName,
-      g_projectAutoOpenEntries[i].commandId,
-      checked
-    );
-  }
-
-  insertMenuSeparator(hMenu);
-
-  for (int i = static_cast<int>(sizeof(g_autoOpenEntries) / sizeof(g_autoOpenEntries[0])) - 1; i >= 0; --i) {
-    if (g_autoOpenEntries[i].commandId == 0) continue;
-    const bool checked = autoMode == g_autoOpenEntries[i].autoOpenMode;
-    insertMenuString(
-      hMenu,
-      g_autoOpenEntries[i].displayName,
-      g_autoOpenEntries[i].commandId,
-      checked
-    );
-  }
-
-  insertMenuSeparator(hMenu);
+  HMENU vsHookMenu = CreatePopupMenu();
+  HMENU startupMenu = CreatePopupMenu();
+  HMENU reaperStartupMenu = CreatePopupMenu();
+  HMENU projectStartupMenu = CreatePopupMenu();
+  if (!vsHookMenu || !startupMenu || !reaperStartupMenu || !projectStartupMenu) return;
 
   const std::string activeScriptMode = getExclusiveActiveScriptMode();
-  for (int i = static_cast<int>(sizeof(g_scripts) / sizeof(g_scripts[0])) - 1; i >= 0; --i) {
-    if (!g_scripts[i].showInExtensionsMenu) continue;
-    if (g_scripts[i].commandId == 0) continue;
-
-    const bool checked = g_scripts[i].autoOpenMode && activeScriptMode == g_scripts[i].autoOpenMode;
-    insertMenuString(hMenu, g_scripts[i].displayName, g_scripts[i].commandId, checked);
+  for (ScriptEntry& script : g_scripts) {
+    if (!script.showInExtensionsMenu || script.commandId == 0) continue;
+    const bool checked = script.autoOpenMode && activeScriptMode == script.autoOpenMode;
+    const char* label = script.autoOpenMode && std::strcmp(script.autoOpenMode, "beta") == 0
+      ? "Executar Beta"
+      : "Executar Estable";
+    appendMenuString(vsHookMenu, label, script.commandId, checked);
   }
+
+  for (AutoOpenEntry& entry : g_autoOpenEntries) {
+    const char* label = entry.autoOpenMode && std::strcmp(entry.autoOpenMode, "beta") == 0
+      ? "Beta"
+      : "Estable";
+    appendMenuString(reaperStartupMenu, label, entry.commandId, autoMode == entry.autoOpenMode);
+  }
+  insertMenuSubMenu(startupMenu, reaperStartupMenu, "Iniciar junto com o REAPER", -1);
+
+  for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
+    const char* label = entry.autoOpenMode && std::strcmp(entry.autoOpenMode, "beta") == 0
+      ? "Beta"
+      : "Estable";
+    appendMenuString(projectStartupMenu, label, entry.commandId, projectAutoMode == entry.autoOpenMode);
+  }
+  insertMenuSubMenu(startupMenu, projectStartupMenu, "Iniciar junto com este projeto", -1);
+  insertMenuSubMenu(vsHookMenu, startupMenu, "Startup", -1);
+
+  // Uma unica entrada no menu Extensions; todas as opcoes ficam no submenu.
+  insertMenuSubMenu(hMenu, vsHookMenu, "VS Hook", 0);
 }
 
 
@@ -2005,16 +2010,37 @@ static const char* kStopPauseModeRevisionKey = "STOP_PAUSE_MODE_REVISION_V1";
 using native_socket_t = SOCKET;
 static const native_socket_t kInvalidNativeSocket = INVALID_SOCKET;
 static void nativeCloseSocket(native_socket_t s) { if (s != INVALID_SOCKET) closesocket(s); }
+static void nativeShutdownSocket(native_socket_t s) { if (s != INVALID_SOCKET) shutdown(s, SD_BOTH); }
 #else
 using native_socket_t = int;
 static const native_socket_t kInvalidNativeSocket = -1;
 static void nativeCloseSocket(native_socket_t s) { if (s >= 0) close(s); }
+static void nativeShutdownSocket(native_socket_t s) { if (s >= 0) shutdown(s, SHUT_RDWR); }
 #endif
 
+static void nativeConfigureClientSocketTimeouts(native_socket_t socketHandle)
+{
+#ifdef _WIN32
+  const DWORD timeoutMs = 750;
+  setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO,
+    reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+  setsockopt(socketHandle, SOL_SOCKET, SO_SNDTIMEO,
+    reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+#else
+  timeval timeout{};
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 750000;
+  setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(socketHandle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+}
+
 static std::mutex g_nativeMutex;
+static std::mutex g_nativeServerMutex;
 static std::thread g_nativeThread;
 static std::atomic<bool> g_nativeRunning{false};
 static native_socket_t g_nativeServerSocket = kInvalidNativeSocket;
+static native_socket_t g_nativeActiveClientSocket = kInvalidNativeSocket;
 static std::string g_nativeStateJson;
 static std::string g_nativeSnapshotSignature;
 static std::string g_nativeLuaLiveFragment;
@@ -2756,6 +2782,16 @@ struct NativeSongWindow {
   int tunerValue = 0;
 };
 
+static std::vector<NativeSongWindow> nativeCollectProjectSongs(
+  ReaProject* project,
+  std::string& markersJsonOut);
+static std::string nativeFindPlayingId(
+  const std::vector<NativeSongWindow>& songs,
+  double pos,
+  std::string& nameOut,
+  double& startOut,
+  double& endOut);
+
 static std::vector<NativeSongWindow> g_nativeSongWindows;
 static bool g_nativeCurrentTransportPlaying = false;
 static std::string g_nativeCurrentPlayingId;
@@ -2886,6 +2922,7 @@ static std::string g_nativeMultiLoopBypassWarningSongKey;
 static double g_nativeMultiLoopBypassWarningStartPos = 0.0;
 static constexpr double kNativeMultiLoopBypassWarningLeadSec = 4.0;
 static std::string g_nativeQueuedSeekSignature;
+static std::string g_nativeQueuedTunerSignature;
 static std::string g_nativeLastAutoQueueForPlayingId;
 static std::string g_nativeAutoStopLastStoppedSignature;
 static std::string g_nativeAutoStopLastPlayingId;
@@ -3068,6 +3105,17 @@ static std::string nativeGetProjExtStateString(ReaProject* project, const char* 
 
 static const char* kTunerProjectSection = "CHATGPT_REGION_PLAYLIST";
 static const char* kTunerOffsetsKey = "TUNER_OFFSETS_V1";
+
+struct NativeTunerRetryRuntime {
+  ReaProject* project = nullptr;
+  std::string songId;
+  int semitones = 0;
+  int attempt = 0;
+  std::chrono::steady_clock::time_point startedAt;
+  bool active = false;
+};
+
+static NativeTunerRetryRuntime g_nativeTunerRetryRuntime;
 
 static std::map<std::string, int> nativeLoadTunerOffsets(ReaProject* project)
 {
@@ -3271,6 +3319,63 @@ static bool nativeApplyTunerValue(ReaProject* project, int semitones)
   return found;
 }
 
+static void nativeScheduleTunerRetry(
+  ReaProject* project,
+  const std::string& songId,
+  int semitones)
+{
+  if (!project || songId.empty()) {
+    g_nativeTunerRetryRuntime = NativeTunerRetryRuntime{};
+    return;
+  }
+  g_nativeTunerRetryRuntime.project = project;
+  g_nativeTunerRetryRuntime.songId = songId;
+  g_nativeTunerRetryRuntime.semitones =
+    std::max(-12, std::min(12, semitones));
+  g_nativeTunerRetryRuntime.attempt = 0;
+  g_nativeTunerRetryRuntime.startedAt =
+    std::chrono::steady_clock::now();
+  g_nativeTunerRetryRuntime.active = true;
+}
+
+static void nativeProcessTunerRetry(
+  ReaProject* project,
+  bool playing,
+  const std::string& playingId)
+{
+  NativeTunerRetryRuntime& pending =
+    g_nativeTunerRetryRuntime;
+  if (!pending.active) return;
+  if (!playing || !project || pending.project != project ||
+      playingId.empty() || pending.songId != playingId) {
+    pending = NativeTunerRetryRuntime{};
+    return;
+  }
+
+  static const int retryAtMs[] = {80, 220, 500};
+  const int retryCount = static_cast<int>(
+    sizeof(retryAtMs) / sizeof(retryAtMs[0]));
+  if (pending.attempt < 0 || pending.attempt >= retryCount) {
+    pending = NativeTunerRetryRuntime{};
+    return;
+  }
+
+  const auto elapsedMs =
+    std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() -
+      pending.startedAt).count();
+  if (elapsedMs < retryAtMs[pending.attempt]) return;
+
+  // Alguns hosts macOS descartam a primeira escrita do parametro no exato
+  // ciclo em que o transporte inicia. A repeticao e limitada ao comeco da
+  // mesma musica e nao cria uma varredura continua durante a reproducao.
+  nativeApplyTunerValue(project, pending.semitones);
+  ++pending.attempt;
+  if (pending.attempt >= retryCount) {
+    pending = NativeTunerRetryRuntime{};
+  }
+}
+
 static const NativeSongWindow* nativeResolveTunerSong(const std::vector<NativeSongWindow>& songs, const std::string& body)
 {
   std::string id = nativeJsonExtractString(body, "songId");
@@ -3323,8 +3428,53 @@ static void nativeProcessTunerCommands(ReaProject* project, const std::vector<Na
     if (current == 0) offsets.erase(key); else offsets[key] = current;
     nativeSaveTunerOffsets(project, offsets);
     { std::lock_guard<std::mutex> lock(g_nativeMutex); nativeBumpSharedRevisionLocked("director"); }
-    if (song->id == g_nativeCurrentPlayingId) nativeApplyTunerValue(project, current);
+    const int playState = GetPlayStateEx_ptr ? GetPlayStateEx_ptr(project) : 0;
+    const bool playing = ((playState & 1) == 1) || ((playState & 4) == 4);
+    const double actualPos = playing
+      ? (GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : g_nativeCurrentPlayPosition)
+      : (GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(project) : -1.0);
+    bool targetIsActualSong = false;
+    if (playing) {
+      std::string actualName;
+      double actualStart = 0.0;
+      double actualEnd = 0.0;
+      const std::string actualPlayingId = nativeFindPlayingId(
+        songs, actualPos, actualName, actualStart, actualEnd);
+      targetIsActualSong =
+        (!actualPlayingId.empty() && actualPlayingId == song->id) ||
+        (actualEnd > actualStart + 0.0005 &&
+         std::fabs(actualStart - song->start) <= 0.002 &&
+         std::fabs(actualEnd - song->end) <= 0.002);
+    } else {
+      targetIsActualSong = actualPos >= song->start - 0.0005 && actualPos < song->end - 0.0005;
+    }
+    // A selecao/fila nunca troca a afinacao da musica que ainda esta tocando.
+    // O valor so vai ao ReaPitch quando a posicao real esta dentro do alvo; com
+    // o transporte parado, isso tambem pre-carrega a musica pronta no cursor.
+    if (targetIsActualSong) {
+      nativeApplyTunerValue(project, current);
+      if (playing) nativeScheduleTunerRetry(project, song->id, current);
+    }
   }
+}
+
+static void nativeProcessPendingTunerCommandsOnMainThread()
+{
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (g_nativeTunerCommandQueue.empty()) return;
+    songs = g_nativeSongWindows;
+  }
+
+  char projectPath[2048] = "";
+  ReaProject* project = getCurrentProject(projectPath, static_cast<int>(sizeof(projectPath)));
+  if (!project) return;
+  if (songs.empty()) {
+    std::string ignoredMarkersJson;
+    songs = nativeCollectProjectSongs(project, ignoredMarkersJson);
+  }
+  nativeProcessTunerCommands(project, songs);
 }
 
 static bool nativeApplyTunerCommand(const std::string& commandBody)
@@ -4420,6 +4570,68 @@ static std::string nativeFindPlayingId(const std::vector<NativeSongWindow>& song
   return id;
 }
 
+static bool nativeApplyTunerForCachedTarget(
+  ReaProject* project,
+  const std::string& targetId,
+  double targetStart,
+  double targetEnd,
+  double actualPosition,
+  std::string* resolvedSongIdOut = nullptr,
+  int* semitonesOut = nullptr)
+{
+  if (!project) return false;
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+  }
+  if (songs.empty()) return false;
+
+  const NativeSongWindow* target = nullptr;
+  for (const auto& song : songs) {
+    if (song.isBlock || song.isHashParent) continue;
+    if (targetEnd > targetStart + 0.0005 &&
+        std::fabs(song.start - targetStart) <= 0.002 &&
+        std::fabs(song.end - targetEnd) <= 0.002) {
+      target = &song;
+      break;
+    }
+  }
+  if (!target && !targetId.empty()) {
+    for (const auto& song : songs) {
+      if (song.isBlock || song.isHashParent) continue;
+      if (song.id == targetId || std::to_string(song.sourceNumber) == targetId ||
+          (!song.playlistEntryId.empty() && song.playlistEntryId == targetId)) {
+        target = &song;
+        break;
+      }
+    }
+  }
+  if (!target && std::isfinite(actualPosition)) {
+    std::string playingName;
+    double playingStart = 0.0;
+    double playingEnd = 0.0;
+    const std::string playingId = nativeFindPlayingId(
+      songs, actualPosition, playingName, playingStart, playingEnd);
+    for (const auto& song : songs) {
+      if (song.isBlock || song.isHashParent) continue;
+      if (song.id == playingId &&
+          std::fabs(song.start - playingStart) <= 0.002 &&
+          std::fabs(song.end - playingEnd) <= 0.002) {
+        target = &song;
+        break;
+      }
+    }
+  }
+  if (!target) return false;
+
+  const int semitones = nativeTunerValueForSong(project, *target);
+  if (!nativeApplyTunerValue(project, semitones)) return false;
+  if (resolvedSongIdOut) *resolvedSongIdOut = target->id;
+  if (semitonesOut) *semitonesOut = semitones;
+  return true;
+}
+
 static std::string nativeStripJsonObjectBraces(std::string json)
 {
   json = nativeTrim(json);
@@ -4886,6 +5098,7 @@ static void nativeClearQueuedSongLocked()
   g_nativeQueuedManual = false;
   g_nativeQueuedKind = "playlist";
   g_nativeQueuedSeekSignature.clear();
+  g_nativeQueuedTunerSignature.clear();
   g_nativeLastAutoQueueForPlayingId.clear();
 }
 
@@ -5188,6 +5401,7 @@ static void nativeSetQueuedSongLocked(const NativeSongWindow& song, bool manual,
   g_nativeQueuedManual = manual;
   g_nativeQueuedKind = nativeLower(kind) == "regions" ? "regions" : "playlist";
   g_nativeQueuedSeekSignature.clear();
+  g_nativeQueuedTunerSignature.clear();
   nativeClearAutoBlocoTargetLocked();
   if (manual) {
     // FIX100: intervencao manual cancela a fila automatica atual. O Auto volta
@@ -5374,6 +5588,7 @@ static void nativeSyncQueueFromLuaExtState(
     g_nativeQueuedManual = queueManual;
     g_nativeQueuedKind = queueKind;
     g_nativeQueuedSeekSignature.clear();
+    g_nativeQueuedTunerSignature.clear();
     nativeClearAutoBlocoTargetLocked();
   } else {
     nativeClearAllQueueStateLocked();
@@ -5456,12 +5671,23 @@ static const NativeSongWindow* nativeFindActivePlaylistSongByOrderLocked(int pla
   return nullptr;
 }
 
-static bool nativeQueuedSongIsSameAsPlayingLocked(const std::string& playingId, double playPos)
+static bool nativeQueuedSongIsSameAsPlayingLocked(
+  const std::string& playingId,
+  double playPos,
+  double songStart,
+  double songEnd)
 {
   if (g_nativeQueuedSongId.empty()) return false;
   if (!playingId.empty() && playingId == g_nativeQueuedSongId) return true;
   if (g_nativeQueuedStart > 0.0 && g_nativeQueuedEnd > g_nativeQueuedStart) {
-    if (playPos >= g_nativeQueuedStart - 0.0005 && playPos < g_nativeQueuedEnd - 0.0005) return true;
+    // IDs podem mudar entre a aba Regioes, o repertorio e o app. Os limites
+    // reais sao a identidade definitiva, principalmente na segunda de duas
+    // regioes coladas. Assim que o alvo da fila vira a musica atual, a fila e
+    // consumida antes de qualquer novo seek para o proprio inicio.
+    if (songEnd > songStart + 0.0005 &&
+        std::fabs(songStart - g_nativeQueuedStart) <= 0.002 &&
+        std::fabs(songEnd - g_nativeQueuedEnd) <= 0.002) return true;
+    if (playPos >= g_nativeQueuedStart && playPos < g_nativeQueuedEnd) return true;
   }
   return false;
 }
@@ -5488,7 +5714,7 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     nativeLoadAutomationSettingsOnceLocked();
-    if (nativeQueuedSongIsSameAsPlayingLocked(playingId, playPos)) {
+    if (nativeQueuedSongIsSameAsPlayingLocked(playingId, playPos, songStart, songEnd)) {
       nativeClearQueuedSongLocked();
     }
   }
@@ -5567,14 +5793,14 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   if (remaining < -0.250 || remaining > 2.0) return false;
 
   const std::string seekSignature = sourceBoundaryId + "->" + queuedId + "@" + nativeNumber(sourceBoundaryStart, 3) + ":" + nativeNumber(queuedStart, 3);
+
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     if (g_nativeQueuedSeekSignature == seekSignature) return false;
     g_nativeQueuedSeekSignature = seekSignature;
   }
 
-  // Mesmo comportamento do Lua: move o cursor com seekplay=true. A propria API
-  // transfere a reproducao; nao envia Stop, Play nem qualquer protecao posterior.
+  // A fila arma o seek sem antecipar o Tuner durante os 2 s de preparacao.
 #ifdef __APPLE__
   // No REAPER/SWELL do macOS, primeiro fixa o cursor de edicao e depois aplica
   // o seek do transporte. Isso evita perder a passagem em alguns frames.
@@ -5584,6 +5810,70 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
   return true;
+}
+
+static void nativePrepareQueuedTunerNearRegionEndOnMainThread()
+{
+  // Este gatilho nao pode depender do snapshot vivo da ponte (220 ms), pois
+  // uma janela curta poderia ser pulada. Usa o timer leve e o play cursor real.
+  if (!GetPlayStateEx_ptr || !GetPlayPositionEx_ptr || nativeIsLuaControlActive()) return;
+
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project) return;
+  const int playState = GetPlayStateEx_ptr(project);
+  if ((playState & 1) != 1 && (playState & 4) != 4) return;
+  if (nativeIsRepeatEnabled(project)) return;
+
+  const double playPos = GetPlayPositionEx_ptr(project);
+  std::vector<NativeSongWindow> songs;
+  std::string queuedId;
+  double queuedStart = 0.0;
+  double queuedEnd = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+    queuedId = g_nativeQueuedSongId;
+    queuedStart = g_nativeQueuedStart;
+    queuedEnd = g_nativeQueuedEnd;
+  }
+  if (songs.empty() || queuedId.empty() || queuedEnd <= queuedStart + 0.0005) return;
+
+  std::string playingName;
+  double songStart = 0.0;
+  double songEnd = 0.0;
+  const std::string playingId = nativeFindPlayingId(
+    songs, playPos, playingName, songStart, songEnd);
+  if (playingId.empty() || songEnd <= songStart + 0.0005) return;
+
+  double boundaryStart = songStart;
+  double boundaryEnd = songEnd;
+  std::string boundaryId = playingId;
+  nativeResolveQueueSourceBoundary(
+    songs, playingId, playPos, songStart, songEnd,
+    boundaryStart, boundaryEnd, boundaryId);
+  if (std::fabs(queuedStart - boundaryStart) <= 0.002 &&
+      std::fabs(queuedEnd - boundaryEnd) <= 0.002) return;
+
+  const double remaining = boundaryEnd - playPos;
+  if (remaining < 0.0 || remaining > 0.300) return;
+
+  const std::string tunerSignature = boundaryId + "->" + queuedId + "@" +
+    nativeNumber(boundaryStart, 3) + ":" + nativeNumber(queuedStart, 3);
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (g_nativeQueuedTunerSignature == tunerSignature) return;
+  }
+
+  if (!nativeApplyTunerForCachedTarget(
+        project, queuedId, queuedStart, queuedEnd, queuedStart)) return;
+
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  if (g_nativeQueuedSongId == queuedId &&
+      std::fabs(g_nativeQueuedStart - queuedStart) <= 0.002 &&
+      std::fabs(g_nativeQueuedEnd - queuedEnd) <= 0.002) {
+    g_nativeQueuedTunerSignature = tunerSignature;
+  }
 }
 
 static const NativeSongWindow* nativeResolveAutoStopTarget(const std::vector<NativeSongWindow>& activeItems, const std::string& playingId, double songStart, double songEnd)
@@ -8136,7 +8426,16 @@ static void nativeProcessMultiLoops(ReaProject* project, const std::vector<Nativ
       if (!g_nativeMultiLoopFadeTracks.empty()) { g_nativeMultiLoopFadeOutActive = true; g_nativeMultiLoopFadeStart = pair.start - fadeSec; g_nativeMultiLoopFadeEnd = pair.start; }
     }
     if (playPos >= pair.start && playPos < pair.end) { active = pair; break; }
-    if (g_nativeMultiLoopDisarmedPairKey == pair.key && playPos > pair.end + 0.0005) g_nativeMultiLoopDisarmedPairKey.clear();
+    if (g_nativeMultiLoopDisarmedPairKey == pair.key &&
+        (playPos > pair.end + 0.0005 || playPos < pair.start - 0.0005)) {
+      // Mantem Mute/Solo ate o segundo marker, como o fallback Lua, e
+      // restaura ao sair da area do par por reproducao ou seek.
+      if (!g_nativeMultiLoopRestore.empty() ||
+          !g_nativeMultiLoopFadeTracks.empty()) {
+        nativeRestoreMultiLoopTracks();
+      }
+      g_nativeMultiLoopDisarmedPairKey.clear();
+    }
   }
   if (g_nativeMultiLoopFadeOutActive && SetMediaTrackInfo_Value_ptr) {
     const double span = std::max(0.001, g_nativeMultiLoopFadeEnd - g_nativeMultiLoopFadeStart);
@@ -8155,12 +8454,31 @@ static void nativeProcessMultiLoops(ReaProject* project, const std::vector<Nativ
     if (g_nativeMultiLoopActivePair.valid && playPos > g_nativeMultiLoopActivePair.end + 0.0005) { nativeRestoreMultiLoopTracks(); g_nativeMultiLoopActivePair = NativeMultiLoopPair(); }
     return;
   }
-  if (g_nativeMultiLoopDisarmedPairKey == active.key) return;
   const bool repeat = nativeIsRepeatEnabled(project);
+  if (g_nativeMultiLoopDisarmedPairKey == active.key) {
+    // R/L continua sendo um loop manual em qualquer outro lugar. Somente uma
+    // selecao criada dentro do mesmo par Multiloops desarmado pode rearma-lo.
+    double loopStart = 0.0;
+    double loopEnd = 0.0;
+    const bool hasLoopRange = nativeGetLoopTimeRange(
+      project, loopStart, loopEnd);
+    const bool loopRangeInsidePair = hasLoopRange &&
+      loopEnd > loopStart + 0.0005 &&
+      loopStart >= active.start - 0.002 &&
+      loopEnd <= active.end + 0.002;
+    const bool multiloopRearmRequested = repeat &&
+      g_nativeArmedMarkerId.empty() && loopRangeInsidePair;
+    if (!multiloopRearmRequested) return;
+
+    g_nativeMultiLoopDisarmedPairKey.clear();
+    nativeCaptureMultiLoopTracks(project, active);
+    nativeSetLoopTimeRange(project, active.start, active.end);
+    nativeSetRepeatEnabled(project, true);
+    g_nativeMultiLoopActivePair = active;
+    return;
+  }
   if (g_nativeMultiLoopActivePair.valid && g_nativeMultiLoopActivePair.key == active.key && !repeat) {
     g_nativeMultiLoopDisarmedPairKey = active.key;
-    for (const auto& row : g_nativeMultiLoopRestore) if (row.track && SetMediaTrackInfo_Value_ptr) { SetMediaTrackInfo_Value_ptr(row.track, "B_MUTE", row.mute); SetMediaTrackInfo_Value_ptr(row.track, "I_SOLO", row.solo); }
-    g_nativeMultiLoopRestore.clear();
     if (!g_nativeMultiLoopFadeTracks.empty()) { g_nativeMultiLoopFadeOutActive = false; g_nativeMultiLoopFadeInActive = true; g_nativeMultiLoopFadeStart = playPos; g_nativeMultiLoopFadeEnd = active.end; }
     g_nativeMultiLoopActivePair = NativeMultiLoopPair();
     return;
@@ -8459,14 +8777,36 @@ static void nativeRebuildState(bool forceSnapshot)
   g_nativeCurrentSongEnd = songEnd;
   g_nativeCurrentPlayPosition = playPos;
 
+  // Com o Lua sozinho no controle, ele proprio aplica e confirma o Tuner. A
+  // extensao nao pode manter um retry paralelo, pois esse retry pode carregar o
+  // valor anterior ao ultimo ajuste feito no Lua. O Diretor continua usando o
+  // motor nativo mesmo durante a curta sobreposicao do heartbeat de retomada.
+  const bool luaOwnsTuner =
+    nativeIsLuaControlActive() && !nativeIsDirectorControlActive();
+
   if (playing && !playingId.empty() && playingId != previousPlayingId) {
     const NativeSongWindow* premixSong = nullptr;
     for (const auto& song : songs) {
       if (!song.isBlock && !song.isHashParent && song.id == playingId) { premixSong = &song; break; }
     }
     nativeApplyPremixOnSongStart(activeProject, premixSong);
-    if (premixSong) nativeApplyTunerValue(activeProject, premixSong->tunerValue);
+    if (premixSong && !luaOwnsTuner) {
+      // tunerValue pertence ao snapshot e pode estar um ciclo atrasado. Le a
+      // configuracao viva do projeto para Play manual, Play do app e handoff da
+      // fila nunca restaurarem o semitom antigo logo depois do valor correto.
+      const int liveTunerValue =
+        nativeTunerValueForSong(activeProject, *premixSong);
+      nativeApplyTunerValue(activeProject, liveTunerValue);
+      nativeScheduleTunerRetry(
+        activeProject, premixSong->id,
+        liveTunerValue);
+    }
     g_nativeForceStateBuild.store(true);
+  }
+  if (luaOwnsTuner) {
+    g_nativeTunerRetryRuntime = NativeTunerRetryRuntime{};
+  } else {
+    nativeProcessTunerRetry(activeProject, playing, playingId);
   }
 
   if (rebuildSnapshot) {
@@ -9325,7 +9665,7 @@ static std::string nativeReadHttpRequest(native_socket_t client)
   char buffer[8192];
   const size_t maxRequestBytes = 1024 * 1024;
 
-  for (;;) {
+  while (g_nativeRunning.load()) {
     int received = 0;
 #ifdef _WIN32
     received = recv(client, buffer, static_cast<int>(sizeof(buffer)), 0);
@@ -9564,6 +9904,7 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
       g_nativeQueuedManual = commandManualQueue;
       g_nativeQueuedKind = type == "queue_region_song" ? "regions" : "playlist";
       g_nativeQueuedSeekSignature.clear();
+      g_nativeQueuedTunerSignature.clear();
       nativeClearAutoBlocoTargetLocked();
       if (commandManualQueue) g_nativeLastAutoQueueForPlayingId.clear();
       else g_nativeLastAutoQueueForPlayingId = g_nativeCurrentPlayingId;
@@ -10816,7 +11157,20 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
     if (!noSeek && SetEditCurPos2_ptr && project && hasResolvedStart && startPos >= 0.0) {
       SetEditCurPos2_ptr(project, startPos, true, false);
     }
+    // Aplica antes de iniciar o transporte. Em Play sem seek usa a posicao que
+    // ja esta pronta no cursor; em Play direcionado usa o inicio resolvido.
+    const double tunerStartPosition = hasResolvedStart
+      ? startPos
+      : (GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(project) : 0.0);
+    std::string playTunerSongId;
+    int playTunerSemitones = 0;
+    const bool playTunerApplied = nativeApplyTunerForCachedTarget(
+      project, idValue, startPos, endPos, tunerStartPosition,
+      &playTunerSongId, &playTunerSemitones);
     Main_OnCommand_ptr(1007, 0); // Transport: Play
+    if (playTunerApplied) {
+      nativeScheduleTunerRetry(project, playTunerSongId, playTunerSemitones);
+    }
     if (UpdateArrange_ptr) UpdateArrange_ptr();
     g_nativeForceStateBuild.store(true);
     return true;
@@ -11573,7 +11927,7 @@ static void nativeProcessHttpCommandsOnMainThread()
 static void nativeHandleClient(native_socket_t client)
 {
   const std::string req = nativeReadHttpRequest(client);
-  if (req.empty()) { nativeCloseSocket(client); return; }
+  if (req.empty()) return;
   const std::string path = nativeRequestPath(req);
   std::string body;
 
@@ -11614,21 +11968,38 @@ static void nativeHandleClient(native_socket_t client)
 #else
   send(client, body.c_str(), body.size(), 0);
 #endif
-  nativeCloseSocket(client);
 }
 
 static void nativeBridgeServerThread()
 {
 #ifdef _WIN32
   WSADATA wsaData{};
-  if (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0) g_nativeWinsockStarted = true;
+  if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+    g_nativeRunning = false;
+    return;
+  }
+  g_nativeWinsockStarted = true;
 #endif
   native_socket_t serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-  if (serverSocket == kInvalidNativeSocket) return;
+  if (serverSocket == kInvalidNativeSocket) {
+#ifdef _WIN32
+    if (g_nativeWinsockStarted) {
+      WSACleanup();
+      g_nativeWinsockStarted = false;
+    }
+#endif
+    g_nativeRunning = false;
+    return;
+  }
 
   int opt = 1;
 #ifdef _WIN32
-  setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+  // O app usa uma porta fixa. SO_REUSEADDR no Windows permitia que varias
+  // instancias do REAPER escutassem a 47830 ao mesmo tempo, distribuindo cada
+  // clique do Diretor para um projeto/processo diferente. A porta precisa ter
+  // um unico dono.
+  setsockopt(serverSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+    reinterpret_cast<const char*>(&opt), sizeof(opt));
 #else
   setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #endif
@@ -11640,15 +12011,46 @@ static void nativeBridgeServerThread()
 
   if (bind(serverSocket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
     nativeCloseSocket(serverSocket);
+#ifdef _WIN32
+    if (g_nativeWinsockStarted) {
+      WSACleanup();
+      g_nativeWinsockStarted = false;
+    }
+#endif
+    g_nativeRunning = false;
     return;
   }
   if (listen(serverSocket, 16) != 0) {
     nativeCloseSocket(serverSocket);
+#ifdef _WIN32
+    if (g_nativeWinsockStarted) {
+      WSACleanup();
+      g_nativeWinsockStarted = false;
+    }
+#endif
+    g_nativeRunning = false;
     return;
   }
-  g_nativeServerSocket = serverSocket;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeServerMutex);
+    g_nativeServerSocket = serverSocket;
+  }
 
   while (g_nativeRunning.load()) {
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(serverSocket, &readSet);
+    timeval selectTimeout{};
+    selectTimeout.tv_sec = 0;
+    selectTimeout.tv_usec = 200000;
+#ifdef _WIN32
+    const int ready = select(0, &readSet, nullptr, nullptr, &selectTimeout);
+#else
+    const int ready = select(serverSocket + 1, &readSet, nullptr, nullptr, &selectTimeout);
+#endif
+    if (!g_nativeRunning.load()) break;
+    if (ready <= 0 || !FD_ISSET(serverSocket, &readSet)) continue;
+
     sockaddr_in clientAddr{};
 #ifdef _WIN32
     int clientLen = sizeof(clientAddr);
@@ -11657,21 +12059,52 @@ static void nativeBridgeServerThread()
 #endif
     native_socket_t client = accept(serverSocket, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
     if (client == kInvalidNativeSocket) continue;
+    nativeConfigureClientSocketTimeouts(client);
+    {
+      std::lock_guard<std::mutex> lock(g_nativeServerMutex);
+      g_nativeActiveClientSocket = client;
+    }
     nativeHandleClient(client);
+    {
+      std::lock_guard<std::mutex> lock(g_nativeServerMutex);
+      if (g_nativeActiveClientSocket == client) {
+        g_nativeActiveClientSocket = kInvalidNativeSocket;
+      }
+    }
+    nativeCloseSocket(client);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_nativeServerMutex);
+    if (g_nativeServerSocket == serverSocket) {
+      g_nativeServerSocket = kInvalidNativeSocket;
+    }
   }
   nativeCloseSocket(serverSocket);
-  g_nativeServerSocket = kInvalidNativeSocket;
 #ifdef _WIN32
   if (g_nativeWinsockStarted) {
     WSACleanup();
     g_nativeWinsockStarted = false;
   }
 #endif
+  g_nativeRunning = false;
+}
+
+static bool nativeCanHostBridgeServer()
+{
+  // Algumas aberturas/trocas de projeto deixam processos auxiliares do REAPER
+  // sem janela principal, tanto no Windows quanto no macOS. Eles nao podem
+  // disputar a ponte usada pelo app.
+  const HWND reaperWindow = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
+  return reaperWindow && IsWindow(reaperWindow) && IsWindowVisible(reaperWindow);
 }
 
 static void startNativeBridgeServer()
 {
   if (g_nativeRunning.load()) return;
+  if (!nativeCanHostBridgeServer()) return;
+  // Uma tentativa anterior pode ter terminado por porta ocupada. Recolhe a
+  // thread concluida antes de permitir a proxima tentativa.
+  if (g_nativeThread.joinable()) g_nativeThread.join();
   g_nativeRunning = true;
   try {
     g_nativeThread = std::thread(nativeBridgeServerThread);
@@ -11682,17 +12115,13 @@ static void startNativeBridgeServer()
 
 static void stopNativeBridgeServer()
 {
-  if (!g_nativeRunning.load()) return;
   g_nativeRunning = false;
-  // Acorda accept() conectando no proprio servidor.
-  native_socket_t wake = socket(AF_INET, SOCK_STREAM, 0);
-  if (wake != kInvalidNativeSocket) {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(kNativeBridgePort));
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    connect(wake, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    nativeCloseSocket(wake);
+  {
+    std::lock_guard<std::mutex> lock(g_nativeServerMutex);
+    // Destrava tanto select()/accept() quanto um cliente que tenha enviado uma
+    // requisicao incompleta. O servidor continua sendo o unico dono do close().
+    nativeShutdownSocket(g_nativeActiveClientSocket);
+    nativeShutdownSocket(g_nativeServerSocket);
   }
   if (g_nativeThread.joinable()) g_nativeThread.join();
 }
@@ -11820,6 +12249,13 @@ static void startupTimer()
   static bool standbyDiscoveryPublished = false;
   static std::string standbyDiscoveryProjectSignature;
 
+  // A janela principal pode ainda nao existir quando a DLL e carregada. Tenta
+  // assumir a ponte novamente em intervalo leve; SO_EXCLUSIVEADDRUSE garante
+  // que somente uma instancia visivel sera a dona da porta.
+  if (!g_nativeRunning.load() && (g_state.startupTimerTicks % 60) == 0) {
+    startNativeBridgeServer();
+  }
+
   // A leitura do heartbeat e a unica verificacao permanente. Sem App Diretor
   // nem Lua ativo, nenhum atalho, transporte, loop, fila ou varredura pesada do
   // projeto e executado pela extensao. A descoberta leve de abas fica ativa.
@@ -11832,6 +12268,9 @@ static void startupTimer()
   // A fila HTTP precisa ser consumida antes de calcular runtimeActive: o
   // director_enter que acorda a extensao tambem chega por essa fila.
   nativeProcessHttpCommandsOnMainThread();
+  // Tuner e comando de resposta imediata: nao espera os 300 ms de estabilidade
+  // usados pela reconstrução pesada de regioes/repertorios.
+  nativeProcessPendingTunerCommandsOnMainThread();
   nativeUpdateTrackMetersOnMainThread();
 #ifndef _WIN32
   // A tela APP ATIVO pode continuar aberta depois que o heartbeat do Diretor
@@ -11860,6 +12299,7 @@ static void startupTimer()
     // Arma o Multiloops antes da manutencao da fila. Assim o mesmo ciclo ja
     // publica Repeat ativo e impede o seek da fila de disputar o cursor.
     nativeProcessMultiLoopsOnMainThread();
+    nativePrepareQueuedTunerNearRegionEndOnMainThread();
     nativeBridgeTick();
     nativeRefreshAppActivePanelModel();
 #ifdef _WIN32
