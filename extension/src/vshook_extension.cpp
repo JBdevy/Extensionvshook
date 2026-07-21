@@ -2820,6 +2820,13 @@ static std::string g_nativeArmedMarkerId;
 static std::chrono::steady_clock::time_point g_nativeArmedMarkerSetAt;
 static double g_nativeSelectedMarkerPos = 0.0;
 static double g_nativeArmedMarkerStartPlayPos = 0.0;
+// O estado visual do marker pode ser limpo no frame em que o Smooth Seek
+// chega ao alvo. Este lock independente preserva a prioridade da Part e
+// impede a fila de mover somente o cursor de edicao nesse mesmo instante.
+static bool g_nativeMarkerSeekCursorLockActive = false;
+static double g_nativeMarkerSeekCursorLockTarget = 0.0;
+static double g_nativeMarkerSeekCursorLockOrigin = 0.0;
+static std::chrono::steady_clock::time_point g_nativeMarkerSeekCursorLockArrivedAt;
 
 static std::vector<NativeSongWindow> g_nativeActivePlaylistItems;
 static bool g_nativeAutoplayEnabled = false;
@@ -2924,6 +2931,12 @@ static constexpr double kNativeMultiLoopBypassWarningLeadSec = 4.0;
 static std::string g_nativeQueuedSeekSignature;
 static std::string g_nativeQueuedSourceConfirmSignature;
 static std::string g_nativeQueuedTunerSignature;
+// Uma Part engatilhada suspende a fila pelo DESTINO, e nao pela origem da
+// passagem. O seek da Part pode trocar a musica atual antes do proximo ciclo;
+// guardar origem->destino faria a fila parecer liberada e mover apenas o cursor.
+// A liberacao imediata continua exclusiva do cancelamento manual.
+static std::string g_nativeQueuedDeferredByMarkerSignature;
+static std::string g_nativeQueuedReleaseAfterMarkerCancelSignature;
 static std::string g_nativeLastAutoQueueForPlayingId;
 static std::string g_nativeAutoStopLastStoppedSignature;
 static std::string g_nativeAutoStopLastPlayingId;
@@ -5101,6 +5114,8 @@ static void nativeClearQueuedSongLocked()
   g_nativeQueuedSeekSignature.clear();
   g_nativeQueuedSourceConfirmSignature.clear();
   g_nativeQueuedTunerSignature.clear();
+  g_nativeQueuedDeferredByMarkerSignature.clear();
+  g_nativeQueuedReleaseAfterMarkerCancelSignature.clear();
   g_nativeLastAutoQueueForPlayingId.clear();
 }
 
@@ -5405,6 +5420,8 @@ static void nativeSetQueuedSongLocked(const NativeSongWindow& song, bool manual,
   g_nativeQueuedSeekSignature.clear();
   g_nativeQueuedSourceConfirmSignature.clear();
   g_nativeQueuedTunerSignature.clear();
+  g_nativeQueuedDeferredByMarkerSignature.clear();
+  g_nativeQueuedReleaseAfterMarkerCancelSignature.clear();
   nativeClearAutoBlocoTargetLocked();
   if (manual) {
     // FIX100: intervencao manual cancela a fila automatica atual. O Auto volta
@@ -5593,6 +5610,8 @@ static void nativeSyncQueueFromLuaExtState(
     g_nativeQueuedSeekSignature.clear();
     g_nativeQueuedSourceConfirmSignature.clear();
     g_nativeQueuedTunerSignature.clear();
+    g_nativeQueuedDeferredByMarkerSignature.clear();
+    g_nativeQueuedReleaseAfterMarkerCancelSignature.clear();
     nativeClearAutoBlocoTargetLocked();
   } else {
     nativeClearAllQueueStateLocked();
@@ -5773,6 +5792,7 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   double queuedEnd = 0.0;
   bool queuedManual = false;
   bool hasQueue = false;
+  bool markerArmed = false;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     queuedId = g_nativeQueuedSongId;
@@ -5780,6 +5800,7 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
     queuedEnd = g_nativeQueuedEnd;
     queuedManual = g_nativeQueuedManual;
     hasQueue = !queuedId.empty() && queuedEnd > queuedStart + 0.0005;
+    markerArmed = !g_nativeArmedMarkerId.empty() || g_nativeMarkerSeekCursorLockActive;
   }
 
   if (!hasQueue || !SetEditCurPos2_ptr) return false;
@@ -5811,6 +5832,54 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   // O limite individual de uma musica-filho nunca conclui a fila.
   const double remaining = sourceBoundaryEnd - playPos;
   const std::string seekSignature = sourceBoundaryId + "->" + queuedId + "@" + nativeNumber(sourceBoundaryStart, 3) + ":" + nativeNumber(queuedStart, 3);
+  const std::string queueTargetSignature = queuedId + "@" + nativeNumber(queuedStart, 3) + ":" + nativeNumber(queuedEnd, 3);
+
+  // Parts/markers engatilhados vencem as duas etapas da Fila de Espera. O
+  // bloqueio usa somente o destino da fila, pois a origem pode mudar assim que
+  // o Smooth Seek chega na Part. Enquanto estiver armada, a fila nao toca no
+  // transporte nem no cursor de edicao.
+  if (markerArmed) {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (g_nativeQueuedSongId == queuedId &&
+        std::fabs(g_nativeQueuedStart - queuedStart) <= 0.002 &&
+        std::fabs(g_nativeQueuedEnd - queuedEnd) <= 0.002 &&
+        !g_nativeArmedMarkerId.empty()) {
+      g_nativeQueuedDeferredByMarkerSignature = queueTargetSignature;
+      g_nativeQueuedReleaseAfterMarkerCancelSignature.clear();
+    }
+    return false;
+  }
+
+  bool queueWasDeferredByMarker = false;
+  bool queueReleasedByMarkerCancel = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    queueWasDeferredByMarker = g_nativeQueuedDeferredByMarkerSignature == queueTargetSignature;
+    queueReleasedByMarkerCancel = g_nativeQueuedReleaseAfterMarkerCancelSignature == queueTargetSignature;
+  }
+  if (queueWasDeferredByMarker && !queueReleasedByMarkerCancel) {
+    // A Part chegou normalmente ao alvo. Se o seek voltou para um ponto com
+    // mais de 2 s restantes, reinicia a passagem da fila e exige de novo as
+    // etapas 4-2 s e 2 s. Dentro dos ultimos 2 s, a Part continua vencedora e
+    // a fila nao pode nem reposicionar o cursor de edicao.
+    if (remaining > 2.0) {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      if (g_nativeQueuedSongId == queuedId &&
+          std::fabs(g_nativeQueuedStart - queuedStart) <= 0.002 &&
+          std::fabs(g_nativeQueuedEnd - queuedEnd) <= 0.002 &&
+          g_nativeQueuedDeferredByMarkerSignature == queueTargetSignature &&
+          g_nativeArmedMarkerId.empty()) {
+        g_nativeQueuedDeferredByMarkerSignature.clear();
+        g_nativeQueuedReleaseAfterMarkerCancelSignature.clear();
+        g_nativeQueuedSourceConfirmSignature.clear();
+        g_nativeQueuedSeekSignature.clear();
+        g_nativeQueuedTunerSignature.clear();
+      }
+      queueWasDeferredByMarker = false;
+    } else {
+      return false;
+    }
+  }
 
   // Primeiro estagio: entre quatro e dois segundos antes do fim, confirma qual
   // regiao esta tocando e qual alvo esta na fila. Nenhum seek nasce nesta etapa.
@@ -5824,8 +5893,9 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
     return false;
   }
   // Segundo estagio: aos dois segundos, o seek so existe se a mesma transicao
-  // foi confirmada no estagio anterior. Sem confirmacao, simplesmente nao atua.
-  if (remaining < -0.250 || remaining > 2.0) return false;
+  // foi confirmada no estagio anterior. Uma fila adiada so ignora essa janela
+  // quando o usuario cancelou explicitamente a Part.
+  if (!queueReleasedByMarkerCancel && (remaining < -0.250 || remaining > 2.0)) return false;
 
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -5834,17 +5904,24 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
     if (g_nativeQueuedSongId != queuedId ||
         std::fabs(g_nativeQueuedStart - queuedStart) > 0.002 ||
         std::fabs(g_nativeQueuedEnd - queuedEnd) > 0.002) return false;
-    if (g_nativeQueuedSourceConfirmSignature != seekSignature) return false;
+    // Reconfirma no instante do seek: uma Part armada entre o snapshot e este
+    // bloco ainda tem prioridade e nao pode perder o cursor para a fila.
+    if (!g_nativeArmedMarkerId.empty() || g_nativeMarkerSeekCursorLockActive) {
+      g_nativeQueuedDeferredByMarkerSignature = queueTargetSignature;
+      g_nativeQueuedReleaseAfterMarkerCancelSignature.clear();
+      return false;
+    }
+    if (!queueReleasedByMarkerCancel && g_nativeQueuedSourceConfirmSignature != seekSignature) return false;
     if (g_nativeQueuedSeekSignature == seekSignature) return false;
     g_nativeQueuedSeekSignature = seekSignature;
+    g_nativeQueuedDeferredByMarkerSignature.clear();
+    g_nativeQueuedReleaseAfterMarkerCancelSignature.clear();
   }
 
-  // A fila arma o seek sem antecipar o Tuner durante os 2 s de preparacao.
-#ifdef __APPLE__
-  // No REAPER/SWELL do macOS, primeiro fixa o cursor de edicao e depois aplica
-  // o seek do transporte. Isso evita perder a passagem em alguns frames.
+  // Todo seek da fila precisa manter o cursor de edicao no MESMO destino.
+  // Primeiro fixa a linha visual e depois aplica o seek do transporte em todas
+  // as plataformas; assim nao existe playback em um ponto e cursor em outro.
   SetEditCurPos2_ptr(project, queuedStart, true, false);
-#endif
   SetEditCurPos2_ptr(project, queuedStart, true, true);
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
@@ -5899,8 +5976,14 @@ static void nativePrepareQueuedTunerNearRegionEndOnMainThread()
 
   const std::string tunerSignature = boundaryId + "->" + queuedId + "@" +
     nativeNumber(boundaryStart, 3) + ":" + nativeNumber(queuedStart, 3);
+  const std::string queueTargetSignature = queuedId + "@" +
+    nativeNumber(queuedStart, 3) + ":" + nativeNumber(queuedEnd, 3);
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
+    // O Tuner faz parte da passagem da fila e tambem deve respeitar a Part.
+    if (!g_nativeArmedMarkerId.empty() || g_nativeMarkerSeekCursorLockActive) return;
+    if (g_nativeQueuedDeferredByMarkerSignature == queueTargetSignature &&
+        g_nativeQueuedReleaseAfterMarkerCancelSignature != queueTargetSignature) return;
     if (g_nativeQueuedSourceConfirmSignature != tunerSignature) return;
     if (g_nativeQueuedTunerSignature == tunerSignature) return;
   }
@@ -8937,8 +9020,37 @@ static void nativeRebuildState(bool forceSnapshot)
   }
 
   std::string luaLiveRaw;
+  bool forceMarkerEditCursor = false;
+  double forceMarkerEditCursorTarget = 0.0;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
+    const auto markerNow = std::chrono::steady_clock::now();
+
+    // O lock do cursor vive alem do indicador visual. Assim, quando o REAPER
+    // finalmente conclui o Smooth Seek da Part, a fila continua bloqueada por
+    // alguns frames e o cursor visual e reafirmado no mesmo destino.
+    if (g_nativeMarkerSeekCursorLockActive && g_nativeMarkerSeekCursorLockTarget > 0.0) {
+      const double target = g_nativeMarkerSeekCursorLockTarget;
+      const double origin = g_nativeMarkerSeekCursorLockOrigin;
+      const bool nearTarget = playing && std::fabs(playPos - target) <= 0.120;
+      const bool forwardCrossed = playing && origin <= target && playPos >= target - 0.080;
+      const bool backwardCrossed = playing && origin > target && playPos <= target + 0.080;
+      const bool playReached = nearTarget || forwardCrossed || backwardCrossed;
+      if (playReached) {
+        forceMarkerEditCursor = true;
+        forceMarkerEditCursorTarget = target;
+        if (g_nativeMarkerSeekCursorLockArrivedAt.time_since_epoch().count() == 0) {
+          g_nativeMarkerSeekCursorLockArrivedAt = markerNow;
+        } else if (std::chrono::duration_cast<std::chrono::milliseconds>(
+            markerNow - g_nativeMarkerSeekCursorLockArrivedAt).count() >= 350) {
+          g_nativeMarkerSeekCursorLockActive = false;
+          g_nativeMarkerSeekCursorLockTarget = 0.0;
+          g_nativeMarkerSeekCursorLockOrigin = 0.0;
+          g_nativeMarkerSeekCursorLockArrivedAt = std::chrono::steady_clock::time_point();
+        }
+      }
+    }
+
     // FIX67: marker engatilhado precisa aparecer verde/piscando no front,
     // mas deve limpar quando o seek realmente chegou no alvo. Mantem um hold curto
     // para o Diretor receber ao menos um snapshot com markerGoId ativo.
@@ -8947,7 +9059,7 @@ static void nativeRebuildState(bool forceSnapshot)
       // O comando marker_go move o cursor de edicao imediatamente, mas o visual
       // do Diretor deve continuar piscando ate o cursor de reproducao chegar no alvo.
       const bool hasGraceElapsed = g_nativeArmedMarkerSetAt.time_since_epoch().count() != 0 &&
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_nativeArmedMarkerSetAt).count() >= 150;
+        std::chrono::duration_cast<std::chrono::milliseconds>(markerNow - g_nativeArmedMarkerSetAt).count() >= 150;
       const double target = g_nativeSelectedMarkerPos;
       const double origin = g_nativeArmedMarkerStartPlayPos;
       const bool nearTarget = playing && std::fabs(playPos - target) <= 0.120;
@@ -8964,6 +9076,10 @@ static void nativeRebuildState(bool forceSnapshot)
       }
     }
     luaLiveRaw = g_nativeLuaLiveFragment;
+  }
+  if (forceMarkerEditCursor && SetEditCurPos2_ptr) {
+    SetEditCurPos2_ptr(activeProject, forceMarkerEditCursorTarget, true, false);
+    if (UpdateArrange_ptr) UpdateArrange_ptr();
   }
   if (luaLiveRaw.empty() && GetExtState_ptr) {
     const char* extLuaLive = GetExtState_ptr(kNativeExtStateSection, kNativeLuaLiveExtKey);
@@ -11484,6 +11600,11 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
       g_nativeSelectedMarkerPos = 0.0;
       g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
       g_nativeArmedMarkerStartPlayPos = 0.0;
+      g_nativeMarkerSeekCursorLockActive = false;
+      g_nativeMarkerSeekCursorLockTarget = 0.0;
+      g_nativeMarkerSeekCursorLockOrigin = 0.0;
+      g_nativeMarkerSeekCursorLockArrivedAt = std::chrono::steady_clock::time_point();
+      g_nativeQueuedReleaseAfterMarkerCancelSignature.clear();
       g_nativeForceStateBuild.store(true);
       return true;
     }
@@ -11518,6 +11639,13 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
       g_nativeSelectedMarkerPos = 0.0;
       g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
       g_nativeArmedMarkerStartPlayPos = 0.0;
+      g_nativeMarkerSeekCursorLockActive = false;
+      g_nativeMarkerSeekCursorLockTarget = 0.0;
+      g_nativeMarkerSeekCursorLockOrigin = 0.0;
+      g_nativeMarkerSeekCursorLockArrivedAt = std::chrono::steady_clock::time_point();
+      // O cancelamento e o unico evento que libera imediatamente a transicao
+      // da fila que ficou suspensa pela Part.
+      g_nativeQueuedReleaseAfterMarkerCancelSignature = g_nativeQueuedDeferredByMarkerSignature;
     }
     if (targetPos >= 0.0) nativeMoveEditCursorAndSeek(project, targetPos, true);
     else if (UpdateArrange_ptr) UpdateArrange_ptr();
@@ -11544,13 +11672,30 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
         g_nativeArmedMarkerId = markerId;
         g_nativeArmedMarkerSetAt = std::chrono::steady_clock::now();
         g_nativeArmedMarkerStartPlayPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : 0.0;
+        g_nativeMarkerSeekCursorLockActive = true;
+        g_nativeMarkerSeekCursorLockTarget = markerPos;
+        g_nativeMarkerSeekCursorLockOrigin = g_nativeArmedMarkerStartPlayPos;
+        g_nativeMarkerSeekCursorLockArrivedAt = std::chrono::steady_clock::time_point();
+        g_nativeQueuedReleaseAfterMarkerCancelSignature.clear();
       } else {
         g_nativeArmedMarkerId.clear();
         g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
         g_nativeArmedMarkerStartPlayPos = 0.0;
+        g_nativeMarkerSeekCursorLockActive = false;
+        g_nativeMarkerSeekCursorLockTarget = 0.0;
+        g_nativeMarkerSeekCursorLockOrigin = 0.0;
+        g_nativeMarkerSeekCursorLockArrivedAt = std::chrono::steady_clock::time_point();
       }
     }
-    if (type == "marker_select" || type == "select_marker") { g_nativeArmedMarkerId.clear(); g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point(); g_nativeArmedMarkerStartPlayPos = 0.0; }
+    if (type == "marker_select" || type == "select_marker") {
+      g_nativeArmedMarkerId.clear();
+      g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
+      g_nativeArmedMarkerStartPlayPos = 0.0;
+      g_nativeMarkerSeekCursorLockActive = false;
+      g_nativeMarkerSeekCursorLockTarget = 0.0;
+      g_nativeMarkerSeekCursorLockOrigin = 0.0;
+      g_nativeMarkerSeekCursorLockArrivedAt = std::chrono::steady_clock::time_point();
+    }
   }
 
   // FIX47: primeiro toque no App Diretor apenas seleciona o marker (amarelo).
