@@ -2922,6 +2922,7 @@ static std::string g_nativeMultiLoopBypassWarningSongKey;
 static double g_nativeMultiLoopBypassWarningStartPos = 0.0;
 static constexpr double kNativeMultiLoopBypassWarningLeadSec = 4.0;
 static std::string g_nativeQueuedSeekSignature;
+static std::string g_nativeQueuedSourceConfirmSignature;
 static std::string g_nativeQueuedTunerSignature;
 static std::string g_nativeLastAutoQueueForPlayingId;
 static std::string g_nativeAutoStopLastStoppedSignature;
@@ -5098,6 +5099,7 @@ static void nativeClearQueuedSongLocked()
   g_nativeQueuedManual = false;
   g_nativeQueuedKind = "playlist";
   g_nativeQueuedSeekSignature.clear();
+  g_nativeQueuedSourceConfirmSignature.clear();
   g_nativeQueuedTunerSignature.clear();
   g_nativeLastAutoQueueForPlayingId.clear();
 }
@@ -5401,6 +5403,7 @@ static void nativeSetQueuedSongLocked(const NativeSongWindow& song, bool manual,
   g_nativeQueuedManual = manual;
   g_nativeQueuedKind = nativeLower(kind) == "regions" ? "regions" : "playlist";
   g_nativeQueuedSeekSignature.clear();
+  g_nativeQueuedSourceConfirmSignature.clear();
   g_nativeQueuedTunerSignature.clear();
   nativeClearAutoBlocoTargetLocked();
   if (manual) {
@@ -5588,6 +5591,7 @@ static void nativeSyncQueueFromLuaExtState(
     g_nativeQueuedManual = queueManual;
     g_nativeQueuedKind = queueKind;
     g_nativeQueuedSeekSignature.clear();
+    g_nativeQueuedSourceConfirmSignature.clear();
     g_nativeQueuedTunerSignature.clear();
     nativeClearAutoBlocoTargetLocked();
   } else {
@@ -5687,7 +5691,11 @@ static bool nativeQueuedSongIsSameAsPlayingLocked(
     if (songEnd > songStart + 0.0005 &&
         std::fabs(songStart - g_nativeQueuedStart) <= 0.002 &&
         std::fabs(songEnd - g_nativeQueuedEnd) <= 0.002) return true;
-    if (playPos >= g_nativeQueuedStart && playPos < g_nativeQueuedEnd) return true;
+    // Na emenda de duas regioes, o primeiro frame do REAPER pode ficar alguns
+    // samples antes do inicio real. Trate esse pre-roll minimo como a musica da
+    // fila ja assumindo o playback; caso contrario o Auto arma um Smooth Seek
+    // para o proprio inicio da musica.
+    if (playPos >= (g_nativeQueuedStart - 0.050) && playPos < g_nativeQueuedEnd) return true;
   }
   return false;
 }
@@ -5778,24 +5786,55 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   // A fila continua armada e visivel, mas nenhum seek pode disputar o cursor
   // enquanto qualquer Loop/Repeat estiver ativo (padrao ou Multiloops).
   if (nativeIsRepeatEnabled(project)) return false;
-  double sourceBoundaryStart = songStart;
-  double sourceBoundaryEnd = songEnd;
-  std::string sourceBoundaryId = playingId;
-  nativeResolveQueueSourceBoundary(projectSongs, playingId, playPos, songStart, songEnd,
+  // Reconfirma a musica diretamente pela posicao viva. Na emenda exata entre
+  // regioes, o snapshot recebido pelo chamador ainda pode representar o frame
+  // anterior; nativeFindPlayingId usa intervalo fechado no inicio e aberto no
+  // fim, portanto o ponto compartilhado pertence somente a proxima regiao.
+  std::string livePlayingName;
+  double liveSongStart = 0.0;
+  double liveSongEnd = 0.0;
+  const std::string livePlayingId = nativeFindPlayingId(
+    projectSongs, playPos, livePlayingName, liveSongStart, liveSongEnd);
+  const bool hasLiveSong = !livePlayingId.empty() && liveSongEnd > liveSongStart + 0.0005;
+  const std::string& sourcePlayingId = hasLiveSong ? livePlayingId : playingId;
+  const double sourceSongStart = hasLiveSong ? liveSongStart : songStart;
+  const double sourceSongEnd = hasLiveSong ? liveSongEnd : songEnd;
+
+  double sourceBoundaryStart = sourceSongStart;
+  double sourceBoundaryEnd = sourceSongEnd;
+  std::string sourceBoundaryId = sourcePlayingId;
+  nativeResolveQueueSourceBoundary(projectSongs, sourcePlayingId, playPos, sourceSongStart, sourceSongEnd,
     sourceBoundaryStart, sourceBoundaryEnd, sourceBoundaryId);
   if (std::fabs(queuedStart - sourceBoundaryStart) <= 0.002 && std::fabs(queuedEnd - sourceBoundaryEnd) <= 0.002) return false;
 
   // O seek antecipado so nasce no fim de uma regiao normal ou no fim do pai.
   // O limite individual de uma musica-filho nunca conclui a fila.
   const double remaining = sourceBoundaryEnd - playPos;
-  // Mesmo intervalo usado pelo Lua: prepara a passagem dois segundos antes e
-  // ainda aceita um frame atrasado por ate 250 ms, especialmente no macOS.
-  if (remaining < -0.250 || remaining > 2.0) return false;
-
   const std::string seekSignature = sourceBoundaryId + "->" + queuedId + "@" + nativeNumber(sourceBoundaryStart, 3) + ":" + nativeNumber(queuedStart, 3);
+
+  // Primeiro estagio: entre quatro e dois segundos antes do fim, confirma qual
+  // regiao esta tocando e qual alvo esta na fila. Nenhum seek nasce nesta etapa.
+  if (remaining > 2.0 && remaining <= 4.0) {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (g_nativeQueuedSongId == queuedId &&
+        std::fabs(g_nativeQueuedStart - queuedStart) <= 0.002 &&
+        std::fabs(g_nativeQueuedEnd - queuedEnd) <= 0.002) {
+      g_nativeQueuedSourceConfirmSignature = seekSignature;
+    }
+    return false;
+  }
+  // Segundo estagio: aos dois segundos, o seek so existe se a mesma transicao
+  // foi confirmada no estagio anterior. Sem confirmacao, simplesmente nao atua.
+  if (remaining < -0.250 || remaining > 2.0) return false;
 
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
+    // A fila tambem pode ter sido trocada pelo usuario depois do snapshot. Nunca
+    // executa um alvo antigo: confirma id e limites no mesmo instante da armacao.
+    if (g_nativeQueuedSongId != queuedId ||
+        std::fabs(g_nativeQueuedStart - queuedStart) > 0.002 ||
+        std::fabs(g_nativeQueuedEnd - queuedEnd) > 0.002) return false;
+    if (g_nativeQueuedSourceConfirmSignature != seekSignature) return false;
     if (g_nativeQueuedSeekSignature == seekSignature) return false;
     g_nativeQueuedSeekSignature = seekSignature;
   }
@@ -5862,6 +5901,7 @@ static void nativePrepareQueuedTunerNearRegionEndOnMainThread()
     nativeNumber(boundaryStart, 3) + ":" + nativeNumber(queuedStart, 3);
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (g_nativeQueuedSourceConfirmSignature != tunerSignature) return;
     if (g_nativeQueuedTunerSignature == tunerSignature) return;
   }
 
@@ -9904,6 +9944,7 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
       g_nativeQueuedManual = commandManualQueue;
       g_nativeQueuedKind = type == "queue_region_song" ? "regions" : "playlist";
       g_nativeQueuedSeekSignature.clear();
+      g_nativeQueuedSourceConfirmSignature.clear();
       g_nativeQueuedTunerSignature.clear();
       nativeClearAutoBlocoTargetLocked();
       if (commandManualQueue) g_nativeLastAutoQueueForPlayingId.clear();
@@ -11092,6 +11133,14 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
   }
 
   if (wantsPlay && !wantsStop) {
+    // O Diretor normalmente envia "selecionar" imediatamente antes de "Play".
+    // A selecao e enfileirada para a thread principal; como os dois comandos HTTP
+    // podem chegar no mesmo ciclo, o Play acabava iniciando antes de a selecao ser
+    // consumida. No ciclo seguinte ela movia o cursor para o inicio da propria
+    // musica, percebido principalmente no macOS como um segundo seek. Consome a
+    // selecao agora, ainda parado, antes de preparar tuner e iniciar o transporte.
+    nativeProcessPendingSelectionOnMainThread();
+
     std::string noSeekValue = nativeJsonExtractString(commandBody, "noSeek");
     std::string transportOnlyValue = nativeJsonExtractString(commandBody, "transportOnly");
     std::transform(noSeekValue.begin(), noSeekValue.end(), noSeekValue.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
@@ -11150,7 +11199,9 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
       const NativeSongWindow* song = nativeFindSongForCommand(idValue, startPos, endPos);
       if (song) playPlaylistOrder = song->playlistOrder;
     }
-    if (playPlaylistOrder > 0) {
+    // Com o Lua ativo ele e o unico dono da fila/Auto. Armar tambem a fila
+    // nativa neste Play cria uma janela curta com dois alvos diferentes.
+    if (playPlaylistOrder > 0 && !nativeIsLuaControlActive()) {
       VS_Hook_Native_ArmAutoQueueFromPlaylistOrder(playPlaylistOrder);
     }
 
