@@ -10743,6 +10743,58 @@ static void nativeAppActiveFillRect(HDC dc, const RECT& rect, COLORREF fill)
   if (brush.temporary) DeleteObject(brush.handle);
 }
 
+struct NativeUiClipState {
+#ifdef _WIN32
+  int savedDc = 0;
+#else
+  bool pushed = false;
+#endif
+};
+
+static NativeUiClipState nativeUiBeginClipRect(
+  HDC dc, const RECT& rect)
+{
+  NativeUiClipState state{};
+  if (!dc || rect.right <= rect.left ||
+      rect.bottom <= rect.top) {
+    return state;
+  }
+#ifdef _WIN32
+  state.savedDc = SaveDC(dc);
+  if (state.savedDc != 0) {
+    IntersectClipRect(dc, rect.left, rect.top,
+      rect.right, rect.bottom);
+  }
+#else
+  SWELL_PushClipRegion(dc);
+  SWELL_SetClipRegion(dc, &rect);
+  state.pushed = true;
+#endif
+  return state;
+}
+
+static void nativeUiEndClipRect(
+  HDC dc, const NativeUiClipState& state)
+{
+  if (!dc) return;
+#ifdef _WIN32
+  if (state.savedDc != 0) RestoreDC(dc, state.savedDc);
+#else
+  if (state.pushed) SWELL_PopClipRegion(dc);
+#endif
+}
+
+static bool nativeUiGetCursorPosition(POINT* point)
+{
+  if (!point) return false;
+#ifdef _WIN32
+  return GetCursorPos(point) != 0;
+#else
+  GetCursorPos(point);
+  return true;
+#endif
+}
+
 static void nativeUiDrawSelectionArrow(
   HDC dc,
   int left,
@@ -11766,16 +11818,10 @@ static void nativePaintPartsColumn(
     return;
   }
 
-#ifdef _WIN32
-  const int clipState = SaveDC(dc);
-  IntersectClipRect(dc, listHitRect.left, listHitRect.top,
-    listHitRect.right - 6, listHitRect.bottom);
-#else
   const RECT clipRect{listHitRect.left, listHitRect.top,
     listHitRect.right - 6, listHitRect.bottom};
-  SWELL_PushClipRegion(dc);
-  SWELL_SetClipRegion(dc, &clipRect);
-#endif
+  const NativeUiClipState clipState =
+    nativeUiBeginClipRect(dc, clipRect);
   int firstRow = 0;
   while (firstRow < rowCount &&
          rowOffsets[static_cast<size_t>(firstRow)] +
@@ -11882,11 +11928,7 @@ static void nativePaintPartsColumn(
       rowHits.push_back({hitRect, i});
     }
   }
-#ifdef _WIN32
-  if (clipState != 0) RestoreDC(dc, clipState);
-#else
-  SWELL_PopClipRegion(dc);
-#endif
+  nativeUiEndClipRect(dc, clipState);
 
   if (maxScrollPixels > 0) {
 #ifdef __APPLE__
@@ -11938,19 +11980,26 @@ static int nativeUiTextWidth(HDC dc, const std::string& text, HFONT font)
   if (cached != g_nativeUiTextWidthCache.end()) return cached->second;
 
   HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
-  SIZE size{0, 0};
+  int measuredWidth = 0;
 #ifdef _WIN32
+  SIZE size{0, 0};
   const int required = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
   if (required > 0) {
     std::vector<wchar_t> wide(static_cast<size_t>(required), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), required);
     GetTextExtentPoint32W(dc, wide.data(), std::max(0, required - 1), &size);
+    measuredWidth = static_cast<int>(size.cx);
   }
 #else
-  GetTextExtentPoint32(dc, text.c_str(), static_cast<int>(text.size()), &size);
+  RECT measuredRect{0, 0, 0, 0};
+  DrawText(dc, text.c_str(), static_cast<int>(text.size()),
+    &measuredRect,
+    DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+  measuredWidth = static_cast<int>(
+    measuredRect.right - measuredRect.left);
 #endif
   if (oldFont) SelectObject(dc, oldFont);
-  const int width = std::max(0, static_cast<int>(size.cx));
+  const int width = std::max(0, measuredWidth);
   if (g_nativeUiTextWidthCache.size() >= 8192) {
     g_nativeUiTextWidthCache.clear();
   }
@@ -12802,10 +12851,8 @@ static void nativeUiDrawEditableText(
   COLORREF placeholderColor = RGB(148, 163, 184))
 {
   if (!dc) return;
-  const int clipState = SaveDC(dc);
-  IntersectClipRect(dc,
-    textRect.left, textRect.top,
-    textRect.right, textRect.bottom);
+  const NativeUiClipState clipState =
+    nativeUiBeginClipRect(dc, textRect);
 
   size_t first = 0;
   size_t last = 0;
@@ -12844,7 +12891,7 @@ static void nativeUiDrawEditableText(
       nativeAppActiveFillRect(dc, caret, textColor);
     }
   }
-  if (clipState != 0) RestoreDC(dc, clipState);
+  nativeUiEndClipRect(dc, clipState);
 }
 
 static std::string nativeUiFirstUtf8(const std::string& text)
@@ -13062,7 +13109,7 @@ static void nativeUiDrawButton(
   const RECT hoverRect =
     nativeUiCustomizePaintRect(rect, false);
   if (enabled && g_nativeAppActivePanelHwnd &&
-      GetCursorPos(&cursor)) {
+      nativeUiGetCursorPosition(&cursor)) {
     ScreenToClient(g_nativeAppActivePanelHwnd,
       &cursor);
     hovered = PtInRect(&hoverRect, cursor) != 0;
@@ -21495,10 +21542,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
         static_cast<double>(cycleW));
       const int firstX = playlistTextRect.left -
         static_cast<int>(std::floor(offset));
-      const int clipState = SaveDC(dc);
-      IntersectClipRect(dc,
-        playlistTextRect.left, playlistTextRect.top,
-        playlistTextRect.right, playlistTextRect.bottom);
+      const NativeUiClipState clipState =
+        nativeUiBeginClipRect(dc, playlistTextRect);
       const auto drawMarqueeCopy = [&](int drawX) {
         RECT drawRect{drawX, playlistTextRect.top,
           drawX + playlistTextW + 2,
@@ -21511,7 +21556,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       };
       drawMarqueeCopy(firstX);
       drawMarqueeCopy(firstX + cycleW);
-      if (clipState != 0) RestoreDC(dc, clipState);
+      nativeUiEndClipRect(dc, clipState);
       g_nativeUiPlaylistMarqueeActive = true;
     } else {
       g_nativeUiPlaylistMarqueeValue = playlistFieldText;
@@ -22717,16 +22762,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
     const bool mainSelectionUsesInactiveVisual =
       visiblePartColumns > 0 && navigationFocusIsKnown &&
       g_nativeMainNavigationFocus != mainNavigationColumn;
-#ifdef _WIN32
-    const int rowsClipState = SaveDC(dc);
-    IntersectClipRect(dc, listRect.left + 2,
-      listInnerTop, listContentRight, listInnerBottom);
-#else
     const RECT rowsClipRect{listRect.left + 2,
       listInnerTop, listContentRight, listInnerBottom};
-    SWELL_PushClipRegion(dc);
-    SWELL_SetClipRegion(dc, &rowsClipRect);
-#endif
+    const NativeUiClipState rowsClipState =
+      nativeUiBeginClipRect(dc, rowsClipRect);
     // A barra numérica é uma faixa única. Pintá-la por linha fazia as linhas
     // parcial e recém-reordenada recomporem pedaços em quadros diferentes no
     // mouse-up, produzindo o lampejo observado depois do drag/drop.
@@ -23284,11 +23323,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
             rowRect.right, rowRect.bottom}, blockEdge);
       }
     }
-#ifdef _WIN32
-    if (rowsClipState != 0) RestoreDC(dc, rowsClipState);
-#else
-    SWELL_PopClipRegion(dc);
-#endif
+    nativeUiEndClipRect(dc, rowsClipState);
 
     if (g_nativeMainListDrag.active &&
         g_nativeMainListDrag.regionsPage ==
@@ -23326,14 +23361,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
         g_nativeMainTunerColumnRect.top + rowH,
         g_nativeMainTunerColumnRect.right,
         g_nativeMainTunerColumnRect.bottom};
-#ifdef _WIN32
-      const int tunerClipState = SaveDC(dc);
-      IntersectClipRect(dc, tunerList.left, tunerList.top,
-        tunerList.right, tunerList.bottom);
-#else
-      SWELL_PushClipRegion(dc);
-      SWELL_SetClipRegion(dc, &tunerList);
-#endif
+      const NativeUiClipState tunerClipState =
+        nativeUiBeginClipRect(dc, tunerList);
       for (int i = g_nativeAppActiveListFirstRow;
            i < endRow; ++i) {
         const auto& row = g_nativeAppActivePanelModel.rows[
@@ -23398,11 +23427,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         g_nativeMainTunerHits.push_back(
           {plusRect, row.id, row.sourceNumber, 1});
       }
-#ifdef _WIN32
-      if (tunerClipState != 0) RestoreDC(dc, tunerClipState);
-#else
-      SWELL_PopClipRegion(dc);
-#endif
+      nativeUiEndClipRect(dc, tunerClipState);
     }
 
     g_nativeMainScrollbarTrackRect = RECT{0, 0, 0, 0};
@@ -26318,7 +26343,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
 #endif
       const int customGap = 7;
 
-      int customSubpageClipState = 0;
+      NativeUiClipState customSubpageClipState{};
       bool customSubpagePaintStarted = false;
       auto beginCustomSubpageScroll = [&]() {
         if (g_nativeMainModalKind ==
@@ -26345,21 +26370,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
           -g_nativeUiCustomizeSubpageScroll;
         g_nativeUiCustomizePaintOffsetActive = true;
         customSubpagePaintStarted = true;
-        customSubpageClipState = SaveDC(dc);
-        IntersectClipRect(dc,
-          g_nativeUiCustomizeSubpageScrollRect.left,
-          g_nativeUiCustomizeSubpageScrollRect.top,
-          g_nativeUiCustomizeSubpageScrollRect.right,
-          g_nativeUiCustomizeSubpageScrollRect.bottom);
+        customSubpageClipState = nativeUiBeginClipRect(
+          dc, g_nativeUiCustomizeSubpageScrollRect);
       };
       auto endCustomSubpageScroll = [&]() {
         if (!customSubpagePaintStarted) return;
         g_nativeUiCustomizePaintOffsetActive = false;
         g_nativeUiCustomizePaintOffsetY = 0;
-        if (customSubpageClipState != 0) {
-          RestoreDC(dc, customSubpageClipState);
-        }
-        customSubpageClipState = 0;
+        nativeUiEndClipRect(dc, customSubpageClipState);
+        customSubpageClipState = NativeUiClipState{};
         customSubpagePaintStarted = false;
 
         const int viewportHeight = std::max(1,
@@ -27104,7 +27123,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
             active ? "play" : "stop", true);
           POINT cursor{};
           bool hovered = false;
-          if (g_nativeAppActivePanelHwnd && GetCursorPos(&cursor)) {
+          if (g_nativeAppActivePanelHwnd &&
+              nativeUiGetCursorPosition(&cursor)) {
             ScreenToClient(g_nativeAppActivePanelHwnd, &cursor);
             hovered = PtInRect(&rect, cursor) != 0;
           }
@@ -27207,12 +27227,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
             g_nativeUiCustomizeMainMaxScroll));
         int sectionY =
           contentTop - g_nativeUiCustomizeMainScroll;
-        const int customizeClipState = SaveDC(dc);
-        IntersectClipRect(dc,
-          g_nativeUiCustomizeMainScrollRect.left,
-          g_nativeUiCustomizeMainScrollRect.top,
-          g_nativeUiCustomizeMainScrollRect.right,
-          g_nativeUiCustomizeMainScrollRect.bottom);
+        const NativeUiClipState customizeClipState =
+          nativeUiBeginClipRect(
+            dc, g_nativeUiCustomizeMainScrollRect);
         struct NativeCustomizeCategoryEntry {
           std::string label;
           std::string target;
@@ -27302,9 +27319,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         addCategory("Gavetas", {
           {"Contorno/Simbolo da gaveta", "drawer_style", "yellow_reset"}
         });
-        if (customizeClipState != 0) {
-          RestoreDC(dc, customizeClipState);
-        }
+        nativeUiEndClipRect(dc, customizeClipState);
         if (g_nativeUiCustomizeMainMaxScroll > 0) {
           const RECT track{
             panelLeft + panelWidth - 6,
@@ -46453,6 +46468,7 @@ static bool g_nativeRuntimeWasActive = false;
 static void nativePollAppActiveEnterKey()
 {
   const bool keyDown = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+  const HWND panelWindow = g_nativeAppActivePanelHwnd;
   if (!nativeAppActivePanelIsOpen()) {
     g_nativeAppActiveEnterWasDown = keyDown;
     return;
@@ -46465,7 +46481,6 @@ static void nativePollAppActiveEnterKey()
   // no REAPER ou na propria janela nativa (solta ou dentro do docker).
   const HWND foreground = GetForegroundWindow();
   const HWND reaperWindow = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
-  const HWND panelWindow = g_nativeAppActivePanelHwnd;
   const HWND foregroundRoot = foreground ? GetAncestor(foreground, GA_ROOT) : nullptr;
   const HWND reaperRoot = reaperWindow ? GetAncestor(reaperWindow, GA_ROOT) : nullptr;
   const HWND panelRoot = panelWindow ? GetAncestor(panelWindow, GA_ROOT) : nullptr;
