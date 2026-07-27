@@ -26,17 +26,6 @@ jobs:
           test -f WDL/swell/swell.h
           echo "VSHookExt sources found."
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: teleprompt-settings/package-lock.json
-
-      - name: Install Teleprompt Settings dependencies
-        shell: bash
-        run: npm ci --prefix teleprompt-settings --legacy-peer-deps
-
       - name: Configure x86_64 macOS 10.13+
         shell: bash
         env:
@@ -93,31 +82,9 @@ jobs:
           nm -arch x86_64 -gU "$BIN" | grep '_ReaperPluginEntry'
           nm -arch arm64 -gU "$BIN" | grep '_ReaperPluginEntry'
 
-      - name: Build Teleprompt Settings macOS app
-        shell: bash
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npm run build:mac --prefix teleprompt-settings
-
-      - name: Assemble macOS installation package
-        shell: bash
-        run: |
-          APP="$(find teleprompt-settings/dist -type d -name 'VS Hook Teleprompt Settings.app' -print -quit)"
-          test -n "$APP"
-          test -d "$APP"
-          PACKAGE_DIR='build-ci-package/VSHookExt-macOS'
-          mkdir -p "$PACKAGE_DIR/VSHookTelepromptSettings"
-          cp build-ci-universal/reaper_VSHookExt.dylib "$PACKAGE_DIR/"
-          ditto "$APP" "$PACKAGE_DIR/VSHookTelepromptSettings/VS Hook Teleprompt Settings.app"
-          test -f "$PACKAGE_DIR/reaper_VSHookExt.dylib"
-          test -d "$PACKAGE_DIR/VSHookTelepromptSettings/VS Hook Teleprompt Settings.app"
-          ditto -c -k --sequesterRsrc --keepParent \
-            "$PACKAGE_DIR" \
-            "build-ci-package/VSHookExt-macOS-${GITHUB_REF_NAME}.zip"
-
-      - name: Upload macOS package
+      - name: Upload macOS dylib
         uses: actions/upload-artifact@v4
         with:
           name: VSHookExt-macOS-Universal-${{ github.ref_name }}
           if-no-files-found: error
-          path: build-ci-package/VSHookExt-macOS-${{ github.ref_name }}.zip
+          path: build-ci-universal/reaper_VSHookExt.dylib
