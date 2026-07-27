@@ -118,8 +118,8 @@ if(MSVC)
 endif()
 
 set_target_properties(reaper_vshook PROPERTIES
-  # O nome do produto ÃƒÂ© VSHookExt; o prefixo reaper_ ÃƒÂ© obrigatÃƒÂ³rio para o
-  # REAPER descobrir automaticamente a extensÃƒÂ£o dentro de UserPlugins.
+  # O nome do produto ÃƒÆ’Ã‚Â© VSHookExt; o prefixo reaper_ ÃƒÆ’Ã‚Â© obrigatÃƒÆ’Ã‚Â³rio para o
+  # REAPER descobrir automaticamente a extensÃƒÆ’Ã‚Â£o dentro de UserPlugins.
   OUTPUT_NAME "reaper_VSHookExt"
 )
 

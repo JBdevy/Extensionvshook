@@ -6,6 +6,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     name: Windows x64
@@ -48,3 +51,12 @@ jobs:
           name: VSHookExt-Windows-${{ github.ref_name }}
           if-no-files-found: error
           path: ${{ steps.binary.outputs.path }}
+
+      - name: Publish DLL in GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.binary.outputs.path }}
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
