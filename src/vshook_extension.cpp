@@ -40509,20 +40509,40 @@ static void nativeOpenTelepromptElectronApp(bool recados)
       "Nao foi possivel localizar as configuracoes do Teleprompt.");
     return;
   }
-  const std::string appPath =
+  const std::vector<std::string> appCandidates = {
     std::string(resourcePath) +
-    "/UserPlugins/VSHookTelepromptSettings/"
-    "VS Hook Teleprompt Settings.app";
+      "/UserPlugins/VSHookTelepromptSettings/"
+      "VS Hook Teleprompt Settings.app",
+    "/Library/Application Support/REAPER/UserPlugins/"
+      "VSHookTelepromptSettings/"
+      "VS Hook Teleprompt Settings.app"
+  };
+  std::string appPath;
+  for (const auto& candidate : appCandidates) {
+    struct stat info {};
+    if (stat(candidate.c_str(), &info) == 0 &&
+        S_ISDIR(info.st_mode)) {
+      appPath = candidate;
+      break;
+    }
+  }
+  if (appPath.empty()) {
+    showDiagnostic(
+      "O aplicativo de Configuracoes/Recados nao foi encontrado.\n\n"
+      "Instale tambem a pasta VSHookTelepromptSettings que acompanha "
+      "a reaper_VSHookExt.dylib dentro de UserPlugins.");
+    return;
+  }
   const pid_t pid = fork();
   if (pid == 0) {
     unsetenv("ELECTRON_RUN_AS_NODE");
     if (recados) {
       execl("/usr/bin/open", "open",
-        "-a", appPath.c_str(),
+        appPath.c_str(),
         "--args", "--recados", nullptr);
     } else {
       execl("/usr/bin/open", "open",
-        "-a", appPath.c_str(), nullptr);
+        appPath.c_str(), nullptr);
     }
     _exit(127);
   }

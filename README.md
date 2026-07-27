@@ -4,11 +4,17 @@ Extensão nativa do VS Hook para REAPER 7.65 ou superior.
 
 ## Artefatos
 
-- Windows x64: `reaper_VSHookExt.dll`
-- macOS universal: `reaper_VSHookExt.dylib`
+- Windows x64: pacote com `reaper_VSHookExt.dll` e
+  `VSHookTelepromptSettings`.
+- macOS universal: pacote com `reaper_VSHookExt.dylib` e
+  `VSHookTelepromptSettings/VS Hook Teleprompt Settings.app`.
 
 Os binários não ficam versionados. Os workflows em `.github/workflows` geram
 os artefatos ao executar manualmente ou publicar uma tag `v*`.
+
+Extraia o pacote e copie tanto o binário quanto a pasta
+`VSHookTelepromptSettings` para `UserPlugins`. A pasta auxiliar é necessária
+para abrir Configurações do Teleprompt e Recados pelo menu da extensão.
 
 ## Build nativo
 
