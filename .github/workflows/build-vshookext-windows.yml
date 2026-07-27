@@ -34,7 +34,7 @@ jobs:
 
       - name: Install Teleprompt Settings dependencies
         shell: pwsh
-        run: npm ci --prefix teleprompt-settings
+        run: npm ci --prefix teleprompt-settings --legacy-peer-deps
 
       - name: Configure Windows x64
         shell: pwsh
