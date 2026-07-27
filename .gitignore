@@ -1,15 +1,18 @@
-# CMake build folders
-extension/build/
-extension/build-*/
+# CMake build folders (somente na raiz)
+/build/
+/build-*/
 
 # CMake generated files
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
+CTestTestfile.cmake
+Testing/
 *.vcxproj
 *.vcxproj.filters
 *.sln
+*.xcodeproj/
 
 # Build outputs
 *.dll
@@ -20,4 +23,31 @@ Makefile
 *.o
 *.a
 *.lib
+
+# Electron / Node
+/teleprompt-settings/node_modules/
+/teleprompt-settings/dist/
+/teleprompt-settings/dist-*/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Previews and local tooling
+/.codex-preview/
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Temporary and operating-system files
+*.log
+*.tmp
+*.bak
 .DS_Store
+Thumbs.db

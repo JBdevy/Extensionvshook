@@ -1,0 +1,50 @@
+name: Build VSHookExt Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check source and SDK
+        shell: bash
+        run: |
+          test -f CMakeLists.txt
+          test -f src/vshook_extension.cpp
+          test -f src/js_api_compat.cpp
+          test -f sdk/reaper_plugin.h
+          test -f sdk/reaper_plugin_functions.h
+          echo "VSHookExt sources found."
+
+      - name: Configure Windows x64
+        shell: pwsh
+        run: cmake -S . -B build-ci-windows -A x64
+
+      - name: Build Release
+        shell: pwsh
+        run: cmake --build build-ci-windows --config Release
+
+      - name: Locate and verify DLL
+        id: binary
+        shell: pwsh
+        run: |
+          $binary = Get-ChildItem build-ci-windows -Recurse -File -Filter reaper_VSHookExt.dll | Select-Object -First 1
+          if (-not $binary) { throw "reaper_VSHookExt.dll nao foi encontrada." }
+          "path=$($binary.FullName)" >> $env:GITHUB_OUTPUT
+          Get-Item $binary.FullName | Format-List FullName,Length,LastWriteTime
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VSHookExt-Windows-${{ github.ref_name }}
+          if-no-files-found: error
+          path: ${{ steps.binary.outputs.path }}

@@ -1,0 +1,90 @@
+name: Build VSHookExt macOS Universal
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-macos-universal:
+    name: macOS Universal x86_64 + arm64
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check source, SDK and SWELL
+        shell: bash
+        run: |
+          test -f CMakeLists.txt
+          test -f src/vshook_extension.cpp
+          test -f src/js_api_compat.cpp
+          test -f sdk/reaper_plugin.h
+          test -f sdk/reaper_plugin_functions.h
+          test -f WDL/swell/swell.h
+          echo "VSHookExt sources found."
+
+      - name: Configure x86_64 macOS 10.13+
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
+        run: >
+          cmake -S . -B build-ci-x86_64
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=x86_64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+
+      - name: Build x86_64 macOS 10.13+
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
+        run: cmake --build build-ci-x86_64 --config Release
+
+      - name: Configure arm64 macOS 11+
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: >
+          cmake -S . -B build-ci-arm64
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Build arm64 macOS 11+
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: cmake --build build-ci-arm64 --config Release
+
+      - name: Create VSHookExt universal dylib
+        shell: bash
+        run: |
+          mkdir -p build-ci-universal
+          X86_BIN="$(find build-ci-x86_64 -type f -name 'reaper_VSHookExt.dylib' | head -n 1)"
+          ARM_BIN="$(find build-ci-arm64 -type f -name 'reaper_VSHookExt.dylib' | head -n 1)"
+          test -n "$X86_BIN"
+          test -n "$ARM_BIN"
+          lipo -create "$X86_BIN" "$ARM_BIN" -output build-ci-universal/reaper_VSHookExt.dylib
+
+      - name: Verify architectures, targets and entrypoint
+        shell: bash
+        run: |
+          BIN='build-ci-universal/reaper_VSHookExt.dylib'
+          test -f "$BIN"
+          file "$BIN"
+          lipo -info "$BIN"
+          echo '--- x86_64 deployment target ---'
+          otool -arch x86_64 -l "$BIN" | grep -A5 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
+          echo '--- arm64 deployment target ---'
+          otool -arch arm64 -l "$BIN" | grep -A5 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
+          nm -arch x86_64 -gU "$BIN" | grep '_ReaperPluginEntry'
+          nm -arch arm64 -gU "$BIN" | grep '_ReaperPluginEntry'
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VSHookExt-macOS-Universal-${{ github.ref_name }}
+          if-no-files-found: error
+          path: build-ci-universal/reaper_VSHookExt.dylib

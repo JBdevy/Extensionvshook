@@ -1,3 +1,0 @@
-/mnt/data/fix_safe_appativo/VSHookwinmac/extension/build/CMakeFiles/reaper_vshook.dir
-/mnt/data/fix_safe_appativo/VSHookwinmac/extension/build/CMakeFiles/edit_cache.dir
-/mnt/data/fix_safe_appativo/VSHookwinmac/extension/build/CMakeFiles/rebuild_cache.dir

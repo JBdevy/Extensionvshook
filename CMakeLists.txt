@@ -1,0 +1,149 @@
+cmake_minimum_required(VERSION 3.20)
+
+if(POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW)
+endif()
+
+if(APPLE)
+  # Nao force target/arquitetura aqui.
+  # Igual a estrategia da SWS: o workflow define o deployment target por arquitetura.
+  # x86_64 precisa continuar carregando no macOS 10.13; arm64 exige macOS 11+.
+  if(NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "x86_64" CACHE STRING "macOS architecture")
+  endif()
+
+  if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+      set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
+    else()
+      set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
+    endif()
+  endif()
+endif()
+
+project(reaper_vshook_loader VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_VISIBILITY_PRESET default)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
+option(VSHOOK_BUILD_TESTS "Build native VS Hook license tests" OFF)
+
+if(APPLE)
+  enable_language(OBJCXX)
+endif()
+
+if(VSHOOK_BUILD_TESTS)
+  add_executable(vshook_license_test
+    src/license_validator.cpp
+    tests/license_validator_test.cpp
+  )
+  target_include_directories(vshook_license_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  if(WIN32)
+    target_compile_definitions(vshook_license_test PRIVATE
+      WIN32_LEAN_AND_MEAN
+      NOMINMAX
+    )
+    target_link_libraries(vshook_license_test PRIVATE advapi32 bcrypt)
+  elseif(APPLE)
+    target_link_libraries(vshook_license_test PRIVATE
+      "-framework CoreFoundation"
+      "-framework Security"
+    )
+  endif()
+endif()
+
+
+add_library(reaper_vshook SHARED
+  src/js_api_compat.cpp
+  src/license_validator.cpp
+  src/vshook_extension.cpp
+)
+
+if(WIN32)
+  target_sources(reaper_vshook PRIVATE
+    src/native_video_decoder_win.cpp
+  )
+elseif(APPLE)
+  target_sources(reaper_vshook PRIVATE
+    src/native_video_decoder_mac.mm
+  )
+endif()
+
+target_include_directories(reaper_vshook PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/sdk
+  ${CMAKE_CURRENT_SOURCE_DIR}/WDL
+  ${CMAKE_CURRENT_SOURCE_DIR}/WDL/swell
+)
+
+target_compile_definitions(reaper_vshook PRIVATE
+  VSHOOK_EXTENSION_VERSION="${PROJECT_VERSION}"
+  SWELL_PROVIDED_BY_APP
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
+)
+
+if(WIN32)
+  target_link_libraries(reaper_vshook PRIVATE
+    ws2_32
+    comctl32
+    comdlg32
+    shell32
+    ole32
+    advapi32
+    bcrypt
+    d3d11
+    dxgi
+    mfplat
+    mfreadwrite
+    mfuuid
+    propsys
+  )
+endif()
+
+if(MSVC)
+  # Igual ao padrao da SWS: runtime C/C++ estatico.
+  # Evita clientes Windows sem VC++ Redistributable ficarem sem carregar a DLL,
+  # o que faz o menu Extensions nem aparecer.
+  set_property(TARGET reaper_vshook PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+  )
+  target_compile_options(reaper_vshook PRIVATE
+    /utf-8
+    /EHsc
+    /Zc:threadSafeInit-
+  )
+endif()
+
+set_target_properties(reaper_vshook PROPERTIES
+  # O nome do produto é VSHookExt; o prefixo reaper_ é obrigatório para o
+  # REAPER descobrir automaticamente a extensão dentro de UserPlugins.
+  OUTPUT_NAME "reaper_VSHookExt"
+)
+
+if(APPLE)
+  set_target_properties(reaper_vshook PROPERTIES
+    PREFIX ""
+    SUFFIX ".dylib"
+  )
+
+  target_sources(reaper_vshook PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/WDL/swell/swell-modstub.mm
+  )
+
+  target_link_libraries(reaper_vshook PRIVATE
+    "-framework AppKit"
+    "-framework AVFoundation"
+    "-framework CoreGraphics"
+    "-framework CoreFoundation"
+    "-framework CoreMedia"
+    "-framework Security"
+  )
+
+  target_link_options(reaper_vshook PRIVATE
+    "-undefined" "dynamic_lookup"
+    "-Wl,-exported_symbol,_ReaperPluginEntry"
+  )
+endif()
