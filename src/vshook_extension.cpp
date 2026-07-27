@@ -35172,6 +35172,11 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       nativeUiSetFrameTimerInterval(
         hwnd, kNativeUiFrameFastIntervalMs);
       return 0;
+    case WM_NCHITTEST:
+      // O SWELL consulta o hit-test antes de entregar qualquer evento de
+      // mouse. Sem HTCLIENT, o macOS converte o clique para WM_NC* e nenhum
+      // controle desenhado pela extensao recebe WM_LBUTTON*/WM_RBUTTON*.
+      return HTCLIENT;
 #ifdef _WIN32
     case WM_GETDLGCODE: {
       // Toda a interface e desenhada pela extensao e tambem implementa os
@@ -36996,6 +37001,10 @@ static LRESULT CALLBACK nativeShortcutNoticeWndProc(
   LPARAM lParam)
 {
   switch (message) {
+    case WM_NCHITTEST:
+      // A janela e inteiramente desenhada por nos. No SWELL/macOS, retornar
+      // zero aqui transforma todos os cliques em eventos de area nao-cliente.
+      return HTCLIENT;
     case WM_PAINT: {
       PAINTSTRUCT ps{};
       HDC dc = BeginPaint(hwnd, &ps);
@@ -40067,6 +40076,9 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
           static_cast<UINT_PTR>(slot),
         16, nullptr);
       return 0;
+    case WM_NCHITTEST:
+      // Mantem duplo clique e arraste da janela funcionando no SWELL/macOS.
+      return HTCLIENT;
     case WM_ERASEBKGND:
       return 1;
     case WM_PAINT:
