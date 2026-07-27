@@ -12,9 +12,8 @@ os artefatos ao executar manualmente ou publicar uma tag `v*`.
 
 A Hook Center instala o binário e a pasta auxiliar
 `VSHookTelepromptSettings` dentro de `UserPlugins`. A pasta auxiliar é
-necessária somente para abrir o aplicativo de Recados pelo menu da extensão,
-mas não faz parte dos artefatos gerados neste repositório. As Configurações do
-Teleprompt são nativas e funcionam diretamente pela extensão.
+necessária para abrir Configurações do Teleprompt e Recados pelo menu da
+extensão, mas não faz parte dos artefatos gerados neste repositório.
 
 ## Build nativo
 
@@ -39,14 +38,7 @@ O workflow do macOS compila separadamente `x86_64` para macOS 10.13+ e
 
 ## Configurações do teleprompt
 
-A tela de Configurações do Teleprompt é nativa, incluindo seletor de cor por
-RGB, código hexadecimal e paleta. As opções de TP1, TP2 e Recados são salvas
-automaticamente no mesmo estado usado pelas janelas nativas.
-
-## Aplicativo auxiliar de Recados
-
-O aplicativo Electron usado para enviar Recados fica em
-`teleprompt-settings`.
+A interface Electron auxiliar fica em `teleprompt-settings`.
 
 ```powershell
 cd teleprompt-settings
@@ -61,7 +53,7 @@ No macOS, use `npm run build:mac`.
 - `src`: código da extensão e dos decodificadores nativos.
 - `sdk`: cabeçalhos do SDK do REAPER.
 - `WDL`: componentes WDL/SWELL necessários no macOS.
-- `teleprompt-settings`: aplicativo auxiliar de envio de recados.
+- `teleprompt-settings`: interface de configurações e recados.
 - `tests`: testes nativos.
 - `.github/workflows`: builds oficiais de Windows e macOS.
 

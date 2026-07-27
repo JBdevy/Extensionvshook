@@ -2401,66 +2401,9 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
   // REAPER de roubar setas, caracteres da lupa e os atalhos internos. Enter e
   // tratado diretamente para um autorepeat nao abrir e confirmar o mesmo modal.
   const bool targetsNativePanel = nativeMessageTargetsNativePanel(msg);
-  const bool targetCommandModifier = nativeHotkeyHasCommandModifier();
-  const bool targetShiftDown =
-    (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-  const int targetMappedCode =
-    (vk >= 'A' && vk <= 'Z') ? vk - 'A' + 'a' : vk;
-  const bool targetCapturesArbitraryKey =
-    g_nativeMainSearchFocused ||
-    g_nativeMixerRenameOpen ||
-    g_nativePartsRenameOpen ||
-    g_nativeMainModalKind == NativeMainModalKind::TimerConfig ||
-    g_nativeMainModalKind == NativeMainModalKind::CreatePlaylist ||
-    g_nativeMainModalKind == NativeMainModalKind::RenameRow ||
-    g_nativeMainModalKind == NativeMainModalKind::PreviewKeyboardCapture ||
-    g_nativeMainModalKind == NativeMainModalKind::TunerKeyboardCapture ||
-    g_nativeMainModalKind == NativeMainModalKind::MixerKeyboardCapture ||
-    g_nativeMainModalKind == NativeMainModalKind::MixerBulkKeyboardCapture ||
-    (g_nativeMainModalKind == NativeMainModalKind::PlaylistDropdown &&
-     g_nativeUiPlaylistInputFocused);
-  const bool targetBuiltInShortcut =
-    !targetCommandModifier &&
-    !(targetShiftDown && (vk == 'R' || vk == 'r')) &&
-    (vk == VK_ESCAPE || vk == VK_RETURN ||
-     vk == VK_SPACE || vk == VK_TAB ||
-     vk == VK_BACK || vk == VK_DELETE ||
-     vk == VK_UP || vk == VK_DOWN ||
-     vk == VK_LEFT || vk == VK_RIGHT ||
-     vk == VK_HOME || vk == VK_END ||
-     vk == 'C' || vk == 'c' ||
-     vk == 'L' || vk == 'l' ||
-     vk == 'R' || vk == 'r' ||
-     (vk >= VK_F1 && vk <= VK_F9));
-  const bool targetConfiguredShortcut =
-    !targetCommandModifier &&
-    nativeUiHasConfiguredKeyboardBinding(targetMappedCode);
-  const bool targetStopBreakShortcut =
-    vk == VK_SPACE && nativeStopBreakModifierDown();
-  const bool targetControlArrowShortcut =
-    (vk == VK_LEFT || vk == VK_RIGHT) &&
-    (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-#ifdef __APPLE__
-  const bool targetPlaylistArrowShortcut =
-    (vk == VK_UP || vk == VK_DOWN) &&
-    ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
-     (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
-#else
-  const bool targetPlaylistArrowShortcut =
-    (vk == VK_UP || vk == VK_DOWN) &&
-    (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-#endif
-  const bool targetOwnsKey =
-    targetCapturesArbitraryKey ||
-    targetBuiltInShortcut ||
-    targetConfiguredShortcut ||
-    targetStopBreakShortcut ||
-    targetControlArrowShortcut ||
-    targetPlaylistArrowShortcut;
-  // Mesmo com o painel focado, teclas que nao pertencem ao VS Hook seguem
-  // para a Action List do REAPER. A captura total fica restrita a campos de
-  // texto e janelas que estejam aguardando um novo mapeamento.
-  if (targetsNativePanel && !targetOwnsKey) return 0;
+  // Com a interface em foco, todo o teclado pertence ao VS Hook. A mensagem
+  // segue para o WndProc do painel, inclusive nos inputs, mas nunca atravessa
+  // para a Action List nem para a timeline do REAPER.
   if (targetsNativePanel && vk == VK_RETURN) {
     if (!keyDown) {
       if (msg->message == WM_KEYUP ||
@@ -2478,12 +2421,9 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
   }
   if (targetsNativePanel) return -1;
 
-  // A interface nova tambem precisa manter os atalhos quando o usuario clica
-  // na timeline, no mixer ou em qualquer outra area do REAPER. Encaminhamos o
-  // mesmo WM_KEYDOWN ao WndProc do painel para que exista uma unica logica de
-  // execucao, tanto com foco quanto sem foco. Campos de texto do host continuam
-  // livres para digitacao e atalhos com modificadores continuam pertencendo ao
-  // REAPER, salvo os comandos que o proprio VS Hook reserva.
+  // Fora do foco, a extensão reserva somente R, L e Esc. Todas as demais
+  // teclas, atalhos configuráveis e combinações pertencem integralmente ao
+  // REAPER.
   if (nativeAppActivePanelIsOpen()) {
     if (!keyDown) {
       if (vk == VK_RETURN &&
@@ -2500,73 +2440,15 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
       (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     if ((vk == 'R' || vk == 'r') && shiftDown) return 0;
 
-    const bool stopBreakShortcut =
-      vk == VK_SPACE && nativeStopBreakModifierDown();
-    const bool controlArrowShortcut =
-      (vk == VK_LEFT || vk == VK_RIGHT) &&
-      (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-#ifdef __APPLE__
-    const bool playlistArrowShortcut =
-      (vk == VK_UP || vk == VK_DOWN) &&
-      ((GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
-       (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
-#else
-    const bool playlistArrowShortcut =
-      (vk == VK_UP || vk == VK_DOWN) &&
-      (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-#endif
-    if (!stopBreakShortcut &&
-        !controlArrowShortcut &&
-        !playlistArrowShortcut &&
-        nativeHotkeyHasCommandModifier()) {
-      return 0;
-    }
-
-    // Fora do foco, somente os atalhos globais declarados pelo VS Hook são
-    // encaminhados. Delete, Backspace, Home/End e setas simples pertencem ao
-    // REAPER; dentro do painel eles continuam funcionando localmente.
-    const bool builtInShortcut =
+    if (nativeHotkeyHasCommandModifier()) return 0;
+    const bool globalKey =
       vk == VK_ESCAPE ||
-      vk == VK_SPACE || vk == VK_TAB ||
-      vk == 'C' || vk == 'c' ||
       vk == 'L' || vk == 'l' ||
-      vk == 'R' || vk == 'r' ||
-      playlistArrowShortcut ||
-      (vk >= VK_F1 && vk <= VK_F9);
-    const int mappedCode =
-      (vk >= 'A' && vk <= 'Z') ? vk - 'A' + 'a' : vk;
-    // ExtStates antigos podem conter mapeamentos gravados antes de essas
-    // teclas terem sido reservadas. Fora do painel, nunca deixe esses resíduos
-    // roubarem edição, exclusão ou navegação normal do REAPER.
-    const bool hostEditingOrNavigationKey =
-      vk == VK_BACK || vk == VK_DELETE ||
-      vk == VK_UP || vk == VK_DOWN ||
-      vk == VK_LEFT || vk == VK_RIGHT ||
-      vk == VK_HOME || vk == VK_END;
-    const bool configuredShortcut =
-      !hostEditingOrNavigationKey &&
-      !builtInShortcut &&
-      nativeUiHasConfiguredKeyboardBinding(mappedCode);
+      vk == 'R' || vk == 'r';
+    if (!globalKey) return 0;
 
-    if (g_state.directorInterfaceBlocked) {
-      if (vk != VK_RETURN && vk != VK_ESCAPE) return 0;
-    } else if (!builtInShortcut && !configuredShortcut) {
-      return 0;
-    }
-
-    // Um unico toque de Enter nao pode abrir e confirmar o mesmo modal por
-    // causa do autorepeat. As demais teclas seguem o repeat normal do sistema,
-    // necessario principalmente para setas e navegacao das listas.
-    if (vk == VK_RETURN) {
-      if (!g_nativeAppActiveEnterWasDown) {
-        g_nativeAppActiveEnterWasDown = true;
-        SendMessage(g_nativeAppActivePanelHwnd,
-          WM_KEYDOWN, VK_RETURN, msg->lParam);
-      }
-    } else {
-      SendMessage(g_nativeAppActivePanelHwnd,
-        WM_KEYDOWN, msg->wParam, msg->lParam);
-    }
+    SendMessage(g_nativeAppActivePanelHwnd,
+      WM_KEYDOWN, msg->wParam, msg->lParam);
 
     // ESC tambem continua chegando ao REAPER, exatamente como na captura da
     // extensao atual, para preservar o cancelamento nativo da timeline.
@@ -38309,8 +38191,6 @@ static COLORREF nativeTelepromptColor(
     fallback == RGB(0, 255, 85) ? "green" : "yellow");
 }
 
-#include "native_teleprompt_settings_ui.inc"
-
 static COLORREF nativeTelepromptRgbColor()
 {
   const double now = std::chrono::duration<double>(
@@ -40507,10 +40387,10 @@ static void nativeCloseAllTelepromptWindows()
   }
 }
 
-static void nativeOpenRecadosElectronApp()
+static void nativeOpenTelepromptElectronApp(bool recados)
 {
-  // O aplicativo auxiliar permanece apenas para o envio de Recados.
-  // Configuracoes, TP1 e TP2 pertencem integralmente a extensao nativa.
+  // O mesmo runtime Electron leve hospeda duas janelas independentes:
+  // configuracoes e Recados. As janelas TP1/TP2 continuam 100% nativas.
 #ifdef _WIN32
   wchar_t modulePath[4096] = {};
   if (!GetModuleFileNameW(
@@ -40519,7 +40399,7 @@ static void nativeOpenRecadosElectronApp()
         static_cast<DWORD>(
           sizeof(modulePath) / sizeof(modulePath[0])))) {
     showDiagnostic(
-      "Nao foi possivel localizar o aplicativo de Recados.");
+      "Nao foi possivel localizar as configuracoes do Teleprompt.");
     return;
   }
   std::wstring base(modulePath);
@@ -40534,7 +40414,8 @@ static void nativeOpenRecadosElectronApp()
     base + L"\\VSHookTelepromptSettings";
   DWORD attrs = GetFileAttributesW(packagedExe.c_str());
   std::wstring command;
-  const std::wstring argument = L" --recados";
+  const std::wstring argument =
+    recados ? L" --recados" : L"";
   if (attrs != INVALID_FILE_ATTRIBUTES &&
       !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
     command = L"\"" + packagedExe + L"\"" + argument;
@@ -40548,7 +40429,7 @@ static void nativeOpenRecadosElectronApp()
   }
   if (command.empty()) {
     showDiagnostic(
-      "O aplicativo de Recados nao foi encontrado ao lado da extensao.\n\n"
+      "A janela Electron de configuracoes nao foi encontrada ao lado da extensao.\n\n"
       "Instale a pasta VSHookTelepromptSettings dentro de UserPlugins.");
     return;
   }
@@ -40599,14 +40480,14 @@ static void nativeOpenRecadosElectronApp()
     CloseHandle(process.hProcess);
   } else {
     showDiagnostic(
-      "Nao foi possivel abrir o aplicativo de Recados.");
+      "Nao foi possivel abrir as configuracoes do Teleprompt.");
   }
 #else
   const char* resourcePath =
     GetResourcePath_ptr ? GetResourcePath_ptr() : nullptr;
   if (!resourcePath || !*resourcePath) {
     showDiagnostic(
-      "Nao foi possivel localizar o aplicativo de Recados.");
+      "Nao foi possivel localizar as configuracoes do Teleprompt.");
     return;
   }
   const std::vector<std::string> appCandidates = {
@@ -40628,7 +40509,7 @@ static void nativeOpenRecadosElectronApp()
   }
   if (appPath.empty()) {
     showDiagnostic(
-      "O aplicativo de Recados nao foi encontrado.\n\n"
+      "O aplicativo de Configuracoes/Recados nao foi encontrado.\n\n"
       "Instale tambem a pasta VSHookTelepromptSettings que acompanha "
       "a reaper_VSHookExt.dylib dentro de UserPlugins.");
     return;
@@ -40636,29 +40517,31 @@ static void nativeOpenRecadosElectronApp()
   const pid_t pid = fork();
   if (pid == 0) {
     unsetenv("ELECTRON_RUN_AS_NODE");
-    execl("/usr/bin/open", "open",
-      appPath.c_str(),
-      "--args", "--recados", nullptr);
+    if (recados) {
+      execl("/usr/bin/open", "open",
+        appPath.c_str(),
+        "--args", "--recados", nullptr);
+    } else {
+      execl("/usr/bin/open", "open",
+        appPath.c_str(), nullptr);
+    }
     _exit(127);
   }
   if (pid < 0) {
     showDiagnostic(
-      "Nao foi possivel abrir o aplicativo de Recados.");
+      "Nao foi possivel abrir as configuracoes do Teleprompt.");
   }
 #endif
 }
 
 static void nativeOpenTelepromptSettings()
 {
-  if (!nativeOpenTelepromptSettingsWindow()) {
-    showDiagnostic(
-      "Nao foi possivel abrir as configuracoes nativas do Teleprompt.");
-  }
+  nativeOpenTelepromptElectronApp(false);
 }
 
 static void nativeOpenRecadosApp()
 {
-  nativeOpenRecadosElectronApp();
+  nativeOpenTelepromptElectronApp(true);
 }
 
 static void nativeRefreshAppActivePanelModel()
@@ -47279,7 +47162,6 @@ static void shutdown()
   if (!plugin_register_ptr) return;
 
   nativeCloseAppActivePanel();
-  nativeCloseTelepromptSettingsWindow();
   nativeCloseAllTelepromptWindows();
   nativeTechnicalNoticeFlushPersistenceOnMainThread();
 

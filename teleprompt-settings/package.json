@@ -2,7 +2,7 @@
   "name": "vshook-teleprompt-settings",
   "version": "1.0.0",
   "private": true,
-  "description": "Aplicativo auxiliar de Recados do VS Hook",
+  "description": "Janela de configurações dos teleprompts nativos do VS Hook",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
