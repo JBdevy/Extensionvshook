@@ -37513,13 +37513,14 @@ static void nativeCloseAppActivePanel()
 // ==========================================================
 // Janelas nativas do Teleprompt
 // ----------------------------------------------------------
-// O Electron e usado exclusivamente pela tela de configuracao. TP1 e TP2
-// pertencem a extensao e sao desenhados em HWND/SWELL, sem BrowserWindow.
+// Configuracoes, TP1 e TP2 pertencem integralmente a extensao e sao
+// desenhados em HWND/SWELL, sem BrowserWindow.
 // ==========================================================
 
 static constexpr UINT_PTR kNativeTelepromptTimerBase = 0x56535450;
 
 struct NativeTelepromptSettings {
+  std::string preset = "night";
   std::string textColor = "#ffea00";
   std::string textBoxColor = "#ffea00";
   std::string clockColor = "#00ff55";
@@ -37701,6 +37702,8 @@ static void nativeTelepromptApplySettingsJson(
       nativeJsonExtractString(json, key));
     if (!value.empty()) field = value;
   };
+  stringValue("preset", next.preset);
+  if (next.preset != "day") next.preset = "night";
   stringValue("textColor", next.textColor);
   stringValue("textBoxColor", next.textBoxColor);
   stringValue("clockColor", next.clockColor);
@@ -37786,6 +37789,7 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   std::ostringstream json;
   json << "{";
   json << "\"slot\":" << slot << ",";
+  json << "\"preset\":\"night\",";
   json << "\"textColor\":\"#ffea00\",";
   json << "\"textBoxColor\":\"#ffea00\",";
   json << "\"clockColor\":\"#00ff55\",";
@@ -37825,6 +37829,101 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"rgbWindowBorderEnabled\":false,";
   json << "\"rgbClockBorderEnabled\":false,";
   json << "\"rgbTextBoxBorderEnabled\":false";
+  json << "}";
+  return json.str();
+}
+
+static std::string nativeTelepromptSettingsToJson(
+  int slot,
+  const NativeTelepromptSettings& settings)
+{
+  auto boolean = [](bool value) {
+    return value ? "true" : "false";
+  };
+  std::ostringstream json;
+  json << "{";
+  json << "\"slot\":" << (slot == 2 ? 2 : 1) << ",";
+  json << "\"preset\":"
+       << nativeJsonString(
+            settings.preset == "day" ? "day" : "night") << ",";
+  json << "\"textColor\":"
+       << nativeJsonString(settings.textColor) << ",";
+  json << "\"textBoxColor\":"
+       << nativeJsonString(settings.textBoxColor) << ",";
+  json << "\"clockColor\":"
+       << nativeJsonString(settings.clockColor) << ",";
+  json << "\"clockExpiredColor\":"
+       << nativeJsonString(settings.clockExpiredColor) << ",";
+  json << "\"clockBorderColor\":"
+       << nativeJsonString(settings.clockBorderColor) << ",";
+  json << "\"localClockColor\":"
+       << nativeJsonString(settings.localClockColor) << ",";
+  json << "\"borderColor\":"
+       << nativeJsonString(settings.borderColor) << ",";
+  json << "\"songNameColor\":"
+       << nativeJsonString(settings.songNameColor) << ",";
+  json << "\"queueNameColor\":"
+       << nativeJsonString(settings.queueNameColor) << ",";
+  json << "\"progressColor\":"
+       << nativeJsonString(settings.progressColor) << ",";
+  json << "\"fontFamily\":"
+       << nativeJsonString(settings.fontFamily) << ",";
+  json << "\"songNameFontFamily\":"
+       << nativeJsonString(settings.songNameFontFamily) << ",";
+  json << "\"queueNameFontFamily\":"
+       << nativeJsonString(settings.queueNameFontFamily) << ",";
+  json << "\"textCase\":"
+       << nativeJsonString(settings.textCase) << ",";
+  json << "\"clockPosition\":"
+       << nativeJsonString(settings.clockPosition) << ",";
+  json << "\"localClockPosition\":"
+       << nativeJsonString(settings.localClockPosition) << ",";
+  json << "\"songNamePosition\":"
+       << nativeJsonString(settings.songNamePosition) << ",";
+  json << "\"queueNamePosition\":"
+       << nativeJsonString(settings.queueNamePosition) << ",";
+  json << "\"progressPosition\":"
+       << nativeJsonString(settings.progressPosition) << ",";
+  json << "\"textScale\":"
+       << nativeNumber(settings.textScale, 3) << ",";
+  json << "\"clockScale\":"
+       << nativeNumber(settings.clockScale, 3) << ",";
+  json << "\"songNameScale\":"
+       << nativeNumber(settings.songNameScale, 3) << ",";
+  json << "\"queueNameScale\":"
+       << nativeNumber(settings.queueNameScale, 3) << ",";
+  json << "\"mediaScale\":"
+       << nativeNumber(settings.mediaScale, 3) << ",";
+  json << "\"previewScale\":"
+       << nativeNumber(settings.previewScale, 3) << ",";
+  json << "\"localClockDepth\":"
+       << nativeNumber(settings.localClockDepth, 3) << ",";
+  json << "\"windowBorderEnabled\":"
+       << boolean(settings.windowBorderEnabled) << ",";
+  json << "\"clockBorderEnabled\":"
+       << boolean(settings.clockBorderEnabled) << ",";
+  json << "\"textBoxEnabled\":"
+       << boolean(settings.textBoxEnabled) << ",";
+  json << "\"clockEnabled\":"
+       << boolean(settings.clockEnabled) << ",";
+  json << "\"localClockEnabled\":"
+       << boolean(settings.localClockEnabled) << ",";
+  json << "\"songNameEnabled\":"
+       << boolean(settings.songNameEnabled) << ",";
+  json << "\"queueNameEnabled\":"
+       << boolean(settings.queueNameEnabled) << ",";
+  json << "\"progressEnabled\":"
+       << boolean(settings.progressEnabled) << ",";
+  json << "\"previewEnabled\":"
+       << boolean(settings.previewEnabled) << ",";
+  json << "\"clearMode\":"
+       << boolean(settings.clearMode) << ",";
+  json << "\"rgbWindowBorderEnabled\":"
+       << boolean(settings.rgbWindowBorderEnabled) << ",";
+  json << "\"rgbClockBorderEnabled\":"
+       << boolean(settings.rgbClockBorderEnabled) << ",";
+  json << "\"rgbTextBoxBorderEnabled\":"
+       << boolean(settings.rgbTextBoxBorderEnabled);
   json << "}";
   return json.str();
 }
@@ -38209,6 +38308,8 @@ static COLORREF nativeTelepromptColor(
   return nativeUiNamedVisualColor(value,
     fallback == RGB(0, 255, 85) ? "green" : "yellow");
 }
+
+#include "native_teleprompt_settings_ui.inc"
 
 static COLORREF nativeTelepromptRgbColor()
 {
@@ -40406,10 +40507,10 @@ static void nativeCloseAllTelepromptWindows()
   }
 }
 
-static void nativeOpenTelepromptElectronApp(bool recados)
+static void nativeOpenRecadosElectronApp()
 {
-  // O mesmo runtime Electron leve hospeda duas janelas independentes:
-  // configuracoes e Recados. As janelas TP1/TP2 continuam 100% nativas.
+  // O aplicativo auxiliar permanece apenas para o envio de Recados.
+  // Configuracoes, TP1 e TP2 pertencem integralmente a extensao nativa.
 #ifdef _WIN32
   wchar_t modulePath[4096] = {};
   if (!GetModuleFileNameW(
@@ -40418,7 +40519,7 @@ static void nativeOpenTelepromptElectronApp(bool recados)
         static_cast<DWORD>(
           sizeof(modulePath) / sizeof(modulePath[0])))) {
     showDiagnostic(
-      "Nao foi possivel localizar as configuracoes do Teleprompt.");
+      "Nao foi possivel localizar o aplicativo de Recados.");
     return;
   }
   std::wstring base(modulePath);
@@ -40433,8 +40534,7 @@ static void nativeOpenTelepromptElectronApp(bool recados)
     base + L"\\VSHookTelepromptSettings";
   DWORD attrs = GetFileAttributesW(packagedExe.c_str());
   std::wstring command;
-  const std::wstring argument =
-    recados ? L" --recados" : L"";
+  const std::wstring argument = L" --recados";
   if (attrs != INVALID_FILE_ATTRIBUTES &&
       !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
     command = L"\"" + packagedExe + L"\"" + argument;
@@ -40448,7 +40548,7 @@ static void nativeOpenTelepromptElectronApp(bool recados)
   }
   if (command.empty()) {
     showDiagnostic(
-      "A janela Electron de configuracoes nao foi encontrada ao lado da extensao.\n\n"
+      "O aplicativo de Recados nao foi encontrado ao lado da extensao.\n\n"
       "Instale a pasta VSHookTelepromptSettings dentro de UserPlugins.");
     return;
   }
@@ -40499,14 +40599,14 @@ static void nativeOpenTelepromptElectronApp(bool recados)
     CloseHandle(process.hProcess);
   } else {
     showDiagnostic(
-      "Nao foi possivel abrir as configuracoes do Teleprompt.");
+      "Nao foi possivel abrir o aplicativo de Recados.");
   }
 #else
   const char* resourcePath =
     GetResourcePath_ptr ? GetResourcePath_ptr() : nullptr;
   if (!resourcePath || !*resourcePath) {
     showDiagnostic(
-      "Nao foi possivel localizar as configuracoes do Teleprompt.");
+      "Nao foi possivel localizar o aplicativo de Recados.");
     return;
   }
   const std::vector<std::string> appCandidates = {
@@ -40528,7 +40628,7 @@ static void nativeOpenTelepromptElectronApp(bool recados)
   }
   if (appPath.empty()) {
     showDiagnostic(
-      "O aplicativo de Configuracoes/Recados nao foi encontrado.\n\n"
+      "O aplicativo de Recados nao foi encontrado.\n\n"
       "Instale tambem a pasta VSHookTelepromptSettings que acompanha "
       "a reaper_VSHookExt.dylib dentro de UserPlugins.");
     return;
@@ -40536,31 +40636,29 @@ static void nativeOpenTelepromptElectronApp(bool recados)
   const pid_t pid = fork();
   if (pid == 0) {
     unsetenv("ELECTRON_RUN_AS_NODE");
-    if (recados) {
-      execl("/usr/bin/open", "open",
-        appPath.c_str(),
-        "--args", "--recados", nullptr);
-    } else {
-      execl("/usr/bin/open", "open",
-        appPath.c_str(), nullptr);
-    }
+    execl("/usr/bin/open", "open",
+      appPath.c_str(),
+      "--args", "--recados", nullptr);
     _exit(127);
   }
   if (pid < 0) {
     showDiagnostic(
-      "Nao foi possivel abrir as configuracoes do Teleprompt.");
+      "Nao foi possivel abrir o aplicativo de Recados.");
   }
 #endif
 }
 
 static void nativeOpenTelepromptSettings()
 {
-  nativeOpenTelepromptElectronApp(false);
+  if (!nativeOpenTelepromptSettingsWindow()) {
+    showDiagnostic(
+      "Nao foi possivel abrir as configuracoes nativas do Teleprompt.");
+  }
 }
 
 static void nativeOpenRecadosApp()
 {
-  nativeOpenTelepromptElectronApp(true);
+  nativeOpenRecadosElectronApp();
 }
 
 static void nativeRefreshAppActivePanelModel()
@@ -47181,6 +47279,7 @@ static void shutdown()
   if (!plugin_register_ptr) return;
 
   nativeCloseAppActivePanel();
+  nativeCloseTelepromptSettingsWindow();
   nativeCloseAllTelepromptWindows();
   nativeTechnicalNoticeFlushPersistenceOnMainThread();
 
