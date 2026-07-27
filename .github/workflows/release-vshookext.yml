@@ -1,0 +1,114 @@
+name: Release VSHookExt
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Windows x64
+        shell: pwsh
+        run: cmake -S . -B build-ci-windows -A x64
+
+      - name: Build Release
+        shell: pwsh
+        run: cmake --build build-ci-windows --config Release
+
+      - name: Prepare Windows DLL
+        shell: pwsh
+        run: |
+          $binary = Get-ChildItem build-ci-windows -Recurse -File -Filter reaper_VSHookExt.dll | Select-Object -First 1
+          if (-not $binary) { throw "reaper_VSHookExt.dll nao foi encontrada." }
+          New-Item -ItemType Directory -Force -Path release-windows | Out-Null
+          Copy-Item -LiteralPath $binary.FullName -Destination release-windows/reaper_VSHookExt.dll -Force
+
+      - name: Upload Windows release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          if-no-files-found: error
+          path: release-windows/reaper_VSHookExt.dll
+
+  build-macos:
+    name: macOS Universal x86_64 + arm64
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure x86_64 macOS 10.13+
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
+        run: >
+          cmake -S . -B build-ci-x86_64
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=x86_64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+
+      - name: Build x86_64 macOS 10.13+
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
+        run: cmake --build build-ci-x86_64 --config Release
+
+      - name: Configure arm64 macOS 11+
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: >
+          cmake -S . -B build-ci-arm64
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Build arm64 macOS 11+
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: cmake --build build-ci-arm64 --config Release
+
+      - name: Create and verify universal dylib
+        run: |
+          mkdir -p release-macos
+          X86_BIN="$(find build-ci-x86_64 -type f -name 'reaper_VSHookExt.dylib' | head -n 1)"
+          ARM_BIN="$(find build-ci-arm64 -type f -name 'reaper_VSHookExt.dylib' | head -n 1)"
+          test -n "$X86_BIN"
+          test -n "$ARM_BIN"
+          lipo -create "$X86_BIN" "$ARM_BIN" -output release-macos/reaper_VSHookExt.dylib
+          lipo -info release-macos/reaper_VSHookExt.dylib
+          nm -arch x86_64 -gU release-macos/reaper_VSHookExt.dylib | grep '_ReaperPluginEntry'
+          nm -arch arm64 -gU release-macos/reaper_VSHookExt.dylib | grep '_ReaperPluginEntry'
+
+      - name: Upload macOS release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          if-no-files-found: error
+          path: release-macos/reaper_VSHookExt.dylib
+
+  release:
+    name: Publish Windows and macOS together
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download both binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish one GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/release-windows/reaper_VSHookExt.dll
+            release-assets/release-macos/reaper_VSHookExt.dylib
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

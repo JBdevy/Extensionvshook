@@ -2,12 +2,6 @@ name: Build VSHookExt macOS Universal
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
-
-permissions:
-  contents: write
 
 jobs:
   build-macos-universal:
@@ -91,12 +85,3 @@ jobs:
           name: VSHookExt-macOS-Universal-${{ github.ref_name }}
           if-no-files-found: error
           path: build-ci-universal/reaper_VSHookExt.dylib
-
-      - name: Publish dylib in GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: build-ci-universal/reaper_VSHookExt.dylib
-          overwrite_files: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
