@@ -2894,10 +2894,8 @@ static void showComingSoonFeatureMessage()
 {
   const char* message =
     "Disponível em breve nas próximas atualizações.";
-  if (g_nativeAppActivePanelHwnd) {
-    nativeUiShowTemporaryPopup(message, 2.4);
-    return;
-  }
+  // Timecode e Project Sync usam o diálogo nativo do próprio REAPER, mesmo
+  // quando a interface da extensão está aberta.
   if (ShowMessageBox_ptr) {
     ShowMessageBox_ptr(message, "VS Hook", 0);
   }
