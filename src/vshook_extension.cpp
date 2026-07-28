@@ -42471,15 +42471,19 @@ static std::string nativeBuildPremixTrackRowsJson(ReaProject* project, const Nat
     if (groupsOnly && folderDepth <= 0) continue;
     const std::string guid = nativeTrackGuid(track, i);
     const std::string name = nativeTrackName(track, i);
-    NativePremixTrackState state;
-    state.volume = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "D_VOL") : 1.0;
-    state.mute = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "B_MUTE") > 0.5 : false;
-    state.solo = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "I_SOLO") > 0.5 : false;
-    state.phase = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "B_PHASE") > 0.5 : false;
+    NativePremixTrackState liveState;
+    liveState.volume = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "D_VOL") : 1.0;
+    liveState.mute = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "B_MUTE") > 0.5 : false;
+    liveState.solo = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "I_SOLO") > 0.5 : false;
+    liveState.phase = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "B_PHASE") > 0.5 : false;
+    NativePremixTrackState presetState;
     bool hasSaved = false;
     if (preset) {
       const auto it = preset->find(guid);
-      if (it != preset->end()) { state = it->second; hasSaved = true; }
+      if (it != preset->end()) {
+        presetState = it->second;
+        hasSaved = true;
+      }
     }
     if (!first) oss << ",";
     first = false;
@@ -42489,14 +42493,31 @@ static std::string nativeBuildPremixTrackRowsJson(ReaProject* project, const Nat
     oss << "\"index\":" << (i + 1) << ",";
     oss << "\"name\":" << nativeJsonString(name) << ",";
     oss << "\"label\":" << nativeJsonString(name) << ",";
-    oss << "\"volume\":" << nativeNumber(state.volume) << ",";
-    oss << "\"volumeRatio\":" << nativeNumber(nativeVolumeToRatio(state.volume), 6) << ",";
-    oss << "\"db\":" << nativeNumber(nativeVolumeToDb(state.volume), 3) << ",";
-    oss << "\"mute\":" << (state.mute ? "true" : "false") << ",";
-    oss << "\"solo\":" << (state.solo ? "true" : "false") << ",";
-    oss << "\"phase\":" << (state.phase ? "true" : "false") << ",";
+    // Os campos principais sempre refletem o D_VOL e os estados que estão
+    // realmente no REAPER. O preset selecionado é apenas metadado separado;
+    // antes ele sobrescrevia a leitura viva e fazia o App mostrar outro dB
+    // logo depois de mover o próprio fader.
+    oss << "\"volume\":" << nativeNumber(liveState.volume) << ",";
+    oss << "\"volumeRatio\":" << nativeNumber(nativeVolumeToRatio(liveState.volume), 6) << ",";
+    oss << "\"db\":" << nativeNumber(nativeVolumeToDb(liveState.volume), 3) << ",";
+    oss << "\"mute\":" << (liveState.mute ? "true" : "false") << ",";
+    oss << "\"solo\":" << (liveState.solo ? "true" : "false") << ",";
+    oss << "\"phase\":" << (liveState.phase ? "true" : "false") << ",";
     oss << "\"folderDepth\":" << folderDepth << ",";
     oss << "\"saved\":" << (hasSaved ? "true" : "false");
+    if (hasSaved) {
+      oss << ",\"presetVolume\":" << nativeNumber(presetState.volume);
+      oss << ",\"presetVolumeRatio\":"
+          << nativeNumber(nativeVolumeToRatio(presetState.volume), 6);
+      oss << ",\"presetDb\":"
+          << nativeNumber(nativeVolumeToDb(presetState.volume), 3);
+      oss << ",\"presetMute\":"
+          << (presetState.mute ? "true" : "false");
+      oss << ",\"presetSolo\":"
+          << (presetState.solo ? "true" : "false");
+      oss << ",\"presetPhase\":"
+          << (presetState.phase ? "true" : "false");
+    }
     oss << "}";
   }
   oss << "]";
@@ -45512,11 +45533,23 @@ static bool nativeApplyPremixCommand(const std::string& commandBody)
       g_nativePremixSelectedSongStart = nativeLooksNumeric(startValue) ? std::atof(startValue.c_str()) : 0.0;
       g_nativePremixSelectedSongEnd = nativeLooksNumeric(endValue) ? std::atof(endValue.c_str()) : 0.0;
     }
+    // A seleção e as linhas do Premix fazem parte do snapshot estrutural em
+    // cache. Força uma única reconstrução ao trocar/abrir a música; sem isso
+    // o app podia continuar recebendo o preset da música anterior.
+    g_nativeForceSnapshotBuild.store(true);
     g_nativeForceStateBuild.store(true);
     return true;
   }
 
   if (type == "premix_close" || type == "premix_screen_close") {
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  if (type == "premix_refresh") {
+    // Enviado somente no fim do gesto do fader. Mantém os eventos `input`
+    // leves e atualiza itens/preset uma vez ao soltar o controle.
+    g_nativeForceSnapshotBuild.store(true);
     g_nativeForceStateBuild.store(true);
     return true;
   }
