@@ -45020,7 +45020,11 @@ static void nativeProcessPendingSelectionOnMainThread()
   if (!project) return;
 
   const int playState = GetPlayStateEx_ptr ? GetPlayStateEx_ptr(project) : 0;
-  const bool transportPlaying = playState != 0;
+  // O REAPER mantém o bit 2 ligado quando está pausado. Pausa não é
+  // reprodução ativa: o painel Grid precisa continuar podendo mover o cursor
+  // de edição nesse estado. Só Play/Record bloqueiam o movimento cursor-only.
+  const bool transportPlaying =
+    ((playState & 1) == 1) || ((playState & 4) == 4);
   const bool cursorOnly = command.exactPosition && !command.seekToMarker && command.noSeek;
   double targetPos = command.startPos;
   bool hasTargetPos = command.hasExplicitStart;
