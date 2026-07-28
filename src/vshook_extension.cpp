@@ -37472,9 +37472,13 @@ struct NativeTelepromptWindowState {
   HWND hwnd = nullptr;
   int slot = 1;
   bool dragging = false;
+  bool resizing = false;
   bool fullscreen = false;
+  int resizeHitTest = HTNOWHERE;
   POINT dragStartCursor{0, 0};
   RECT dragStartWindow{0, 0, 0, 0};
+  POINT resizeStartCursor{0, 0};
+  RECT resizeStartWindow{0, 0, 0, 0};
   RECT restoreRect{0, 0, 0, 0};
 #ifdef _WIN32
   LONG_PTR restoreStyle = 0;
@@ -40052,6 +40056,140 @@ static POINT nativeTelepromptClientPoint(LPARAM lParam)
   return point;
 }
 
+static bool nativeTelepromptIsResizeHit(int hitTest)
+{
+  return hitTest == HTLEFT ||
+    hitTest == HTRIGHT ||
+    hitTest == HTTOP ||
+    hitTest == HTBOTTOM ||
+    hitTest == HTTOPLEFT ||
+    hitTest == HTTOPRIGHT ||
+    hitTest == HTBOTTOMLEFT ||
+    hitTest == HTBOTTOMRIGHT;
+}
+
+static int nativeTelepromptResizeHitTest(HWND hwnd, LPARAM lParam)
+{
+  if (!hwnd || !IsWindow(hwnd)) return HTCLIENT;
+  RECT bounds{0, 0, 0, 0};
+#ifdef _WIN32
+  if (!GetWindowRect(hwnd, &bounds)) return HTCLIENT;
+#else
+  // No SWELL/macOS a moldura pertence ao NSWindow. Também disponibilizamos
+  // uma faixa interna junto à borda desenhada pelo VS Hook para que o
+  // redimensionamento funcione mesmo quando a moldura do sistema está oculta.
+  GetClientRect(hwnd, &bounds);
+  POINT topLeft{bounds.left, bounds.top};
+  POINT bottomRight{bounds.right, bounds.bottom};
+  ClientToScreen(hwnd, &topLeft);
+  ClientToScreen(hwnd, &bottomRight);
+  bounds.left = topLeft.x;
+  bounds.top = topLeft.y;
+  bounds.right = bottomRight.x;
+  bounds.bottom = bottomRight.y;
+#endif
+  const POINT point = nativeTelepromptClientPoint(lParam);
+  constexpr int resizeMargin = 12;
+  const bool left =
+    point.x >= bounds.left - resizeMargin &&
+    point.x <= bounds.left + resizeMargin;
+  const bool right =
+    point.x >= bounds.right - resizeMargin &&
+    point.x <= bounds.right + resizeMargin;
+  const bool top =
+    point.y >= bounds.top - resizeMargin &&
+    point.y <= bounds.top + resizeMargin;
+  const bool bottom =
+    point.y >= bounds.bottom - resizeMargin &&
+    point.y <= bounds.bottom + resizeMargin;
+  if (top && left) return HTTOPLEFT;
+  if (top && right) return HTTOPRIGHT;
+  if (bottom && left) return HTBOTTOMLEFT;
+  if (bottom && right) return HTBOTTOMRIGHT;
+  if (left) return HTLEFT;
+  if (right) return HTRIGHT;
+  if (top) return HTTOP;
+  if (bottom) return HTBOTTOM;
+  return HTCLIENT;
+}
+
+static void nativeTelepromptApplyManualResize(
+  NativeTelepromptWindowState& window)
+{
+  if (!window.hwnd || !IsWindow(window.hwnd) ||
+      !window.resizing || window.fullscreen) {
+    return;
+  }
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  const int deltaX = cursor.x - window.resizeStartCursor.x;
+  const int deltaY = cursor.y - window.resizeStartCursor.y;
+  RECT rect = window.resizeStartWindow;
+  const int hitTest = window.resizeHitTest;
+  if (hitTest == HTLEFT ||
+      hitTest == HTTOPLEFT ||
+      hitTest == HTBOTTOMLEFT) {
+    rect.left += deltaX;
+  }
+  if (hitTest == HTRIGHT ||
+      hitTest == HTTOPRIGHT ||
+      hitTest == HTBOTTOMRIGHT) {
+    rect.right += deltaX;
+  }
+  if (hitTest == HTTOP ||
+      hitTest == HTTOPLEFT ||
+      hitTest == HTTOPRIGHT) {
+    rect.top += deltaY;
+  }
+  if (hitTest == HTBOTTOM ||
+      hitTest == HTBOTTOMLEFT ||
+      hitTest == HTBOTTOMRIGHT) {
+    rect.bottom += deltaY;
+  }
+  constexpr int minimumWidth = 420;
+  constexpr int minimumHeight = 260;
+  if (rect.right - rect.left < minimumWidth) {
+    if (hitTest == HTLEFT ||
+        hitTest == HTTOPLEFT ||
+        hitTest == HTBOTTOMLEFT) {
+      rect.left = rect.right - minimumWidth;
+    } else {
+      rect.right = rect.left + minimumWidth;
+    }
+  }
+  if (rect.bottom - rect.top < minimumHeight) {
+    if (hitTest == HTTOP ||
+        hitTest == HTTOPLEFT ||
+        hitTest == HTTOPRIGHT) {
+      rect.top = rect.bottom - minimumHeight;
+    } else {
+      rect.bottom = rect.top + minimumHeight;
+    }
+  }
+  SetWindowPos(window.hwnd, nullptr,
+    rect.left, rect.top,
+    rect.right - rect.left,
+    rect.bottom - rect.top,
+    SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void nativeTelepromptEndManualResize(
+  NativeTelepromptWindowState& window,
+  int slot)
+{
+  if (!window.resizing) return;
+  window.resizing = false;
+  window.resizeHitTest = HTNOWHERE;
+  if (GetCapture() == window.hwnd) ReleaseCapture();
+  if (!window.fullscreen && window.hwnd &&
+      IsWindow(window.hwnd)) {
+    RECT rect{0, 0, 0, 0};
+    if (GetWindowRect(window.hwnd, &rect)) {
+      nativeTelepromptSaveNormalRect(slot, rect);
+    }
+  }
+}
+
 static LRESULT CALLBACK nativeTelepromptWndProc(
   HWND hwnd,
   UINT message,
@@ -40082,8 +40220,61 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
         16, nullptr);
       return 0;
     case WM_NCHITTEST:
-      // Mantem duplo clique e arraste da janela funcionando no SWELL/macOS.
-      return HTCLIENT;
+      // O centro continua sendo cliente para preservar arraste e duplo clique.
+      // Somente uma faixa estreita nas bordas vira área de resize.
+      return window.fullscreen
+        ? HTCLIENT
+        : nativeTelepromptResizeHitTest(hwnd, lParam);
+    case WM_SETCURSOR: {
+      const int hitTest = LOWORD(lParam);
+      if (nativeTelepromptIsResizeHit(hitTest)) {
+        HCURSOR resizeCursor =
+          LoadCursor(nullptr, IDC_SIZEWE);
+        if (hitTest == HTTOP || hitTest == HTBOTTOM) {
+          resizeCursor = LoadCursor(nullptr, IDC_SIZENS);
+        } else if (hitTest == HTTOPLEFT ||
+                   hitTest == HTBOTTOMRIGHT) {
+          resizeCursor = LoadCursor(nullptr, IDC_SIZENWSE);
+        } else if (hitTest == HTTOPRIGHT ||
+                   hitTest == HTBOTTOMLEFT) {
+          resizeCursor = LoadCursor(nullptr, IDC_SIZENESW);
+        }
+        SetCursor(resizeCursor);
+        return 1;
+      }
+      break;
+    }
+    case WM_GETMINMAXINFO: {
+      MINMAXINFO* limits =
+        reinterpret_cast<MINMAXINFO*>(lParam);
+      if (limits) {
+        limits->ptMinTrackSize.x = 420;
+        limits->ptMinTrackSize.y = 260;
+        return 0;
+      }
+      break;
+    }
+#ifndef _WIN32
+    case WM_NCLBUTTONDOWN:
+      if (!window.fullscreen &&
+          nativeTelepromptIsResizeHit(
+            static_cast<int>(wParam))) {
+        window.dragging = false;
+        window.resizing = true;
+        window.resizeHitTest = static_cast<int>(wParam);
+        GetCursorPos(&window.resizeStartCursor);
+        GetWindowRect(hwnd, &window.resizeStartWindow);
+        SetCapture(hwnd);
+        return 0;
+      }
+      break;
+    case WM_NCLBUTTONUP:
+      if (window.resizing) {
+        nativeTelepromptEndManualResize(window, slot);
+        return 0;
+      }
+      break;
+#endif
     case WM_ERASEBKGND:
       return 1;
     case WM_PAINT:
@@ -40115,6 +40306,12 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       return 0;
     }
     case WM_MOUSEMOVE:
+#ifndef _WIN32
+      if (window.resizing && GetCapture() == hwnd) {
+        nativeTelepromptApplyManualResize(window);
+        return 0;
+      }
+#endif
       if (window.dragging && GetCapture() == hwnd) {
         POINT cursor{};
         GetCursorPos(&cursor);
@@ -40129,11 +40326,33 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       }
       break;
     case WM_LBUTTONUP:
+#ifndef _WIN32
+      if (window.resizing) {
+        nativeTelepromptEndManualResize(window, slot);
+        return 0;
+      }
+#endif
       if (window.dragging) {
         window.dragging = false;
         if (GetCapture() == hwnd) ReleaseCapture();
         return 0;
       }
+      break;
+#ifdef _WIN32
+    case WM_EXITSIZEMOVE:
+      if (!window.fullscreen) {
+        RECT rect{0, 0, 0, 0};
+        if (GetWindowRect(hwnd, &rect)) {
+          nativeTelepromptSaveNormalRect(slot, rect);
+        }
+      }
+      return 0;
+#endif
+    case WM_CAPTURECHANGED:
+      if (window.resizing) {
+        nativeTelepromptEndManualResize(window, slot);
+      }
+      window.dragging = false;
       break;
     case WM_KEYDOWN:
       if (wParam == VK_ESCAPE) {
@@ -40151,6 +40370,8 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
           static_cast<UINT_PTR>(slot));
       window.hwnd = nullptr;
       window.dragging = false;
+      window.resizing = false;
+      window.resizeHitTest = HTNOWHERE;
       window.fullscreen = false;
       if (RefreshToolbar2_ptr) {
         RefreshToolbar2_ptr(0,
