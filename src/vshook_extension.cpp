@@ -2885,46 +2885,39 @@ static ReaProject* getCurrentProject(char* pathOut, int pathOutSize)
 
 static std::string getTimecodeMode()
 {
-  if (!GetExtState_ptr) return std::string();
-  const char* raw = GetExtState_ptr(kExtStateSection, kTimecodeModeKey);
-  const std::string mode = raw ? raw : "";
-  return mode == "receive" || mode == "transmitter" ? mode : std::string();
+  // Recurso reservado para uma atualizacao futura. Nao apresenta como ativo
+  // mesmo que uma versao de desenvolvimento tenha deixado ExtState salvo.
+  return std::string();
+}
+
+static void showComingSoonFeatureMessage()
+{
+  const char* message =
+    "Disponível em breve nas próximas atualizações.";
+  if (g_nativeAppActivePanelHwnd) {
+    nativeUiShowTemporaryPopup(message, 2.4);
+    return;
+  }
+  if (ShowMessageBox_ptr) {
+    ShowMessageBox_ptr(message, "VS Hook", 0);
+  }
 }
 
 static void toggleTimecodeMode(const char* requestedMode)
 {
-  if (!SetExtState_ptr || !requestedMode) return;
-  const std::string requested = requestedMode;
-  if (requested != "receive" && requested != "transmitter") return;
-
-  // Receive e Transmitter sao mutuamente exclusivos. Clicar novamente na
-  // opcao marcada desativa o Timecode. A funcao de rede sera ligada depois.
-  const std::string next = getTimecodeMode() == requested ? "" : requested;
-  SetExtState_ptr(kExtStateSection, kTimecodeModeKey, next.c_str(), true);
+  (void)requestedMode;
+  showComingSoonFeatureMessage();
 }
 
 static bool getProjectSyncEnabled()
 {
-  if (!GetProjExtState_ptr) return false;
-  char value[16] = "";
-  char path[2048] = "";
-  ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
-  if (!project) return false;
-  GetProjExtState_ptr(project, kExtStateSection, kProjectSyncEnabledKey, value, static_cast<int>(sizeof(value)));
-  return std::strcmp(value, "1") == 0;
+  // Recurso reservado para uma atualizacao futura.
+  return false;
 }
 
 static void toggleProjectSync()
 {
-  if (!SetProjExtState_ptr) return;
-  char path[2048] = "";
-  ReaProject* project = getCurrentProject(path, static_cast<int>(sizeof(path)));
-  if (!project) return;
-
-  const bool next = !getProjectSyncEnabled();
-  SetProjExtState_ptr(project, kExtStateSection, kProjectSyncEnabledKey, next ? "1" : "");
-  // Assim como o startup por projeto da SWS, a marcacao fica dentro do RPP.
-  if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+  showComingSoonFeatureMessage();
 }
 
 static std::string getCurrentProjectSignature()
