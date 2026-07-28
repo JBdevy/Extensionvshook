@@ -10935,11 +10935,17 @@ static void nativeAppActiveDrawBlackShadow(HDC dc, const RECT& rect)
     return;
   }
 #else
-  // O SWELL/macOS não expõe AlphaBlend de forma confiável. O overlay sólido
-  // evita as listras que o preenchimento intercalado produzia em telas Retina
-  // e devolve o destaque visual para todos os modais e para o bloqueio do
-  // Diretor. O conteúdo do modal é desenhado logo depois, por cima desta base.
-  nativeAppActiveFillRect(dc, rect, RGB(9, 12, 18));
+  // O SWELL/LICE oferece pincel com alpha no macOS. Ele mistura a sombra
+  // diretamente no backbuffer, preservando a interface visível por trás sem
+  // o pontilhado que gerava listras em telas Retina.
+  HBRUSH shadowBrush =
+    CreateSolidBrushAlpha(RGB(0, 0, 0), 0.62f);
+  if (shadowBrush) {
+    FillRect(dc, &rect, shadowBrush);
+    DeleteObject(shadowBrush);
+  } else {
+    nativeAppActiveFillRect(dc, rect, RGB(19, 23, 29));
+  }
   return;
 #endif
   // Fallback raro do Windows quando AlphaBlend nao estiver disponivel.
@@ -14142,10 +14148,15 @@ static void nativeUiPollBatteryState()
     std::atoi(output.substr(begin, percentPos - begin).c_str())));
   g_nativeUiBatteryPresent = true;
   const std::string lower = nativeLower(output);
-  g_nativeUiBatteryCharging =
-    lower.find("charging") != std::string::npos ||
-    lower.find("charged") != std::string::npos ||
-    lower.find("ac power") != std::string::npos;
+  // "discharging" contém literalmente "charging". A busca antiga, portanto,
+  // considerava todo Mac fora da tomada como se ainda estivesse carregando e
+  // impedia qualquer aviso de queda de bateria.
+  const bool discharging =
+    lower.find("discharging") != std::string::npos;
+  g_nativeUiBatteryCharging = !discharging && (
+    lower.find("; charging;") != std::string::npos ||
+    lower.find("; charged;") != std::string::npos ||
+    lower.find("ac power") != std::string::npos);
 #endif
 }
 
@@ -36178,6 +36189,10 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
                     (wParam - VK_NUMPAD0))
                 : static_cast<char>(wParam);
               nativeUiSetTimerDigit(digit);
+              nativeUiCollapseTextSelection(
+                NativeUiTextInputKind::TimerCountdown,
+                static_cast<size_t>(
+                  g_nativeUiTimerDigitCursor));
               nativeUiRefreshTextInputNow(hwnd);
 #endif
             } else if (wParam == VK_BACK) {
