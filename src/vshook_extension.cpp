@@ -63,6 +63,34 @@ class LICE_IBitmap;
 #define CF_TEXT RegisterClipboardFormat("SWELL__CF_TEXT")
 #endif
 
+// O SWELL do REAPER publica apenas parte dos códigos de hit-test do Win32.
+// Mantemos os valores oficiais para que o resize por todas as bordas use o
+// mesmo contrato no Windows e no macOS sem alterar os headers de terceiros.
+#ifndef HTLEFT
+#define HTLEFT 10
+#endif
+#ifndef HTRIGHT
+#define HTRIGHT 11
+#endif
+#ifndef HTTOP
+#define HTTOP 12
+#endif
+#ifndef HTTOPLEFT
+#define HTTOPLEFT 13
+#endif
+#ifndef HTTOPRIGHT
+#define HTTOPRIGHT 14
+#endif
+#ifndef HTBOTTOM
+#define HTBOTTOM 15
+#endif
+#ifndef HTBOTTOMLEFT
+#define HTBOTTOMLEFT 16
+#endif
+#ifndef HTBOTTOMRIGHT
+#define HTBOTTOMRIGHT 17
+#endif
+
 namespace vshook {
 
 using plugin_register_t = int (*)(const char*, void*);
