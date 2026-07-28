@@ -121,18 +121,11 @@ struct Decoder::Impl {
   {
     const int wantedWidth = std::max(2, requestedWidth);
     const int wantedHeight = std::max(2, requestedHeight);
-    constexpr double maximumDecodedPixels =
-      960.0 * 540.0;
-    const double requestedPixels =
-      static_cast<double>(wantedWidth) *
-      static_cast<double>(wantedHeight);
-    const double scale = requestedPixels > maximumDecodedPixels
-      ? std::sqrt(maximumDecodedPixels / requestedPixels)
-      : 1.0;
-    const int decodeWidth = std::max(
-      2, static_cast<int>(std::lround(wantedWidth * scale)));
-    const int decodeHeight = std::max(
-      2, static_cast<int>(std::lround(wantedHeight * scale)));
+    // O teleprompt da extensão usa a resolução real da tela. A redução de
+    // qualidade pertence apenas aos apps remotos e não pode limitar o vídeo
+    // nativo a 960x540, especialmente em monitores Retina/4K.
+    const int decodeWidth = wantedWidth;
+    const int decodeHeight = wantedHeight;
 
     if (generator &&
         path == utf8Path &&

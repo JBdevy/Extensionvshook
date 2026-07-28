@@ -321,18 +321,9 @@ struct Decoder::Impl {
           static_cast<double>(sourceWidth),
         static_cast<double>(safeRequestedHeight) /
           static_cast<double>(sourceHeight)));
-    // 960x540 mantém boa definição mesmo ampliado no segundo monitor e evita
-    // que uma janela 4K multiplique o custo da conversão por oito.
-    constexpr double maximumDecodedPixels =
-      960.0 * 540.0;
-    const double fittedPixels =
-      static_cast<double>(sourceWidth) *
-      static_cast<double>(sourceHeight) *
-      scale * scale;
-    if (fittedPixels > maximumDecodedPixels) {
-      scale *= std::sqrt(
-        maximumDecodedPixels / fittedPixels);
-    }
+    // A extensão nativa preserva a resolução solicitada. Qualquer redução de
+    // qualidade deve acontecer somente nos apps remotos, nunca no teleprompt
+    // aberto diretamente pelo REAPER.
     int wantedWidth = std::max(
       2, static_cast<int>(std::lround(sourceWidth * scale)));
     int wantedHeight = std::max(

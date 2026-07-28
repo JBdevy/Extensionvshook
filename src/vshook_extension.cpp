@@ -33,6 +33,7 @@
 #ifdef __APPLE__
   #include <CoreGraphics/CoreGraphics.h>
   #include "native_keyboard_mac.h"
+  #include "native_teleprompt_mac.h"
 #endif
 
 #ifdef _WIN32
@@ -187,6 +188,7 @@ using LICE_GetBits_t = void* (*)(LICE_IBitmap*);
 using LICE_GetWidth_t = int (*)(LICE_IBitmap*);
 using LICE_GetHeight_t = int (*)(LICE_IBitmap*);
 using LICE_GetRowSpan_t = int (*)(LICE_IBitmap*);
+using LICE_IsFlipped_t = bool (*)(LICE_IBitmap*);
 using LICE_CreateBitmap_t = LICE_IBitmap* (*)(int, int, int);
 using LICE_Clear_t = void (*)(LICE_IBitmap*, unsigned int);
 using LICE_ScaledBlit_t = void (*)(LICE_IBitmap*, LICE_IBitmap*,
@@ -308,6 +310,7 @@ static LICE_GetBits_t LICE_GetBits_ptr = nullptr;
 static LICE_GetWidth_t LICE_GetWidth_ptr = nullptr;
 static LICE_GetHeight_t LICE_GetHeight_ptr = nullptr;
 static LICE_GetRowSpan_t LICE_GetRowSpan_ptr = nullptr;
+static LICE_IsFlipped_t LICE_IsFlipped_ptr = nullptr;
 static LICE_CreateBitmap_t LICE_CreateBitmap_ptr = nullptr;
 static LICE_Clear_t LICE_Clear_ptr = nullptr;
 static LICE_ScaledBlit_t LICE_ScaledBlit_ptr = nullptr;
@@ -38169,6 +38172,9 @@ static void nativeTelepromptApplyTopmost(int slot)
   const int index = nativeTelepromptIndex(slot);
   HWND hwnd = g_nativeTelepromptWindows[index].hwnd;
   if (!hwnd || !IsWindow(hwnd)) return;
+#ifdef __APPLE__
+  if (g_nativeTelepromptWindows[index].fullscreen) return;
+#endif
   // A janela segue a ordem normal do sistema. Não existe mais opção de
   // mantê-la permanentemente acima das demais janelas.
   SetWindowPos(hwnd,
@@ -38336,6 +38342,188 @@ static RECT nativeTelepromptMeasureText(
   if (oldFont) SelectObject(dc, oldFont);
   return rect;
 }
+
+#ifdef __APPLE__
+struct NativeTelepromptWrappedTextLayout {
+  std::vector<std::string> lines;
+  int lineHeight = 1;
+  int lineGap = 0;
+  int maxLineWidth = 0;
+  int totalHeight = 0;
+};
+
+static size_t nativeTelepromptUtf8CharacterLength(
+  const std::string& text,
+  size_t offset)
+{
+  if (offset >= text.size()) return 0;
+  const unsigned char lead =
+    static_cast<unsigned char>(text[offset]);
+  size_t length = 1;
+  if ((lead & 0xe0) == 0xc0) length = 2;
+  else if ((lead & 0xf0) == 0xe0) length = 3;
+  else if ((lead & 0xf8) == 0xf0) length = 4;
+  if (offset + length > text.size()) return 1;
+  for (size_t index = 1; index < length; ++index) {
+    const unsigned char continuation =
+      static_cast<unsigned char>(text[offset + index]);
+    if ((continuation & 0xc0) != 0x80) return 1;
+  }
+  return length;
+}
+
+static NativeTelepromptWrappedTextLayout
+nativeTelepromptLayoutWrappedTextMac(
+  HDC dc,
+  const std::string& text,
+  HFONT font,
+  int maximumWidth)
+{
+  NativeTelepromptWrappedTextLayout layout;
+  maximumWidth = std::max(1, maximumWidth);
+
+  RECT lineMeasure{0, 0, maximumWidth, 1};
+  lineMeasure = nativeTelepromptMeasureText(
+    dc, "Ágj", lineMeasure,
+    DT_SINGLELINE | DT_NOPREFIX, font);
+  layout.lineHeight = std::max(
+    1, static_cast<int>(
+      lineMeasure.bottom - lineMeasure.top));
+  layout.lineGap = std::max(1, layout.lineHeight / 12);
+
+  auto textWidth = [&](const std::string& value) {
+    return nativeUiTextWidth(dc, value, font);
+  };
+  auto appendLine = [&](const std::string& value) {
+    layout.lines.push_back(value);
+    layout.maxLineWidth =
+      std::max(layout.maxLineWidth, textWidth(value));
+  };
+
+  auto appendParagraph = [&](const std::string& paragraph) {
+    std::string line;
+    bool foundWord = false;
+    size_t cursor = 0;
+    while (cursor < paragraph.size()) {
+      while (cursor < paragraph.size() &&
+             (paragraph[cursor] == ' ' ||
+              paragraph[cursor] == '\t' ||
+              paragraph[cursor] == '\r')) {
+        ++cursor;
+      }
+      if (cursor >= paragraph.size()) break;
+      const size_t wordStart = cursor;
+      while (cursor < paragraph.size() &&
+             paragraph[cursor] != ' ' &&
+             paragraph[cursor] != '\t' &&
+             paragraph[cursor] != '\r') {
+        ++cursor;
+      }
+      const std::string word =
+        paragraph.substr(wordStart, cursor - wordStart);
+      if (word.empty()) continue;
+      foundWord = true;
+
+      const std::string candidate =
+        line.empty() ? word : line + " " + word;
+      if (textWidth(candidate) <= maximumWidth) {
+        line = candidate;
+        continue;
+      }
+      if (!line.empty()) {
+        appendLine(line);
+        line.clear();
+      }
+      if (textWidth(word) <= maximumWidth) {
+        line = word;
+        continue;
+      }
+
+      // Uma palavra sem espaços também não pode ultrapassar a lateral.
+      // Divide apenas em limites UTF-8 válidos para não corromper acentos.
+      std::string fragment;
+      size_t wordOffset = 0;
+      while (wordOffset < word.size()) {
+        const size_t characterLength =
+          nativeTelepromptUtf8CharacterLength(word, wordOffset);
+        const std::string character =
+          word.substr(wordOffset, characterLength);
+        const std::string fragmentCandidate =
+          fragment + character;
+        if (!fragment.empty() &&
+            textWidth(fragmentCandidate) > maximumWidth) {
+          appendLine(fragment);
+          fragment = character;
+        } else {
+          fragment = fragmentCandidate;
+        }
+        wordOffset += characterLength;
+      }
+      line = fragment;
+    }
+    if (!line.empty()) {
+      appendLine(line);
+    } else if (!foundWord) {
+      // Mantém linhas vazias intencionais entre trechos da letra.
+      appendLine("");
+    }
+  };
+
+  size_t paragraphStart = 0;
+  while (paragraphStart <= text.size()) {
+    const size_t paragraphEnd =
+      text.find('\n', paragraphStart);
+    appendParagraph(text.substr(
+      paragraphStart,
+      paragraphEnd == std::string::npos
+        ? std::string::npos
+        : paragraphEnd - paragraphStart));
+    if (paragraphEnd == std::string::npos) break;
+    paragraphStart = paragraphEnd + 1;
+  }
+
+  if (!layout.lines.empty()) {
+    layout.totalHeight =
+      static_cast<int>(layout.lines.size()) *
+        layout.lineHeight +
+      static_cast<int>(layout.lines.size() - 1) *
+        layout.lineGap;
+  }
+  return layout;
+}
+
+static void nativeTelepromptDrawWrappedTextMac(
+  HDC dc,
+  const NativeTelepromptWrappedTextLayout& layout,
+  const RECT& available,
+  COLORREF color,
+  HFONT font)
+{
+  if (!dc || layout.lines.empty()) return;
+  const int availableHeight = std::max(
+    0, static_cast<int>(
+      available.bottom - available.top));
+  int y = available.top +
+    std::max(0, (availableHeight - layout.totalHeight) / 2);
+  for (const std::string& line : layout.lines) {
+    if (!line.empty()) {
+      RECT lineRect{
+        available.left, y,
+        available.right, y + layout.lineHeight
+      };
+      nativeAppActiveDrawText(
+        dc, line, lineRect,
+        DT_CENTER | DT_VCENTER |
+          DT_SINGLELINE | DT_NOPREFIX,
+        color, font);
+    }
+    y += layout.lineHeight + layout.lineGap;
+  }
+}
+
+static NativeTelepromptWrappedTextLayout
+  g_nativeTelepromptWrappedTextLayout[2];
+#endif
 
 static std::string nativeTelepromptDisplayText(
   const std::string& raw,
@@ -39355,16 +39543,30 @@ static bool nativeTelepromptDrawMedia(
     1, static_cast<int>(available.right - available.left));
   const int availableH = std::max(
     1, static_cast<int>(available.bottom - available.top));
+  const double scaleLimit = nativeTelepromptClamp(
+    settings.mediaScale, 0.25, 3.0);
+  double sourceRequestScale = std::max(1.0, scaleLimit);
+#ifdef __APPLE__
+  sourceRequestScale *=
+    VSHookMacTelepromptBackingScale(
+      g_nativeTelepromptWindows[index].hwnd);
+#endif
+  const int requestedSourceW = std::max(
+    1, std::min(
+      65535, static_cast<int>(std::lround(
+        availableW * sourceRequestScale))));
+  const int requestedSourceH = std::max(
+    1, std::min(
+      65535, static_cast<int>(std::lround(
+        availableH * sourceRequestScale))));
   NativeTelepromptMediaFrame frame =
     nativeTelepromptAcquireMediaFrame(
-      slot, state, availableW, availableH);
+      slot, state, requestedSourceW, requestedSourceH);
   if (!frame.image) return false;
   g_nativeTelepromptMediaStatus[index].store(2);
 
   const int sourceW = std::max(1, LICE_GetWidth_ptr(frame.image));
   const int sourceH = std::max(1, LICE_GetHeight_ptr(frame.image));
-  const double scaleLimit = nativeTelepromptClamp(
-    settings.mediaScale, 0.25, 3.0);
   const double fitScale = std::min(
     static_cast<double>(availableW) / sourceW,
     static_cast<double>(availableH) / sourceH);
@@ -39376,6 +39578,26 @@ static bool nativeTelepromptDrawMedia(
   const int drawH = std::max(
     1, static_cast<int>(
       std::lround(sourceH * drawScale)));
+  const int drawX = available.left + (availableW - drawW) / 2;
+  const int drawY = available.top + (availableH - drawH) / 2;
+#ifdef __APPLE__
+  void* sourceBits = LICE_GetBits_ptr
+    ? LICE_GetBits_ptr(frame.image) : nullptr;
+  const int sourceRowSpan = LICE_GetRowSpan_ptr
+    ? LICE_GetRowSpan_ptr(frame.image) : 0;
+  const bool sourceFlipped = LICE_IsFlipped_ptr
+    ? LICE_IsFlipped_ptr(frame.image) : false;
+  if (sourceBits &&
+      VSHookMacDrawTelepromptBitmap(
+        dc, sourceBits,
+        sourceW, sourceH, sourceRowSpan,
+        sourceFlipped,
+        drawX, drawY, drawW, drawH)) {
+    nativeTelepromptReleaseMediaFrame(frame);
+    g_nativeTelepromptMediaStatus[index].store(3);
+    return true;
+  }
+#endif
   if (!g_nativeTelepromptMediaBuffer[index] ||
       g_nativeTelepromptMediaBufferWidth[index] != drawW ||
       g_nativeTelepromptMediaBufferHeight[index] != drawH) {
@@ -39400,10 +39622,13 @@ static bool nativeTelepromptDrawMedia(
     0.0f, 0.0f,
     static_cast<float>(sourceW),
     static_cast<float>(sourceH),
-    1.0f, 0);
+    1.0f, 0x100);
+#ifdef __APPLE__
+  // O ScaledBlit já converte uma source LICE invertida para o framebuffer
+  // normal do SysBitmap. O BitBlt direto (inclusive Metal) não deve inverter
+  // essas linhas de novo.
+#endif
   HDC mediaDc = LICE_GetDC_ptr(output);
-  const int drawX = available.left + (availableW - drawW) / 2;
-  const int drawY = available.top + (availableH - drawH) / 2;
   if (mediaDc) {
     BitBlt(dc, drawX, drawY, drawW, drawH,
       mediaDc, 0, 0, SRCCOPY);
@@ -39461,6 +39686,12 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     std::max(0, static_cast<int>(client.right - client.left));
   const int clientHeight =
     std::max(0, static_cast<int>(client.bottom - client.top));
+#ifdef __APPLE__
+  // O contexto de pintura da NSView já é Retina e bufferizado pelo AppKit.
+  // Desenhar nele preserva a resolução física; o framebuffer SWELL auxiliar
+  // era sempre 1x e deixava texto, imagens e vídeo borrados no Mac.
+  HDC dc = paintDc;
+#else
   if (!g_nativeTelepromptBackBuffer[index] ||
       g_nativeTelepromptBackBufferWidth[index] != clientWidth ||
       g_nativeTelepromptBackBufferHeight[index] != clientHeight) {
@@ -39473,13 +39704,16 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   }
   HDC dc = g_nativeTelepromptBackBuffer[index]
     ? g_nativeTelepromptBackBuffer[index]->GetDC() : paintDc;
+#endif
   auto finishPaint = [&]() {
+#ifndef __APPLE__
     if (dc && dc != paintDc &&
         clientWidth > 0 && clientHeight > 0) {
       BitBlt(paintDc, 0, 0,
         clientWidth, clientHeight,
         dc, 0, 0, SRCCOPY);
     }
+#endif
     EndPaint(hwnd, &paint);
   };
   nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
@@ -39851,6 +40085,14 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
           HFONT font = nativeTelepromptFont(
             technicalNoticeSettings.fontFamily,
             size, FW_BOLD);
+#ifdef __APPLE__
+          const NativeTelepromptWrappedTextLayout measured =
+            nativeTelepromptLayoutWrappedTextMac(
+              dc, noticeText, font, availableWidth);
+          const bool fits =
+            measured.totalHeight <= availableHeight &&
+            measured.maxLineWidth <= availableWidth;
+#else
           RECT measured{
             available.left, available.top,
             available.right, available.top + 1
@@ -39859,8 +40101,11 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
             dc, noticeText, measured,
             DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
             font);
-          if (measured.bottom - measured.top <=
-              availableHeight) {
+          const bool fits =
+            measured.bottom - measured.top <=
+              availableHeight;
+#endif
+          if (fits) {
             chosen = size;
             low = size + 1;
           } else {
@@ -39874,7 +40119,27 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         layoutCache.availableHeight = availableHeight;
         layoutCache.maxFont = maxFont;
         layoutCache.chosenFont = chosen;
+#ifdef __APPLE__
+        g_nativeTelepromptWrappedTextLayout[index] =
+          nativeTelepromptLayoutWrappedTextMac(
+            dc, noticeText,
+            nativeTelepromptFont(
+              technicalNoticeSettings.fontFamily,
+              chosen, FW_BOLD),
+            availableWidth);
+#endif
       }
+#ifdef __APPLE__
+      nativeTelepromptDrawWrappedTextMac(
+        dc, g_nativeTelepromptWrappedTextLayout[index],
+        available,
+        nativeTelepromptColor(
+          technicalNoticeSettings.textColor,
+          RGB(255, 234, 0)),
+        nativeTelepromptFont(
+          technicalNoticeSettings.fontFamily,
+          layoutCache.chosenFont, FW_BOLD));
+#else
       nativeAppActiveDrawText(
         dc, noticeText, available,
         DT_CENTER | DT_VCENTER |
@@ -39885,6 +40150,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         nativeTelepromptFont(
           technicalNoticeSettings.fontFamily,
           layoutCache.chosenFont, FW_BOLD));
+#endif
     }
     finishPaint();
     return;
@@ -40009,6 +40275,14 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         const int size = low + (high - low) / 2;
         HFONT font = nativeTelepromptFont(
           settings.fontFamily, size, FW_BOLD);
+#ifdef __APPLE__
+        const NativeTelepromptWrappedTextLayout measured =
+          nativeTelepromptLayoutWrappedTextMac(
+            dc, lyrics, font, availableWidth);
+        const bool fits =
+          measured.totalHeight <= availableHeight &&
+          measured.maxLineWidth <= availableWidth;
+#else
         RECT measured{
           available.left, available.top,
           available.right, available.top + 1
@@ -40016,8 +40290,11 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         measured = nativeTelepromptMeasureText(
           dc, lyrics, measured,
           DT_CENTER | DT_WORDBREAK | DT_NOPREFIX, font);
-        if (measured.bottom - measured.top <=
-            availableHeight) {
+        const bool fits =
+          measured.bottom - measured.top <=
+            availableHeight;
+#endif
+        if (fits) {
           chosen = size;
           low = size + 1;
         } else {
@@ -40030,7 +40307,25 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       layoutCache.availableHeight = availableHeight;
       layoutCache.maxFont = maxFont;
       layoutCache.chosenFont = chosen;
+#ifdef __APPLE__
+      g_nativeTelepromptWrappedTextLayout[index] =
+        nativeTelepromptLayoutWrappedTextMac(
+          dc, lyrics,
+          nativeTelepromptFont(
+            settings.fontFamily, chosen, FW_BOLD),
+          availableWidth);
+#endif
     }
+#ifdef __APPLE__
+    nativeTelepromptDrawWrappedTextMac(
+      dc, g_nativeTelepromptWrappedTextLayout[index],
+      available,
+      nativeTelepromptColor(
+        settings.textColor, RGB(255, 234, 0)),
+      nativeTelepromptFont(
+        settings.fontFamily,
+        layoutCache.chosenFont, FW_BOLD));
+#else
     nativeAppActiveDrawText(dc, lyrics, available,
       DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX,
       nativeTelepromptColor(
@@ -40038,6 +40333,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       nativeTelepromptFont(
         settings.fontFamily,
         layoutCache.chosenFont, FW_BOLD));
+#endif
   }
 
   finishPaint();
@@ -40063,7 +40359,6 @@ static void nativeTelepromptToggleFullscreen(int slot)
       GetWindowLongPtr(window.hwnd, GWL_STYLE);
     SetWindowLongPtr(window.hwnd, GWL_STYLE,
       WS_POPUP | WS_VISIBLE);
-#endif
     if (monitor) {
       SetWindowPos(window.hwnd,
         HWND_TOP,
@@ -40073,11 +40368,15 @@ static void nativeTelepromptToggleFullscreen(int slot)
           monitor->monitorRect.left,
         monitor->monitorRect.bottom -
           monitor->monitorRect.top,
-#ifdef _WIN32
         SWP_FRAMECHANGED |
-#endif
         SWP_SHOWWINDOW);
     }
+#else
+    if (!VSHookMacSetTelepromptFullscreen(
+          window.hwnd, true)) {
+      return;
+    }
+#endif
     window.fullscreen = true;
     nativeTelepromptRememberFullscreen(
       slot, true, monitor);
@@ -40087,12 +40386,17 @@ static void nativeTelepromptToggleFullscreen(int slot)
       window.restoreStyle
         ? window.restoreStyle
         : (WS_POPUP | WS_THICKFRAME | WS_VISIBLE));
-#endif
     SetWindowPos(window.hwnd, nullptr,
       window.restoreRect.left, window.restoreRect.top,
       window.restoreRect.right - window.restoreRect.left,
       window.restoreRect.bottom - window.restoreRect.top,
       SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+#else
+    if (!VSHookMacSetTelepromptFullscreen(
+          window.hwnd, false)) {
+      return;
+    }
+#endif
     window.fullscreen = false;
     nativeTelepromptRememberFullscreen(
       slot, false, nullptr);
@@ -40420,6 +40724,9 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       KillTimer(hwnd,
         kNativeTelepromptTimerBase +
           static_cast<UINT_PTR>(slot));
+#ifdef __APPLE__
+      VSHookMacReleaseTelepromptFullscreen(hwnd);
+#endif
       window.hwnd = nullptr;
       window.dragging = false;
       window.resizing = false;
@@ -47275,6 +47582,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
     rec->GetFunc("LICE__GetHeight"));
   LICE_GetRowSpan_ptr = reinterpret_cast<LICE_GetRowSpan_t>(
     rec->GetFunc("LICE__GetRowSpan"));
+  LICE_IsFlipped_ptr = reinterpret_cast<LICE_IsFlipped_t>(
+    rec->GetFunc("LICE__IsFlipped"));
   LICE_CreateBitmap_ptr = reinterpret_cast<LICE_CreateBitmap_t>(
     rec->GetFunc("LICE_CreateBitmap"));
   LICE_Clear_ptr = reinterpret_cast<LICE_Clear_t>(
