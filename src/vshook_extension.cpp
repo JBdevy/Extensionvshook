@@ -32,6 +32,7 @@
 
 #ifdef __APPLE__
   #include <CoreGraphics/CoreGraphics.h>
+  #include "native_keyboard_mac.h"
 #endif
 
 #ifdef _WIN32
@@ -12744,6 +12745,38 @@ static bool nativeUiInsertActiveTextCodepoint(
   nativeUiRefreshTextInputNow(hwnd);
   return true;
 }
+
+#ifdef __APPLE__
+static bool nativeUiInsertActiveMacKeyText(HWND hwnd)
+{
+  const NativeUiTextInputKind kind =
+    nativeUiFocusedTextInputKind();
+  if (kind == NativeUiTextInputKind::None ||
+      nativeUiTextCommandModifierDown()) {
+    return false;
+  }
+
+  char utf8[1024] = "";
+  const size_t length =
+    VSHookMacReadCurrentKeyText(utf8, sizeof(utf8));
+  if (length == 0) return false;
+
+  if (kind == NativeUiTextInputKind::TimerCountdown) {
+    // Mantem o campo regressivo estritamente numerico, mas passa pelo mesmo
+    // editor com cursor e selecao usado no Windows.
+    if (length == 1 && utf8[0] >= '0' && utf8[0] <= '9') {
+      return nativeUiInsertActiveTextCodepoint(
+        hwnd, static_cast<uint32_t>(utf8[0]));
+    }
+    return true;
+  }
+
+  nativeUiInsertTextValue(
+    kind, std::string(utf8, length));
+  nativeUiRefreshTextInputNow(hwnd);
+  return true;
+}
+#endif
 
 static void nativeUiDrawEditableText(
   HDC dc,
@@ -35784,6 +35817,15 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             hwnd, wParam)) {
         return 0;
       }
+#ifdef __APPLE__
+      // O SWELL entrega apenas WM_KEYDOWN para views customizadas no macOS.
+      // Le o texto real do NSEvent (incluindo layout, Shift e acentos) e o
+      // envia ao mesmo editor usado pelo WM_CHAR no Windows.
+      if (!g_state.directorInterfaceBlocked &&
+          nativeUiInsertActiveMacKeyText(hwnd)) {
+        return 0;
+      }
+#endif
       if (!g_state.directorInterfaceBlocked &&
           g_nativeMixerRenameOpen &&
           g_nativeMainModalKind == NativeMainModalKind::None) {
@@ -36203,24 +36245,6 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
                          "countdown") {
               // No Progressivo o campo regressivo não existe nem recebe
               // edição de teclado.
-#ifdef __APPLE__
-            } else if ((wParam >= '0' && wParam <= '9') ||
-                       (wParam >= VK_NUMPAD0 &&
-                        wParam <= VK_NUMPAD9)) {
-              // No SWELL/macOS as teclas numéricas podem chegar apenas como
-              // WM_KEYDOWN, sem o WM_CHAR usado pelo Windows.
-              const char digit = wParam >= VK_NUMPAD0 &&
-                  wParam <= VK_NUMPAD9
-                ? static_cast<char>('0' +
-                    (wParam - VK_NUMPAD0))
-                : static_cast<char>(wParam);
-              nativeUiSetTimerDigit(digit);
-              nativeUiCollapseTextSelection(
-                NativeUiTextInputKind::TimerCountdown,
-                static_cast<size_t>(
-                  g_nativeUiTimerDigitCursor));
-              nativeUiRefreshTextInputNow(hwnd);
-#endif
             } else if (wParam == VK_BACK) {
               nativeUiClearTimerDigit(true);
             } else if (wParam == VK_DELETE) {
