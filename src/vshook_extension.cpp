@@ -10935,10 +10935,11 @@ static void nativeAppActiveDrawBlackShadow(HDC dc, const RECT& rect)
     return;
   }
 #else
-  // O GDI do SWELL/macOS nao oferece aqui uma composicao alfa equivalente.
-  // O preenchimento intercalado aparecia como listras em telas Retina e o
-  // preenchimento solido escondia toda a interface. Mantem o conteudo visivel;
-  // o painel continua somente leitura pela propria logica de mouse/teclado.
+  // O SWELL/macOS não expõe AlphaBlend de forma confiável. O overlay sólido
+  // evita as listras que o preenchimento intercalado produzia em telas Retina
+  // e devolve o destaque visual para todos os modais e para o bloqueio do
+  // Diretor. O conteúdo do modal é desenhado logo depois, por cima desta base.
+  nativeAppActiveFillRect(dc, rect, RGB(9, 12, 18));
   return;
 #endif
   // Fallback raro do Windows quando AlphaBlend nao estiver disponivel.
@@ -32741,7 +32742,9 @@ static bool nativeMainHandleModalClick(
       nativeUiCloseMainModal();
     }
   } else if (action == "confirm_timer_stop") {
-    nativeApplyTimerCommand("{\"type\":\"timer_toggle\"}");
+    // Encerrar não é pausar: zera o estado compartilhado para a interface,
+    // os apps e as duas janelas de Teleprompt no mesmo frame.
+    nativeApplyTimerCommand("{\"type\":\"timer_stop_reset\"}");
     nativeUiCloseMainModal();
   } else if (action == "confirm_live") {
     const bool enabling =
@@ -36163,6 +36166,20 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
                          "countdown") {
               // No Progressivo o campo regressivo não existe nem recebe
               // edição de teclado.
+#ifdef __APPLE__
+            } else if ((wParam >= '0' && wParam <= '9') ||
+                       (wParam >= VK_NUMPAD0 &&
+                        wParam <= VK_NUMPAD9)) {
+              // No SWELL/macOS as teclas numéricas podem chegar apenas como
+              // WM_KEYDOWN, sem o WM_CHAR usado pelo Windows.
+              const char digit = wParam >= VK_NUMPAD0 &&
+                  wParam <= VK_NUMPAD9
+                ? static_cast<char>('0' +
+                    (wParam - VK_NUMPAD0))
+                : static_cast<char>(wParam);
+              nativeUiSetTimerDigit(digit);
+              nativeUiRefreshTextInputNow(hwnd);
+#endif
             } else if (wParam == VK_BACK) {
               nativeUiClearTimerDigit(true);
             } else if (wParam == VK_DELETE) {
@@ -36183,7 +36200,8 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             // Igual ao Lua: Enter nao fecha a lista de pistas.
           } else if (wParam == VK_RETURN) {
             if (g_nativeMainModalKind == NativeMainModalKind::ConfirmTimer) {
-              nativeApplyTimerCommand("{\"type\":\"timer_toggle\"}");
+              nativeApplyTimerCommand(
+                "{\"type\":\"timer_stop_reset\"}");
               nativeUiCloseMainModal();
             } else if (g_nativeMainModalKind == NativeMainModalKind::ConfirmRetry) {
               const bool changed = nativeUiApplyRetry();
