@@ -5221,12 +5221,24 @@ struct NativeSongWindow {
   int tunerValue = 0;
 };
 
+struct NativePendingPlayTarget {
+  ReaProject* project = nullptr;
+  std::string id;
+  double start = 0.0;
+  double end = 0.0;
+  std::chrono::steady_clock::time_point requestedAt;
+  uint64_t revision = 0;
+  bool active = false;
+};
+
 static std::vector<NativeSongWindow> g_nativeSongWindows;
 static bool g_nativeCurrentTransportPlaying = false;
 static std::string g_nativeCurrentPlayingId;
 static double g_nativeCurrentSongStart = 0.0;
 static double g_nativeCurrentSongEnd = 0.0;
 static double g_nativeCurrentPlayPosition = 0.0;
+static NativePendingPlayTarget g_nativePendingPlayTarget;
+static uint64_t g_nativePendingPlayTargetRevision = 0;
 static std::string g_nativeSelectedId;
 static std::string g_nativeSelectedTab;
 static std::string g_nativeDirectorActivePage = "playlist";
@@ -8714,6 +8726,137 @@ static std::string nativeFindPlayingId(const std::vector<NativeSongWindow>& song
     }
   }
   return id;
+}
+
+static void nativeClearPendingPlayTarget()
+{
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  g_nativePendingPlayTarget = NativePendingPlayTarget{};
+  ++g_nativePendingPlayTargetRevision;
+}
+
+static void nativeArmPendingPlayTarget(
+  ReaProject* project,
+  const NativeSongWindow& song)
+{
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  NativePendingPlayTarget pending;
+  pending.project = project;
+  pending.id = song.id;
+  pending.start = song.start;
+  pending.end = song.end;
+  pending.requestedAt = std::chrono::steady_clock::now();
+  pending.revision = ++g_nativePendingPlayTargetRevision;
+  pending.active =
+    project && !song.isBlock &&
+    !song.id.empty() &&
+    song.end > song.start + 0.0005;
+  g_nativePendingPlayTarget = std::move(pending);
+}
+
+static std::string nativeFindPlayingIdWithPendingTarget(
+  ReaProject* project,
+  const std::vector<NativeSongWindow>& songs,
+  bool playing,
+  double& pos,
+  std::string& nameOut,
+  double& startOut,
+  double& endOut)
+{
+  std::string playingId =
+    playing
+      ? nativeFindPlayingId(
+          songs, pos, nameOut, startOut, endOut)
+      : std::string();
+
+  NativePendingPlayTarget pending;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    pending = g_nativePendingPlayTarget;
+  }
+  if (!pending.active) return playingId;
+
+  const auto clearPendingCopy = [&]() {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (g_nativePendingPlayTarget.active &&
+        g_nativePendingPlayTarget.revision ==
+          pending.revision) {
+      g_nativePendingPlayTarget =
+        NativePendingPlayTarget{};
+      ++g_nativePendingPlayTargetRevision;
+    }
+  };
+
+  const auto ageMs =
+    std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() -
+        pending.requestedAt).count();
+  if (pending.project != project || ageMs > 500) {
+    clearPendingCopy();
+    return playingId;
+  }
+
+  // Main_OnCommand(Play) pode confirmar o bit de transporte um ciclo antes
+  // de GetPlayPositionEx alcançar o início pedido. Conserva o alvo enquanto
+  // esse primeiro ciclo ainda não estiver tocando; Stop limpa-o explicitamente.
+  if (!playing) return playingId;
+
+  const NativeSongWindow* target = nullptr;
+  const NativeSongWindow* targetById = nullptr;
+  for (const auto& song : songs) {
+    if (song.isBlock || song.id != pending.id) continue;
+    if (!targetById) targetById = &song;
+    if (std::fabs(song.start - pending.start) <= 0.003 &&
+        std::fabs(song.end - pending.end) <= 0.003) {
+      target = &song;
+      break;
+    }
+  }
+  if (!target) target = targetById;
+  if (!target) {
+    clearPendingCopy();
+    return playingId;
+  }
+
+  // Assim que o REAPER entra no alvo, a posição real volta a ser a única
+  // fonte. A regra de intervalos continua [início,fim), sem sobreposição.
+  if (pos >= target->start && pos < target->end) {
+    clearPendingCopy();
+    return playingId;
+  }
+
+  const NativeSongWindow* predecessor = nullptr;
+  for (const auto& song : songs) {
+    if (song.isBlock) continue;
+    const bool rawSong =
+      !playingId.empty() && song.id == playingId &&
+      pos >= song.start && pos < song.end;
+    const bool containsRawPosition =
+      playingId.empty() &&
+      pos >= song.start && pos < song.end;
+    if ((rawSong || containsRawPosition) &&
+        std::fabs(song.end - target->start) <= 0.003) {
+      predecessor = &song;
+      break;
+    }
+  }
+
+  // Corrige somente a primeira leitura obsoleta no limite de duas regiões
+  // realmente coladas. Não antecipa regiões separadas nem muda overlaps.
+  const bool staleAdjacentBoundary =
+    predecessor &&
+    pos < target->start &&
+    target->start - pos <= 0.075;
+  if (staleAdjacentBoundary) {
+    pos = target->start;
+    nameOut = target->name;
+    startOut = target->start;
+    endOut = target->end;
+    return target->id;
+  }
+
+  clearPendingCopy();
+  return playingId;
 }
 
 static std::string nativeStripJsonObjectBraces(std::string json)
@@ -43309,7 +43452,7 @@ static void nativeProcessMultiLoopsOnMainThread()
   const int playState = project ? GetPlayStateEx_ptr(project) : 0;
   const bool playing = (playState & 1) == 1 || (playState & 4) == 4;
   const bool paused = (playState & 2) == 2;
-  const double playPos = project ? GetPlayPositionEx_ptr(project) : 0.0;
+  double playPos = project ? GetPlayPositionEx_ptr(project) : 0.0;
   // Pause congela o Multiloops exatamente no ponto atual. Nao restaura pistas,
   // nao avanca fade e nao desarma o loop; ao continuar, o playPos retoma dali.
   if (paused) {
@@ -43345,7 +43488,10 @@ static void nativeProcessMultiLoopsOnMainThread()
   std::string playingName;
   double songStart = 0.0;
   double songEnd = 0.0;
-  std::string playingId = playing ? nativeFindPlayingId(songs, playPos, playingName, songStart, songEnd) : std::string();
+  std::string playingId =
+    nativeFindPlayingIdWithPendingTarget(
+      project, songs, playing, playPos,
+      playingName, songStart, songEnd);
 
   nativeProcessMultiLoops(project, songs, playing, playPos, playingId, songStart, songEnd);
   nativePublishMultiLoopBypassState();
@@ -43555,7 +43701,10 @@ static void nativeRebuildState(bool forceSnapshot)
   std::string playingName;
   double songStart = 0.0;
   double songEnd = 0.0;
-  std::string playingId = playing ? nativeFindPlayingId(songs, playPos, playingName, songStart, songEnd) : "";
+  std::string playingId =
+    nativeFindPlayingIdWithPendingTarget(
+      activeProject, songs, playing, playPos,
+      playingName, songStart, songEnd);
 
   // Musicas-filho agora sao regioes reais da ruler lane 2 e ja fazem parte de
   // `songs`. Nao existe mais motivo para revarrer markers durante a reproducao.
@@ -46161,6 +46310,7 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
   const bool isPlaying = playState != 0;
 
   if (type == "director_pause") {
+    nativeClearPendingPlayTarget();
     if (isPlaying) Main_OnCommand_ptr(1008, 0); // Transport: Pause
     g_nativeForceStateBuild.store(true);
     return true;
@@ -46223,6 +46373,7 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
   }
 
   if (wantsStop && !wantsPlay) {
+    nativeClearPendingPlayTarget();
     // STOP BREAK pode chegar pelo atalho nativo ou pelo app. Além do tipo,
     // honra as flags do payload para que nenhuma normalização intermediária
     // transforme a parada imediata em Manual Stop/Faderout.
@@ -46306,6 +46457,12 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
       }
     }
 
+    const double editCursorBeforePlay =
+      GetCursorPositionEx_ptr && project
+        ? GetCursorPositionEx_ptr(project)
+        : startPos;
+    NativeSongWindow pendingPlaySong;
+    bool hasPendingPlaySong = false;
     {
       std::lock_guard<std::mutex> lock(g_nativeMutex);
       const NativeSongWindow* song = exactPosition ? nullptr : nativeFindSongForCommand(idValue, startPos, endPos);
@@ -46318,6 +46475,43 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
         g_nativeSelectedId = idValue;
         g_nativeSelectedStart = startPos;
         g_nativeSelectedEnd = endPos;
+      }
+
+      const NativeSongWindow* expectedSong = song;
+      if (!expectedSong && !g_nativeSelectedId.empty()) {
+        expectedSong = nativeFindSongForCommand(
+          g_nativeSelectedId,
+          g_nativeSelectedStart,
+          g_nativeSelectedEnd);
+      }
+      if (!expectedSong && hasResolvedStart) {
+        std::string positionSongName;
+        double positionSongStart = 0.0;
+        double positionSongEnd = 0.0;
+        const std::string positionSongId =
+          nativeFindPlayingId(
+            g_nativeSongWindows, startPos,
+            positionSongName,
+            positionSongStart,
+            positionSongEnd);
+        if (!positionSongId.empty()) {
+          expectedSong = nativeFindSongForCommand(
+            positionSongId,
+            positionSongStart,
+            positionSongEnd);
+        }
+      }
+      if (expectedSong) {
+        const double intendedPosition =
+          !noSeek && hasResolvedStart
+            ? startPos : editCursorBeforePlay;
+        const bool intendedInsideSong =
+          intendedPosition >= expectedSong->start - 0.003 &&
+          intendedPosition < expectedSong->end;
+        if (intendedInsideSong) {
+          pendingPlaySong = *expectedSong;
+          hasPendingPlaySong = true;
+        }
       }
     }
 
@@ -46351,6 +46545,12 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
         nativeTunerValueForSong(project, playTunerSong);
       playTunerApplied =
         nativeApplyTunerValue(project, playTunerSemitones);
+    }
+    if (!isPlaying && hasPendingPlaySong) {
+      nativeArmPendingPlayTarget(
+        project, pendingPlaySong);
+    } else {
+      nativeClearPendingPlayTarget();
     }
     Main_OnCommand_ptr(1007, 0); // Transport: Play
     if (playTunerApplied) {
