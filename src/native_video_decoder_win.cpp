@@ -21,9 +21,12 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -56,6 +59,119 @@ LONGLONG secondsToHns(double value)
   const double safe = std::max(0.0, value);
   return static_cast<LONGLONG>(
     std::llround(safe * 10000000.0));
+}
+
+struct BilinearAxisSample {
+  int first = 0;
+  int second = 0;
+  int weight = 0;
+};
+
+bool checkedSizeProduct(
+  std::size_t left,
+  std::size_t right,
+  std::size_t& result)
+{
+  if (left != 0 &&
+      right > std::numeric_limits<std::size_t>::max() / left) {
+    return false;
+  }
+  result = left * right;
+  return true;
+}
+
+bool checkedSizeSum(
+  std::size_t left,
+  std::size_t right,
+  std::size_t& result)
+{
+  if (right >
+      std::numeric_limits<std::size_t>::max() - left) {
+    return false;
+  }
+  result = left + right;
+  return true;
+}
+
+bool checkedBgraLayout(
+  int width,
+  int height,
+  std::size_t& stride,
+  std::size_t& byteCount)
+{
+  if (width <= 0 || height <= 0 ||
+      width > std::numeric_limits<int>::max() / 4) {
+    return false;
+  }
+  stride = static_cast<std::size_t>(width) * 4u;
+  return checkedSizeProduct(
+    stride, static_cast<std::size_t>(height), byteCount);
+}
+
+void buildBilinearAxis(
+  int sourceSize,
+  int outputSize,
+  std::vector<BilinearAxisSample>& samples)
+{
+  samples.resize(static_cast<std::size_t>(outputSize));
+  if (sourceSize <= 1) {
+    std::fill(
+      samples.begin(), samples.end(), BilinearAxisSample{});
+    return;
+  }
+
+  for (int outputIndex = 0;
+       outputIndex < outputSize;
+       ++outputIndex) {
+    const double sourcePosition =
+      (static_cast<double>(outputIndex) + 0.5) *
+        static_cast<double>(sourceSize) /
+        static_cast<double>(outputSize) -
+      0.5;
+    int first =
+      static_cast<int>(std::floor(sourcePosition));
+    double fraction = sourcePosition - first;
+    if (first < 0) {
+      first = 0;
+      fraction = 0.0;
+    } else if (first >= sourceSize - 1) {
+      first = sourceSize - 1;
+      fraction = 0.0;
+    }
+    const int second = std::min(sourceSize - 1, first + 1);
+    samples[static_cast<std::size_t>(outputIndex)] = {
+      first,
+      second,
+      std::max(
+        0,
+        std::min(
+          256,
+          static_cast<int>(
+            std::lround(fraction * 256.0))))
+    };
+  }
+}
+
+int bilinearByte(
+  int topLeft,
+  int topRight,
+  int bottomLeft,
+  int bottomRight,
+  int horizontalWeight,
+  int verticalWeight)
+{
+  const int inverseHorizontal = 256 - horizontalWeight;
+  const int inverseVertical = 256 - verticalWeight;
+  const int top =
+    topLeft * inverseHorizontal +
+    topRight * horizontalWeight;
+  const int bottom =
+    bottomLeft * inverseHorizontal +
+    bottomRight * horizontalWeight;
+  return (
+    top * inverseVertical +
+    bottom * verticalWeight +
+    32768) >> 16;
 }
 
 } // namespace
@@ -129,8 +245,8 @@ struct Decoder::Impl {
   int outputWidth = 0;
   int outputHeight = 0;
   bool outputIsNv12 = false;
-  std::vector<int> sourceXForOutput;
-  std::vector<int> sourceYForOutput;
+  std::vector<BilinearAxisSample> sourceXForOutput;
+  std::vector<BilinearAxisSample> sourceYForOutput;
   int yScaleTable[256]{};
   int uBlueTable[256]{};
   int uGreenTable[256]{};
@@ -310,58 +426,110 @@ struct Decoder::Impl {
     int requestedHeight)
   {
     if (sourceWidth <= 0 || sourceHeight <= 0) return false;
-    const int safeRequestedWidth =
-      std::max(2, requestedWidth);
-    const int safeRequestedHeight =
-      std::max(2, requestedHeight);
-    double scale = std::min(
+    const bool portraitSource = sourceHeight > sourceWidth;
+    const int maximumOutputWidth =
+      portraitSource ? 1080 : 1920;
+    const int maximumOutputHeight =
+      portraitSource ? 1920 : 1080;
+    const int safeRequestedWidth = std::min(
+      maximumOutputWidth,
+      std::max(1, requestedWidth));
+    const int safeRequestedHeight = std::min(
+      maximumOutputHeight,
+      std::max(1, requestedHeight));
+    const double requestedScale = std::min(
       1.0,
       std::min(
         static_cast<double>(safeRequestedWidth) /
           static_cast<double>(sourceWidth),
         static_cast<double>(safeRequestedHeight) /
           static_cast<double>(sourceHeight)));
-    // A extensão nativa preserva a resolução solicitada. Qualquer redução de
-    // qualidade deve acontecer somente nos apps remotos, nunca no teleprompt
-    // aberto diretamente pelo REAPER.
-    int wantedWidth = std::max(
-      2, static_cast<int>(std::lround(sourceWidth * scale)));
-    int wantedHeight = std::max(
-      2, static_cast<int>(std::lround(sourceHeight * scale)));
-    wantedWidth -= wantedWidth & 1;
-    wantedHeight -= wantedHeight & 1;
+
+    // A saída BGRA acompanha os pixels que realmente serão desenhados. O
+    // maior eixo sobe em pequenos degraus para uma sequência de WM_SIZE não
+    // recriar texturas a cada pixel. O teto do teleprompt é Full HD, orientado
+    // conforme a fonte, sem reintroduzir a antiga redução fixa para 960x540.
+    double outputScale = requestedScale;
+    if (requestedScale < 1.0) {
+      const int sourceLongEdge =
+        std::max(sourceWidth, sourceHeight);
+      const double requestedLongEdge =
+        sourceLongEdge * requestedScale;
+      const int quantum =
+        requestedLongEdge >= 1024.0 ? 16 :
+        requestedLongEdge >= 256.0 ? 8 :
+        requestedLongEdge >= 64.0 ? 4 : 2;
+      const double quantizedLongEdge =
+        std::max(
+          1.0,
+          std::floor(requestedLongEdge / quantum) * quantum);
+      outputScale = std::min(
+        requestedScale,
+        quantizedLongEdge /
+          static_cast<double>(sourceLongEdge));
+    }
+
+    const int wantedWidth = std::max(
+      1,
+      std::min(
+        std::min(sourceWidth, safeRequestedWidth),
+        static_cast<int>(
+          std::lround(sourceWidth * outputScale))));
+    const int wantedHeight = std::max(
+      1,
+      std::min(
+        std::min(sourceHeight, safeRequestedHeight),
+        static_cast<int>(
+          std::lround(sourceHeight * outputScale))));
     if (wantedWidth == outputWidth &&
         wantedHeight == outputHeight) {
       return true;
     }
+
+    std::size_t destinationStride = 0;
+    std::size_t destinationBytes = 0;
+    if (!checkedBgraLayout(
+          wantedWidth,
+          wantedHeight,
+          destinationStride,
+          destinationBytes)) {
+      statusCode = -106;
+      return false;
+    }
+
+    std::vector<std::uint8_t> resizedPixels;
+    std::vector<BilinearAxisSample> resizedX;
+    std::vector<BilinearAxisSample> resizedY;
+    if (destinationBytes > resizedPixels.max_size() ||
+        static_cast<std::size_t>(wantedWidth) >
+          resizedX.max_size() ||
+        static_cast<std::size_t>(wantedHeight) >
+          resizedY.max_size()) {
+      statusCode = -107;
+      return false;
+    }
+    try {
+      resizedPixels.assign(destinationBytes, 0);
+      buildBilinearAxis(
+        sourceWidth, wantedWidth, resizedX);
+      buildBilinearAxis(
+        sourceHeight, wantedHeight, resizedY);
+    } catch (const std::bad_alloc&) {
+      statusCode = -107;
+      return false;
+    } catch (const std::length_error&) {
+      statusCode = -107;
+      return false;
+    }
+
     clearGpuProcessor();
     outputWidth = wantedWidth;
     outputHeight = wantedHeight;
-    pixels.assign(
-      static_cast<std::size_t>(outputWidth) *
-      static_cast<std::size_t>(outputHeight) * 4u, 0);
-    sourceXForOutput.resize(
-      static_cast<std::size_t>(outputWidth));
-    sourceYForOutput.resize(
-      static_cast<std::size_t>(outputHeight));
-    for (int x = 0; x < outputWidth; ++x) {
-      sourceXForOutput[static_cast<std::size_t>(x)] =
-        std::min(
-          sourceWidth - 1,
-          static_cast<int>(
-            static_cast<std::int64_t>(x) * sourceWidth /
-            outputWidth));
-    }
-    for (int y = 0; y < outputHeight; ++y) {
-      sourceYForOutput[static_cast<std::size_t>(y)] =
-        std::min(
-          sourceHeight - 1,
-          static_cast<int>(
-            static_cast<std::int64_t>(y) * sourceHeight /
-            outputHeight));
-    }
-    // O quadro em cache possui a dimensão anterior; solicita novamente o
-    // quadro atual somente quando a janela realmente muda de tamanho.
+    pixels.swap(resizedPixels);
+    sourceXForOutput.swap(resizedX);
+    sourceYForOutput.swap(resizedY);
+    // O quadro em cache possui a dimensão anterior; solicita novamente quando
+    // a janela cruza o próximo degrau de resolução.
     hasFrame = false;
     frameTimestamp = -1.0;
     return true;
@@ -502,8 +670,17 @@ struct Decoder::Impl {
     result = MFGetAttributeSize(
       currentType.Get(), MF_MT_FRAME_SIZE,
       &frameWidth, &frameHeight);
-    if (FAILED(result) || frameWidth == 0 || frameHeight == 0) {
-      statusCode = static_cast<int>(result);
+    if (FAILED(result) ||
+        frameWidth == 0 || frameHeight == 0 ||
+        frameWidth >
+          static_cast<UINT32>(
+            std::numeric_limits<int>::max()) ||
+        frameHeight >
+          static_cast<UINT32>(
+            std::numeric_limits<int>::max())) {
+      statusCode = FAILED(result)
+        ? static_cast<int>(result)
+        : -106;
       clearReader();
       return false;
     }
@@ -514,6 +691,13 @@ struct Decoder::Impl {
       SUCCEEDED(currentType->GetGUID(
         MF_MT_SUBTYPE, &currentSubtype)) &&
       IsEqualGUID(currentSubtype, MFVideoFormat_NV12);
+    if (!outputIsNv12 &&
+        sourceWidth >
+          std::numeric_limits<LONG>::max() / 4) {
+      statusCode = -106;
+      clearReader();
+      return false;
+    }
 
     UINT32 numerator = 0;
     UINT32 denominator = 0;
@@ -545,8 +729,9 @@ struct Decoder::Impl {
       }
     }
     if (defaultStride == 0) {
-      defaultStride =
-        outputIsNv12 ? sourceWidth : sourceWidth * 4;
+      defaultStride = outputIsNv12
+        ? static_cast<LONG>(sourceWidth)
+        : static_cast<LONG>(sourceWidth * 4);
     }
 
     path = utf8Path;
@@ -790,6 +975,17 @@ struct Decoder::Impl {
     d3dContext->CopyResource(
       videoReadbackTexture.Get(),
       videoOutputTexture.Get());
+    std::size_t destinationStride = 0;
+    std::size_t destinationBytes = 0;
+    if (!checkedBgraLayout(
+          outputWidth,
+          outputHeight,
+          destinationStride,
+          destinationBytes) ||
+        destinationBytes != pixels.size()) {
+      statusCode = -106;
+      return false;
+    }
     D3D11_MAPPED_SUBRESOURCE mapped{};
     result = d3dContext->Map(
       videoReadbackTexture.Get(),
@@ -798,8 +994,8 @@ struct Decoder::Impl {
       0,
       &mapped);
     if (FAILED(result) || !mapped.pData ||
-        mapped.RowPitch <
-          static_cast<UINT>(outputWidth * 4)) {
+        static_cast<std::size_t>(mapped.RowPitch) <
+          destinationStride) {
       if (SUCCEEDED(result)) {
         d3dContext->Unmap(
           videoReadbackTexture.Get(), 0);
@@ -807,11 +1003,6 @@ struct Decoder::Impl {
       return false;
     }
 
-    const std::size_t destinationStride =
-      static_cast<std::size_t>(outputWidth) * 4u;
-    pixels.resize(
-      destinationStride *
-      static_cast<std::size_t>(outputHeight));
     const auto* source =
       static_cast<const std::uint8_t*>(mapped.pData);
     for (int row = 0; row < outputHeight; ++row) {
@@ -835,10 +1026,18 @@ struct Decoder::Impl {
 
   bool copySample(IMFSample* sample, LONGLONG timestamp)
   {
+    std::size_t destinationStride = 0;
+    std::size_t destinationBytes = 0;
     if (!sample ||
         sourceWidth <= 0 || sourceHeight <= 0 ||
         outputWidth <= 0 || outputHeight <= 0 ||
-        pixels.empty()) {
+        pixels.empty() ||
+        !checkedBgraLayout(
+          outputWidth,
+          outputHeight,
+          destinationStride,
+          destinationBytes) ||
+        destinationBytes != pixels.size()) {
       return false;
     }
     if (copyGpuSample(sample, timestamp)) {
@@ -863,28 +1062,60 @@ struct Decoder::Impl {
         return false;
       }
 
-      int stride = static_cast<int>(
-        defaultStride < 0 ? -defaultStride : defaultStride);
-      if (stride < sourceWidth) stride = sourceWidth;
-      std::size_t yPlaneBytes =
-        static_cast<std::size_t>(stride) *
-        static_cast<std::size_t>(sourceHeight);
-      const std::size_t chromaRows =
-        static_cast<std::size_t>((sourceHeight + 1) / 2);
-      std::size_t requiredBytes =
-        yPlaneBytes +
-        static_cast<std::size_t>(stride) * chromaRows;
-      if (currentLength < requiredBytes) {
-        // Alguns decoders não publicam o padding na mídia final.
-        stride = sourceWidth;
-        yPlaneBytes =
-          static_cast<std::size_t>(stride) *
-          static_cast<std::size_t>(sourceHeight);
-        requiredBytes =
-          yPlaneBytes +
-          static_cast<std::size_t>(stride) * chromaRows;
+      const std::int64_t strideMagnitude =
+        defaultStride < 0
+          ? -static_cast<std::int64_t>(defaultStride)
+          : static_cast<std::int64_t>(defaultStride);
+      if (strideMagnitude <= 0 ||
+          strideMagnitude >
+            std::numeric_limits<int>::max() ||
+          sourceWidth >
+            std::numeric_limits<int>::max() - 1) {
+        mediaBuffer->Unlock();
+        statusCode = -105;
+        return false;
       }
-      if (currentLength < requiredBytes) {
+      const int packedStride =
+        sourceWidth + (sourceWidth & 1);
+      int stride = std::max(
+        packedStride,
+        static_cast<int>(strideMagnitude));
+      const std::size_t chromaRows =
+        (static_cast<std::size_t>(sourceHeight) + 1u) / 2u;
+      auto nv12Layout =
+        [&](int candidateStride,
+            std::size_t& yBytes,
+            std::size_t& requiredBytes) -> bool {
+          std::size_t chromaBytes = 0;
+          return candidateStride >= packedStride &&
+            checkedSizeProduct(
+              static_cast<std::size_t>(candidateStride),
+              static_cast<std::size_t>(sourceHeight),
+              yBytes) &&
+            checkedSizeProduct(
+              static_cast<std::size_t>(candidateStride),
+              chromaRows,
+              chromaBytes) &&
+            checkedSizeSum(
+              yBytes, chromaBytes, requiredBytes);
+        };
+      std::size_t yPlaneBytes = 0;
+      std::size_t requiredBytes = 0;
+      if (!nv12Layout(
+            stride, yPlaneBytes, requiredBytes) ||
+          static_cast<std::size_t>(currentLength) <
+            requiredBytes) {
+        // Alguns decoders não publicam o padding na mídia final.
+        stride = packedStride;
+        if (!nv12Layout(
+              stride, yPlaneBytes, requiredBytes)) {
+          mediaBuffer->Unlock();
+          statusCode = -105;
+          return false;
+        }
+      }
+      if (static_cast<std::size_t>(currentLength) <
+          requiredBytes) {
         mediaBuffer->Unlock();
         statusCode = -105;
         return false;
@@ -897,25 +1128,52 @@ struct Decoder::Impl {
           std::max(0, std::min(255, value)));
       };
       for (int y = 0; y < outputHeight; ++y) {
-        const int sourceY =
+        const BilinearAxisSample& sourceY =
           sourceYForOutput[static_cast<std::size_t>(y)];
-        const BYTE* yRow =
-          yPlane + static_cast<std::size_t>(sourceY) * stride;
-        const BYTE* uvRow =
+        const BYTE* yRowTop =
+          yPlane +
+          static_cast<std::size_t>(sourceY.first) * stride;
+        const BYTE* yRowBottom =
+          yPlane +
+          static_cast<std::size_t>(sourceY.second) * stride;
+        const BYTE* uvRowTop =
           uvPlane +
-          static_cast<std::size_t>(sourceY / 2) * stride;
+          static_cast<std::size_t>(sourceY.first / 2) * stride;
+        const BYTE* uvRowBottom =
+          uvPlane +
+          static_cast<std::size_t>(sourceY.second / 2) * stride;
         std::uint8_t* destinationRow =
           pixels.data() +
           static_cast<std::size_t>(y) *
-            static_cast<std::size_t>(outputWidth) * 4u;
+            destinationStride;
         for (int x = 0; x < outputWidth; ++x) {
-          const int sourceX =
+          const BilinearAxisSample& sourceX =
             sourceXForOutput[static_cast<std::size_t>(x)];
-          const int uvX = std::min(
-            stride - 2, sourceX & ~1);
-          const int yValue = yRow[sourceX];
-          const int uValue = uvRow[uvX];
-          const int vValue = uvRow[uvX + 1];
+          const int uvLeft = std::min(
+            stride - 2, sourceX.first & ~1);
+          const int uvRight = std::min(
+            stride - 2, sourceX.second & ~1);
+          const int yValue = bilinearByte(
+            yRowTop[sourceX.first],
+            yRowTop[sourceX.second],
+            yRowBottom[sourceX.first],
+            yRowBottom[sourceX.second],
+            sourceX.weight,
+            sourceY.weight);
+          const int uValue = bilinearByte(
+            uvRowTop[uvLeft],
+            uvRowTop[uvRight],
+            uvRowBottom[uvLeft],
+            uvRowBottom[uvRight],
+            sourceX.weight,
+            sourceY.weight);
+          const int vValue = bilinearByte(
+            uvRowTop[uvLeft + 1],
+            uvRowTop[uvRight + 1],
+            uvRowBottom[uvLeft + 1],
+            uvRowBottom[uvRight + 1],
+            sourceX.weight,
+            sourceY.weight);
           const int scaledLuma = yScaleTable[yValue];
           destinationRow[x * 4 + 0] =
             byteClamp(
@@ -963,35 +1221,88 @@ struct Decoder::Impl {
 
     const std::size_t rowBytes =
       static_cast<std::size_t>(sourceWidth) * 4u;
-    const LONG absolutePitch =
-      pitch < 0 ? -pitch : pitch;
-    if (absolutePitch < static_cast<LONG>(rowBytes)) {
+    const std::int64_t absolutePitch64 =
+      pitch < 0
+        ? -static_cast<std::int64_t>(pitch)
+        : static_cast<std::int64_t>(pitch);
+    if (absolutePitch64 <= 0 ||
+        static_cast<std::uint64_t>(absolutePitch64) <
+          static_cast<std::uint64_t>(rowBytes) ||
+        static_cast<std::uint64_t>(absolutePitch64) >
+          static_cast<std::uint64_t>(
+            std::numeric_limits<std::size_t>::max())) {
+      if (locked2d) buffer2d->Unlock2D();
+      else mediaBuffer->Unlock();
+      statusCode = -102;
+      return false;
+    }
+    const std::size_t absolutePitch =
+      static_cast<std::size_t>(absolutePitch64);
+    std::size_t lastRowOffset = 0;
+    std::size_t requiredBytes = 0;
+    if (!checkedSizeProduct(
+          absolutePitch,
+          static_cast<std::size_t>(sourceHeight - 1),
+          lastRowOffset) ||
+        !checkedSizeSum(
+          lastRowOffset, rowBytes, requiredBytes) ||
+        lastRowOffset >
+          static_cast<std::size_t>(
+            std::numeric_limits<std::ptrdiff_t>::max())) {
       if (locked2d) buffer2d->Unlock2D();
       else mediaBuffer->Unlock();
       statusCode = -102;
       return false;
     }
 
+    // IMFMediaBuffer::Lock aponta para o início físico do bloco. Em RGB
+    // bottom-up isso é a última linha lógica, ao contrário de Lock2D, que já
+    // entrega scanline0 na linha superior exibida.
+    if (!locked2d) {
+      if (requiredBytes >
+          static_cast<std::size_t>(currentLength)) {
+        mediaBuffer->Unlock();
+        statusCode = -102;
+        return false;
+      }
+      if (pitch < 0) {
+        scanline0 = contiguous + lastRowOffset;
+      }
+    }
+
     // scanline0 representa a primeira linha lógica da imagem. O sinal do
     // pitch já informa a direção necessária para alcançar as linhas seguintes;
     // inverter manualmente o índice deixa o vídeo de cabeça para baixo.
     for (int y = 0; y < outputHeight; ++y) {
-      const int sourceY =
+      const BilinearAxisSample& sourceY =
         sourceYForOutput[static_cast<std::size_t>(y)];
-      const BYTE* sourceRow =
+      const BYTE* sourceRowTop =
         scanline0 +
-        static_cast<std::ptrdiff_t>(sourceY) * pitch;
+        static_cast<std::ptrdiff_t>(sourceY.first) * pitch;
+      const BYTE* sourceRowBottom =
+        scanline0 +
+        static_cast<std::ptrdiff_t>(sourceY.second) * pitch;
       std::uint8_t* destinationRow =
         pixels.data() +
         static_cast<std::size_t>(y) *
-          static_cast<std::size_t>(outputWidth) * 4u;
+          destinationStride;
       for (int x = 0; x < outputWidth; ++x) {
-        const int sourceX =
+        const BilinearAxisSample& sourceX =
           sourceXForOutput[static_cast<std::size_t>(x)];
-        std::memcpy(
-          destinationRow + x * 4,
-          sourceRow + sourceX * 4,
-          4u);
+        const std::size_t leftOffset =
+          static_cast<std::size_t>(sourceX.first) * 4u;
+        const std::size_t rightOffset =
+          static_cast<std::size_t>(sourceX.second) * 4u;
+        for (int channel = 0; channel < 3; ++channel) {
+          destinationRow[x * 4 + channel] =
+            static_cast<std::uint8_t>(bilinearByte(
+              sourceRowTop[leftOffset + channel],
+              sourceRowTop[rightOffset + channel],
+              sourceRowBottom[leftOffset + channel],
+              sourceRowBottom[rightOffset + channel],
+              sourceX.weight,
+              sourceY.weight));
+        }
         destinationRow[x * 4 + 3] = 255;
       }
     }
@@ -1081,8 +1392,17 @@ struct Decoder::Impl {
 
     // A cópia acontece na worker. A interface recebe um snapshot imutável e
     // pode desenhá-lo sem bloquear o decoder ou correr risco de data race.
-    auto snapshot =
-      std::make_shared<std::vector<std::uint8_t>>(pixels);
+    std::shared_ptr<std::vector<std::uint8_t>> snapshot;
+    try {
+      snapshot =
+        std::make_shared<std::vector<std::uint8_t>>(pixels);
+    } catch (const std::bad_alloc&) {
+      statusCode = -107;
+      return;
+    } catch (const std::length_error&) {
+      statusCode = -107;
+      return;
+    }
     std::lock_guard<std::mutex> lock(stateMutex);
     if (!hasRequest ||
         request.path != path ||

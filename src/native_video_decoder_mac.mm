@@ -2,15 +2,19 @@
 
 #ifdef __APPLE__
 
+#import <Accelerate/Accelerate.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreVideo/CoreVideo.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -26,6 +30,7 @@ struct Decoder::Impl {
     int requestedWidth = 1;
     int requestedHeight = 1;
     bool playing = false;
+    bool discontinuity = false;
     std::uint64_t serial = 0;
     std::chrono::steady_clock::time_point sampledAt =
       std::chrono::steady_clock::now();
@@ -39,6 +44,7 @@ struct Decoder::Impl {
   PlaybackRequest request;
   bool hasRequest = false;
   bool stopRequested = false;
+  std::uint64_t handledRequestSerial = 0;
   std::shared_ptr<const std::vector<std::uint8_t>> publishedPixels;
   std::string publishedPath;
   std::string publishedPlaybackKey;
@@ -60,10 +66,27 @@ struct Decoder::Impl {
   // Estado usado apenas pela worker.
   AVURLAsset* asset = nil;
   AVAssetImageGenerator* generator = nil;
+  AVVideoComposition* sequentialComposition = nil;
+  AVAssetReader* sequentialReader = nil;
+  AVAssetReaderVideoCompositionOutput* sequentialOutput = nil;
+  double sequentialFrameTimestamp = -1.0;
+  double sequentialCursorTimestamp = -1.0;
+  double assetDurationSeconds = -1.0;
+  bool sequentialUnsupported = false;
+  bool sequentialReachedEnd = false;
+  bool sequentialNeedsMoreSamples = false;
+  bool sequentialReaderProducedFrame = false;
   std::string path;
-  std::vector<std::uint8_t> pixels;
+  std::shared_ptr<std::vector<std::uint8_t>> pixels;
+  std::array<
+    std::shared_ptr<std::vector<std::uint8_t>>, 3>
+    pixelPool;
+  std::vector<std::uint8_t> vImageWorkspace;
+  std::size_t nextPixelPoolIndex = 0;
   int width = 0;
   int height = 0;
+  int sourceDisplayWidth = 0;
+  int sourceDisplayHeight = 0;
   int maximumWidth = 0;
   int maximumHeight = 0;
   double frameDuration = 1.0 / 30.0;
@@ -85,21 +108,80 @@ struct Decoder::Impl {
     if (worker.joinable()) worker.join();
   }
 
+  void clearSequentialReader()
+  {
+    [sequentialReader cancelReading];
+    [sequentialOutput release];
+    sequentialOutput = nil;
+    [sequentialReader release];
+    sequentialReader = nil;
+    sequentialFrameTimestamp = -1.0;
+    sequentialCursorTimestamp = -1.0;
+  }
+
   void clearDecoder()
   {
+    clearSequentialReader();
+    [sequentialComposition release];
+    sequentialComposition = nil;
     [generator cancelAllCGImageGeneration];
     [generator release];
     generator = nil;
     [asset release];
     asset = nil;
     path.clear();
-    pixels.clear();
+    pixels.reset();
+    pixelPool = {};
+    vImageWorkspace.clear();
+    nextPixelPoolIndex = 0;
     width = 0;
     height = 0;
+    sourceDisplayWidth = 0;
+    sourceDisplayHeight = 0;
     maximumWidth = 0;
     maximumHeight = 0;
     frameDuration = 1.0 / 30.0;
     frameTimestamp = -1.0;
+    assetDurationSeconds = -1.0;
+    sequentialUnsupported = false;
+    sequentialReachedEnd = false;
+    sequentialNeedsMoreSamples = false;
+    sequentialReaderProducedFrame = false;
+  }
+
+  std::shared_ptr<std::vector<std::uint8_t>>
+  acquirePixelBuffer(std::size_t byteCount)
+  {
+    for (std::size_t attempt = 0;
+         attempt < pixelPool.size();
+         ++attempt) {
+      const std::size_t index =
+        (nextPixelPoolIndex + attempt) % pixelPool.size();
+      auto& candidate = pixelPool[index];
+      if (!candidate || candidate.use_count() == 1) {
+        if (!candidate) {
+          candidate =
+            std::make_shared<std::vector<std::uint8_t>>();
+        }
+        candidate->resize(byteCount);
+        nextPixelPoolIndex =
+          (index + 1) % pixelPool.size();
+        return candidate;
+      }
+    }
+
+    // A interface ainda pode estar desenhando todos os buffers do pequeno
+    // pool. Substituir uma entrada é seguro porque os snapshots publicados
+    // mantêm sua própria referência imutável.
+    const std::size_t index =
+      nextPixelPoolIndex % pixelPool.size();
+    auto replacement =
+      std::make_shared<std::vector<std::uint8_t>>(
+        byteCount);
+    pixelPool[index] = replacement;
+    nextPixelPoolIndex =
+      (index + 1) % pixelPool.size();
+    return replacement;
   }
 
   void clearPublished()
@@ -114,23 +196,243 @@ struct Decoder::Impl {
     publishedTimestamp = -1.0;
   }
 
+  void calculateDecodeSize(
+    int requestedWidth,
+    int requestedHeight,
+    int& decodeWidth,
+    int& decodeHeight) const
+  {
+    const int wantedWidth =
+      std::max(2, requestedWidth);
+    const int wantedHeight =
+      std::max(2, requestedHeight);
+    const bool portraitSource =
+      sourceDisplayHeight > sourceDisplayWidth;
+    const int fullHdWidth =
+      portraitSource ? 1080 : 1920;
+    const int fullHdHeight =
+      portraitSource ? 1920 : 1080;
+    const int quantizedWidth = std::min(
+      fullHdWidth,
+      ((std::min(wantedWidth, fullHdWidth) + 63) /
+        64) * 64);
+    const int quantizedHeight = std::min(
+      fullHdHeight,
+      ((std::min(wantedHeight, fullHdHeight) + 63) /
+        64) * 64);
+    const double sourceWidth =
+      static_cast<double>(std::max(
+        1, sourceDisplayWidth));
+    const double sourceHeight =
+      static_cast<double>(std::max(
+        1, sourceDisplayHeight));
+    const double scale = std::min(
+      1.0,
+      std::min(
+        static_cast<double>(quantizedWidth) /
+          sourceWidth,
+        static_cast<double>(quantizedHeight) /
+          sourceHeight));
+    int boundedWidth = std::max(
+      2, static_cast<int>(std::lround(
+        sourceWidth * scale)));
+    int boundedHeight = std::max(
+      2, static_cast<int>(std::lround(
+        sourceHeight * scale)));
+    boundedWidth =
+      std::min(fullHdWidth, boundedWidth);
+    boundedHeight =
+      std::min(fullHdHeight, boundedHeight);
+    // O limite solicitado é quantizado, mas o render final conserva a
+    // proporção da mídia. Isso evita recriar o reader por oscilações de 1 px
+    // sem introduzir uma tela 16:9 em volta de conteúdo 4:3 ou ultrawide.
+    decodeWidth = std::max(
+      2, boundedWidth - (boundedWidth & 1));
+    decodeHeight = std::max(
+      2, boundedHeight - (boundedHeight & 1));
+  }
+
+  bool rebuildSequentialComposition(
+    int decodeWidth,
+    int decodeHeight)
+  {
+    [sequentialComposition release];
+    sequentialComposition = nil;
+    if (!asset ||
+        decodeWidth <= 0 || decodeHeight <= 0) {
+      return false;
+    }
+
+    NSArray<AVAssetTrack*>* videoTracks =
+      [asset tracksWithMediaType:AVMediaTypeVideo];
+    if ([videoTracks count] == 0) return false;
+    AVAssetTrack* videoTrack =
+      [videoTracks objectAtIndex:0];
+    const CGSize naturalSize =
+      [videoTrack naturalSize];
+    const CGAffineTransform preferredTransform =
+      [videoTrack preferredTransform];
+    if (!std::isfinite(naturalSize.width) ||
+        !std::isfinite(naturalSize.height) ||
+        naturalSize.width <= 0.0 ||
+        naturalSize.height <= 0.0) {
+      return false;
+    }
+
+    const CGRect transformedRect = CGRectStandardize(
+      CGRectApplyAffineTransform(
+        CGRectMake(
+          0.0, 0.0,
+          naturalSize.width, naturalSize.height),
+        preferredTransform));
+    const double displayWidth =
+      static_cast<double>(transformedRect.size.width);
+    const double displayHeight =
+      static_cast<double>(transformedRect.size.height);
+    if (!std::isfinite(displayWidth) ||
+        !std::isfinite(displayHeight) ||
+        !std::isfinite(transformedRect.origin.x) ||
+        !std::isfinite(transformedRect.origin.y) ||
+        displayWidth <= 0.0 ||
+        displayHeight <= 0.0) {
+      return false;
+    }
+    const bool portraitSource =
+      displayHeight > displayWidth;
+    const int fullHdWidth =
+      portraitSource ? 1080 : 1920;
+    const int fullHdHeight =
+      portraitSource ? 1920 : 1080;
+    if (decodeWidth > fullHdWidth ||
+        decodeHeight > fullHdHeight) {
+      return false;
+    }
+
+    const double fittedScale = std::min(
+      1.0,
+      std::min(
+        static_cast<double>(decodeWidth) /
+          displayWidth,
+        static_cast<double>(decodeHeight) /
+          displayHeight));
+    const double offsetX = std::max(
+      0.0,
+      (static_cast<double>(decodeWidth) -
+        displayWidth * fittedScale) * 0.5);
+    const double offsetY = std::max(
+      0.0,
+      (static_cast<double>(decodeHeight) -
+        displayHeight * fittedScale) * 0.5);
+    // Normaliza a origem produzida pelo preferredTransform, escala os seis
+    // coeficientes de forma uniforme e centraliza qualquer sobra causada
+    // pelo arredondamento para dimensões pares.
+    const CGAffineTransform fittedTransform =
+      CGAffineTransformMake(
+        preferredTransform.a * fittedScale,
+        preferredTransform.b * fittedScale,
+        preferredTransform.c * fittedScale,
+        preferredTransform.d * fittedScale,
+        offsetX +
+          (preferredTransform.tx -
+            CGRectGetMinX(transformedRect)) *
+            fittedScale,
+        offsetY +
+          (preferredTransform.ty -
+            CGRectGetMinY(transformedRect)) *
+            fittedScale);
+
+    CMTimeRange instructionTimeRange =
+      [videoTrack timeRange];
+    const CMTime duration = [asset duration];
+    if (CMTIME_IS_NUMERIC(duration) &&
+        CMTimeCompare(duration, kCMTimeZero) > 0) {
+      instructionTimeRange =
+        CMTimeRangeMake(kCMTimeZero, duration);
+    }
+    if (!CMTIMERANGE_IS_VALID(instructionTimeRange) ||
+        !CMTIME_IS_NUMERIC(instructionTimeRange.start) ||
+        !CMTIME_IS_NUMERIC(instructionTimeRange.duration) ||
+        CMTimeCompare(
+          instructionTimeRange.duration,
+          kCMTimeZero) <= 0) {
+      return false;
+    }
+
+    AVMutableVideoComposition* nextComposition =
+      [[AVMutableVideoComposition
+        videoComposition] retain];
+    AVMutableVideoCompositionInstruction* instruction =
+      [AVMutableVideoCompositionInstruction
+        videoCompositionInstruction];
+    AVMutableVideoCompositionLayerInstruction*
+      layerInstruction =
+        [AVMutableVideoCompositionLayerInstruction
+          videoCompositionLayerInstructionWithAssetTrack:
+            videoTrack];
+    if (!nextComposition ||
+        !instruction || !layerInstruction) {
+      [nextComposition release];
+      return false;
+    }
+
+    nextComposition.renderSize =
+      CGSizeMake(decodeWidth, decodeHeight);
+    nextComposition.frameDuration =
+      CMTimeMakeWithSeconds(
+        std::max(
+          1.0 / 240.0,
+          std::min(1.0, frameDuration)),
+        60000);
+    [layerInstruction
+      setTransform:fittedTransform
+      atTime:instructionTimeRange.start];
+    instruction.timeRange = instructionTimeRange;
+    instruction.layerInstructions =
+      @[layerInstruction];
+    nextComposition.instructions =
+      @[instruction];
+    sequentialComposition = nextComposition;
+    return true;
+  }
+
   bool open(
     const std::string& utf8Path,
     int requestedWidth,
     int requestedHeight)
   {
-    const int wantedWidth = std::max(2, requestedWidth);
-    const int wantedHeight = std::max(2, requestedHeight);
-    // O teleprompt da extensão usa a resolução real da tela. A redução de
-    // qualidade pertence apenas aos apps remotos e não pode limitar o vídeo
-    // nativo a 960x540, especialmente em monitores Retina/4K.
-    const int decodeWidth = wantedWidth;
-    const int decodeHeight = wantedHeight;
-
     if (generator &&
-        path == utf8Path &&
-        maximumWidth == decodeWidth &&
-        maximumHeight == decodeHeight) {
+        path == utf8Path) {
+      int decodeWidth = 2;
+      int decodeHeight = 2;
+      calculateDecodeSize(
+        requestedWidth,
+        requestedHeight,
+        decodeWidth,
+        decodeHeight);
+      if (maximumWidth != decodeWidth ||
+          maximumHeight != decodeHeight) {
+        // Resize não reabre o asset, mas precisa reconstruir o compositor na
+        // resolução final. Manter o renderSize original faria um arquivo 4K
+        // continuar criando superfícies 4K antes do downscale.
+        clearSequentialReader();
+        generator.maximumSize =
+          CGSizeMake(decodeWidth, decodeHeight);
+        maximumWidth = decodeWidth;
+        maximumHeight = decodeHeight;
+        sequentialUnsupported =
+          !rebuildSequentialComposition(
+            decodeWidth, decodeHeight);
+        sequentialReachedEnd = false;
+        sequentialNeedsMoreSamples = false;
+        sequentialReaderProducedFrame = false;
+        // O cache de pausa depende também do maximumSize. Sem invalidá-lo,
+        // entrar em tela cheia parado reutilizava indefinidamente o bitmap
+        // pequeno gerado antes do resize.
+        pixels.reset();
+        width = 0;
+        height = 0;
+        frameTimestamp = -1.0;
+      }
       return true;
     }
 
@@ -156,6 +458,30 @@ struct Decoder::Impl {
       return false;
     }
     AVAssetTrack* videoTrack = [videoTracks objectAtIndex:0];
+    const CGSize naturalSize =
+      videoTrack ? [videoTrack naturalSize] : CGSizeZero;
+    const CGAffineTransform preferredTransform =
+      videoTrack
+        ? [videoTrack preferredTransform]
+        : CGAffineTransformIdentity;
+    const CGRect displayRect = CGRectApplyAffineTransform(
+      CGRectMake(
+        0.0, 0.0,
+        naturalSize.width, naturalSize.height),
+      preferredTransform);
+    sourceDisplayWidth = std::max(
+      1, static_cast<int>(std::lround(
+        std::fabs(displayRect.size.width))));
+    sourceDisplayHeight = std::max(
+      1, static_cast<int>(std::lround(
+        std::fabs(displayRect.size.height))));
+    int decodeWidth = 2;
+    int decodeHeight = 2;
+    calculateDecodeSize(
+      requestedWidth,
+      requestedHeight,
+      decodeWidth,
+      decodeHeight);
     const float nominalFrameRate =
       videoTrack ? [videoTrack nominalFrameRate] : 0.0f;
     if (nominalFrameRate > 0.1f) {
@@ -164,19 +490,35 @@ struct Decoder::Impl {
         std::min(1.0,
           1.0 / static_cast<double>(nominalFrameRate)));
     }
+    const CMTime assetDuration = [asset duration];
+    if (CMTIME_IS_NUMERIC(assetDuration)) {
+      const double seconds =
+        CMTimeGetSeconds(assetDuration);
+      if (std::isfinite(seconds) && seconds > 0.0) {
+        assetDurationSeconds = seconds;
+      }
+    }
 
     generator =
       [[AVAssetImageGenerator alloc] initWithAsset:asset];
     generator.appliesPreferredTrackTransform = YES;
     generator.maximumSize =
       CGSizeMake(decodeWidth, decodeHeight);
-    // Aceita o quadro real mais próximo, mas nunca um salto grande. Isso
-    // evita buscar novamente o mesmo GOP por diferenças sub-frame do relógio.
+    // Aceita o quadro real mais próximo dentro da metade de um frame. Uma
+    // tolerância de 1/120 s forçava seeks quase exatos em cada quadro e fazia
+    // o AVAssetImageGenerator reprocessar GOPs continuamente.
     const CMTime tolerance = CMTimeMakeWithSeconds(
-      std::min(1.0 / 120.0, frameDuration * 0.45),
+      std::max(
+        1.0 / 600.0,
+        std::min(0.05, frameDuration * 0.55)),
       60000);
     generator.requestedTimeToleranceBefore = tolerance;
     generator.requestedTimeToleranceAfter = tolerance;
+    // Se a composição não for válida, o ImageGenerator continua sendo um
+    // fallback correto, já com a orientação e o mesmo teto Full HD.
+    sequentialUnsupported =
+      !rebuildSequentialComposition(
+        decodeWidth, decodeHeight);
     path = utf8Path;
     maximumWidth = decodeWidth;
     maximumHeight = decodeHeight;
@@ -184,18 +526,372 @@ struct Decoder::Impl {
     return true;
   }
 
-  bool decode(double sourceTime)
+  bool startSequentialReader(double sourceTime)
+  {
+    if (!asset || sequentialUnsupported) return false;
+    clearSequentialReader();
+
+    NSArray<AVAssetTrack*>* videoTracks =
+      [asset tracksWithMediaType:AVMediaTypeVideo];
+    if ([videoTracks count] == 0) return false;
+    NSArray<AVAssetTrack*>* compositionTracks =
+      [NSArray arrayWithObject:
+        [videoTracks objectAtIndex:0]];
+
+    NSError* error = nil;
+    AVAssetReader* nextReader =
+      [[AVAssetReader alloc] initWithAsset:asset error:&error];
+    if (!nextReader) {
+      statusCode = error
+        ? static_cast<int>([error code])
+        : -206;
+      sequentialUnsupported = true;
+      return false;
+    }
+
+    double displayWidth =
+      static_cast<double>(sourceDisplayWidth);
+    double displayHeight =
+      static_cast<double>(sourceDisplayHeight);
+    if (sequentialComposition) {
+      const CGSize renderSize =
+        [sequentialComposition renderSize];
+      if (renderSize.width > 0.0 &&
+          renderSize.height > 0.0) {
+        displayWidth = renderSize.width;
+        displayHeight = renderSize.height;
+      }
+    }
+    const double outputScale = std::min(
+      1.0,
+      std::min(
+        static_cast<double>(
+          std::max(2, maximumWidth)) /
+          displayWidth,
+        static_cast<double>(
+          std::max(2, maximumHeight)) /
+          displayHeight));
+    int readerOutputWidth = std::max(
+      2, static_cast<int>(std::lround(
+        displayWidth * outputScale)));
+    int readerOutputHeight = std::max(
+      2, static_cast<int>(std::lround(
+        displayHeight * outputScale)));
+    readerOutputWidth -= readerOutputWidth & 1;
+    readerOutputHeight -= readerOutputHeight & 1;
+    NSDictionary* outputSettings = @{
+      (id)kCVPixelBufferPixelFormatTypeKey:
+        @(kCVPixelFormatType_32BGRA),
+      (id)kCVPixelBufferWidthKey:
+        @(readerOutputWidth),
+      (id)kCVPixelBufferHeightKey:
+        @(readerOutputHeight)
+    };
+    AVAssetReaderVideoCompositionOutput* nextOutput =
+      [[AVAssetReaderVideoCompositionOutput alloc]
+        initWithVideoTracks:compositionTracks
+              videoSettings:outputSettings];
+    if (!nextOutput) {
+      [nextReader release];
+      statusCode = -207;
+      sequentialUnsupported = true;
+      return false;
+    }
+    nextOutput.alwaysCopiesSampleData = NO;
+    if (sequentialComposition) {
+      nextOutput.videoComposition =
+        sequentialComposition;
+    }
+    if (![nextReader canAddOutput:nextOutput]) {
+      [nextOutput release];
+      [nextReader release];
+      statusCode = -208;
+      sequentialUnsupported = true;
+      return false;
+    }
+    [nextReader addOutput:nextOutput];
+
+    const double readerStartSeconds = std::max(
+      0.0, sourceTime - frameDuration * 1.5);
+    const CMTime readerStart =
+      CMTimeMakeWithSeconds(readerStartSeconds, 60000);
+    const CMTime assetDuration = [asset duration];
+    if (CMTIME_IS_NUMERIC(assetDuration) &&
+        CMTimeCompare(assetDuration, readerStart) > 0) {
+      nextReader.timeRange = CMTimeRangeMake(
+        readerStart,
+        CMTimeSubtract(assetDuration, readerStart));
+    }
+    if (![nextReader startReading]) {
+      NSError* readerError = [nextReader error];
+      statusCode = readerError
+        ? static_cast<int>([readerError code])
+        : -209;
+      [nextOutput release];
+      [nextReader release];
+      sequentialUnsupported = true;
+      return false;
+    }
+
+    sequentialReader = nextReader;
+    sequentialOutput = nextOutput;
+    sequentialFrameTimestamp = -1.0;
+    sequentialCursorTimestamp = -1.0;
+    sequentialReachedEnd = false;
+    sequentialNeedsMoreSamples = false;
+    sequentialReaderProducedFrame = false;
+    return true;
+  }
+
+  bool copySequentialSample(
+    CMSampleBufferRef sample,
+    double timestamp)
+  {
+    if (!sample) return false;
+    CVPixelBufferRef pixelBuffer =
+      CMSampleBufferGetImageBuffer(sample);
+    if (!pixelBuffer ||
+        CVPixelBufferGetPixelFormatType(pixelBuffer) !=
+          kCVPixelFormatType_32BGRA ||
+        CVPixelBufferLockBaseAddress(
+          pixelBuffer, kCVPixelBufferLock_ReadOnly) !=
+          kCVReturnSuccess) {
+      return false;
+    }
+
+    const std::size_t sampleWidth =
+      CVPixelBufferGetWidth(pixelBuffer);
+    const std::size_t sampleHeight =
+      CVPixelBufferGetHeight(pixelBuffer);
+    const std::size_t sourceStride =
+      CVPixelBufferGetBytesPerRow(pixelBuffer);
+    const auto* source =
+      static_cast<const std::uint8_t*>(
+        CVPixelBufferGetBaseAddress(pixelBuffer));
+    const std::size_t sourceRowBytes =
+      sampleWidth * 4u;
+    if (!source ||
+        sampleWidth == 0 || sampleHeight == 0 ||
+        sourceStride < sourceRowBytes ||
+        sampleWidth >
+          static_cast<std::size_t>(
+            std::numeric_limits<int>::max()) ||
+        sampleHeight >
+          static_cast<std::size_t>(
+            std::numeric_limits<int>::max())) {
+      CVPixelBufferUnlockBaseAddress(
+        pixelBuffer, kCVPixelBufferLock_ReadOnly);
+      return false;
+    }
+
+    const double outputScale = std::min(
+      1.0,
+      std::min(
+        static_cast<double>(
+          std::max(2, maximumWidth)) /
+          static_cast<double>(sampleWidth),
+        static_cast<double>(
+          std::max(2, maximumHeight)) /
+          static_cast<double>(sampleHeight)));
+    const std::size_t outputWidth = std::max<std::size_t>(
+      2,
+      static_cast<std::size_t>(std::lround(
+        sampleWidth * outputScale)));
+    const std::size_t outputHeight = std::max<std::size_t>(
+      2,
+      static_cast<std::size_t>(std::lround(
+        sampleHeight * outputScale)));
+    const std::size_t outputRowBytes =
+      outputWidth * 4u;
+    if (outputHeight >
+        std::numeric_limits<std::size_t>::max() /
+          outputRowBytes) {
+      CVPixelBufferUnlockBaseAddress(
+        pixelBuffer, kCVPixelBufferLock_ReadOnly);
+      return false;
+    }
+    auto nextPixels =
+      acquirePixelBuffer(
+        outputRowBytes * outputHeight);
+    bool copied = false;
+    if (outputWidth == sampleWidth &&
+        outputHeight == sampleHeight) {
+      for (std::size_t row = 0;
+           row < sampleHeight;
+           ++row) {
+        std::memcpy(
+          nextPixels->data() +
+            row * outputRowBytes,
+          source + row * sourceStride,
+          outputRowBytes);
+      }
+      copied = true;
+    } else {
+      vImage_Buffer sourceBuffer{
+        const_cast<std::uint8_t*>(source),
+        static_cast<vImagePixelCount>(sampleHeight),
+        static_cast<vImagePixelCount>(sampleWidth),
+        sourceStride
+      };
+      vImage_Buffer destinationBuffer{
+        nextPixels->data(),
+        static_cast<vImagePixelCount>(outputHeight),
+        static_cast<vImagePixelCount>(outputWidth),
+        outputRowBytes
+      };
+      const vImage_Flags scaleFlags =
+        kvImageHighQualityResampling;
+      const vImage_Error workspaceBytes =
+        vImageScale_ARGB8888(
+          &sourceBuffer,
+          &destinationBuffer,
+          nullptr,
+          scaleFlags |
+            kvImageGetTempBufferSize);
+      if (workspaceBytes > 0 &&
+          static_cast<std::size_t>(workspaceBytes) >
+            vImageWorkspace.size()) {
+        vImageWorkspace.resize(
+          static_cast<std::size_t>(
+            workspaceBytes));
+      }
+      copied =
+        workspaceBytes >= 0 &&
+        vImageScale_ARGB8888(
+          &sourceBuffer,
+          &destinationBuffer,
+          vImageWorkspace.empty()
+            ? nullptr
+            : vImageWorkspace.data(),
+          scaleFlags) ==
+        kvImageNoError;
+    }
+    CVPixelBufferUnlockBaseAddress(
+      pixelBuffer, kCVPixelBufferLock_ReadOnly);
+    if (!copied) return false;
+
+    pixels = std::move(nextPixels);
+    width = static_cast<int>(outputWidth);
+    height = static_cast<int>(outputHeight);
+    frameTimestamp = timestamp;
+    sequentialFrameTimestamp = timestamp;
+    sequentialCursorTimestamp = timestamp;
+    sequentialReaderProducedFrame = true;
+    statusCode = 4;
+    return true;
+  }
+
+  double clampSourceTime(double sourceTime) const
+  {
+    const double safeTime = std::max(0.0, sourceTime);
+    if (assetDurationSeconds <= 0.0) {
+      return safeTime;
+    }
+    const double lastFrameTime = std::max(
+      0.0,
+      assetDurationSeconds -
+        std::max(1.0 / 600.0, frameDuration));
+    return std::min(safeTime, lastFrameTime);
+  }
+
+  bool decodeSequentialFrame(
+    double sourceTime,
+    bool forceRestart)
+  {
+    const double safeTime =
+      clampSourceTime(sourceTime);
+    if (forceRestart) {
+      clearSequentialReader();
+      sequentialReachedEnd = false;
+    }
+    sequentialNeedsMoreSamples = false;
+    if (sequentialReachedEnd) {
+      return sequentialReaderProducedFrame &&
+        pixels && !pixels->empty();
+    }
+    const bool needsRestart =
+      !sequentialReader || !sequentialOutput ||
+      (sequentialCursorTimestamp >= 0.0 &&
+       safeTime <
+         sequentialCursorTimestamp -
+           frameDuration * 0.75);
+    if (needsRestart &&
+        !startSequentialReader(safeTime)) {
+      return false;
+    }
+
+    if (sequentialFrameTimestamp >= 0.0 &&
+        safeTime <=
+          sequentialFrameTimestamp + frameDuration * 0.75) {
+      return pixels && !pixels->empty();
+    }
+
+    // O reader é sequencial: atraso normal descarta quadros até alcançar o
+    // relógio, sem reconstruir asset/composição. Um teto amplo impede arquivo
+    // corrompido de prender a worker, mas jamais publica um quadro atrasado
+    // só porque o teto foi atingido.
+    constexpr int maximumSamplesPerPass = 240;
+    for (int attempt = 0;
+         attempt < maximumSamplesPerPass;
+         ++attempt) {
+      CMSampleBufferRef sample =
+        [sequentialOutput copyNextSampleBuffer];
+      if (!sample) {
+        AVAssetReaderStatus readerStatus =
+          [sequentialReader status];
+        NSError* readerError = [sequentialReader error];
+        if (readerStatus ==
+            AVAssetReaderStatusCompleted) {
+          sequentialReachedEnd = true;
+          statusCode = 5;
+          return sequentialReaderProducedFrame &&
+            pixels && !pixels->empty();
+        }
+        statusCode = readerError
+          ? static_cast<int>([readerError code])
+          : -211;
+        sequentialUnsupported = true;
+        clearSequentialReader();
+        return false;
+      }
+
+      const CMTime presentationTime =
+        CMSampleBufferGetPresentationTimeStamp(sample);
+      const double timestamp =
+        CMTIME_IS_NUMERIC(presentationTime)
+          ? CMTimeGetSeconds(presentationTime)
+          : safeTime;
+      sequentialCursorTimestamp = timestamp;
+      const bool reachedTarget =
+        timestamp >= safeTime - frameDuration * 0.25;
+      if (reachedTarget) {
+        const bool copied =
+          copySequentialSample(sample, timestamp);
+        CFRelease(sample);
+        return copied;
+      }
+      CFRelease(sample);
+    }
+    // Mantém o último snapshot visível e continua drenando imediatamente na
+    // próxima passagem; não publica deliberadamente um frame defasado.
+    sequentialNeedsMoreSamples = true;
+    return false;
+  }
+
+  bool decodeStillFrame(double sourceTime)
   {
     if (!generator) return false;
-    if (!pixels.empty() &&
-        std::abs(sourceTime - frameTimestamp) <
-          std::max(1.0 / 240.0, frameDuration * 0.65)) {
+    const double safeTime =
+      clampSourceTime(sourceTime);
+    if (pixels && !pixels->empty() &&
+        std::abs(safeTime - frameTimestamp) <
+          std::max(1.0 / 240.0, frameDuration * 0.90)) {
       return true;
     }
 
     const CMTime requested =
       CMTimeMakeWithSeconds(
-        std::max(0.0, sourceTime), 60000);
+        safeTime, 60000);
     CMTime actual = kCMTimeZero;
     NSError* error = nil;
     CGImageRef image =
@@ -219,12 +915,21 @@ struct Decoder::Impl {
 
     const std::size_t stride =
       static_cast<std::size_t>(width) * 4u;
-    pixels.assign(
-      stride * static_cast<std::size_t>(height), 0);
+    if (static_cast<std::size_t>(height) >
+        std::numeric_limits<std::size_t>::max() /
+          stride) {
+      CGImageRelease(image);
+      statusCode = -205;
+      return false;
+    }
+    auto nextPixels = acquirePixelBuffer(
+      stride * static_cast<std::size_t>(height));
+    std::fill(
+      nextPixels->begin(), nextPixels->end(), 0);
     CGColorSpaceRef colorSpace =
       CGColorSpaceCreateDeviceRGB();
     CGContextRef context = CGBitmapContextCreate(
-      pixels.data(), static_cast<std::size_t>(width),
+      nextPixels->data(), static_cast<std::size_t>(width),
       static_cast<std::size_t>(height), 8, stride,
       colorSpace,
       kCGBitmapByteOrder32Little |
@@ -236,9 +941,9 @@ struct Decoder::Impl {
       return false;
     }
 
-    CGContextTranslateCTM(
-      context, 0.0, static_cast<CGFloat>(height));
-    CGContextScaleCTM(context, 1.0, -1.0);
+    // copyCGImageAtTime já entrega o CGImage com a transformação preferida
+    // aplicada. O flip adicional usado aqui invertia somente o vídeo no Mac;
+    // imagens vindas do LICE já chegavam na orientação correta.
     CGContextDrawImage(
       context,
       CGRectMake(0.0, 0.0,
@@ -247,37 +952,83 @@ struct Decoder::Impl {
       image);
     CGContextRelease(context);
     CGImageRelease(image);
+    pixels = std::move(nextPixels);
 
     frameTimestamp =
       CMTIME_IS_NUMERIC(actual)
         ? CMTimeGetSeconds(actual)
-        : sourceTime;
+        : safeTime;
     statusCode = 2;
     return true;
   }
 
-  void publishCurrentFrame(
+  bool decode(
+    double sourceTime,
+    bool playing,
+    bool forceRestart)
+  {
+    if (playing && !sequentialUnsupported) {
+      if (decodeSequentialFrame(
+            sourceTime, forceRestart)) {
+        return true;
+      }
+      if (sequentialReachedEnd &&
+          sequentialReaderProducedFrame &&
+          pixels && !pixels->empty()) {
+        return true;
+      }
+      if (sequentialReachedEnd) {
+        // Seek direto no fim pode não publicar amostra sequencial. O
+        // ImageGenerator resolve uma única imagem final sem declarar o
+        // formato incompatível nem recriar readers em loop.
+        const bool decodedFinal =
+          decodeStillFrame(sourceTime);
+        sequentialReaderProducedFrame =
+          decodedFinal;
+        return decodedFinal;
+      }
+      if (sequentialNeedsMoreSamples) {
+        return pixels && !pixels->empty();
+      }
+      // Formatos que não aceitem AVAssetReader continuam funcionais pelo
+      // extrator de quadro, mas o caminho normal de reprodução é sequencial.
+      sequentialUnsupported = true;
+      clearSequentialReader();
+      return decodeStillFrame(sourceTime);
+    }
+    if (sequentialReader || sequentialOutput) {
+      clearSequentialReader();
+    }
+    sequentialReachedEnd = false;
+    sequentialNeedsMoreSamples = false;
+    return decodeStillFrame(sourceTime);
+  }
+
+  bool publishCurrentFrame(
     const PlaybackRequest& processed)
   {
-    if (pixels.empty() ||
+    if (!pixels || pixels->empty() ||
         width <= 0 || height <= 0) {
-      return;
+      return false;
     }
-    auto snapshot =
-      std::make_shared<std::vector<std::uint8_t>>(pixels);
     std::lock_guard<std::mutex> lock(stateMutex);
     if (!hasRequest ||
         request.path != path ||
-        request.playbackKey != processed.playbackKey) {
-      return;
+        request.playbackKey != processed.playbackKey ||
+        request.serial != processed.serial) {
+      return false;
     }
-    publishedPixels = std::move(snapshot);
+    // Cada decode cria um buffer novo. Publicar o mesmo shared_ptr elimina
+    // uma cópia integral por quadro sem permitir que a worker altere um
+    // snapshot que a interface ainda esteja desenhando.
+    publishedPixels = pixels;
     publishedPath = path;
     publishedPlaybackKey = processed.playbackKey;
     publishedWidth = width;
     publishedHeight = height;
     publishedStride = width * 4;
     publishedTimestamp = frameTimestamp;
+    return true;
   }
 
   void waitForWork(
@@ -299,6 +1050,7 @@ struct Decoder::Impl {
     std::string lastPublishedPlaybackKey;
     int lastPublishedWidth = 0;
     int lastPublishedHeight = 0;
+    std::uint64_t lastHandledSerial = 0;
     for (;;) {
       PlaybackRequest current;
       {
@@ -320,8 +1072,12 @@ struct Decoder::Impl {
         lastPublishedPlaybackKey.clear();
         lastPublishedWidth = 0;
         lastPublishedHeight = 0;
+        lastHandledSerial = current.serial;
         {
           std::lock_guard<std::mutex> lock(stateMutex);
+          handledRequestSerial =
+            std::max(
+              handledRequestSerial, current.serial);
           if (request.serial == current.serial) {
             hasRequest = false;
           }
@@ -343,13 +1099,26 @@ struct Decoder::Impl {
           elapsed * current.playbackRate);
 
       bool decoded = false;
+      const bool forceRestart =
+        current.discontinuity &&
+        current.serial != lastHandledSerial;
       @autoreleasepool {
         decoded =
           open(
             current.path,
             current.requestedWidth,
             current.requestedHeight) &&
-          decode(targetTime);
+          decode(
+            targetTime,
+            current.playing,
+            forceRestart);
+      }
+      lastHandledSerial = current.serial;
+      {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        handledRequestSerial =
+          std::max(
+            handledRequestSerial, current.serial);
       }
       if (decoded &&
           (lastPublishedPath != path ||
@@ -359,22 +1128,58 @@ struct Decoder::Impl {
            std::abs(
              lastPublishedTimestamp - frameTimestamp) >
              0.000001)) {
-        publishCurrentFrame(current);
-        lastPublishedPath = path;
-        lastPublishedPlaybackKey = current.playbackKey;
-        lastPublishedWidth = width;
-        lastPublishedHeight = height;
-        lastPublishedTimestamp = frameTimestamp;
+        if (publishCurrentFrame(current)) {
+          lastPublishedPath = path;
+          lastPublishedPlaybackKey =
+            current.playbackKey;
+          lastPublishedWidth = width;
+          lastPublishedHeight = height;
+          lastPublishedTimestamp = frameTimestamp;
+        }
       }
 
       {
         std::lock_guard<std::mutex> lock(stateMutex);
         if (stopRequested) break;
       }
-      waitForWork(
-        current,
-        std::chrono::milliseconds(
-          current.playing ? 8 : 40));
+      const bool atSourceEnd =
+        assetDurationSeconds > 0.0 &&
+        targetTime >=
+          assetDurationSeconds -
+            frameDuration * 0.5;
+      if (current.playing &&
+          (sequentialReachedEnd || atSourceEnd)) {
+        waitForWork(
+          current, std::chrono::milliseconds(80));
+      } else if (current.playing &&
+          sequentialFrameTimestamp >= 0.0) {
+        const auto afterDecode =
+          std::chrono::steady_clock::now();
+        const double liveTarget = std::max(
+          0.0,
+          current.sourceTime +
+            std::chrono::duration<double>(
+              afterDecode - current.sampledAt).count() *
+            current.playbackRate);
+        const double secondsUntilNext =
+          (sequentialFrameTimestamp +
+             frameDuration * 0.75 -
+             liveTarget) /
+          std::max(0.1, current.playbackRate);
+        const int waitMs = std::max(
+          1,
+          std::min(
+            20,
+            static_cast<int>(std::lround(
+              secondsUntilNext * 1000.0))));
+        waitForWork(
+          current, std::chrono::milliseconds(waitMs));
+      } else {
+        waitForWork(
+          current,
+          std::chrono::milliseconds(
+            current.playing ? 12 : 40));
+      }
     }
 
     @autoreleasepool {
@@ -425,7 +1230,11 @@ struct Decoder::Impl {
           lastObservedSourceTime +
           std::chrono::duration<double>(
             now - lastObservedAt).count() * safeRate;
+        const bool clockRegressed =
+          safeTime <
+            lastObservedSourceTime - 0.010;
         explicitTransportJump =
+          clockRegressed ||
           std::abs(safeTime - expectedExternalTime) > 0.30;
       }
 
@@ -469,8 +1278,17 @@ struct Decoder::Impl {
         outputSizeChanged ||
         !hasRequest;
       if (!changed) return;
+      const bool pendingDiscontinuity =
+        request.discontinuity &&
+        request.serial > handledRequestSerial;
       request.path = utf8Path;
       request.playbackKey = playbackKey;
+      request.discontinuity =
+        pendingDiscontinuity ||
+        identityChanged ||
+        explicitTransportJump ||
+        driftNeedsCorrection ||
+        stoppedPositionChanged;
       if (synchronizeClock) {
         request.sourceTime = safeTime;
         request.sampledAt = now;

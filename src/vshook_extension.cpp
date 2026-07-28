@@ -6936,6 +6936,20 @@ static std::string nativeFindSongNameAtPosition(const std::vector<NativeSongWind
 static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std::vector<NativeSongWindow>& songs, int slot, const std::string& trackName, bool transportPlaying, double playPos, const std::string& playingName)
 {
   const double pos = (transportPlaying && GetPlayPositionEx_ptr) ? playPos : (GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(project) : playPos);
+  double nextChangePosition =
+    std::numeric_limits<double>::infinity();
+  auto rememberNextChange = [&](double position) {
+    if (std::isfinite(position) &&
+        position > pos + 0.0005) {
+      nextChangePosition =
+        std::min(nextChangePosition, position);
+    }
+  };
+  for (const auto& song : songs) {
+    if (song.isBlock) continue;
+    rememberNextChange(song.start);
+    rememberNextChange(song.end);
+  }
   int trackIndex = -1;
   MediaTrack* track = nativeFindTrackByExactName(project, trackName, &trackIndex);
 
@@ -6997,6 +7011,8 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
       const double itemStart = GetMediaItemInfo_Value_ptr(currentItem, "D_POSITION");
       const double itemLen = std::max(0.0, GetMediaItemInfo_Value_ptr(currentItem, "D_LENGTH"));
       const double itemEnd = itemStart + itemLen;
+      rememberNextChange(itemStart);
+      rememberNextChange(itemEnd);
 
       MediaItem_Take* currentTake = currentItem && GetActiveTake_ptr ? GetActiveTake_ptr(currentItem) : nullptr;
       std::string currentMediaPath = nativeReadTakeSourcePath(currentTake);
@@ -7190,6 +7206,12 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   out << "\"mediaPlayrate\":" << nativeNumber(chosenMediaPlayrate) << ",";
   out << "\"mediaSourceLength\":" << nativeNumber(chosenMediaSourceLength) << ",";
   out << "\"mediaLoopsSource\":" << (chosenMediaLoopsSource ? "true" : "false") << ",";
+  out << "\"nextChangePosition\":"
+      << nativeNumber(
+           std::isfinite(nextChangePosition)
+             ? nextChangePosition
+             : -1.0)
+      << ",";
   out << "\"nextMediaFound\":" << (nextMediaFound ? "true" : "false") << ",";
   out << "\"nextMediaType\":" << nativeJsonString(nextMediaType) << ",";
   out << "\"nextMediaPath\":" << nativeJsonString(nextMediaPath) << ",";
@@ -37562,7 +37584,10 @@ struct NativeTelepromptRenderState {
   double mediaCurrentTime = 0.0;
   double mediaOffset = 0.0;
   double mediaPlayrate = 1.0;
+  double mediaSourceLength = 0.0;
+  bool mediaLoopsSource = false;
   double projectPosition = 0.0;
+  double nextChangePosition = -1.0;
   double itemStart = 0.0;
   double itemEnd = 0.0;
   double progressStart = 0.0;
@@ -37625,6 +37650,18 @@ struct NativeTelepromptTextLayoutCache {
 };
 static NativeTelepromptTextLayoutCache
   g_nativeTelepromptTextLayoutCache[2];
+
+struct NativeTelepromptRenderStateCache {
+  bool valid = false;
+  ReaProject* project = nullptr;
+  int projectChangeCount = -1;
+  int playState = -1;
+  double lastObservedPosition = 0.0;
+  std::chrono::steady_clock::time_point builtAt{};
+  NativeTelepromptRenderState state;
+};
+static NativeTelepromptRenderStateCache
+  g_nativeTelepromptRenderStateCache[2];
 
 static int nativeTelepromptIndex(int slot)
 {
@@ -38543,7 +38580,7 @@ static std::string nativeTelepromptDisplayText(
   return raw;
 }
 
-static NativeTelepromptRenderState nativeTelepromptReadRenderState(
+static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
   int slot)
 {
   NativeTelepromptRenderState state;
@@ -38678,6 +38715,11 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
       state.mediaPlayrate = std::max(
         0.000001, nativeTelepromptJsonNumber(
           liveState, "mediaPlayrate", 1.0));
+      state.mediaSourceLength = std::max(
+        0.0, nativeTelepromptJsonNumber(
+          liveState, "mediaSourceLength", 0.0));
+      state.mediaLoopsSource = nativeTelepromptJsonBool(
+        liveState, "mediaLoopsSource", false);
       state.itemStart = nativeTelepromptJsonNumber(
         liveState, "itemStart", 0.0);
       state.itemEnd = nativeTelepromptJsonNumber(
@@ -38686,6 +38728,9 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
         liveState, "progressStart", state.itemStart);
       state.progressEnd = nativeTelepromptJsonNumber(
         liveState, "progressEnd", state.itemEnd);
+      state.nextChangePosition =
+        nativeTelepromptJsonNumber(
+          liveState, "nextChangePosition", -1.0);
       const double liveItemPosition =
         nativeTelepromptJsonNumber(
           liveState, "position", livePosition);
@@ -38796,6 +38841,111 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
           static_cast<std::ptrdiff_t>(last));
     }
   }
+  return state;
+}
+
+static NativeTelepromptRenderState nativeTelepromptReadRenderState(
+  int slot)
+{
+  const int index = nativeTelepromptIndex(slot);
+  NativeTelepromptRenderStateCache& cache =
+    g_nativeTelepromptRenderStateCache[index];
+  const auto now = std::chrono::steady_clock::now();
+
+  ReaProject* project =
+    EnumProjects_ptr ? EnumProjects_ptr(-1, nullptr, 0) : nullptr;
+  const int projectChangeCount =
+    project && GetProjectStateChangeCount_ptr
+      ? GetProjectStateChangeCount_ptr(project)
+      : -1;
+  const int playState =
+    project && GetPlayStateEx_ptr
+      ? GetPlayStateEx_ptr(project)
+      : 0;
+  const bool livePlaying =
+    (playState & 1) == 1 || (playState & 4) == 4;
+  const bool transportPositionActive =
+    livePlaying || (playState & 2) == 2;
+  double livePosition = 0.0;
+  if (project) {
+    if (transportPositionActive && GetPlayPositionEx_ptr) {
+      livePosition = GetPlayPositionEx_ptr(project);
+    } else if (GetCursorPositionEx_ptr) {
+      livePosition = GetCursorPositionEx_ptr(project);
+    }
+  }
+
+  bool rebuild =
+    !cache.valid ||
+    cache.project != project ||
+    cache.projectChangeCount != projectChangeCount ||
+    cache.playState != playState;
+  if (!rebuild) {
+    const auto cacheAgeMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - cache.builtAt).count();
+    // O snapshot, fila e cronômetro não fazem parte da revisão do projeto.
+    // Uma atualização curta mantém esses dados responsivos sem reler a pista
+    // e reconstruir JSON em todo repaint de 16 ms.
+    rebuild = cacheAgeMs >= 100;
+  }
+  if (!rebuild &&
+      livePosition < cache.lastObservedPosition - 0.0005) {
+    // Seek para trás ou retorno de loop precisa resolver imediatamente qual
+    // item está ativo; o próximo limite conhecido só cobre avanço.
+    rebuild = true;
+  }
+  if (!rebuild &&
+      cache.state.nextChangePosition >= 0.0 &&
+      livePosition >= cache.state.nextChangePosition - 0.0005) {
+    // Inícios/fins de itens e regiões são publicados pelo último scan. Assim
+    // a troca de letra/mídia continua no quadro correto mesmo com o cache.
+    rebuild = true;
+  }
+
+  if (rebuild) {
+    cache.state = nativeTelepromptBuildRenderState(slot);
+    cache.valid = true;
+    cache.project = project;
+    cache.projectChangeCount = projectChangeCount;
+    cache.playState = playState;
+    cache.builtAt = now;
+  }
+
+  NativeTelepromptRenderState state = cache.state;
+  state.projectPosition = livePosition;
+  state.playing = livePlaying;
+  state.progress =
+    state.progressEnd > state.progressStart + 0.000001
+      ? nativeTelepromptClamp(
+          (livePosition - state.progressStart) /
+            (state.progressEnd - state.progressStart),
+          0.0, 1.0)
+      : 0.0;
+  if (state.mediaType == "image" ||
+      state.mediaType == "video") {
+    const double linearSourceTime =
+      state.mediaOffset +
+      (std::max(0.0, livePosition - state.itemStart) *
+        state.mediaPlayrate);
+    if (state.mediaLoopsSource &&
+        state.mediaSourceLength > 0.000001) {
+      state.mediaCurrentTime =
+        std::fmod(linearSourceTime, state.mediaSourceLength);
+      if (state.mediaCurrentTime < 0.0) {
+        state.mediaCurrentTime += state.mediaSourceLength;
+      }
+    } else {
+      state.mediaCurrentTime =
+        std::max(0.0, linearSourceTime);
+    }
+  }
+
+  cache.state.projectPosition = state.projectPosition;
+  cache.state.playing = state.playing;
+  cache.state.progress = state.progress;
+  cache.state.mediaCurrentTime = state.mediaCurrentTime;
+  cache.lastObservedPosition = livePosition;
   return state;
 }
 
@@ -39406,7 +39556,46 @@ static void nativeTelepromptReleaseMediaFrame(
   frame.keepPreviewAlive = false;
 }
 
-#ifdef _WIN32
+static void nativeTelepromptClampToFullHd(
+  int requestedWidth,
+  int requestedHeight,
+  int& outputWidth,
+  int& outputHeight)
+{
+  const int safeWidth = std::max(1, requestedWidth);
+  const int safeHeight = std::max(1, requestedHeight);
+  const bool portrait = safeHeight > safeWidth;
+  const int maximumWidth = portrait ? 1080 : 1920;
+  const int maximumHeight = portrait ? 1920 : 1080;
+  const double scale = std::min(
+    1.0,
+    std::min(
+      static_cast<double>(maximumWidth) / safeWidth,
+      static_cast<double>(maximumHeight) / safeHeight));
+  outputWidth = std::max(
+    1, static_cast<int>(std::lround(
+      safeWidth * scale)));
+  outputHeight = std::max(
+    1, static_cast<int>(std::lround(
+      safeHeight * scale)));
+}
+
+static void nativeTelepromptClampDecodeRequest(
+  int requestedWidth,
+  int requestedHeight,
+  int& outputWidth,
+  int& outputHeight)
+{
+  // A orientação da mídia só é conhecida pelo decoder. Um limite quadrado
+  // de 1920 permite que ele escolha 1920x1080 (paisagem) ou 1080x1920
+  // (retrato), sem que a orientação da janela reduza o eixo errado.
+  outputWidth = std::max(
+    1, std::min(1920, requestedWidth));
+  outputHeight = std::max(
+    1, std::min(1920, requestedHeight));
+}
+
+#if defined(_WIN32) || defined(__APPLE__)
 static bool nativeTelepromptDrawPlatformVideoDirect(
   HDC dc,
   int slot,
@@ -39430,6 +39619,32 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
     1, static_cast<int>(available.right - available.left));
   const int availableH = std::max(
     1, static_cast<int>(available.bottom - available.top));
+  const double scaleLimit = nativeTelepromptClamp(
+    settings.mediaScale, 0.25, 3.0);
+  // O decoder prepara somente a resolução física que realmente será
+  // exibida. Zoom menor que 1 não precisa carregar um quadro de tela cheia.
+  double sourceScale = scaleLimit;
+#ifdef __APPLE__
+  sourceScale *= VSHookMacTelepromptBackingScale(
+    g_nativeTelepromptWindows[index].hwnd);
+#endif
+  const int uncappedRequestedWidth = std::max(
+    1, std::min(
+      65535,
+      static_cast<int>(std::lround(
+        availableW * sourceScale))));
+  const int uncappedRequestedHeight = std::max(
+    1, std::min(
+      65535,
+      static_cast<int>(std::lround(
+        availableH * sourceScale))));
+  int requestedWidth = 1;
+  int requestedHeight = 1;
+  nativeTelepromptClampDecodeRequest(
+    uncappedRequestedWidth,
+    uncappedRequestedHeight,
+    requestedWidth,
+    requestedHeight);
   vshook_video::DecodedFrame decoded;
   if (!g_nativeTelepromptPlatformVideoDecoder[index]->frameAt(
         state.mediaPath,
@@ -39437,8 +39652,8 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
         state.mediaCurrentTime,
         state.playing,
         state.mediaPlayrate,
-        availableW,
-        availableH,
+        requestedWidth,
+        requestedHeight,
         decoded) ||
       !decoded.pixels ||
       decoded.width <= 0 ||
@@ -39455,8 +39670,6 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
     return false;
   }
 
-  const double scaleLimit = nativeTelepromptClamp(
-    settings.mediaScale, 0.25, 3.0);
   const double fitScale = std::min(
     static_cast<double>(availableW) / decoded.width,
     static_cast<double>(availableH) / decoded.height);
@@ -39473,6 +39686,7 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
   const int drawY =
     available.top + (availableH - drawH) / 2;
 
+#ifdef _WIN32
   BITMAPINFO bitmapInfo{};
   bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
   bitmapInfo.bmiHeader.biWidth = decoded.width;
@@ -39482,12 +39696,13 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
   bitmapInfo.bmiHeader.biPlanes = 1;
   bitmapInfo.bmiHeader.biBitCount = 32;
   bitmapInfo.bmiHeader.biCompression = BI_RGB;
-  bitmapInfo.bmiHeader.biSizeImage =
-    static_cast<DWORD>(
-      decoded.stride * decoded.height);
+  // BI_RGB permite zero e evita truncar buffers grandes para DWORD.
+  bitmapInfo.bmiHeader.biSizeImage = 0;
 
   const int oldStretchMode =
-    SetStretchBltMode(dc, COLORONCOLOR);
+    SetStretchBltMode(dc, HALFTONE);
+  POINT oldBrushOrigin{0, 0};
+  SetBrushOrgEx(dc, 0, 0, &oldBrushOrigin);
   const int renderedLines = StretchDIBits(
     dc,
     drawX, drawY, drawW, drawH,
@@ -39496,11 +39711,31 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
     &bitmapInfo,
     DIB_RGB_COLORS,
     SRCCOPY);
+  SetBrushOrgEx(
+    dc, oldBrushOrigin.x, oldBrushOrigin.y, nullptr);
   if (oldStretchMode != 0) {
     SetStretchBltMode(dc, oldStretchMode);
   }
 
-  const bool rendered = renderedLines != GDI_ERROR;
+  const bool rendered = renderedLines > 0;
+#else
+  // O frame AVFoundation é desenhado diretamente no CGContext Retina. Isso
+  // evita a cópia para um bitmap LICE 1x e deixa o snapshot imutável vivo
+  // durante todo o desenho.
+  const bool rendered =
+    decoded.stride % 4 == 0 &&
+    VSHookMacDrawTelepromptBitmap(
+      dc,
+      decoded.pixels,
+      decoded.width,
+      decoded.height,
+      decoded.stride / 4,
+      false,
+      drawX,
+      drawY,
+      drawW,
+      drawH);
+#endif
   const int decoderStatus =
     g_nativeTelepromptPlatformVideoDecoder[index]->status();
   g_nativeTelepromptPlatformVideoStatus[index].store(
@@ -39518,13 +39753,19 @@ static bool nativeTelepromptDrawMedia(
   const NativeTelepromptSettings& settings,
   const RECT& available)
 {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
   if (nativeLower(state.mediaType) == "video") {
-    // O vídeo já chega redimensionável como snapshot imutável do decoder
-    // assíncrono. StretchDIBits evita duas cópias e o ScaledBlit por software
-    // que deixavam o início da mídia pesado.
-    return nativeTelepromptDrawPlatformVideoDirect(
-      dc, slot, state, settings, available);
+    // O vídeo já chega como snapshot imutável do decoder assíncrono. Nos dois
+    // sistemas o caminho direto evita uma cópia e um redimensionamento 1x.
+    if (nativeTelepromptDrawPlatformVideoDirect(
+          dc, slot, state, settings, available)) {
+      return true;
+    }
+#ifdef _WIN32
+    return false;
+#endif
+    // SWELL/Metal pode não expor CGContext. Nesse caso o Mac continua pelo
+    // framebuffer Retina abaixo, usando o mesmo snapshot em cache.
   }
 #endif
   const int index = nativeTelepromptIndex(slot);
@@ -39546,19 +39787,27 @@ static bool nativeTelepromptDrawMedia(
   const double scaleLimit = nativeTelepromptClamp(
     settings.mediaScale, 0.25, 3.0);
   double sourceRequestScale = std::max(1.0, scaleLimit);
+  double outputRasterScale = 1.0;
 #ifdef __APPLE__
-  sourceRequestScale *=
-    VSHookMacTelepromptBackingScale(
-      g_nativeTelepromptWindows[index].hwnd);
+  outputRasterScale = VSHookMacTelepromptBackingScale(
+    g_nativeTelepromptWindows[index].hwnd);
+  sourceRequestScale *= outputRasterScale;
 #endif
-  const int requestedSourceW = std::max(
+  const int uncappedRequestedSourceW = std::max(
     1, std::min(
       65535, static_cast<int>(std::lround(
         availableW * sourceRequestScale))));
-  const int requestedSourceH = std::max(
+  const int uncappedRequestedSourceH = std::max(
     1, std::min(
       65535, static_cast<int>(std::lround(
         availableH * sourceRequestScale))));
+  int requestedSourceW = 1;
+  int requestedSourceH = 1;
+  nativeTelepromptClampDecodeRequest(
+    uncappedRequestedSourceW,
+    uncappedRequestedSourceH,
+    requestedSourceW,
+    requestedSourceH);
   NativeTelepromptMediaFrame frame =
     nativeTelepromptAcquireMediaFrame(
       slot, state, requestedSourceW, requestedSourceH);
@@ -39598,16 +39847,29 @@ static bool nativeTelepromptDrawMedia(
     return true;
   }
 #endif
+  const int uncappedOutputW = std::max(
+    1, static_cast<int>(std::lround(
+      drawW * outputRasterScale)));
+  const int uncappedOutputH = std::max(
+    1, static_cast<int>(std::lround(
+      drawH * outputRasterScale)));
+  int outputW = 1;
+  int outputH = 1;
+  nativeTelepromptClampToFullHd(
+    uncappedOutputW,
+    uncappedOutputH,
+    outputW,
+    outputH);
   if (!g_nativeTelepromptMediaBuffer[index] ||
-      g_nativeTelepromptMediaBufferWidth[index] != drawW ||
-      g_nativeTelepromptMediaBufferHeight[index] != drawH) {
+      g_nativeTelepromptMediaBufferWidth[index] != outputW ||
+      g_nativeTelepromptMediaBufferHeight[index] != outputH) {
     if (g_nativeTelepromptMediaBuffer[index]) {
       LICE_Destroy_ptr(g_nativeTelepromptMediaBuffer[index]);
     }
     g_nativeTelepromptMediaBuffer[index] =
-      LICE_CreateBitmap_ptr(1, drawW, drawH);
-    g_nativeTelepromptMediaBufferWidth[index] = drawW;
-    g_nativeTelepromptMediaBufferHeight[index] = drawH;
+      LICE_CreateBitmap_ptr(1, outputW, outputH);
+    g_nativeTelepromptMediaBufferWidth[index] = outputW;
+    g_nativeTelepromptMediaBufferHeight[index] = outputH;
   }
   LICE_IBitmap* output = g_nativeTelepromptMediaBuffer[index];
   if (!output) {
@@ -39618,7 +39880,7 @@ static bool nativeTelepromptDrawMedia(
   LICE_Clear_ptr(output, 0xff000000);
   LICE_ScaledBlit_ptr(
     output, frame.image,
-    0, 0, drawW, drawH,
+    0, 0, outputW, outputH,
     0.0f, 0.0f,
     static_cast<float>(sourceW),
     static_cast<float>(sourceH),
@@ -39630,8 +39892,12 @@ static bool nativeTelepromptDrawMedia(
 #endif
   HDC mediaDc = LICE_GetDC_ptr(output);
   if (mediaDc) {
-    BitBlt(dc, drawX, drawY, drawW, drawH,
-      mediaDc, 0, 0, SRCCOPY);
+    StretchBlt(
+      dc,
+      drawX, drawY, drawW, drawH,
+      mediaDc,
+      0, 0, outputW, outputH,
+      SRCCOPY);
   }
   nativeTelepromptReleaseMediaFrame(frame);
   g_nativeTelepromptMediaStatus[index].store(
