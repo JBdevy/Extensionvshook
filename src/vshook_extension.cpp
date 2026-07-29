@@ -177,6 +177,7 @@ using GetTakeName_t = const char* (*)(MediaItem_Take*);
 using TakeIsMIDI_t = bool (*)(MediaItem_Take*);
 using GetSetMediaItemTakeInfo_String_t = bool (*)(MediaItem_Take*, const char*, char*, bool);
 using GetMediaItemTakeInfo_Value_t = double (*)(MediaItem_Take*, const char*);
+using SetMediaItemTakeInfo_Value_t = bool (*)(MediaItem_Take*, const char*, double);
 using GetMediaItemTake_Source_t = PCM_source* (*)(MediaItem_Take*);
 using GetMediaSourceFileName_t = void (*)(PCM_source*, char*, int);
 using GetMediaSourceParent_t = PCM_source* (*)(PCM_source*);
@@ -299,6 +300,7 @@ static GetTakeName_t GetTakeName_ptr = nullptr;
 static TakeIsMIDI_t TakeIsMIDI_ptr = nullptr;
 static GetSetMediaItemTakeInfo_String_t GetSetMediaItemTakeInfo_String_ptr = nullptr;
 static GetMediaItemTakeInfo_Value_t GetMediaItemTakeInfo_Value_ptr = nullptr;
+static SetMediaItemTakeInfo_Value_t SetMediaItemTakeInfo_Value_ptr = nullptr;
 static GetMediaItemTake_Source_t GetMediaItemTake_Source_ptr = nullptr;
 static GetMediaSourceFileName_t GetMediaSourceFileName_ptr = nullptr;
 static GetMediaSourceParent_t GetMediaSourceParent_ptr = nullptr;
@@ -4165,6 +4167,47 @@ static double nativeVolumeToDb(double volume)
 {
   if (!std::isfinite(volume) || volume <= 0.000001) return -150.0;
   return 20.0 * std::log10(volume);
+}
+
+// O valor numérico mostrado nas propriedades do item pelo REAPER pertence ao
+// take ativo. O Premix deve ler e alterar essa mesma fonte.
+static double nativePremixMediaItemVolume(MediaItem* item)
+{
+  if (!item) return 1.0;
+  if (GetActiveTake_ptr && GetMediaItemTakeInfo_Value_ptr) {
+    MediaItem_Take* take = GetActiveTake_ptr(item);
+    if (take) {
+      const double volume = GetMediaItemTakeInfo_Value_ptr(take, "D_VOL");
+      return std::isfinite(volume) ? std::fabs(volume) : 1.0;
+    }
+  }
+  if (GetMediaItemInfo_Value_ptr) {
+    const double volume = GetMediaItemInfo_Value_ptr(item, "D_VOL");
+    return std::isfinite(volume) ? std::fabs(volume) : 1.0;
+  }
+  return 1.0;
+}
+
+static bool nativeSetPremixMediaItemVolume(MediaItem* item, double volume)
+{
+  if (!item || !std::isfinite(volume)) return false;
+  const double magnitude = std::fabs(volume);
+  if (GetActiveTake_ptr && GetMediaItemTakeInfo_Value_ptr &&
+      SetMediaItemTakeInfo_Value_ptr) {
+    MediaItem_Take* take = GetActiveTake_ptr(item);
+    if (take) {
+      const double current = GetMediaItemTakeInfo_Value_ptr(take, "D_VOL");
+      return SetMediaItemTakeInfo_Value_ptr(
+        take, "D_VOL", current < 0.0 ? -magnitude : magnitude);
+    }
+  }
+  if (SetMediaItemInfo_Value_ptr) {
+    const double current = GetMediaItemInfo_Value_ptr
+      ? GetMediaItemInfo_Value_ptr(item, "D_VOL") : 1.0;
+    return SetMediaItemInfo_Value_ptr(
+      item, "D_VOL", current < 0.0 ? -magnitude : magnitude);
+  }
+  return false;
 }
 
 static std::string nativeTrackName(MediaTrack* track, int index)
@@ -18810,8 +18853,7 @@ static bool nativeUiSetPremixVolumeFromPoint(
   int pointX)
 {
   if (rowIndex < 0 || rowIndex >= static_cast<int>(
-        g_nativeUiPremixRows.size()) ||
-      !SetMediaItemInfo_Value_ptr) {
+        g_nativeUiPremixRows.size())) {
     return false;
   }
   char pathBuf[2048] = "";
@@ -18826,8 +18868,10 @@ static bool nativeUiSetPremixVolumeFromPoint(
     static_cast<int>(slider.right - slider.left));
   const double ratio = std::max(0.0, std::min(1.0,
     static_cast<double>(pointX - slider.left) / width));
-  SetMediaItemInfo_Value_ptr(row.mediaItem, "D_VOL",
-    nativeUiPremixRatioToVolume(ratio));
+  if (!nativeSetPremixMediaItemVolume(
+        row.mediaItem, nativeUiPremixRatioToVolume(ratio))) {
+    return false;
+  }
   if (project && MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   g_nativeForceStateBuild.store(true);
@@ -24675,9 +24719,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
         addModalButton("premix_mute|" + std::to_string(index), "M",
           RECT{muteX, topY, muteX + muteW, topY + buttonHeight},
           muted ? "stop" : "page", muted);
-        const double volume = validMediaItem &&
-          GetMediaItemInfo_Value_ptr
-            ? GetMediaItemInfo_Value_ptr(row.mediaItem, "D_VOL") : 1.0;
+        const double volume = validMediaItem
+          ? nativePremixMediaItemVolume(row.mediaItem) : 1.0;
         RECT dbRect{dbX, sliderY - 8,
           dbX + dbW, sliderY + sliderHeight + 2};
         nativeAppActiveDrawText(dc,
@@ -42508,7 +42551,7 @@ static std::string nativeBuildPremixItemRowsJson(ReaProject* project, const Nati
       } else if (itemStart < song->start - eps || itemStart >= song->end - eps) {
         continue;
       }
-      const double volume = GetMediaItemInfo_Value_ptr(item, "D_VOL");
+      const double volume = nativePremixMediaItemVolume(item);
       const bool mute = GetMediaItemInfo_Value_ptr(item, "B_MUTE") > 0.5;
       ++visualIndex;
       const std::string fallbackId = std::string("premix_item_") + std::to_string(trackIndex + 1) + "_" + std::to_string(itemIndex + 1);
@@ -45722,13 +45765,14 @@ static bool nativeApplyPremixCommand(const std::string& commandBody)
 
   bool changed = false;
   MediaItem* mediaItem = nativeFindPremixMediaItemById(project, targetId);
-  if (mediaItem && GetMediaItemInfo_Value_ptr && SetMediaItemInfo_Value_ptr) {
+  if (mediaItem && GetMediaItemInfo_Value_ptr) {
     if (type == "premix_set_volume" || type == "premix_item_set_volume") {
       std::string ratioText = nativeJsonExtractString(commandBody, "ratio");
       if (ratioText.empty()) ratioText = nativeJsonExtractString(commandBody, "volumeRatio");
       if (ratioText.empty()) ratioText = nativeJsonExtractString(commandBody, "value");
       const double ratio = ratioText.empty() ? 0.76 : std::atof(ratioText.c_str());
-      changed = SetMediaItemInfo_Value_ptr(mediaItem, "D_VOL", nativePremixRatioToVolume(ratio));
+      changed = nativeSetPremixMediaItemVolume(
+        mediaItem, nativePremixRatioToVolume(ratio));
     } else {
       const double current = GetMediaItemInfo_Value_ptr(mediaItem, "B_MUTE");
       std::string desired = nativeJsonExtractString(commandBody, "desiredMute");
@@ -48062,6 +48106,7 @@ static bool loadApi(reaper_plugin_info_t* rec)
     rec->GetFunc("TakeIsMIDI"));
   GetSetMediaItemTakeInfo_String_ptr = reinterpret_cast<GetSetMediaItemTakeInfo_String_t>(rec->GetFunc("GetSetMediaItemTakeInfo_String"));
   GetMediaItemTakeInfo_Value_ptr = reinterpret_cast<GetMediaItemTakeInfo_Value_t>(rec->GetFunc("GetMediaItemTakeInfo_Value"));
+  SetMediaItemTakeInfo_Value_ptr = reinterpret_cast<SetMediaItemTakeInfo_Value_t>(rec->GetFunc("SetMediaItemTakeInfo_Value"));
   GetMediaItemTake_Source_ptr = reinterpret_cast<GetMediaItemTake_Source_t>(rec->GetFunc("GetMediaItemTake_Source"));
   GetMediaSourceFileName_ptr = reinterpret_cast<GetMediaSourceFileName_t>(rec->GetFunc("GetMediaSourceFileName"));
   GetMediaSourceParent_ptr = reinterpret_cast<GetMediaSourceParent_t>(rec->GetFunc("GetMediaSourceParent"));
