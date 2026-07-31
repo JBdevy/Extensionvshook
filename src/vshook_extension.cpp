@@ -12486,10 +12486,9 @@ static void nativeUiRefreshNavigationNow(HWND hwnd)
   nativeUiSetFrameTimerInterval(
     hwnd, kNativeUiFrameFastIntervalMs);
   InvalidateRect(hwnd, nullptr, FALSE);
-#ifdef _WIN32
-  // WM_PAINT tem prioridade menor que a repetição de WM_KEYDOWN. Durante o
-  // autorepeat do Windows, apresentar no máximo um quadro a cada 16 ms evita
-  // que a seleção pareça congelada até a seta ser solta.
+  // WM_PAINT/timer podem perder prioridade durante a repetição de WM_KEYDOWN
+  // tanto no Win32 quanto no SWELL do macOS. Apresentar no máximo um quadro
+  // a cada 16 ms mantém os dois sistemas com a mesma resposta visual.
   static std::chrono::steady_clock::time_point
     lastImmediateNavigationPaint{};
   const auto now = std::chrono::steady_clock::now();
@@ -12505,7 +12504,6 @@ static void nativeUiRefreshNavigationNow(HWND hwnd)
     nativeUiAdvanceSmoothScrolls();
     UpdateWindow(hwnd);
   }
-#endif
 }
 
 static bool nativeUiInsertTextAtCursor(
