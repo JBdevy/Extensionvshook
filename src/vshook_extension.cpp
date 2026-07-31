@@ -31175,10 +31175,27 @@ static bool nativeNavigateMainRows(int step)
         }
       }
       int revealTarget = revealFrom;
-      if (rowTop < revealTarget) {
-        // Subindo, a seleção permanece na primeira linha visível.
+      if (direction < 0) {
+        // Subindo, mantém uma linha renderizada acima da seleção. Blocos e
+        // linhas de altura variável também contam como esse contexto.
+        const size_t upperContextIndex =
+          candidate > 0 ? static_cast<size_t>(candidate - 1) : size_t{0};
+        const int upperContextTop =
+          upperContextIndex < g_nativeMainRowOffsets.size()
+            ? g_nativeMainRowOffsets[upperContextIndex]
+            : rowTop;
+        if (upperContextTop < revealTarget) {
+          revealTarget = upperContextTop;
+        } else if (rowBottom >
+                   revealTarget + g_nativeMainListViewportPixels) {
+          // Protege o salto circular para o fim ao navegar para cima.
+          revealTarget =
+            rowBottom - g_nativeMainListViewportPixels;
+        }
+      } else if (rowTop < revealTarget) {
+        // Protege o salto circular para o início ao navegar para baixo.
         revealTarget = rowTop;
-      } else if (direction > 0) {
+      } else {
         // Descendo, mantém a seleção na antepenúltima linha: as duas linhas
         // seguintes continuam visíveis. Os offsets medidos incluem blocos e
         // linhas com altura variável; no fim, completa o contexto com as
@@ -31207,11 +31224,6 @@ static bool nativeNavigateMainRows(int step)
           revealTarget = std::min(rowTop,
             contextBottom - g_nativeMainListViewportPixels);
         }
-      } else if (rowBottom >
-                 revealTarget + g_nativeMainListViewportPixels) {
-        // Protege o salto circular para o fim ao navegar para cima.
-        revealTarget =
-          rowBottom - g_nativeMainListViewportPixels;
       }
       revealTarget = std::max(0,
         std::min(revealTarget,
