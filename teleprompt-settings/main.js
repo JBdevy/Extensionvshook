@@ -8,6 +8,7 @@ let recadosWindow = null;
 let bridgeMonitor = null;
 let bridgeWasConnected = false;
 let bridgeMisses = 0;
+let bridgeCheckInFlight = false;
 const recadosImageExtensions = new Set([
   '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'
 ]);
@@ -121,12 +122,19 @@ function hasOpenWindow() {
 }
 
 function checkReaperBridge() {
+  if (bridgeCheckInFlight) return;
+  bridgeCheckInFlight = true;
+  const finishCheck = () => {
+    bridgeCheckInFlight = false;
+  };
   const request = http.get(
-    'http://127.0.0.1:47830/teleprompt-settings',
-    { timeout: 700 },
+    'http://127.0.0.1:47830/health',
+    { timeout: 3000 },
     (response) => {
       response.resume();
-      if (response.statusCode >= 200 && response.statusCode < 500) {
+      response.once('end', finishCheck);
+      response.once('close', finishCheck);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
         bridgeWasConnected = true;
         bridgeMisses = 0;
         return;
@@ -134,11 +142,15 @@ function checkReaperBridge() {
       bridgeMisses += 1;
     }
   );
-  request.on('timeout', () => request.destroy());
+  request.on('timeout', () => {
+    finishCheck();
+    request.destroy();
+  });
   request.on('error', () => {
+    finishCheck();
     if (!bridgeWasConnected) return;
     bridgeMisses += 1;
-    if (bridgeMisses >= 3) {
+    if (bridgeMisses >= 5) {
       if (settingsWindow && !settingsWindow.isDestroyed()) {
         settingsWindow.close();
       }
@@ -153,6 +165,7 @@ function startBridgeMonitor() {
   clearInterval(bridgeMonitor);
   bridgeWasConnected = false;
   bridgeMisses = 0;
+  bridgeCheckInFlight = false;
   checkReaperBridge();
   bridgeMonitor = setInterval(checkReaperBridge, 1000);
 }

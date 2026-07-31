@@ -33,15 +33,24 @@ const state = {
 };
 
 async function fetchJson(path, options = {}) {
-  const response = await fetch(`${BRIDGE}${path}`, {
-    cache: 'no-store',
-    ...options
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok || payload.ok === false) {
-    throw new Error(payload.error || `HTTP ${response.status}`);
+  const controller = new AbortController();
+  const timeout = window.setTimeout(
+    () => controller.abort(), Number(options.timeoutMs || 3000));
+  const { timeoutMs: _timeoutMs, ...fetchOptions } = options;
+  try {
+    const response = await fetch(`${BRIDGE}${path}`, {
+      cache: 'no-store',
+      ...fetchOptions,
+      signal: controller.signal
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload.error || `HTTP ${response.status}`);
+    }
+    return payload;
+  } finally {
+    window.clearTimeout(timeout);
   }
-  return payload;
 }
 
 function currentDraft() {
@@ -153,19 +162,30 @@ function selectSlot(slot) {
   render();
 }
 
+let refreshInFlight = false;
 async function refresh() {
+  if (refreshInFlight) return;
   if (document.activeElement === elements.input &&
       !elements.input.readOnly) {
     render();
     return;
   }
+  refreshInFlight = true;
   try {
-    const [snapshot, noticeData, templateData] =
-      await Promise.all([
+    const [snapshotResult, noticeResult, templateResult] =
+      await Promise.allSettled([
         fetchJson('/state'),
         fetchJson('/technical-notice'),
         fetchJson('/recados-templates')
       ]);
+    if (snapshotResult.status !== 'fulfilled') {
+      throw snapshotResult.reason;
+    }
+    const snapshot = snapshotResult.value;
+    const noticeData = noticeResult.status === 'fulfilled'
+      ? noticeResult.value : {};
+    const templateData = templateResult.status === 'fulfilled'
+      ? templateResult.value : {};
     state.connected = true;
     state.projectName = String(
       snapshot.projectName ||
@@ -195,6 +215,8 @@ async function refresh() {
   } catch (error) {
     state.connected = false;
     state.status = 'ABRA O REAPER COM A EXTENSÃO VS HOOK';
+  } finally {
+    refreshInFlight = false;
   }
   render();
 }

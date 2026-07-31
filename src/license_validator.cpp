@@ -109,6 +109,15 @@ std::string machineIdPath()
   return joinPath(sharedDirectory(), "vslive_machine_id.dat");
 }
 
+std::string legacyMachineIdPath()
+{
+#ifdef __APPLE__
+  return joinPath(sharedDirectory(), ".vslive_machine_id");
+#else
+  return {};
+#endif
+}
+
 std::string sanitizeAnchor(std::string value)
 {
   std::string out;
@@ -267,11 +276,16 @@ std::string legacySimpleHash(const std::string& input)
 
 std::string machineId()
 {
-  const std::string cached = normalize(readFile(machineIdPath()));
-  if (!cached.empty() &&
-      std::all_of(cached.begin(), cached.end(),
-        [](unsigned char c) { return std::isxdigit(c) != 0; })) {
-    return cached;
+  const std::array<std::string, 2> paths{
+    machineIdPath(), legacyMachineIdPath()};
+  for (const std::string& path : paths) {
+    if (path.empty()) continue;
+    const std::string cached = normalize(readFile(path));
+    if (!cached.empty() &&
+        std::all_of(cached.begin(), cached.end(),
+          [](unsigned char c) { return std::isxdigit(c) != 0; })) {
+      return cached;
+    }
   }
   std::string anchor = hardwareAnchor();
   if (anchor.empty()) anchor = genericAnchor();

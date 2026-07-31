@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cwchar>
 #include <ctime>
@@ -647,9 +648,9 @@ static bool g_nativeShortcutNoticeSuppressChecked = false;
 // scroll/drag e entrada de texto; parado, acorda em baixa frequência sem
 // solicitar repaint. O modelo continua no timer principal da extensão.
 static constexpr UINT_PTR kNativeUiFrameTimerId = 0x5653484b;
-// 40 FPS para manipulacao direta, RGB e letreiro; 30 FPS no playback e
-// 5 FPS em repouso. O limite menor evita gastar um nucleo apenas com desenho.
-static constexpr UINT kNativeUiFrameFastIntervalMs = 25;
+// 60 FPS para manipulacao direta e scroll; 30 FPS no playback e 5 FPS em
+// repouso. A lista só permanece em 60 FPS enquanto existe interação/animação.
+static constexpr UINT kNativeUiFrameFastIntervalMs = 16;
 static constexpr UINT kNativeUiFrameActiveIntervalMs = 33;
 static constexpr UINT kNativeUiFrameRgbIntervalMs = 100;
 static constexpr UINT kNativeUiFrameIdleIntervalMs = 200;
@@ -3567,18 +3568,72 @@ static void nativeShutdownSocket(native_socket_t s) { if (s >= 0) shutdown(s, SH
 static void nativeConfigureClientSocketTimeouts(native_socket_t socketHandle)
 {
 #ifdef _WIN32
-  const DWORD timeoutMs = 750;
+  const DWORD receiveTimeoutMs = 1000;
+  const DWORD sendTimeoutMs = 3500;
   setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO,
-    reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+    reinterpret_cast<const char*>(&receiveTimeoutMs),
+    sizeof(receiveTimeoutMs));
   setsockopt(socketHandle, SOL_SOCKET, SO_SNDTIMEO,
-    reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+    reinterpret_cast<const char*>(&sendTimeoutMs),
+    sizeof(sendTimeoutMs));
 #else
-  timeval timeout{};
-  timeout.tv_sec = 0;
-  timeout.tv_usec = 750000;
-  setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-  setsockopt(socketHandle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  timeval receiveTimeout{};
+  receiveTimeout.tv_sec = 1;
+  timeval sendTimeout{};
+  sendTimeout.tv_sec = 3;
+  sendTimeout.tv_usec = 500000;
+  setsockopt(
+    socketHandle, SOL_SOCKET, SO_RCVTIMEO,
+    &receiveTimeout, sizeof(receiveTimeout));
+  setsockopt(
+    socketHandle, SOL_SOCKET, SO_SNDTIMEO,
+    &sendTimeout, sizeof(sendTimeout));
+#ifdef __APPLE__
+  // Evita que um cliente que feche a conexão durante uma resposta grande
+  // derrube o processo do REAPER com SIGPIPE.
+  const int noSigPipe = 1;
+  setsockopt(
+    socketHandle, SOL_SOCKET, SO_NOSIGPIPE,
+    &noSigPipe, sizeof(noSigPipe));
 #endif
+#endif
+}
+
+static bool nativeSendAll(
+  native_socket_t socketHandle,
+  const char* data,
+  size_t size)
+{
+  if (socketHandle == kInvalidNativeSocket || !data) return false;
+  size_t sentTotal = 0;
+#ifndef _WIN32
+  const auto sendDeadline =
+    std::chrono::steady_clock::now() +
+    std::chrono::milliseconds(4000);
+#endif
+  while (sentTotal < size) {
+#ifdef _WIN32
+    const int remaining = static_cast<int>(std::min<size_t>(
+      size - sentTotal,
+      static_cast<size_t>(std::numeric_limits<int>::max())));
+    const int sent = send(
+      socketHandle, data + sentTotal, remaining, 0);
+    if (sent == SOCKET_ERROR || sent <= 0) return false;
+#else
+    const ssize_t sent = send(
+      socketHandle, data + sentTotal, size - sentTotal, 0);
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent < 0 &&
+        (errno == EAGAIN || errno == EWOULDBLOCK) &&
+        std::chrono::steady_clock::now() < sendDeadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      continue;
+    }
+    if (sent <= 0) return false;
+#endif
+    sentTotal += static_cast<size_t>(sent);
+  }
+  return true;
 }
 
 static std::mutex g_nativeMutex;
@@ -12419,6 +12474,29 @@ static void nativeUiRefreshTextInputNow(HWND hwnd)
   // mostra o resultado quando a tecla é solta.
   InvalidateRect(hwnd, nullptr, FALSE);
   UpdateWindow(hwnd);
+}
+
+static void nativeUiRefreshNavigationNow(HWND hwnd)
+{
+  if (!hwnd || !IsWindow(hwnd)) return;
+  nativeUiSetFrameTimerInterval(
+    hwnd, kNativeUiFrameFastIntervalMs);
+  InvalidateRect(hwnd, nullptr, FALSE);
+#ifdef _WIN32
+  // WM_PAINT tem prioridade menor que a repetição de WM_KEYDOWN. Durante o
+  // autorepeat do Windows, apresentar no máximo um quadro a cada 16 ms evita
+  // que a seleção pareça congelada até a seta ser solta.
+  static std::chrono::steady_clock::time_point
+    lastImmediateNavigationPaint{};
+  const auto now = std::chrono::steady_clock::now();
+  if (lastImmediateNavigationPaint.time_since_epoch().count() == 0 ||
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - lastImmediateNavigationPaint).count() >=
+        static_cast<long long>(kNativeUiFrameFastIntervalMs)) {
+    lastImmediateNavigationPaint = now;
+    UpdateWindow(hwnd);
+  }
+#endif
 }
 
 static bool nativeUiInsertTextAtCursor(
@@ -22816,6 +22894,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
     const bool shouldFocusSelected =
       selectedFocusChanged && !selectedFocusKey.empty();
     if (!smartSearchOwnsScroll &&
+        !g_nativeUiPendingMusicNavigation.pending &&
+        g_nativeMainSmoothScroll.target < 0 &&
         (shouldFocusQueued || shouldFocusSelected)) {
       const bool focusQueued = shouldFocusQueued;
       const std::string& targetId = focusQueued
@@ -31071,16 +31151,39 @@ static bool nativeNavigateMainRows(int step)
       const int rowTop = g_nativeMainRowOffsets[static_cast<size_t>(candidate)];
       const int rowBottom = rowTop +
         g_nativeMainRowHeights[static_cast<size_t>(candidate)];
-      if (rowTop < g_nativeAppActiveListScrollPixels) {
-        g_nativeAppActiveListScrollPixels = rowTop;
-      } else if (rowBottom > g_nativeAppActiveListScrollPixels +
-                 g_nativeMainListViewportPixels) {
-        g_nativeAppActiveListScrollPixels =
+      int revealFrom = g_nativeAppActiveListScrollPixels;
+      // Mantém o alvo anterior enquanto a tecla continua na mesma direção.
+      // Ao inverter a seta, o quadro atual volta a ser a base e a animação
+      // responde imediatamente, sem continuar deslizando para o lado antigo.
+      if (g_nativeMainSmoothScroll.target >= 0) {
+        const bool sameDirection =
+          (direction > 0 &&
+            g_nativeMainSmoothScroll.target >= revealFrom) ||
+          (direction < 0 &&
+            g_nativeMainSmoothScroll.target <= revealFrom);
+        if (sameDirection) {
+          revealFrom = g_nativeMainSmoothScroll.target;
+        }
+      }
+      int revealTarget = revealFrom;
+      if (rowTop < revealTarget) {
+        revealTarget = rowTop;
+      } else if (rowBottom >
+                 revealTarget + g_nativeMainListViewportPixels) {
+        revealTarget =
           rowBottom - g_nativeMainListViewportPixels;
       }
-      g_nativeAppActiveListScrollPixels = std::max(0,
-        std::min(g_nativeAppActiveListScrollPixels,
+      revealTarget = std::max(0,
+        std::min(revealTarget,
           g_nativeMainListMaxScrollPixels));
+      if (revealTarget != g_nativeAppActiveListScrollPixels) {
+        g_nativeMainSmoothScroll.target = revealTarget;
+        g_nativeMainSmoothScroll.lastApplied =
+          g_nativeAppActiveListScrollPixels;
+      } else {
+        g_nativeMainSmoothScroll =
+          NativeUiSmoothScrollState{};
+      }
     }
     g_nativeForceStateBuild.store(true);
     return true;
@@ -34951,8 +35054,14 @@ static bool nativeUiAdvanceSmoothScroll(
     return false;
   }
 
+  // Easing proporcional: um deslocamento de uma linha também precisa ocupar
+  // vários quadros. O limite anterior consumia a linha inteira no primeiro
+  // tick e, apesar do timer de 60 FPS, a lista ainda parecia saltar.
+  const int easedStep = static_cast<int>(std::ceil(
+    static_cast<double>(std::abs(distance)) * 0.28));
   const int step = std::max(1,
-    std::min(std::abs(distance), maximumStep));
+    std::min(std::abs(distance),
+      std::min(maximumStep, easedStep)));
   value += distance > 0 ? step : -step;
   state.lastApplied = value;
   if (value == state.target) {
@@ -35384,6 +35493,13 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
              navigationCommitted || localClockChanged ||
              batteryChanged || timedRefresh)) {
           InvalidateRect(hwnd, nullptr, FALSE);
+#ifdef _WIN32
+          // A animação da lista não depende da fila normal de WM_PAINT:
+          // durante o autorepeat das setas ela continua apresentando a 60 FPS.
+          if (scrollChanged || dragScrollChanged) {
+            UpdateWindow(hwnd);
+          }
+#endif
         } else if (IsWindowVisible(hwnd)) {
           if (g_nativeUiPlaylistMarqueeActive &&
               g_nativeMainPlaylistFieldRect.right >
@@ -36644,8 +36760,12 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             refreshSearchInputNow = true;
           } else if (wParam == VK_UP) {
             nativeNavigateMainRows(-1);
+            nativeUiRefreshNavigationNow(hwnd);
+            return 0;
           } else if (wParam == VK_DOWN) {
             nativeNavigateMainRows(1);
+            nativeUiRefreshNavigationNow(hwnd);
+            return 0;
           } else if (wParam == VK_ESCAPE) {
             nativeUiShowShortcutPopup(
               "Esc", "Busca inteligente fechada");
@@ -36955,7 +37075,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           } else {
             nativeNavigateMainRows(-1);
           }
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiRefreshNavigationNow(hwnd);
           return 0;
         }
         if (wParam == VK_DOWN) {
@@ -36968,7 +37088,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           } else {
             nativeNavigateMainRows(1);
           }
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiRefreshNavigationNow(hwnd);
           return 0;
         }
         if (wParam == VK_RIGHT) {
@@ -41613,7 +41733,14 @@ static void nativeRefreshAppActivePanelModel()
     g_nativeAppActivePanelModel.playing ||
     nativeUiSmoothScrollActive() ||
     nativeUiNeedsTimedVisualRefresh();
-  const int modelIntervalMs = activeModel ? 30 : 200;
+  // O scroll e a seleção local já são desenhados pelo timer visual. Durante
+  // esse movimento não há motivo para reconstruir e copiar o modelo inteiro
+  // em todo quadro; isso era o principal engasgo no macOS antigo.
+  const bool visualListNavigation =
+    g_nativeUiPendingMusicNavigation.pending ||
+    nativeUiSmoothScrollActive();
+  const int modelIntervalMs =
+    visualListNavigation ? 80 : (activeModel ? 30 : 200);
   if (g_nativeUiLastModelRefreshAt.time_since_epoch().count() != 0 &&
       std::chrono::duration_cast<std::chrono::milliseconds>(
         modelNow - g_nativeUiLastModelRefreshAt).count() <
@@ -47469,15 +47596,26 @@ static void nativeHandleClient(native_socket_t client)
     if (!commandBody.empty()) nativeQueueHttpCommand(commandBody);
     body = nativeHttpResponse(200, "{\"ok\":true,\"nativeBridge\":true,\"queued\":true}");
   } else if (path == "/health" || path == "/ping") {
-    body = nativeHttpResponse(200, "{\"ok\":true,\"nativeBridge\":true}");
+    bool stateReady = false;
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      stateReady = !g_nativeStateJson.empty();
+    }
+    std::ostringstream health;
+    health << "{\"ok\":true,\"nativeBridge\":true,"
+           << "\"extensionVersion\":"
+           << nativeJsonString(VSHOOK_EXTENSION_VERSION) << ","
+           << "\"build\":"
+           << nativeJsonString(
+                std::string(__DATE__) + " " + __TIME__) << ","
+           << "\"stateReady\":"
+           << (stateReady ? "true" : "false")
+           << "}";
+    body = nativeHttpResponse(200, health.str());
   } else {
     body = nativeHttpResponse(404, "{\"ok\":false,\"error\":\"not_found\"}");
   }
-#ifdef _WIN32
-  send(client, body.c_str(), static_cast<int>(body.size()), 0);
-#else
-  send(client, body.c_str(), body.size(), 0);
-#endif
+  nativeSendAll(client, body.data(), body.size());
 }
 
 static void nativeBridgeServerThread()
@@ -47599,8 +47737,15 @@ static void nativeBridgeServerThread()
 
 static bool nativeCanHostBridgeServer()
 {
+#ifdef __APPLE__
+  // A DLL já está sendo executada dentro do REAPER. Em versões antigas do
+  // SWELL, tanto GetMainHwnd quanto IsWindow podem ficar temporariamente
+  // inconsistentes mesmo depois da interface aparecer.
+  return true;
+#else
   const HWND reaperWindow = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
-  return reaperWindow && IsWindow(reaperWindow) && IsWindowVisible(reaperWindow);
+  return reaperWindow && IsWindow(reaperWindow);
+#endif
 }
 
 static void startNativeBridgeServer()
@@ -48171,11 +48316,23 @@ static bool loadApi(reaper_plugin_info_t* rec)
   return true;
 }
 
-static void initialize()
+static bool initialize()
 {
-  if (g_state.initialized) return;
+  if (g_state.initialized) return true;
 
   bool hasRegisteredAction = false;
+
+  // Esta action funciona como identidade única da extensão dentro do processo
+  // do REAPER. Se outra cópia (por exemplo, reaper_vshook + reaper_VSHookExt,
+  // ou instalações global e do usuário no macOS) já a registrou, esta segunda
+  // instância deve ficar completamente inativa. Sem essa trava ela criava um
+  // segundo menu VS Hook sem "Executar" e ainda disputava a porta do bridge.
+  g_nativeInterfaceCommandId =
+    plugin_register_ptr("custom_action", (void*)&g_nativeInterfaceAction);
+  if (g_nativeInterfaceCommandId == 0) {
+    return false;
+  }
+  hasRegisteredAction = true;
 
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     entry.commandId = plugin_register_ptr("custom_action", (void*)&entry.action);
@@ -48191,10 +48348,6 @@ static void initialize()
     }
   }
 
-  g_nativeInterfaceCommandId = plugin_register_ptr("custom_action", (void*)&g_nativeInterfaceAction);
-  if (g_nativeInterfaceCommandId != 0) {
-    hasRegisteredAction = true;
-  }
   g_timecodeReceiveCommandId = plugin_register_ptr("custom_action", (void*)&g_timecodeReceiveAction);
   if (g_timecodeReceiveCommandId != 0) {
     hasRegisteredAction = true;
@@ -48264,6 +48417,10 @@ static void initialize()
   nativeTechnicalNoticeRefreshAuthCache(
     nativeDirectorPasswordHash(nativeReadDirectorPassword()),
     nativeDirectorPasswordHash(nativeReadRecadosPassword()));
+  // Deixa a descoberta do projeto pronta antes da primeira consulta da Hook
+  // Center. O timer continuará atualizando normalmente, mas Macs antigos não
+  // dependem mais do primeiro ciclo do SWELL para aparecer no app.
+  nativePublishStandbyDiscoveryState();
   startNativeBridgeServer();
 
   if (plugin_register_ptr("accelerator", reinterpret_cast<void*>(&g_vshookGlobalHotkeyAccelerator))) {
@@ -48309,11 +48466,12 @@ static void initialize()
   }
 
   g_state.initialized = true;
+  return true;
 }
 
 static void shutdown()
 {
-  if (!plugin_register_ptr) return;
+  if (!plugin_register_ptr || !g_state.initialized) return;
 
   nativeCloseAppActivePanel();
   nativeCloseAllTelepromptWindows();
@@ -48458,6 +48616,5 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   }
   if (!vshook::nativeEnsurePluginLicense()) return 0;
 
-  vshook::initialize();
-  return 1;
+  return vshook::initialize() ? 1 : 0;
 }
