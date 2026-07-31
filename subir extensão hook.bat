@@ -25,11 +25,13 @@ if errorlevel 1 goto erro_powershell
 git rev-parse --is-inside-work-tree >nul 2>&1
 if errorlevel 1 goto erro_repositorio
 
+for %%I in ("CMakeLists.txt") do if %%~zI GTR 1048576 goto erro_cmake_corrompido
+
 for /f "delims=" %%B in ('git branch --show-current') do set "BRANCH=%%B"
 if not defined BRANCH goto erro_branch
 
 set "CURRENT_VERSION="
-for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "$raw=Get-Content -Raw -LiteralPath 'CMakeLists.txt'; if($raw -match 'project\(reaper_vshook_loader VERSION ([0-9]+\.[0-9]+\.[0-9]+) LANGUAGES CXX\)'){$matches[1]}"`) do set "CURRENT_VERSION=%%V"
+for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "$path=(Resolve-Path 'CMakeLists.txt'); $raw=[IO.File]::ReadAllText($path,[Text.Encoding]::UTF8); if($raw -match 'project\(reaper_vshook_loader VERSION ([0-9]+\.[0-9]+\.[0-9]+) LANGUAGES CXX\)'){$matches[1]}"`) do set "CURRENT_VERSION=%%V"
 if not defined CURRENT_VERSION set "CURRENT_VERSION=1.0.0"
 
 :pedir_versao
@@ -59,8 +61,9 @@ if errorlevel 2 goto cancelado
 
 echo.
 echo Atualizando a versao no CMakeLists.txt...
-powershell -NoProfile -Command "$path='CMakeLists.txt'; $raw=Get-Content -Raw -LiteralPath $path; $next=[regex]::Replace($raw,'project\(reaper_vshook_loader VERSION [0-9]+\.[0-9]+\.[0-9]+ LANGUAGES CXX\)','project(reaper_vshook_loader VERSION %VERSION% LANGUAGES CXX)',1); if($next -eq $raw -and $raw -notmatch 'VERSION %VERSION%'){throw 'Linha de versao nao encontrada.'}; [IO.File]::WriteAllText((Resolve-Path $path),$next,(New-Object Text.UTF8Encoding($false)))"
+powershell -NoProfile -Command "$path=(Resolve-Path 'CMakeLists.txt'); $utf8=New-Object Text.UTF8Encoding($false); $raw=[IO.File]::ReadAllText($path,[Text.Encoding]::UTF8); $next=[regex]::Replace($raw,'project\(reaper_vshook_loader VERSION [0-9]+\.[0-9]+\.[0-9]+ LANGUAGES CXX\)','project(reaper_vshook_loader VERSION %VERSION% LANGUAGES CXX)',1); if($next -eq $raw -and $raw -notmatch 'VERSION %VERSION%'){throw 'Linha de versao nao encontrada.'}; [IO.File]::WriteAllText($path,$next,$utf8)"
 if errorlevel 1 goto erro
+for %%I in ("CMakeLists.txt") do if %%~zI GTR 1048576 goto erro_cmake_corrompido
 
 echo.
 echo Adicionando arquivos...
@@ -157,6 +160,12 @@ exit /b 1
 
 :erro_branch
 echo ERRO: nao consegui detectar a branch atual.
+pause
+exit /b 1
+
+:erro_cmake_corrompido
+echo ERRO: CMakeLists.txt passou de 1 MB e provavelmente esta corrompido.
+echo O envio foi interrompido antes do commit.
 pause
 exit /b 1
 

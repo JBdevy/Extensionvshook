@@ -7,6 +7,7 @@ jobs:
   build-macos-universal:
     name: macOS Universal x86_64 + arm64
     runs-on: macos-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -21,6 +22,11 @@ jobs:
           test -f sdk/reaper_plugin.h
           test -f sdk/reaper_plugin_functions.h
           test -f WDL/swell/swell.h
+          CMAKE_SIZE="$(wc -c < CMakeLists.txt)"
+          test "$CMAKE_SIZE" -lt 1048576 || {
+            echo "::error::CMakeLists.txt passou de 1 MB e esta corrompido."
+            exit 1
+          }
           echo "VSHookExt sources found."
 
       - name: Configure x86_64 macOS 10.13+

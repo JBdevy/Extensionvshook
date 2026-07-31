@@ -16,6 +16,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate CMake input
+        shell: bash
+        run: |
+          CMAKE_SIZE="$(wc -c < CMakeLists.txt)"
+          test "$CMAKE_SIZE" -lt 1048576 || {
+            echo "::error::CMakeLists.txt passou de 1 MB e esta corrompido."
+            exit 1
+          }
+
       - name: Configure Windows x64
         shell: pwsh
         run: cmake -S . -B build-ci-windows -A x64
@@ -42,9 +51,18 @@ jobs:
   build-macos:
     name: macOS Universal x86_64 + arm64
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Validate CMake input
+        run: |
+          CMAKE_SIZE="$(wc -c < CMakeLists.txt)"
+          test "$CMAKE_SIZE" -lt 1048576 || {
+            echo "::error::CMakeLists.txt passou de 1 MB e esta corrompido."
+            exit 1
+          }
 
       - name: Configure x86_64 macOS 10.13+
         env:

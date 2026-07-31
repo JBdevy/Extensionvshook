@@ -20,6 +20,11 @@ jobs:
           test -f src/js_api_compat.cpp
           test -f sdk/reaper_plugin.h
           test -f sdk/reaper_plugin_functions.h
+          CMAKE_SIZE="$(wc -c < CMakeLists.txt)"
+          test "$CMAKE_SIZE" -lt 1048576 || {
+            echo "::error::CMakeLists.txt passou de 1 MB e esta corrompido."
+            exit 1
+          }
           echo "VSHookExt sources found."
 
       - name: Configure Windows x64
