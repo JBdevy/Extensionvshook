@@ -879,6 +879,8 @@ struct NativeUiSmoothScrollState {
 static NativeUiSmoothScrollState g_nativeMainSmoothScroll;
 static NativeUiSmoothScrollState g_nativeParts1SmoothScroll;
 static NativeUiSmoothScrollState g_nativeParts2SmoothScroll;
+static std::chrono::steady_clock::time_point
+  g_nativeUiLastSmoothScrollAdvanceAt{};
 struct NativePartsRowHit {
   RECT rect{0, 0, 0, 0};
   int rowIndex = -1;
@@ -12476,6 +12478,8 @@ static void nativeUiRefreshTextInputNow(HWND hwnd)
   UpdateWindow(hwnd);
 }
 
+static bool nativeUiAdvanceSmoothScrolls();
+
 static void nativeUiRefreshNavigationNow(HWND hwnd)
 {
   if (!hwnd || !IsWindow(hwnd)) return;
@@ -12494,6 +12498,11 @@ static void nativeUiRefreshNavigationNow(HWND hwnd)
         now - lastImmediateNavigationPaint).count() >=
         static_cast<long long>(kNativeUiFrameFastIntervalMs)) {
     lastImmediateNavigationPaint = now;
+    // O autorepeat de WM_KEYDOWN também pode impedir a entrega de WM_TIMER.
+    // O avanço compartilhado controla o limite de 60 FPS e recupera os
+    // quadros represados, fazendo o scroll acompanhar a seleção sem esperar
+    // a tecla ser solta.
+    nativeUiAdvanceSmoothScrolls();
     UpdateWindow(hwnd);
   }
 #endif
@@ -31167,9 +31176,40 @@ static bool nativeNavigateMainRows(int step)
       }
       int revealTarget = revealFrom;
       if (rowTop < revealTarget) {
+        // Subindo, a seleção permanece na primeira linha visível.
         revealTarget = rowTop;
+      } else if (direction > 0) {
+        // Descendo, mantém a seleção na antepenúltima linha: as duas linhas
+        // seguintes continuam visíveis. Os offsets medidos incluem blocos e
+        // linhas com altura variável; no fim, completa o contexto com as
+        // linhas virtuais de respiro.
+        const NativeUiListLayout scrollLayout =
+          nativeUiCurrentListLayout(nativeUiVisualPrefsForPaint());
+        const size_t measuredRowCount = std::min(
+          g_nativeMainVisibleRowIndices.size(),
+          std::min(g_nativeMainRowHeights.size(),
+            g_nativeMainRowOffsets.empty()
+              ? size_t{0}
+              : g_nativeMainRowOffsets.size() - 1));
+        const size_t requestedContextEnd =
+          static_cast<size_t>(candidate) + 3;
+        const size_t contextEnd =
+          std::min(measuredRowCount, requestedContextEnd);
+        const int missingContextRows =
+          static_cast<int>(requestedContextEnd - contextEnd);
+        const int contextBottom =
+          g_nativeMainRowOffsets[contextEnd] +
+          missingContextRows * scrollLayout.singleRowHeight;
+        if (contextBottom >
+            revealTarget + g_nativeMainListViewportPixels) {
+          // Em uma janela muito baixa, prioriza manter o topo da seleção
+          // visível mesmo que não caibam as três linhas completas.
+          revealTarget = std::min(rowTop,
+            contextBottom - g_nativeMainListViewportPixels);
+        }
       } else if (rowBottom >
                  revealTarget + g_nativeMainListViewportPixels) {
+        // Protege o salto circular para o fim ao navegar para cima.
         revealTarget =
           rowBottom - g_nativeMainListViewportPixels;
       }
@@ -35072,6 +35112,33 @@ static bool nativeUiAdvanceSmoothScroll(
 
 static bool nativeUiAdvanceSmoothScrolls()
 {
+  const bool hasActiveScroll =
+    g_nativeMainSmoothScroll.target >= 0 ||
+    g_nativeParts1SmoothScroll.target >= 0 ||
+    g_nativeParts2SmoothScroll.target >= 0;
+  if (!hasActiveScroll) {
+    g_nativeUiLastSmoothScrollAdvanceAt = {};
+    return false;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  int frameCount = 1;
+  if (g_nativeUiLastSmoothScrollAdvanceAt.time_since_epoch().count() != 0) {
+    const auto elapsedMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - g_nativeUiLastSmoothScrollAdvanceAt).count();
+    if (elapsedMs <
+        static_cast<long long>(kNativeUiFrameFastIntervalMs)) {
+      return false;
+    }
+    // Recupera somente uma curta lacuna. Isso acompanha o autorepeat sem
+    // saltar vários itens depois de uma pausa longa do processo.
+    frameCount = std::max(1, std::min(4,
+      static_cast<int>(
+        elapsedMs /
+        static_cast<long long>(kNativeUiFrameFastIntervalMs))));
+  }
+
   const NativeUiListLayout layout =
     nativeUiCurrentListLayout(nativeUiVisualPrefsForPaint());
   // O Lua limita cada quadro a 3.35 unidades. Aqui a unidade e pixel, entao
@@ -35080,18 +35147,28 @@ static bool nativeUiAdvanceSmoothScrolls()
     static_cast<int>(std::floor(
       layout.singleRowHeight * 3.35 + 0.5)));
   bool changed = false;
-  changed = nativeUiAdvanceSmoothScroll(
-    g_nativeAppActiveListScrollPixels,
-    g_nativeMainListMaxScrollPixels,
-    g_nativeMainSmoothScroll, maximumStep) || changed;
-  changed = nativeUiAdvanceSmoothScroll(
-    g_nativeParts1ScrollPixels,
-    g_nativeParts1MaxScrollPixels,
-    g_nativeParts1SmoothScroll, maximumStep) || changed;
-  changed = nativeUiAdvanceSmoothScroll(
-    g_nativeParts2ScrollPixels,
-    g_nativeParts2MaxScrollPixels,
-    g_nativeParts2SmoothScroll, maximumStep) || changed;
+  for (int frame = 0; frame < frameCount; ++frame) {
+    bool frameChanged = false;
+    frameChanged = nativeUiAdvanceSmoothScroll(
+      g_nativeAppActiveListScrollPixels,
+      g_nativeMainListMaxScrollPixels,
+      g_nativeMainSmoothScroll, maximumStep) || frameChanged;
+    frameChanged = nativeUiAdvanceSmoothScroll(
+      g_nativeParts1ScrollPixels,
+      g_nativeParts1MaxScrollPixels,
+      g_nativeParts1SmoothScroll, maximumStep) || frameChanged;
+    frameChanged = nativeUiAdvanceSmoothScroll(
+      g_nativeParts2ScrollPixels,
+      g_nativeParts2MaxScrollPixels,
+      g_nativeParts2SmoothScroll, maximumStep) || frameChanged;
+    changed = frameChanged || changed;
+    if (!frameChanged) break;
+  }
+  if (changed) {
+    g_nativeUiLastSmoothScrollAdvanceAt = now;
+  } else {
+    g_nativeUiLastSmoothScrollAdvanceAt = {};
+  }
   return changed;
 }
 
