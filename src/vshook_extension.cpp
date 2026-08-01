@@ -672,6 +672,7 @@ static HFONT g_nativeUiInfoStripFont = nullptr;
 static HFONT g_nativeUiMultiLoopFont = nullptr;
 static HFONT g_nativeUiPopupFont = nullptr;
 static std::map<std::string, HFONT> g_nativeUiConfiguredFonts;
+static std::map<std::string, HFONT> g_nativeUiCompactBlockFonts;
 static HFONT g_nativeUiButtonPaintFont = nullptr;
 static std::unique_ptr<WDL_WinMemBitmap> g_nativeUiBackBuffer;
 static int g_nativeUiBackBufferWidth = 0;
@@ -965,6 +966,7 @@ static bool g_nativeUiMainLayoutRegionsPage = false;
 static bool g_nativeUiMainLayoutViewEnabled = false;
 static std::string g_nativeUiMainLayoutSearchText;
 static std::string g_nativeUiMainLayoutScaleMode;
+static std::string g_nativeUiMainLayoutBlockHeightMode;
 static std::string g_nativeUiMainLayoutFontMode;
 static std::string g_nativeUiMainLayoutPlayingKey;
 static int g_nativeMainListViewportPixels = 0;
@@ -1085,6 +1087,7 @@ enum class NativeMainModalKind {
   CustomizeListPanelBackground,
   CustomizeNoBlockColor,
   CustomizeBlockBorder,
+  CustomizeBlockHeight,
   CustomizeInterfaceBackground,
   CustomizeListScale,
   CustomizeTransportBackground,
@@ -11096,6 +11099,38 @@ static HFONT nativeUiConfiguredFont(const std::string& rawMode)
   return font;
 }
 
+static HFONT nativeUiCompactBlockFont(const std::string& rawMode)
+{
+  std::string mode = nativeLower(nativeTrim(rawMode));
+  if (mode.empty()) mode = "default";
+  const auto found = g_nativeUiCompactBlockFonts.find(mode);
+  if (found != g_nativeUiCompactBlockFonts.end()) return found->second;
+
+#ifdef _WIN32
+  const char* fontName = mode == "default" ? "Segoe UI" : "Arial";
+#else
+  const char* fontName = "Arial";
+#endif
+  if (mode == "verdana") fontName = "Verdana";
+  else if (mode == "trebuchet") fontName = "Trebuchet MS";
+  else if (mode == "georgia") fontName = "Georgia";
+  else if (mode == "courier") fontName = "Courier New";
+#ifdef _WIN32
+  else if (mode == "system") fontName = "Segoe UI";
+#else
+  else if (mode == "system") fontName = "Arial";
+#endif
+
+  constexpr int fontSize = 11;
+  HFONT font = CreateFont(fontSize, 0, 0, 0,
+    FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+    DEFAULT_QUALITY, DEFAULT_PITCH, fontName);
+  if (!font) return nativeUiConfiguredFont(mode);
+  g_nativeUiCompactBlockFonts.emplace(mode, font);
+  return font;
+}
+
 static HFONT nativeUiTimerFont()
 {
   if (g_nativeUiTimerFont) return g_nativeUiTimerFont;
@@ -11221,6 +11256,10 @@ static void nativeUiReleasePaintResources()
     if (item.second) DeleteObject(item.second);
   }
   g_nativeUiConfiguredFonts.clear();
+  for (const auto& item : g_nativeUiCompactBlockFonts) {
+    if (item.second) DeleteObject(item.second);
+  }
+  g_nativeUiCompactBlockFonts.clear();
   g_nativeUiButtonPaintFont = nullptr;
   if (g_nativeUiTimerFont) {
     DeleteObject(g_nativeUiTimerFont);
@@ -13600,6 +13639,7 @@ nativeUiVisualPreferenceKeys()
     "block_rgb_border", "top_fields_rgb_border",
     "search_border_color_mode",
     "interface_bg_mode", "list_scale_mode",
+    "block_height_mode",
     "transport_panel_bg_mode", "number_bar_bg_mode",
     "scrollbar_color_mode", "timer_color_mode", "live_mark_color_mode",
     "playlist_selection_arrow_color_mode",
@@ -13664,6 +13704,7 @@ nativeUiVisualDefaults()
     {"search_border_color_mode", "green"},
     {"interface_bg_mode", "medium"},
     {"list_scale_mode", "normal"},
+    {"block_height_mode", "normal"},
     {"transport_panel_bg_mode", "black"},
     {"number_bar_bg_mode", "black"},
     {"scrollbar_color_mode", "yellow"},
@@ -14372,6 +14413,7 @@ static bool nativeUiIsCustomizeModal(
     kind == NativeMainModalKind::CustomizeListPanelBackground ||
     kind == NativeMainModalKind::CustomizeNoBlockColor ||
     kind == NativeMainModalKind::CustomizeBlockBorder ||
+    kind == NativeMainModalKind::CustomizeBlockHeight ||
     kind == NativeMainModalKind::CustomizeInterfaceBackground ||
     kind == NativeMainModalKind::CustomizeListScale ||
     kind == NativeMainModalKind::CustomizeTransportBackground ||
@@ -15033,6 +15075,29 @@ static NativeUiListLayout nativeUiCurrentListLayout(
   return layout;
 }
 
+static std::string nativeUiBlockHeightMode(
+  const std::map<std::string, std::string>& visualPrefs)
+{
+  const std::string mode = nativeLower(
+    nativeUiVisualPref(
+      visualPrefs, "block_height_mode", "normal"));
+  return mode == "compact" ? "compact" : "normal";
+}
+
+static int nativeUiCompactBlockHeight()
+{
+#ifdef __APPLE__
+  return 17;
+#else
+  return 13;
+#endif
+}
+
+static int nativeUiCompactBlockLineHeight()
+{
+  return std::max(1, nativeUiCompactBlockHeight() - 2);
+}
+
 static size_t nativeUiNextUtf8Byte(
   const std::string& value,
   size_t index)
@@ -15225,6 +15290,7 @@ static NativeUiMainRowMetrics nativeUiMeasureMainRow(
   bool isPlaying,
   bool familyControlVisible,
   bool liveResetVisible,
+  bool compactBlock,
   HFONT font,
   const NativeUiListLayout& layout)
 {
@@ -15279,6 +15345,11 @@ static NativeUiMainRowMetrics nativeUiMeasureMainRow(
   if (row.block) {
     metrics.label = nativeUiFitBlockLabelBeforeWrap(
       dc, metrics.label, metrics.labelMaxWidth, font);
+  }
+  if (compactBlock && row.block) {
+    metrics.lines = {metrics.label};
+    metrics.height = nativeUiCompactBlockHeight();
+    return metrics;
   }
   metrics.lines = nativeUiWrapText(dc, metrics.label,
     metrics.labelMaxWidth, font);
@@ -21613,6 +21684,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
       ? "regions_font_mode" : "playlist_font_mode",
     "default");
   HFONT listFont = nativeUiConfiguredFont(listFontMode);
+  const std::string blockHeightMode =
+    nativeUiBlockHeightMode(paintVisualPrefs);
+  const bool compactBlocks = blockHeightMode == "compact";
+  HFONT compactBlockFont = compactBlocks
+    ? nativeUiCompactBlockFont(listFontMode)
+    : listFont;
   const RECT versionStrip{pad, versionStripY, width - pad,
     versionStripY + versionStripH};
   nativeAppActiveFillRect(dc, versionStrip,
@@ -22806,6 +22883,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     g_nativeUiMainLayoutSearchText !=
       g_nativeMainSearchAppliedText ||
     g_nativeUiMainLayoutScaleMode != listScaleMode ||
+    g_nativeUiMainLayoutBlockHeightMode != blockHeightMode ||
     g_nativeUiMainLayoutFontMode != listFontMode ||
     g_nativeUiMainLayoutPlayingKey != playingLayoutKey;
   if (rebuildMainLayout) {
@@ -22851,7 +22929,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
             !measuredPlaying &&
             !measuredFamilyContainsPlayback &&
             !measuredRow.block,
-          listFont, listLayout);
+          compactBlocks && measuredRow.block,
+          compactBlocks && measuredRow.block
+            ? compactBlockFont : listFont,
+          listLayout);
       g_nativeMainRowHeights.push_back(metrics.height);
       measuredRowsHeight += metrics.height;
     }
@@ -22867,6 +22948,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     g_nativeUiMainLayoutSearchText =
       g_nativeMainSearchAppliedText;
     g_nativeUiMainLayoutScaleMode = listScaleMode;
+    g_nativeUiMainLayoutBlockHeightMode = blockHeightMode;
     g_nativeUiMainLayoutFontMode = listFontMode;
     g_nativeUiMainLayoutPlayingKey = playingLayoutKey;
   }
@@ -23195,13 +23277,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
       const bool familyControlVisible =
         g_nativeMainViewEnabled &&
         row.familyParent && !row.id.empty();
+      const bool compactBlock = compactBlocks && row.block;
+      HFONT rowFont = compactBlock
+        ? compactBlockFont : listFont;
       const NativeUiMainRowMetrics rowMetrics =
         nativeUiMeasureMainRow(dc, row,
           listBaseWidth,
           isPlaying || familyContainsPlayback,
           familyControlVisible,
           isLiveExecuted && !row.block,
-          listFont,
+          compactBlock,
+          rowFont,
           listLayout);
 
       const COLORREF panelFill = listPanelFill;
@@ -23393,17 +23479,20 @@ static void nativePaintAppActivePanel(HWND hwnd)
         std::snprintf(displayNumberText,
           sizeof(displayNumberText), "%02d", displayNumber);
       }
+      const int rowLineHeight = compactBlock
+        ? nativeUiCompactBlockLineHeight()
+        : listLayout.lineHeight;
       const int centeredTextTop =
         rowRect.top + std::max(0,
           (static_cast<int>(rowRect.bottom -
              rowRect.top) -
-           listLayout.lineHeight) / 2);
+           rowLineHeight) / 2);
       const int timeX = rowRect.right -
         rowMetrics.timeWidth - 8;
       RECT durationRect{timeX,
         centeredTextTop,
         timeX + rowMetrics.timeWidth,
-        centeredTextTop + listLayout.lineHeight};
+        centeredTextTop + rowLineHeight};
       const bool rowControlsFullyVisible =
         rowRect.top >= listInnerTop &&
         rowRect.bottom <= listInnerBottom;
@@ -23501,7 +23590,18 @@ static void nativePaintAppActivePanel(HWND hwnd)
         nativeUiDrawDesignerBlockLabel(dc,
           blockNameRect, row.name,
           blockSymbolMode, textColor,
-          ornamentColor, listFont);
+          ornamentColor, rowFont);
+      } else if (compactBlock) {
+        const RECT compactLabelRect{
+          labelX, rowRect.top + 1,
+          std::min(static_cast<int>(rowRect.right),
+            labelX + rowMetrics.labelMaxWidth),
+          rowRect.bottom - 1};
+        nativeAppActiveDrawText(dc,
+          rowMetrics.label, compactLabelRect,
+          DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+            DT_END_ELLIPSIS | DT_NOPREFIX,
+          textColor, rowFont);
       } else {
         nativeUiDrawWrappedText(dc,
           rowMetrics.lines, labelX,
@@ -23512,7 +23612,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
               rowRect.top) -
             listLayout.paddingY * 2),
           listLayout.lineHeight, textColor,
-          listFont);
+          rowFont);
       }
       if (!rowMetrics.timeText.empty()) {
         COLORREF timeColor = RGB(255, 224, 46);
@@ -23534,17 +23634,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
           rowMetrics.timeText, durationRect,
           DT_LEFT | DT_TOP | DT_SINGLELINE |
             DT_NOPREFIX | DT_NOCLIP,
-          timeColor, listFont);
+          timeColor, rowFont);
       }
       RECT numberRect{rowRect.left,
         centeredTextTop,
         rowRect.left + indexColumnW,
-        centeredTextTop + listLayout.lineHeight};
+        centeredTextTop + rowLineHeight};
       nativeAppActiveDrawText(dc,
         displayNumberText, numberRect,
         DT_CENTER | DT_TOP | DT_SINGLELINE |
           DT_NOPREFIX | DT_NOCLIP,
-        RGB(255, 224, 46), listFont);
+        RGB(255, 224, 46), rowFont);
       RECT clippedHit{
         std::max(static_cast<LONG>(
           listRect.left + 1), rowRect.left),
@@ -23754,12 +23854,16 @@ static void nativePaintAppActivePanel(HWND hwnd)
       nativeAppActiveFillOutlinedRect(dc, scrollTrack,
         RGB(87, 69, 10), scrollEdge);
       const int trackH = std::max(1, trackBottom - trackTop);
+      const double visibleContentRatio =
+        compactBlocks && hasBlock
+          ? static_cast<double>(viewportPixels) /
+              std::max(1, totalContentPixels)
+          : static_cast<double>(visibleRows) /
+              std::max(1, virtualRowCount);
       const int thumbH = std::min(trackH,
         std::max(mainScrollbarMinimumThumbH,
           static_cast<int>(std::floor(
-            trackH *
-            (static_cast<double>(visibleRows) /
-             std::max(1, virtualRowCount)) *
+            trackH * visibleContentRatio *
             mainScrollbarThumbScale + 0.5))));
       const int travel = std::max(0, trackH - thumbH);
       const int thumbY = trackTop + static_cast<int>(travel *
@@ -27497,7 +27601,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
               rows * (buttonHeight + gap) - gap + 9;
           };
         const size_t categoryEntryCounts[] = {
-          3, 10, 10, 3, 1, 1
+          3, 10, 10, 3, 2, 1
         };
         int contentHeight = 0;
         for (const size_t count : categoryEntryCounts) {
@@ -27597,7 +27701,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
           {"Ocultar/posicionar botões", "button_visibility", "remove_queue"}
         });
         addCategory("Blocos", {
-          {"Simbolo/Bloco", "block_symbol", "block"}
+          {"Simbolo/Bloco", "block_symbol", "block"},
+          {"Altura do bloco", "block_height", "up"}
         });
         addCategory("Gavetas", {
           {"Contorno/Simbolo da gaveta", "drawer_style", "yellow_reset"}
@@ -28194,6 +28299,92 @@ static void nativePaintAppActivePanel(HWND hwnd)
           "custom_set|battery_warning_color_mode|", flowY,
           panelWidth >= 560 ? 3 : (panelWidth >= 340 ? 2 : 1),
           customButtonH, customGap, true);
+        addCustomNav("custom_back_main");
+      } else if (g_nativeMainModalKind ==
+          NativeMainModalKind::CustomizeBlockHeight) {
+        drawCustomHeader("Altura do bloco",
+          "Escolha a altura dos itens de bloco. Compacto usa uma linha mais fina e uma fonte menor.");
+        const std::vector<std::pair<std::string, std::string>> options = {
+          {"normal", "Normal"}, {"compact", "Compacto"}
+        };
+        const int optionsBottom = addChoiceGrid(options,
+          nativeUiVisualRawValue(visual, "block_height_mode"),
+          "custom_set|block_height_mode|", modal.top + 66,
+          panelWidth >= 420 ? 2 : 1, 24, 8, false);
+
+        RECT preview{panelLeft, optionsBottom + 10,
+          panelLeft + panelWidth, optionsBottom + 106};
+        drawPanel(preview);
+        const NativeUiListLayout sampleLayout =
+          nativeUiCurrentListLayout(visual);
+        const std::string previewFontMode = nativeUiVisualPref(
+          visual,
+          g_nativeAppActivePanelModel.regionsPage
+            ? "regions_font_mode" : "playlist_font_mode",
+          "default");
+        HFONT previewListFont =
+          nativeUiConfiguredFont(previewFontMode);
+        const bool previewCompact =
+          nativeUiBlockHeightMode(visual) == "compact";
+        HFONT previewBlockFont = previewCompact
+          ? nativeUiCompactBlockFont(previewFontMode)
+          : previewListFont;
+        const int musicHeight = sampleLayout.singleRowHeight;
+        const int blockHeight = previewCompact
+          ? nativeUiCompactBlockHeight()
+          : sampleLayout.singleRowHeight;
+        int rowTop = preview.top + 9;
+        const RECT firstMusic{preview.left + 9, rowTop,
+          preview.right - 9, rowTop + musicHeight};
+        nativeAppActiveFillRect(dc, firstMusic, RGB(46, 48, 54));
+        nativeAppActiveDrawText(dc, "01  MÚSICA DA LISTA",
+          firstMusic,
+          DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+            DT_END_ELLIPSIS | DT_NOPREFIX,
+          RGB(248, 250, 252), previewListFont);
+        rowTop = firstMusic.bottom + 2;
+        const RECT blockSample{preview.left + 9, rowTop,
+          preview.right - 9, rowTop + blockHeight};
+        nativeAppActiveFillOutlinedRect(dc, blockSample,
+          RGB(64, 42, 20), RGB(153, 108, 28));
+        const RECT blockNumber{blockSample.left,
+          blockSample.top, blockSample.left + 28,
+          blockSample.bottom};
+        nativeAppActiveDrawText(dc, "--", blockNumber,
+          DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+            DT_NOPREFIX,
+          RGB(255, 224, 46), previewBlockFont);
+        const std::string previewSymbolMode = nativeLower(
+          nativeUiVisualPref(
+            visual, "block_symbol_mode", "none"));
+        const COLORREF previewOrnamentColor =
+          nativeUiNamedVisualColor(
+            nativeUiVisualPref(visual,
+              "block_symbol_" + previewSymbolMode +
+                "_color_mode",
+              "yellow"),
+            "yellow");
+        const RECT blockName{blockNumber.right + 2,
+          blockSample.top + 1, blockSample.right - 7,
+          blockSample.bottom - 1};
+        nativeUiDrawDesignerBlockLabel(dc, blockName,
+          "BLOCO 01", previewSymbolMode,
+          RGB(255, 224, 46), previewOrnamentColor,
+          previewBlockFont);
+        rowTop = blockSample.bottom + 2;
+        const RECT secondMusic{preview.left + 9, rowTop,
+          preview.right - 9,
+          std::min(static_cast<int>(preview.bottom - 8),
+            rowTop + musicHeight)};
+        if (secondMusic.bottom > secondMusic.top) {
+          nativeAppActiveFillRect(dc, secondMusic,
+            RGB(41, 46, 51));
+          nativeAppActiveDrawText(dc,
+            "02  PRÓXIMA MÚSICA", secondMusic,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+              DT_END_ELLIPSIS | DT_NOPREFIX,
+            RGB(248, 250, 252), previewListFont);
+        }
         addCustomNav("custom_back_main");
       } else if (g_nativeMainModalKind ==
           NativeMainModalKind::CustomizeBlockSymbol) {
@@ -33683,6 +33874,9 @@ static bool nativeMainHandleModalClick(
     } else if (target == "block_border") {
       g_nativeMainModalKind =
         NativeMainModalKind::CustomizeBlockBorder;
+    } else if (target == "block_height") {
+      g_nativeMainModalKind =
+        NativeMainModalKind::CustomizeBlockHeight;
     } else if (target == "interface_bg") {
       g_nativeMainModalKind =
         NativeMainModalKind::CustomizeInterfaceBackground;
@@ -38038,6 +38232,7 @@ static void nativeCloseAppActivePanel()
   g_nativeUiMainLayoutSortMode = -1;
   g_nativeUiMainLayoutSearchText.clear();
   g_nativeUiMainLayoutScaleMode.clear();
+  g_nativeUiMainLayoutBlockHeightMode.clear();
   g_nativeUiMainLayoutFontMode.clear();
   g_nativeUiMainLayoutPlayingKey.clear();
   g_nativeMainListViewportPixels = 0;
@@ -44496,6 +44691,8 @@ static void nativeRebuildState(bool forceSnapshot)
   nativeTechnicalNoticeRefreshAuthCache(
     directorAuthHash, recadosAuthHash);
   const auto bridgeVisualPrefs = nativeUiReadVisualPrefs();
+  const std::string blockHeightMode =
+    nativeUiBlockHeightMode(bridgeVisualPrefs);
   const std::string blockSymbolMode = nativeLower(
     nativeUiVisualPref(
       bridgeVisualPrefs, "block_symbol_mode", "none"));
@@ -44523,6 +44720,10 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"nativeBridge\":true,";
   json << "\"bridgeVersion\":2,";
   json << "\"extensionVersion\":" << nativeJsonString(VSHOOK_EXTENSION_VERSION) << ",";
+  json << "\"blockHeightMode\":"
+       << nativeJsonString(blockHeightMode) << ",";
+  json << "\"block_height_mode\":"
+       << nativeJsonString(blockHeightMode) << ",";
   json << "\"blockSymbolMode\":"
        << nativeJsonString(blockSymbolMode) << ",";
   json << "\"blockSymbolColor\":"
