@@ -12421,14 +12421,6 @@ static std::string nativeUiMainTooltipAtPoint(const POINT& point)
       return "Limpar a marcacao de ja executada desta musica.";
     }
   }
-  for (auto it = g_nativeMainRowHits.rbegin();
-       it != g_nativeMainRowHits.rend(); ++it) {
-    if (!PtInRect(&it->rect, point) ||
-        it->sourceIndex >= g_nativeAppActivePanelModel.rows.size()) continue;
-    return g_nativeAppActivePanelModel.rows[it->sourceIndex].block
-      ? "Clique direito para renomear o bloco."
-      : "Clique para selecionar. Clique direito para renomear.";
-  }
   return std::string();
 }
 
