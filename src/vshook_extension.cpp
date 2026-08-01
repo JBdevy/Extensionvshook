@@ -17415,8 +17415,12 @@ static bool nativeUiExecuteExportAudio(
   if (GetSetProjectInfo_ptr) {
     GetSetProjectInfo_ptr(
       project, "RENDER_SETTINGS", 8.0, true);
+    // A matriz já contém somente as regiões pertencentes ao repertório que
+    // será exportado. Usar "selected project regions" fazia o REAPER limitar
+    // novamente o render à região selecionada na régua (normalmente o pai).
+    // "All project regions" deixa a própria matriz aplicar o filtro correto.
     GetSetProjectInfo_ptr(
-      project, "RENDER_BOUNDSFLAG", 5.0, true);
+      project, "RENDER_BOUNDSFLAG", 3.0, true);
     GetSetProjectInfo_ptr(
       project, "RENDER_CHANNELS", 2.0, true);
     GetSetProjectInfo_ptr(
@@ -18612,6 +18616,10 @@ static bool nativeUiExecuteConverter(bool applyNativeColors)
   if (applyNativeColors) {
     nativeUiApplyProjectColorRules(project, true);
   }
+  // Converter também prepara imediatamente as pistas harmônicas. Essa ação
+  // não pode depender de um pedido externo do Lua/bridge para inserir o FX.
+  const int preparedReaPitchTracks =
+    nativeEnsureReaPitchFirstOnHashTracks(project);
   if (Undo_EndBlock2_ptr) {
     Undo_EndBlock2_ptr(project,
       "Converter projeto e preparar espaço inicial", -1);
@@ -18628,7 +18636,8 @@ static bool nativeUiExecuteConverter(bool applyNativeColors)
         static_cast<size_t>(created)) +
       " marker(s) preservado(s) | scan " +
       std::to_string(markers.size()) + " marker(s)/" +
-      std::to_string(audio.size()) + " áudio(s)", 3.5);
+      std::to_string(audio.size()) + " áudio(s) | ReaPitch " +
+      std::to_string(preparedReaPitchTracks) + " pista(s)", 3.5);
   return true;
 }
 
@@ -18672,9 +18681,12 @@ static void nativeUiUpdateProjectFromConfig()
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(
     pathBuf, static_cast<int>(sizeof(pathBuf)));
+  int preparedReaPitchTracks = 0;
   if (project) {
     nativeUiConverterPlaceRulerLanes(project, {});
     if (applyColors) nativeUiApplyProjectColorRules(project, true);
+    preparedReaPitchTracks =
+      nativeEnsureReaPitchFirstOnHashTracks(project);
     if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
     if (UpdateTimeline_ptr) UpdateTimeline_ptr();
     if (UpdateArrange_ptr) UpdateArrange_ptr();
@@ -18682,8 +18694,10 @@ static void nativeUiUpdateProjectFromConfig()
   g_nativeForceSnapshotBuild.store(true);
   g_nativeForceStateBuild.store(true);
   nativeUiShowTemporaryPopup(applyColors
-    ? "Atualizado com padrão de cores do VS Hook"
-    : "Atualizado preservando as cores atuais", 2.0);
+    ? "Atualizado com padrão de cores do VS Hook | ReaPitch " +
+        std::to_string(preparedReaPitchTracks) + " pista(s)"
+    : "Atualizado preservando as cores atuais | ReaPitch " +
+        std::to_string(preparedReaPitchTracks) + " pista(s)", 2.0);
 }
 
 static bool nativeUiConverterPartsMarkerIsActionable(
@@ -48866,6 +48880,9 @@ static void startupTimer()
   // quando runtimeActive já ficou falso.
   processPcResumeRequestFromAppActiveOnMainThread();
 #endif
+  // Compatibilidade com conversores antigos: o pedido de preparação do
+  // ReaPitch deve ser consumido mesmo sem Diretor/Teleprompt em execução.
+  nativeProcessEnsureReaPitchRequestOnMainThread();
   const bool runtimeActive = nativeIsRuntimeControlActive();
   if (runtimeActive) {
     const bool runtimeJustActivated = !g_nativeRuntimeWasActive;
@@ -48882,7 +48899,6 @@ static void startupTimer()
     nativeProcessGlobalStopPauseOnMainThread();
     nativeUpdateManualStopFadeoutOnMainThread();
     nativeProcessPendingSelectionOnMainThread();
-    nativeProcessEnsureReaPitchRequestOnMainThread();
     // Arma o Multiloops antes da manutencao da fila. Assim o mesmo ciclo ja
     // publica Repeat ativo e impede o seek da fila de disputar o cursor.
     nativeProcessMultiLoopsOnMainThread();
