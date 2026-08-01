@@ -1088,6 +1088,7 @@ enum class NativeMainModalKind {
   CustomizeNoBlockColor,
   CustomizeBlockBorder,
   CustomizeBlockHeight,
+  CustomizeTooltips,
   CustomizeInterfaceBackground,
   CustomizeListScale,
   CustomizeTransportBackground,
@@ -13641,6 +13642,7 @@ nativeUiVisualPreferenceKeys()
     "search_border_color_mode",
     "interface_bg_mode", "list_scale_mode",
     "block_height_mode",
+    "tooltips_enabled",
     "transport_panel_bg_mode", "number_bar_bg_mode",
     "scrollbar_color_mode", "timer_color_mode", "live_mark_color_mode",
     "playlist_selection_arrow_color_mode",
@@ -13706,6 +13708,7 @@ nativeUiVisualDefaults()
     {"interface_bg_mode", "medium"},
     {"list_scale_mode", "normal"},
     {"block_height_mode", "normal"},
+    {"tooltips_enabled", "1"},
     {"transport_panel_bg_mode", "black"},
     {"number_bar_bg_mode", "black"},
     {"scrollbar_color_mode", "yellow"},
@@ -14415,6 +14418,7 @@ static bool nativeUiIsCustomizeModal(
     kind == NativeMainModalKind::CustomizeNoBlockColor ||
     kind == NativeMainModalKind::CustomizeBlockBorder ||
     kind == NativeMainModalKind::CustomizeBlockHeight ||
+    kind == NativeMainModalKind::CustomizeTooltips ||
     kind == NativeMainModalKind::CustomizeInterfaceBackground ||
     kind == NativeMainModalKind::CustomizeListScale ||
     kind == NativeMainModalKind::CustomizeTransportBackground ||
@@ -27717,6 +27721,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           {"Borda Campos do Topo", "top_border", "pink"},
           {"Contorno da lupa", "search_border", "play"},
           {"Configurações da lupa", "search_settings", "access"},
+          {"Tooltips", "tooltips", "access"},
           {"Cor das bordas da interface", "border_color", "autoplay"}
         });
         addCategory("Botões", {
@@ -28323,6 +28328,19 @@ static void nativePaintAppActivePanel(HWND hwnd)
           "custom_set|battery_warning_color_mode|", flowY,
           panelWidth >= 560 ? 3 : (panelWidth >= 340 ? 2 : 1),
           customButtonH, customGap, true);
+        addCustomNav("custom_back_main");
+      } else if (g_nativeMainModalKind ==
+          NativeMainModalKind::CustomizeTooltips) {
+        drawCustomHeader("Tooltips",
+          "Ative ou desative as dicas exibidas ao apontar para os controles.");
+        const std::vector<std::pair<std::string, std::string>> options = {
+          {"1", "Ativado"}, {"0", "Desativado"}
+        };
+        addChoiceGrid(options,
+          nativeUiVisualRawValue(visual, "tooltips_enabled"),
+          "custom_set|tooltips_enabled|", modal.top + 66,
+          panelWidth >= 420 ? 2 : 1,
+          customButtonH, customGap, false);
         addCustomNav("custom_back_main");
       } else if (g_nativeMainModalKind ==
           NativeMainModalKind::CustomizeBlockHeight) {
@@ -30516,7 +30534,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
     }
   }
 
-  if (!g_state.directorInterfaceBlocked && !g_nativePartsRenameOpen &&
+  if (nativeUiVisualPrefBool(
+        paintVisualPrefs, "tooltips_enabled", true) &&
+      !g_state.directorInterfaceBlocked && !g_nativePartsRenameOpen &&
       !g_nativeMixerRenameOpen) {
     POINT cursor{};
     GetCursorPos(&cursor);
@@ -33901,6 +33921,9 @@ static bool nativeMainHandleModalClick(
     } else if (target == "block_height") {
       g_nativeMainModalKind =
         NativeMainModalKind::CustomizeBlockHeight;
+    } else if (target == "tooltips") {
+      g_nativeMainModalKind =
+        NativeMainModalKind::CustomizeTooltips;
     } else if (target == "interface_bg") {
       g_nativeMainModalKind =
         NativeMainModalKind::CustomizeInterfaceBackground;
@@ -38356,6 +38379,7 @@ struct NativeTelepromptPreviewBlock {
   std::string id;
   std::string name;
   std::string colorHex;
+  std::string colorKey;
   std::vector<NativeTelepromptPreviewSong> songs;
 };
 
@@ -38448,7 +38472,22 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
       // A paleta do repertório é a fonte da verdade. Se um bloco antigo
       // não possuir cor salva, usa o mesmo amarelo do nome de bloco nativo.
       block.colorHex = nativeTrim(item.blockColorHex);
-      if (block.colorHex.empty()) block.colorHex = "#FFE02E";
+      block.colorKey = nativeLower(
+        nativeTrim(item.blockColorKey));
+      if (block.colorHex.empty()) {
+        block.colorHex = "#FFE02E";
+        if (block.colorKey.empty()) block.colorKey = "yellow";
+      } else if (block.colorKey.empty()) {
+        const std::string normalizedHex =
+          nativeLower(block.colorHex);
+        if (normalizedHex == nativeLower(
+              nativeBlockColorHexFromKey("green", 1))) {
+          block.colorKey = "green";
+        } else if (normalizedHex == nativeLower(
+                     nativeBlockColorHexFromKey("yellow", 1))) {
+          block.colorKey = "yellow";
+        }
+      }
       allBlocks.push_back(std::move(block));
       current = &allBlocks.back();
       visibleFamilyParentId.clear();
@@ -38543,6 +38582,7 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
     nativeUiHashString(hash, block.id);
     nativeUiHashString(hash, block.name);
     nativeUiHashString(hash, block.colorHex);
+    nativeUiHashString(hash, block.colorKey);
     nativeUiHashValue(hash, block.songs.size());
     for (const auto& song : block.songs) {
       nativeUiHashString(hash, song.id);
@@ -38591,6 +38631,10 @@ static std::string nativeTelepromptPreviewStateJson(
          << nativeJsonString(block.colorHex) << ",";
     json << "\"blockColorHex\":"
          << nativeJsonString(block.colorHex) << ",";
+    json << "\"colorKey\":"
+         << nativeJsonString(block.colorKey) << ",";
+    json << "\"blockColorKey\":"
+         << nativeJsonString(block.colorKey) << ",";
     json << "\"songs\":[";
     for (size_t songIndex = 0;
          songIndex < block.songs.size(); ++songIndex) {
@@ -40049,6 +40093,10 @@ static void nativeTelepromptDrawPreview(
 
   const COLORREF fallbackColor = nativeTelepromptColor(
     settings.queueNameColor, RGB(255, 234, 0));
+  // Estados do Preview são fixos: Tocando em verde e Fila em amarelo.
+  // As preferências de letra do TP não podem eliminar esse contraste.
+  const COLORREF playingColor = RGB(0, 255, 85);
+  const COLORREF queuedColor = RGB(255, 234, 0);
   const auto nowMs =
     std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -40152,6 +40200,21 @@ static void nativeTelepromptDrawPreview(
     int songTop = titleRect.bottom +
       std::max(2, padY / 2);
     const int songGap = std::max(1, padY / 3);
+    const bool hasPlayingSong = std::any_of(
+      block.songs.begin(), block.songs.end(),
+      [](const NativeTelepromptPreviewSong& song) {
+        return song.playing;
+      });
+    const bool hasQueuedSong = std::any_of(
+      block.songs.begin(), block.songs.end(),
+      [](const NativeTelepromptPreviewSong& song) {
+        return song.queued;
+      });
+    const std::string blockColorKey =
+      nativeLower(block.colorKey);
+    const bool whitenOtherSongs =
+      (blockColorKey == "green" && hasPlayingSong) ||
+      (blockColorKey == "yellow" && hasQueuedSong);
     for (const auto& song : block.songs) {
       std::string label = song.name;
       if (song.playing || song.queued) {
@@ -40171,13 +40234,20 @@ static void nativeTelepromptDrawPreview(
       // O pisca apaga somente os pixels. A medição e o avanço vertical
       // permanecem idênticos para a lista não saltar a cada 350 ms.
       if (!song.playing || showPlaying) {
+        const COLORREF songColor = song.playing
+          ? playingColor
+          : (song.queued
+              ? queuedColor
+              : (whitenOtherSongs
+                  ? RGB(255, 255, 255)
+                  : blockColor));
         nativeTelepromptDrawPreviewLines(
           dc, songLines,
           RECT{card.left + padX, songTop,
             card.right - padX,
-            songTop + songHeight},
+          songTop + songHeight},
           songLineHeight, false,
-          blockColor, songFont);
+          songColor, songFont);
       }
       songTop += songHeight + songGap;
     }
