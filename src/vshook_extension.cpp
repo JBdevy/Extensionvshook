@@ -2467,6 +2467,34 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
     }
     return 1;
   }
+#ifdef __APPLE__
+  // No SWELL do macOS, devolver -1 encaminha a tecla para a NSView focada,
+  // mas as function keys ainda podem continuar pela cadeia de atalhos nativa.
+  // F1-F9 sem Ctrl/Command/Alt pertencem ao painel do VS Hook: entrega
+  // diretamente ao WndProc e informa ao accelerator que o evento inteiro foi
+  // consumido. As combinacoes modificadas e F10+ continuam livres (F11, por
+  // exemplo, e encaminhado ao REAPER pelo proprio WndProc).
+  const bool keyUp = msg->message == WM_KEYUP ||
+    msg->message == WM_SYSKEYUP;
+  if (targetsNativePanel && (keyDown || keyUp) &&
+      vk >= VK_F1 && vk <= VK_F9) {
+    static bool consumedFunctionKeyDown[9]{};
+    const int functionKeyIndex = vk - VK_F1;
+    if (keyDown) {
+      if (nativeHotkeyHasCommandModifier()) {
+        consumedFunctionKeyDown[functionKeyIndex] = false;
+      } else {
+        consumedFunctionKeyDown[functionKeyIndex] = true;
+        SendMessage(g_nativeAppActivePanelHwnd,
+          WM_KEYDOWN, msg->wParam, msg->lParam);
+        return 1;
+      }
+    } else if (consumedFunctionKeyDown[functionKeyIndex]) {
+      consumedFunctionKeyDown[functionKeyIndex] = false;
+      return 1;
+    }
+  }
+#endif
   if (targetsNativePanel) return -1;
 
   // Fora do foco, a extensão reserva somente R, L e Esc. Todas as demais
@@ -31079,12 +31107,22 @@ static bool nativeNavigateMainRows(int step)
   const int pageSlot = regionsPage ? 1 : 0;
   const int directionSlot = direction > 0 ? 1 : 0;
   const auto navigationNow = std::chrono::steady_clock::now();
+#ifdef __APPLE__
+  // No macOS o repeat sintetico pode atrasar junto com o WM_TIMER. Mesmo que
+  // um quadro leve mais de 120 ms, a tecla continua fisicamente pressionada e
+  // nao pode provocar a navegacao circular ao chegar no inicio/fim. Os repeats
+  // nativos do Cocoa ja foram consumidos antes daqui, portanto um WM_KEYDOWN
+  // fisico novo sempre continua livre para fazer a navegacao circular.
+  const bool rapidNavigationRepeat =
+    g_nativeUiMacSyntheticNavigationRepeat;
+#else
   const auto previousNavigationAt =
     lastNavigationAt[pageSlot][directionSlot];
   const bool rapidNavigationRepeat =
     previousNavigationAt.time_since_epoch().count() != 0 &&
     std::chrono::duration_cast<std::chrono::milliseconds>(
       navigationNow - previousNavigationAt).count() < 120;
+#endif
   lastNavigationAt[pageSlot][directionSlot] = navigationNow;
   int current = -1;
   const auto* selected = nativeUiCurrentMainSelectedSongRow();
@@ -31238,9 +31276,24 @@ static bool nativeNavigateMainRows(int step)
         std::min(revealTarget,
           g_nativeMainListMaxScrollPixels));
       if (revealTarget != g_nativeAppActiveListScrollPixels) {
-        g_nativeMainSmoothScroll.target = revealTarget;
-        g_nativeMainSmoothScroll.lastApplied =
-          g_nativeAppActiveListScrollPixels;
+#ifdef __APPLE__
+        if (g_nativeUiMacSyntheticNavigationRepeat) {
+          // O repeat do Mac e produzido pelo mesmo timer que anima o scroll.
+          // Se apenas acumularmos um novo alvo, a selecao de 33 ms anda mais
+          // rapido que os pixels e escapa da linha de retencao. Durante o
+          // repeat, desloca lista e selecao no mesmo passo: descendo ela fica
+          // na antepenultima linha; subindo, com uma linha de contexto acima.
+          g_nativeAppActiveListScrollPixels = revealTarget;
+          g_nativeMainSmoothScroll = NativeUiSmoothScrollState{};
+          g_nativeUiLastSmoothScrollAdvanceAt = {};
+        } else {
+#endif
+          g_nativeMainSmoothScroll.target = revealTarget;
+          g_nativeMainSmoothScroll.lastApplied =
+            g_nativeAppActiveListScrollPixels;
+#ifdef __APPLE__
+        }
+#endif
       } else {
         g_nativeMainSmoothScroll =
           NativeUiSmoothScrollState{};
