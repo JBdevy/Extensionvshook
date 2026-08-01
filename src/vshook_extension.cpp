@@ -11879,7 +11879,8 @@ static void nativeUiDrawWrappedText(
   int height,
   int lineHeight,
   COLORREF color,
-  HFONT font);
+  HFONT font,
+  bool strikeThrough = false);
 static COLORREF nativeUiNamedVisualColor(
   std::string mode,
   const std::string& fallback);
@@ -15370,7 +15371,8 @@ static void nativeUiDrawWrappedText(
   int height,
   int lineHeight,
   COLORREF color,
-  HFONT font)
+  HFONT font,
+  bool strikeThrough)
 {
   const int maxLines = std::max(
     1, height / std::max(1, lineHeight));
@@ -15386,6 +15388,27 @@ static void nativeUiDrawWrappedText(
       DT_LEFT | DT_TOP | DT_SINGLELINE |
         DT_NOPREFIX | DT_NOCLIP,
       color, font);
+    if (strikeThrough &&
+        !lines[static_cast<size_t>(index)].empty()) {
+      const int measuredWidth = std::max(0,
+        nativeUiTextWidth(dc,
+          lines[static_cast<size_t>(index)], font));
+      const int strikeRight = std::min(
+        x + std::max(0, width), x + measuredWidth);
+      const int strikeTop = std::min(
+        static_cast<int>(lineRect.bottom) - 2,
+        static_cast<int>(lineRect.top) +
+          std::max(0, lineHeight / 2));
+      const RECT strikeRect{x,
+        std::max(static_cast<int>(lineRect.top), strikeTop),
+        strikeRight,
+        std::min(static_cast<int>(lineRect.bottom),
+          std::max(static_cast<int>(lineRect.top), strikeTop) + 2)};
+      if (strikeRect.right > strikeRect.left &&
+          strikeRect.bottom > strikeRect.top) {
+        nativeAppActiveFillRect(dc, strikeRect, color);
+      }
+    }
   }
 }
 
@@ -23245,7 +23268,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
               g_nativeAppActivePanelModel.selectedId,
               g_nativeAppActivePanelModel.selectedStart,
               g_nativeAppActivePanelModel.selectedEnd));
-      const bool isLiveExecuted = row.liveExecuted && !isPlaying;
+      const bool isLiveMarked = row.liveExecuted && !row.block;
+      const bool isLiveExecuted = isLiveMarked && !isPlaying;
       const COLORREF liveExecutedTextColor =
         RGB(248, 113, 113);
       const NativeAppActivePanelModel::Row* nextVisibleRow =
@@ -23612,7 +23636,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
               rowRect.top) -
             listLayout.paddingY * 2),
           listLayout.lineHeight, textColor,
-          rowFont);
+          rowFont, isLiveMarked);
       }
       if (!rowMetrics.timeText.empty()) {
         COLORREF timeColor = RGB(255, 224, 46);
@@ -38321,15 +38345,275 @@ struct NativeTelepromptWindowState {
 };
 
 struct NativeTelepromptPreviewSong {
+  std::string id;
   std::string name;
+  std::string colorHex;
   bool playing = false;
   bool queued = false;
 };
 
 struct NativeTelepromptPreviewBlock {
+  std::string id;
   std::string name;
+  std::string colorHex;
   std::vector<NativeTelepromptPreviewSong> songs;
 };
+
+struct NativeTelepromptPreviewState {
+  bool active = false;
+  bool enabled = false;
+  int mode = 0;
+  int pageIndex = 0;
+  int pageSize = 8;
+  int firstBlockIndex = 0;
+  int totalBlocks = 0;
+  std::string revision;
+  std::string noSongsMessage = "Sem músicas";
+  std::vector<NativeTelepromptPreviewBlock> blocks;
+};
+
+static std::string nativeTelepromptPreviewItemId(
+  const NativeSongWindow& item,
+  const std::string& prefix,
+  size_t fallbackIndex)
+{
+  if (!item.playlistEntryId.empty()) {
+    return item.playlistEntryId;
+  }
+  if (!item.id.empty()) return item.id;
+  return prefix + std::to_string(fallbackIndex + 1);
+}
+
+static bool nativeTelepromptPreviewTargetMatches(
+  const NativeSongWindow& item,
+  const std::string& id,
+  double start,
+  double end)
+{
+  if (!id.empty() && nativeSongIdMatches(item, id)) return true;
+  return end > start + 0.0005 &&
+    std::fabs(item.start - start) <= 0.003 &&
+    std::fabs(item.end - end) <= 0.003;
+}
+
+// Constrói uma única representação do Preview para o desenho nativo e
+// para o bridge. Toda decisão sobre gavetas, paginação, fila e cores fica
+// concentrada aqui para TP1, TP2 e apps nunca divergirem visualmente.
+static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
+  const std::vector<NativeSongWindow>& playlistItems,
+  int previewMode,
+  bool transportPlaying,
+  const std::string& playingId,
+  double playingStart,
+  double playingEnd,
+  const std::string& queuedId,
+  double queuedStart,
+  double queuedEnd,
+  const std::map<std::string, bool>& openFamilyDrawers)
+{
+  NativeTelepromptPreviewState state;
+  state.mode = previewMode >= 1 && previewMode <= 6
+    ? previewMode : 0;
+  state.active = state.mode > 0;
+  state.enabled = state.active;
+  state.pageIndex = state.active ? state.mode - 1 : 0;
+  state.firstBlockIndex = state.pageIndex * state.pageSize;
+
+  // O objeto vazio continua explícito no bridge para o app distinguir uma
+  // extensão nova de uma DLL antiga. Com o Preview desligado, porém, não há
+  // motivo para agrupar nem hashear todo o repertório a cada atualização.
+  if (!state.active) {
+    state.revision = "0";
+    return state;
+  }
+
+  std::vector<NativeTelepromptPreviewBlock> allBlocks;
+  NativeTelepromptPreviewBlock* current = nullptr;
+  std::string visibleFamilyParentId;
+  size_t visibleFamilyParentSongIndex =
+    std::numeric_limits<size_t>::max();
+
+  for (size_t itemIndex = 0;
+       itemIndex < playlistItems.size(); ++itemIndex) {
+    const NativeSongWindow& item = playlistItems[itemIndex];
+    if (item.isBlock) {
+      NativeTelepromptPreviewBlock block;
+      block.id = nativeTelepromptPreviewItemId(
+        item, "block-", itemIndex);
+      block.name = nativeTrim(item.name);
+      if (block.name.empty()) {
+        block.name = "BLOCO " +
+          std::to_string(allBlocks.size() + 1);
+      }
+      // A paleta do repertório é a fonte da verdade. Se um bloco antigo
+      // não possuir cor salva, usa o mesmo amarelo do nome de bloco nativo.
+      block.colorHex = nativeTrim(item.blockColorHex);
+      if (block.colorHex.empty()) block.colorHex = "#FFE02E";
+      allBlocks.push_back(std::move(block));
+      current = &allBlocks.back();
+      visibleFamilyParentId.clear();
+      visibleFamilyParentSongIndex =
+        std::numeric_limits<size_t>::max();
+      continue;
+    }
+
+    if (current == nullptr) {
+      NativeTelepromptPreviewBlock block;
+      block.id = "no-block";
+      block.name = "SEM BLOCO";
+      // Músicas sem bloco usam branco no repertório quando não há
+      // personalização de cor. O mesmo fallback é publicado aos apps.
+      block.colorHex = "#FFFFFF";
+      allBlocks.push_back(std::move(block));
+      current = &allBlocks.back();
+    }
+
+    const std::string name = nativeTrim(item.name);
+    if (name.empty()) continue;
+
+    const bool playing = transportPlaying &&
+      nativeTelepromptPreviewTargetMatches(
+        item, playingId, playingStart, playingEnd);
+    const bool queued = nativeTelepromptPreviewTargetMatches(
+      item, queuedId, queuedStart, queuedEnd);
+    if (item.isHashChild) {
+      const auto drawer =
+        openFamilyDrawers.find(item.parentId);
+      const bool drawerOpen =
+        !item.parentId.empty() &&
+        drawer != openFamilyDrawers.end() &&
+        drawer->second;
+      if (!drawerOpen) {
+        // Com a gaveta fechada, o pai representa visualmente a família e
+        // recebe também Tocando/Fila de qualquer filho oculto.
+        if (item.parentId == visibleFamilyParentId &&
+            visibleFamilyParentSongIndex <
+              current->songs.size()) {
+          auto& parentSong =
+            current->songs[visibleFamilyParentSongIndex];
+          parentSong.playing = parentSong.playing || playing;
+          parentSong.queued = parentSong.queued || queued;
+        }
+        continue;
+      }
+    }
+
+    NativeTelepromptPreviewSong song;
+    song.id = nativeTelepromptPreviewItemId(
+      item, "song-", itemIndex);
+    song.name = name;
+    // Dentro do Preview todas as músicas herdam deliberadamente a cor do
+    // contorno/nome do bloco, inclusive durante Tocando e Fila.
+    song.colorHex = current->colorHex;
+    song.playing = playing;
+    song.queued = queued;
+    current->songs.push_back(std::move(song));
+    if (item.isHashParent) {
+      visibleFamilyParentId = item.id;
+      visibleFamilyParentSongIndex =
+        current->songs.size() - 1;
+    } else if (!item.isHashChild) {
+      visibleFamilyParentId.clear();
+      visibleFamilyParentSongIndex =
+        std::numeric_limits<size_t>::max();
+    }
+  }
+
+  state.totalBlocks = static_cast<int>(allBlocks.size());
+  if (state.active &&
+      state.firstBlockIndex < state.totalBlocks) {
+    const size_t first = static_cast<size_t>(
+      state.firstBlockIndex);
+    const size_t last = std::min(
+      allBlocks.size(),
+      first + static_cast<size_t>(state.pageSize));
+    state.blocks.assign(
+      allBlocks.begin() + static_cast<std::ptrdiff_t>(first),
+      allBlocks.begin() + static_cast<std::ptrdiff_t>(last));
+  }
+
+  uint64_t hash = 1469598103934665603ull;
+  nativeUiHashValue(hash, state.mode);
+  nativeUiHashValue(hash, state.pageSize);
+  nativeUiHashValue(hash, state.firstBlockIndex);
+  nativeUiHashValue(hash, state.totalBlocks);
+  // A revisão representa apenas a página publicada. Mudanças de
+  // Tocando/Fila em blocos fora dela não precisam reconstruir o DOM do app.
+  for (const auto& block : state.blocks) {
+    nativeUiHashString(hash, block.id);
+    nativeUiHashString(hash, block.name);
+    nativeUiHashString(hash, block.colorHex);
+    nativeUiHashValue(hash, block.songs.size());
+    for (const auto& song : block.songs) {
+      nativeUiHashString(hash, song.id);
+      nativeUiHashString(hash, song.name);
+      nativeUiHashString(hash, song.colorHex);
+      nativeUiHashValue(hash, song.playing);
+      nativeUiHashValue(hash, song.queued);
+    }
+  }
+  std::ostringstream revision;
+  revision << std::hex << std::uppercase << hash;
+  state.revision = revision.str();
+  return state;
+}
+
+static std::string nativeTelepromptPreviewStateJson(
+  const NativeTelepromptPreviewState& state)
+{
+  std::ostringstream json;
+  json << "{";
+  json << "\"active\":"
+       << (state.active ? "true" : "false") << ",";
+  json << "\"enabled\":"
+       << (state.enabled ? "true" : "false") << ",";
+  json << "\"mode\":" << state.mode << ",";
+  json << "\"pageIndex\":" << state.pageIndex << ",";
+  json << "\"pageSize\":" << state.pageSize << ",";
+  json << "\"firstBlockIndex\":"
+       << state.firstBlockIndex << ",";
+  json << "\"totalBlocks\":" << state.totalBlocks << ",";
+  json << "\"revision\":"
+       << nativeJsonString(state.revision) << ",";
+  json << "\"signature\":"
+       << nativeJsonString(state.revision) << ",";
+  json << "\"noSongsMessage\":"
+       << nativeJsonString(state.noSongsMessage) << ",";
+  json << "\"blocks\":[";
+  for (size_t blockIndex = 0;
+       blockIndex < state.blocks.size(); ++blockIndex) {
+    if (blockIndex > 0) json << ",";
+    const auto& block = state.blocks[blockIndex];
+    json << "{";
+    json << "\"id\":" << nativeJsonString(block.id) << ",";
+    json << "\"name\":" << nativeJsonString(block.name) << ",";
+    json << "\"colorHex\":"
+         << nativeJsonString(block.colorHex) << ",";
+    json << "\"blockColorHex\":"
+         << nativeJsonString(block.colorHex) << ",";
+    json << "\"songs\":[";
+    for (size_t songIndex = 0;
+         songIndex < block.songs.size(); ++songIndex) {
+      if (songIndex > 0) json << ",";
+      const auto& song = block.songs[songIndex];
+      json << "{";
+      json << "\"id\":" << nativeJsonString(song.id) << ",";
+      json << "\"name\":" << nativeJsonString(song.name) << ",";
+      json << "\"playing\":"
+           << (song.playing ? "true" : "false") << ",";
+      json << "\"queued\":"
+           << (song.queued ? "true" : "false") << ",";
+      json << "\"colorHex\":"
+           << nativeJsonString(song.colorHex) << ",";
+      json << "\"textColorHex\":"
+           << nativeJsonString(song.colorHex);
+      json << "}";
+    }
+    json << "]}";
+  }
+  json << "]}";
+  return json.str();
+}
 
 struct NativeTelepromptRenderState {
   std::string lyrics;
@@ -38353,8 +38637,7 @@ struct NativeTelepromptRenderState {
   double progress = 0.0;
   bool playing = false;
   bool timerExpired = false;
-  int previewMode = 0;
-  std::vector<NativeTelepromptPreviewBlock> previewBlocks;
+  NativeTelepromptPreviewState preview;
 };
 
 static NativeTelepromptWindowState g_nativeTelepromptWindows[2] = {
@@ -39352,13 +39635,14 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
   double queuedStart = 0.0;
   double queuedEnd = 0.0;
   bool transportPlaying = false;
+  int previewMode = 0;
   std::map<std::string, bool> openFamilyDrawers;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     snapshot = g_nativeStateJson;
     songs = g_nativeSongWindows;
     playlistItems = g_nativeActivePlaylistItems;
-    state.previewMode =
+    previewMode =
       g_nativePreviewMode >= 1 && g_nativePreviewMode <= 6
         ? g_nativePreviewMode : 0;
     playingId = g_nativeCurrentPlayingId;
@@ -39507,98 +39791,17 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
   state.queuedName = nativeAppActiveSongNameForState(
     playlistItems, songs, queuedId, queuedStart, queuedEnd);
 
-  if (state.previewMode > 0) {
-    std::vector<NativeTelepromptPreviewBlock> allBlocks;
-    NativeTelepromptPreviewBlock* current = nullptr;
-    std::string visibleFamilyParentId;
-    size_t visibleFamilyParentSongIndex =
-      std::numeric_limits<size_t>::max();
-    const auto targetMatches = [](
-        const NativeSongWindow& item,
-        const std::string& id,
-        double start,
-        double end) {
-      if (!id.empty() && nativeSongIdMatches(item, id)) return true;
-      return end > start + 0.0005 &&
-        std::fabs(item.start - start) <= 0.003 &&
-        std::fabs(item.end - end) <= 0.003;
-    };
-    for (const auto& item : playlistItems) {
-      if (item.isBlock) {
-        NativeTelepromptPreviewBlock block;
-        block.name = nativeTrim(item.name);
-        if (block.name.empty()) {
-          block.name = "BLOCO " +
-            std::to_string(allBlocks.size() + 1);
-        }
-        allBlocks.push_back(std::move(block));
-        current = &allBlocks.back();
-        visibleFamilyParentId.clear();
-        visibleFamilyParentSongIndex =
-          std::numeric_limits<size_t>::max();
-        continue;
-      }
-      if (current == nullptr) {
-        allBlocks.push_back(
-          NativeTelepromptPreviewBlock{"SEM BLOCO", {}});
-        current = &allBlocks.back();
-      }
-      const std::string name = nativeTrim(item.name);
-      if (name.empty()) continue;
-
-      const bool playing = transportPlaying &&
-        targetMatches(
-          item, playingId, playingStart, playingEnd);
-      const bool queued = targetMatches(
-        item, queuedId, queuedStart, queuedEnd);
-      if (item.isHashChild) {
-        const bool drawerOpen =
-          !item.parentId.empty() &&
-          openFamilyDrawers.find(item.parentId) !=
-            openFamilyDrawers.end();
-        if (!drawerOpen) {
-          // Com a gaveta fechada, o pai representa visualmente a família.
-          // Mantém nele também os estados de Tocando/Fila de um filho oculto.
-          if (item.parentId == visibleFamilyParentId &&
-              visibleFamilyParentSongIndex <
-                current->songs.size()) {
-            auto& parentSong =
-              current->songs[visibleFamilyParentSongIndex];
-            parentSong.playing =
-              parentSong.playing || playing;
-            parentSong.queued =
-              parentSong.queued || queued;
-          }
-          continue;
-        }
-      }
-      current->songs.push_back({
-        name,
-        playing,
-        queued
-      });
-      if (item.isHashParent) {
-        visibleFamilyParentId = item.id;
-        visibleFamilyParentSongIndex =
-          current->songs.size() - 1;
-      } else if (!item.isHashChild) {
-        visibleFamilyParentId.clear();
-        visibleFamilyParentSongIndex =
-          std::numeric_limits<size_t>::max();
-      }
-    }
-    const size_t first = static_cast<size_t>(
-      (state.previewMode - 1) * 8);
-    if (first < allBlocks.size()) {
-      const size_t last = std::min(
-        allBlocks.size(), first + 8);
-      state.previewBlocks.assign(
-        allBlocks.begin() +
-          static_cast<std::ptrdiff_t>(first),
-        allBlocks.begin() +
-          static_cast<std::ptrdiff_t>(last));
-    }
-  }
+  state.preview = nativeTelepromptBuildPreviewState(
+    playlistItems,
+    previewMode,
+    transportPlaying,
+    playingId,
+    playingStart,
+    playingEnd,
+    queuedId,
+    queuedStart,
+    queuedEnd,
+    openFamilyDrawers);
   return state;
 }
 
@@ -39725,6 +39928,67 @@ static void nativeTelepromptDrawBorder(
     RECT{rect.right - t, rect.top, rect.right, rect.bottom}, color);
 }
 
+static std::vector<std::string>
+nativeTelepromptPreviewWrapLines(
+  HDC dc,
+  const std::string& text,
+  int maxWidth,
+  HFONT font,
+  size_t maxLines)
+{
+  std::vector<std::string> lines =
+    nativeUiWrapText(dc, text, maxWidth, font);
+  if (maxLines == 0) return {};
+  if (lines.size() <= maxLines) return lines;
+
+  lines.resize(maxLines);
+  std::string& last = lines.back();
+  const std::string ellipsis = "...";
+  while (!last.empty() &&
+         nativeUiTextWidth(
+           dc, last + ellipsis, font) > maxWidth) {
+    size_t eraseAt = last.size() - 1;
+    while (eraseAt > 0 &&
+           (static_cast<unsigned char>(last[eraseAt]) & 0xc0) ==
+             0x80) {
+      --eraseAt;
+    }
+    last.erase(eraseAt);
+    last = nativeTrim(last);
+  }
+  last += ellipsis;
+  return lines;
+}
+
+static void nativeTelepromptDrawPreviewLines(
+  HDC dc,
+  const std::vector<std::string>& lines,
+  const RECT& rect,
+  int lineHeight,
+  bool centered,
+  COLORREF color,
+  HFONT font)
+{
+  int top = rect.top;
+  for (const auto& line : lines) {
+    if (top >= rect.bottom) break;
+    RECT lineRect{
+      rect.left,
+      top,
+      rect.right,
+      std::min<LONG>(rect.bottom, top + lineHeight)
+    };
+    if (!line.empty()) {
+      nativeAppActiveDrawText(
+        dc, line, lineRect,
+        (centered ? DT_CENTER : DT_LEFT) |
+          DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        color, font);
+    }
+    top += lineHeight;
+  }
+}
+
 static void nativeTelepromptDrawPreview(
   HDC dc,
   const NativeTelepromptRenderState& state,
@@ -39733,8 +39997,9 @@ static void nativeTelepromptDrawPreview(
   int topReserve,
   int bottomReserve)
 {
-  if (!dc || state.previewMode < 1 ||
-      state.previewMode > 6) {
+  if (!dc || !state.preview.active ||
+      state.preview.mode < 1 ||
+      state.preview.mode > 6) {
     return;
   }
   const int width = std::max(
@@ -39782,27 +40047,23 @@ static void nativeTelepromptDrawPreview(
         centerY + (scaledH + 1) / 2))
   };
 
-  const COLORREF titleColor = nativeTelepromptColor(
-    settings.queueNameColor, RGB(255, 234, 0));
-  const COLORREF playingColor = nativeTelepromptColor(
-    settings.songNameColor, RGB(0, 255, 85));
-  const COLORREF queuedColor = nativeTelepromptColor(
+  const COLORREF fallbackColor = nativeTelepromptColor(
     settings.queueNameColor, RGB(255, 234, 0));
   const auto nowMs =
     std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
   const bool showPlaying = ((nowMs / 350) % 2) == 0;
 
-  if (state.previewBlocks.empty()) {
+  if (state.preview.blocks.empty()) {
     nativeAppActiveFillOutlinedRect(
       dc, area, RGB(0, 0, 0), RGB(96, 96, 96));
     const int emptyFontSize = std::max(
       18, std::min(72, width / 18));
     nativeAppActiveDrawText(
-      dc, "Sem músicas", area,
+      dc, state.preview.noSongsMessage, area,
       DT_CENTER | DT_VCENTER | DT_SINGLELINE |
         DT_NOPREFIX,
-      queuedColor,
+      fallbackColor,
       nativeTelepromptFont(
         settings.fontFamily, emptyFontSize, FW_BOLD));
     return;
@@ -39814,7 +40075,7 @@ static void nativeTelepromptDrawPreview(
   // sobra uma segunda linha vazia enquanto nomes de músicas são cortados.
   const int rows = std::max(
     1, std::min(2,
-      (static_cast<int>(state.previewBlocks.size()) +
+      (static_cast<int>(state.preview.blocks.size()) +
        columns - 1) / columns));
   const int gap = std::max(
     4, std::min(16, width / 80));
@@ -39834,10 +40095,20 @@ static void nativeTelepromptDrawPreview(
     settings.fontFamily, titleFontSize, FW_BOLD);
   HFONT songFont = nativeTelepromptFont(
     settings.fontFamily, songFontSize, FW_BOLD);
+  const int titleLineHeight = std::max(
+    titleFontSize + 4,
+    static_cast<int>(std::lround(
+      titleFontSize * 1.20)));
+  const int songLineHeight = std::max(
+    songFontSize + 3,
+    static_cast<int>(std::lround(
+      songFontSize * 1.18)));
 
   for (size_t index = 0;
-       index < state.previewBlocks.size() &&
+       index < state.preview.blocks.size() &&
        index < 8; ++index) {
+    const NativeTelepromptPreviewBlock& block =
+      state.preview.blocks[index];
     const int column = static_cast<int>(index) % columns;
     const int row = static_cast<int>(index) / columns;
     const int left = area.left +
@@ -39849,61 +40120,66 @@ static void nativeTelepromptDrawPreview(
       column == columns - 1 ? area.right : left + cardW,
       row == rows - 1 ? area.bottom : top + cardH
     };
+    const COLORREF blockColor = nativeTelepromptColor(
+      block.colorHex, fallbackColor);
     nativeAppActiveFillOutlinedRect(
-      dc, card, RGB(0, 0, 0), titleColor);
+      dc, card, RGB(0, 0, 0), blockColor);
 
     const int padX = std::max(5, cardW / 28);
     const int padY = std::max(4, cardH / 42);
-    const int titleHeight = std::min(
-      cardH / 3,
-      std::max(titleFontSize + 8,
-        titleFontSize * 3 + 4));
+    const int textWidth = std::max(
+      1, static_cast<int>(
+        card.right - card.left) - padX * 2);
+    const std::vector<std::string> titleLines =
+      nativeTelepromptPreviewWrapLines(
+        dc, block.name, textWidth, titleFont, 3);
+    const int titleHeight = std::max(
+      titleLineHeight,
+      static_cast<int>(titleLines.size()) *
+        titleLineHeight);
     RECT titleRect{
       card.left + padX,
       card.top + padY,
       card.right - padX,
-      card.top + padY + titleHeight
+      std::min<LONG>(card.bottom - padY,
+        card.top + padY + titleHeight)
     };
-    nativeAppActiveDrawText(
-      dc, state.previewBlocks[index].name,
-      titleRect,
-      DT_CENTER | DT_WORDBREAK | DT_NOPREFIX |
-        DT_END_ELLIPSIS,
-      titleColor, titleFont);
+    nativeTelepromptDrawPreviewLines(
+      dc, titleLines, titleRect,
+      titleLineHeight, true,
+      blockColor, titleFont);
 
     int songTop = titleRect.bottom +
       std::max(2, padY / 2);
-    const int songLineHeight =
-      std::max(songFontSize + 3,
-        static_cast<int>(std::lround(
-          songFontSize * 1.18)));
-    for (const auto& song :
-         state.previewBlocks[index].songs) {
-      if (songTop + songLineHeight >
-          card.bottom - padY) {
-        break;
-      }
-      if (song.playing && !showPlaying) {
-        songTop += songLineHeight;
-        continue;
-      }
+    const int songGap = std::max(1, padY / 3);
+    for (const auto& song : block.songs) {
       std::string label = song.name;
       if (song.playing || song.queued) {
         label = "[ " + label + " ]";
       }
-      const COLORREF color = song.playing
-        ? playingColor
-        : (song.queued ? queuedColor
-                       : RGB(255, 255, 255));
-      nativeAppActiveDrawText(
-        dc, label,
-        RECT{card.left + padX, songTop,
-          card.right - padX,
-          songTop + songLineHeight},
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE |
-          DT_END_ELLIPSIS | DT_NOPREFIX,
-        color, songFont);
-      songTop += songLineHeight;
+      const std::vector<std::string> songLines =
+        nativeTelepromptPreviewWrapLines(
+          dc, label, textWidth, songFont, 2);
+      const int songHeight = std::max(
+        songLineHeight,
+        static_cast<int>(songLines.size()) *
+          songLineHeight);
+      if (songTop + songHeight >
+          card.bottom - padY) {
+        break;
+      }
+      // O pisca apaga somente os pixels. A medição e o avanço vertical
+      // permanecem idênticos para a lista não saltar a cada 350 ms.
+      if (!song.playing || showPlaying) {
+        nativeTelepromptDrawPreviewLines(
+          dc, songLines,
+          RECT{card.left + padX, songTop,
+            card.right - padX,
+            songTop + songHeight},
+          songLineHeight, false,
+          blockColor, songFont);
+      }
+      songTop += songHeight + songGap;
     }
   }
 }
@@ -40779,8 +41055,9 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   const bool previewActive =
     !technicalNoticeActive &&
     settings.previewEnabled &&
-    state.previewMode >= 1 &&
-    state.previewMode <= 6;
+    state.preview.active &&
+    state.preview.mode >= 1 &&
+    state.preview.mode <= 6;
 
   const bool hasMedia =
     state.mediaType == "image" || state.mediaType == "video";
@@ -44583,6 +44860,8 @@ static void nativeRebuildState(bool forceSnapshot)
   bool autoBlocoEnabled = false;
   bool autoStopEnabled = true;
   std::string sharedActivePage = "playlist";
+  int previewModeForState = 0;
+  std::map<std::string, bool> previewOpenFamilyDrawers;
   bool timerRunning = false;
   std::string timerMode = "progressive";
   double timerStartedAtMs = 0.0;
@@ -44618,6 +44897,11 @@ static void nativeRebuildState(bool forceSnapshot)
     sharedActivePage =
       g_nativeDirectorActivePage.empty()
         ? "playlist" : g_nativeDirectorActivePage;
+    previewModeForState =
+      g_nativePreviewMode >= 1 && g_nativePreviewMode <= 6
+        ? g_nativePreviewMode : 0;
+    previewOpenFamilyDrawers =
+      g_nativeDirectorOpenFamilyDrawers;
     timerRunning = g_nativeTimerRunning;
     timerMode = g_nativeTimerMode;
     timerStartedAtMs = timerRunning ? nativeTimerEpochMs(g_nativeTimerStartedAtSystem) : 0.0;
@@ -44635,6 +44919,21 @@ static void nativeRebuildState(bool forceSnapshot)
   }
 
   if (queuedPlaylistSongId.empty() && !queuedSongId.empty()) queuedPlaylistSongId = queuedSongId;
+  const NativeTelepromptPreviewState telepromptPreview =
+    nativeTelepromptBuildPreviewState(
+      activePlaylistItems,
+      previewModeForState,
+      playing,
+      playingId,
+      songStart,
+      songEnd,
+      queuedPlaylistSongId.empty()
+        ? queuedSongId : queuedPlaylistSongId,
+      queuedStart,
+      queuedEnd,
+      previewOpenFamilyDrawers);
+  const std::string telepromptPreviewJson =
+    nativeTelepromptPreviewStateJson(telepromptPreview);
   const bool loopActive = nativeIsRepeatEnabled(activeProject);
   double loopStartPos = 0.0;
   double loopEndPos = 0.0;
@@ -44951,10 +45250,13 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"autoBlocoEnabled\":" << (autoBlocoEnabled ? "true" : "false") << ",";
   json << "\"autoBlocoArmed\":" << (autoBlocoEnabled ? "true" : "false") << ",";
   json << "\"autoBlocoActive\":" << ((autoplayEnabled && autoBlocoEnabled) ? "true" : "false") << ",";
+  json << "\"previewMode\":" << telepromptPreview.mode << ",";
+  json << "\"previewActive\":"
+       << (telepromptPreview.active ? "true" : "false") << ",";
+  json << "\"telepromptPreview\":"
+       << telepromptPreviewJson << ",";
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
-    json << "\"previewMode\":" << g_nativePreviewMode << ",";
-    json << "\"previewActive\":" << (g_nativePreviewMode > 0 ? "true" : "false") << ",";
     json << "\"liveModeEnabled\":" << (g_nativeLiveMarkEnabled ? "true" : "false") << ",";
     json << "\"liveEnabled\":" << (g_nativeLiveMarkEnabled ? "true" : "false") << ",";
     json << "\"liveExecutedCount\":" << g_nativeLiveExecutedItems.size() << ",";
