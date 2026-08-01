@@ -655,6 +655,17 @@ static constexpr UINT kNativeUiFrameActiveIntervalMs = 33;
 static constexpr UINT kNativeUiFrameRgbIntervalMs = 100;
 static constexpr UINT kNativeUiFrameIdleIntervalMs = 200;
 static UINT g_nativeUiFrameTimerIntervalMs = 0;
+#ifdef __APPLE__
+// O autorepeat entregue pelo Cocoa varia com a configuração do macOS e pode
+// ficar bem mais lento que no Windows. A interface usa um ritmo próprio
+// somente para as setas verticais enquanto a tecla permanece pressionada.
+static constexpr int kNativeUiMacNavigationRepeatDelayMs = 250;
+static constexpr int kNativeUiMacNavigationRepeatIntervalMs = 33;
+static int g_nativeUiMacHeldNavigationKey = 0;
+static bool g_nativeUiMacSyntheticNavigationRepeat = false;
+static std::chrono::steady_clock::time_point
+  g_nativeUiMacNextNavigationRepeatAt{};
+#endif
 static HFONT g_nativeUiSharedFont = nullptr;
 static HFONT g_nativeUiTimerFont = nullptr;
 static HFONT g_nativeUiInfoStripFont = nullptr;
@@ -35182,6 +35193,85 @@ static bool nativeUiAdvanceSmoothScrolls()
   return changed;
 }
 
+#ifdef __APPLE__
+static void nativeUiResetMacNavigationRepeat(int releasedKey = 0)
+{
+  if (releasedKey != 0 &&
+      releasedKey != g_nativeUiMacHeldNavigationKey) {
+    return;
+  }
+  g_nativeUiMacHeldNavigationKey = 0;
+  g_nativeUiMacNextNavigationRepeatAt = {};
+}
+
+static bool nativeUiPrepareMacNavigationKeyDown(
+  HWND hwnd,
+  WPARAM key)
+{
+  if (key != VK_UP && key != VK_DOWN) return false;
+  if (g_nativeUiMacSyntheticNavigationRepeat) return false;
+  if (g_state.directorInterfaceBlocked) {
+    nativeUiResetMacNavigationRepeat();
+    return false;
+  }
+
+  const int navigationKey = static_cast<int>(key);
+  if (g_nativeUiMacHeldNavigationKey == navigationKey) {
+    // O timer próprio já produz o autorepeat. Consome as repetições mais
+    // lentas do Cocoa para não somar dois ritmos diferentes.
+    return true;
+  }
+
+  g_nativeUiMacHeldNavigationKey = navigationKey;
+  g_nativeUiMacNextNavigationRepeatAt =
+    std::chrono::steady_clock::now() +
+    std::chrono::milliseconds(
+      kNativeUiMacNavigationRepeatDelayMs);
+  nativeUiSetFrameTimerInterval(
+    hwnd, kNativeUiFrameFastIntervalMs);
+  return false;
+}
+
+static bool nativeUiAdvanceMacNavigationRepeat(HWND hwnd)
+{
+  if (!hwnd || !IsWindow(hwnd) ||
+      g_nativeUiMacHeldNavigationKey == 0) {
+    return false;
+  }
+  if (g_state.directorInterfaceBlocked) {
+    nativeUiResetMacNavigationRepeat();
+    return false;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  if (g_nativeUiMacNextNavigationRepeatAt.time_since_epoch().count() == 0 ||
+      now < g_nativeUiMacNextNavigationRepeatAt) {
+    return false;
+  }
+
+  g_nativeUiMacNextNavigationRepeatAt +=
+    std::chrono::milliseconds(
+      kNativeUiMacNavigationRepeatIntervalMs);
+  if (now >= g_nativeUiMacNextNavigationRepeatAt) {
+    // Descarta apenas o atraso acumulado: nunca dispara várias músicas no
+    // mesmo quadro depois de o processo ficar suspenso.
+    g_nativeUiMacNextNavigationRepeatAt =
+      now + std::chrono::milliseconds(
+        kNativeUiMacNavigationRepeatIntervalMs);
+  }
+
+  const int navigationKey = g_nativeUiMacHeldNavigationKey;
+  g_nativeUiMacSyntheticNavigationRepeat = true;
+  SendMessage(hwnd, WM_KEYDOWN,
+    static_cast<WPARAM>(navigationKey), 0);
+  g_nativeUiMacSyntheticNavigationRepeat = false;
+  if (!IsWindow(hwnd)) {
+    nativeUiResetMacNavigationRepeat();
+  }
+  return true;
+}
+#endif
+
 static bool nativeUiSmoothScrollActive()
 {
   return g_nativeMainSmoothScroll.target >= 0 ||
@@ -35481,6 +35571,9 @@ static UINT nativeUiDesiredFrameInterval()
 {
   const bool directManipulation =
     nativeUiSmoothScrollActive() ||
+#ifdef __APPLE__
+    g_nativeUiMacHeldNavigationKey != 0 ||
+#endif
     g_nativeUiPendingMusicNavigation.pending ||
     g_nativeUiPremixSliderDragging ||
     g_nativeUiMultiLoopLimitDragging ||
@@ -35549,6 +35642,9 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       return 0;
     case WM_TIMER:
       if (wParam == kNativeUiFrameTimerId) {
+#ifdef __APPLE__
+        nativeUiAdvanceMacNavigationRepeat(hwnd);
+#endif
         const bool scrollChanged =
           nativeUiAdvanceSmoothScrolls();
         const bool dragScrollChanged =
@@ -35580,13 +35676,12 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
              navigationCommitted || localClockChanged ||
              batteryChanged || timedRefresh)) {
           InvalidateRect(hwnd, nullptr, FALSE);
-#ifdef _WIN32
           // A animação da lista não depende da fila normal de WM_PAINT:
-          // durante o autorepeat das setas ela continua apresentando a 60 FPS.
+          // no Win32 e no SWELL do macOS, cada passo continua sendo
+          // apresentado durante o autorepeat das setas.
           if (scrollChanged || dragScrollChanged) {
             UpdateWindow(hwnd);
           }
-#endif
         } else if (IsWindowVisible(hwnd)) {
           if (g_nativeUiPlaylistMarqueeActive &&
               g_nativeMainPlaylistFieldRect.right >
@@ -36224,18 +36319,37 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
+#ifdef __APPLE__
+    case WM_KILLFOCUS:
+      nativeUiResetMacNavigationRepeat();
+      return 0;
+    case WM_SYSKEYUP:
+    case WM_KEYUP:
+      if (wParam == VK_UP || wParam == VK_DOWN) {
+        nativeUiResetMacNavigationRepeat(
+          static_cast<int>(wParam));
+        return 0;
+      }
+      break;
+#endif
     case WM_SYSKEYDOWN:
     case WM_KEYDOWN:
+#ifdef __APPLE__
+      if (nativeUiPrepareMacNavigationKeyDown(hwnd, wParam)) {
+        return 0;
+      }
+#endif
       if (!g_state.directorInterfaceBlocked &&
           nativeUiHandleActiveTextInputKey(
             hwnd, wParam)) {
         return 0;
       }
 #ifdef __APPLE__
-      // O SWELL entrega apenas WM_KEYDOWN para views customizadas no macOS.
-      // Le o texto real do NSEvent (incluindo layout, Shift e acentos) e o
-      // envia ao mesmo editor usado pelo WM_CHAR no Windows.
-      if (!g_state.directorInterfaceBlocked &&
+      // O SWELL não entrega WM_CHAR para estas views customizadas no macOS.
+      // Lê o texto real do NSEvent no WM_KEYDOWN (incluindo layout, Shift e
+      // acentos) e o envia ao mesmo editor usado no Windows.
+      if (!g_nativeUiMacSyntheticNavigationRepeat &&
+          !g_state.directorInterfaceBlocked &&
           nativeUiInsertActiveMacKeyText(hwnd)) {
         return 0;
       }
@@ -37350,6 +37464,9 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       return 0;
     case WM_DESTROY:
     case WM_NCDESTROY:
+#ifdef __APPLE__
+      nativeUiResetMacNavigationRepeat();
+#endif
       if (message == WM_DESTROY && DockWindowRemove_ptr) {
         // Como na SWS, remover e sempre seguro mesmo para janela flutuante.
         DockWindowRemove_ptr(hwnd);
