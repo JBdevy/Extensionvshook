@@ -31795,7 +31795,13 @@ static bool nativeNavigateMainRows(int step)
         }
       }
       int revealTarget = revealFrom;
-      if (direction < 0) {
+      if (wrappedAtListEdge && direction > 0) {
+        // Ao atravessar do fim para o início, a seleção deve continuar
+        // ignorando linhas de bloco, mas o scroll precisa voltar ao início
+        // absoluto. Usar rowTop aqui ocultava o bloco que estivesse antes da
+        // primeira música selecionável.
+        revealTarget = 0;
+      } else if (direction < 0) {
         // Subindo, mantém uma linha renderizada acima da seleção. Blocos e
         // linhas de altura variável também contam como esse contexto.
         const size_t upperContextIndex =
