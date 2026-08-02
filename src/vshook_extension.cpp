@@ -3650,6 +3650,8 @@ static void nativeConfigureClientSocketTimeouts(native_socket_t socketHandle)
 #endif
 }
 
+static std::atomic<bool> g_nativeRunning{false};
+
 static bool nativeSendAll(
   native_socket_t socketHandle,
   const char* data,
@@ -3662,7 +3664,7 @@ static bool nativeSendAll(
     std::chrono::steady_clock::now() +
     std::chrono::milliseconds(4000);
 #endif
-  while (sentTotal < size) {
+  while (sentTotal < size && g_nativeRunning.load()) {
 #ifdef _WIN32
     const int remaining = static_cast<int>(std::min<size_t>(
       size - sentTotal,
@@ -3684,13 +3686,12 @@ static bool nativeSendAll(
 #endif
     sentTotal += static_cast<size_t>(sent);
   }
-  return true;
+  return sentTotal == size;
 }
 
 static std::mutex g_nativeMutex;
 static std::mutex g_nativeServerMutex;
 static std::thread g_nativeThread;
-static std::atomic<bool> g_nativeRunning{false};
 static native_socket_t g_nativeServerSocket = kInvalidNativeSocket;
 static native_socket_t g_nativeActiveClientSocket = kInvalidNativeSocket;
 static std::string g_nativeStateJson;
@@ -31744,15 +31745,18 @@ static bool nativeNavigateMainRows(int step)
   int candidate = current < 0
     ? (direction > 0 ? -1 : count)
     : current;
+  bool wrappedAtListEdge = false;
   for (int guard = 0; guard < count; ++guard) {
     candidate += direction;
     if (candidate >= count) {
       if (rapidNavigationRepeat) return false;
       candidate = 0;
+      wrappedAtListEdge = true;
     }
     if (candidate < 0) {
       if (rapidNavigationRepeat) return false;
       candidate = count - 1;
+      wrappedAtListEdge = true;
     }
     const auto* row = nativeUiMainVisibleRowAt(candidate);
     if (!row) continue;
@@ -31845,11 +31849,14 @@ static bool nativeNavigateMainRows(int step)
         std::min(revealTarget,
           g_nativeMainListMaxScrollPixels));
       if (revealTarget != g_nativeAppActiveListScrollPixels) {
-        if (g_nativeUiSyntheticNavigationRepeat) {
+        if (g_nativeUiSyntheticNavigationRepeat ||
+            wrappedAtListEdge) {
           // O repeat das duas plataformas é produzido pelo mesmo timer que
           // anima o scroll. Deslocar lista e seleção no mesmo passo impede
           // pulos: descendo fica na antepenúltima linha; subindo, com uma
-          // linha de contexto acima.
+          // linha de contexto acima. Ao atravessar começo/fim também posiciona
+          // imediatamente; animar a distância inteira faz a lista parecer
+          // rolar no sentido errado antes de chegar à outra extremidade.
           g_nativeAppActiveListScrollPixels = revealTarget;
           g_nativeMainSmoothScroll = NativeUiSmoothScrollState{};
           g_nativeUiLastSmoothScrollAdvanceAt = {};
@@ -39062,6 +39069,17 @@ static std::unique_ptr<vshook_video::Decoder>
   g_nativeTelepromptPlatformVideoDecoder[2];
 static PCM_source* g_nativeTelepromptVideoSource[2]{nullptr, nullptr};
 static std::string g_nativeTelepromptVideoSourcePath[2];
+// Imagens estáticas não precisam passar por GETIMAGE e ScaledBlit em cada
+// quadro de 16 ms. O source dedicado continua sendo o dono do bitmap; o cache
+// só permanece válido enquanto esse mesmo source e tamanho solicitado vivem.
+static LICE_IBitmap*
+  g_nativeTelepromptStillImage[2]{nullptr, nullptr};
+static std::string g_nativeTelepromptStillImagePath[2];
+static int g_nativeTelepromptStillImageRequestWidth[2]{0, 0};
+static int g_nativeTelepromptStillImageRequestHeight[2]{0, 0};
+static LICE_IBitmap*
+  g_nativeTelepromptMediaBufferSource[2]{nullptr, nullptr};
+static std::string g_nativeTelepromptMediaBufferPath[2];
 // Diagnóstico publicado no bridge: 0=sem mídia, 1=fonte pronta,
 // 2=quadro decodificado, 3=quadro desenhado; valores negativos identificam
 // em qual etapa o vídeo nativo falhou.
@@ -40634,6 +40652,12 @@ static PCM_source* nativeTelepromptCachedVideoSource(
   const int index = nativeTelepromptIndex(slot);
   if (g_nativeTelepromptVideoSource[index] &&
       g_nativeTelepromptVideoSourcePath[index] != mediaPath) {
+    g_nativeTelepromptStillImage[index] = nullptr;
+    g_nativeTelepromptStillImagePath[index].clear();
+    g_nativeTelepromptStillImageRequestWidth[index] = 0;
+    g_nativeTelepromptStillImageRequestHeight[index] = 0;
+    g_nativeTelepromptMediaBufferSource[index] = nullptr;
+    g_nativeTelepromptMediaBufferPath[index].clear();
     double clearPreviewPosition = -1.0;
     g_nativeTelepromptVideoSource[index]->Extended(
       PCM_SOURCE_EXT_SET_PREVIEW_POS_OVERRIDE,
@@ -40796,6 +40820,19 @@ static NativeTelepromptMediaFrame nativeTelepromptAcquireMediaFrame(
     g_nativeTelepromptMediaDiagParent[index].store(0);
     return nativeTelepromptAcquirePlatformVideoFrame(
       slot, state, wantW, wantH);
+  }
+
+  if (g_nativeTelepromptStillImage[index] &&
+      g_nativeTelepromptVideoSource[index] &&
+      g_nativeTelepromptStillImagePath[index] == state.mediaPath &&
+      g_nativeTelepromptVideoSourcePath[index] == state.mediaPath &&
+      g_nativeTelepromptStillImageRequestWidth[index] == wantW &&
+      g_nativeTelepromptStillImageRequestHeight[index] == wantH) {
+    frame.source = g_nativeTelepromptVideoSource[index];
+    frame.image = g_nativeTelepromptStillImage[index];
+    frame.keepPreviewAlive = true;
+    g_nativeTelepromptMediaStatus[index].store(2);
+    return frame;
   }
 
   ReaProject* project = EnumProjects_ptr
@@ -40977,6 +41014,10 @@ static NativeTelepromptMediaFrame nativeTelepromptAcquireMediaFrame(
   if (trySource(
         dedicatedSource, true,
         g_nativeTelepromptMediaDiagDedicated[index])) {
+    g_nativeTelepromptStillImage[index] = frame.image;
+    g_nativeTelepromptStillImagePath[index] = state.mediaPath;
+    g_nativeTelepromptStillImageRequestWidth[index] = wantW;
+    g_nativeTelepromptStillImageRequestHeight[index] = wantH;
     return frame;
   }
 
@@ -41341,6 +41382,8 @@ static bool nativeTelepromptDrawMedia(
       LICE_CreateBitmap_ptr(1, outputW, outputH);
     g_nativeTelepromptMediaBufferWidth[index] = outputW;
     g_nativeTelepromptMediaBufferHeight[index] = outputH;
+    g_nativeTelepromptMediaBufferSource[index] = nullptr;
+    g_nativeTelepromptMediaBufferPath[index].clear();
   }
   LICE_IBitmap* output = g_nativeTelepromptMediaBuffer[index];
   if (!output) {
@@ -41348,14 +41391,27 @@ static bool nativeTelepromptDrawMedia(
     nativeTelepromptReleaseMediaFrame(frame);
     return false;
   }
-  LICE_Clear_ptr(output, 0xff000000);
-  LICE_ScaledBlit_ptr(
-    output, frame.image,
-    0, 0, outputW, outputH,
-    0.0f, 0.0f,
-    static_cast<float>(sourceW),
-    static_cast<float>(sourceH),
-    1.0f, 0x100);
+  const bool scaledImageAlreadyCached =
+    nativeLower(state.mediaType) == "image" &&
+    g_nativeTelepromptMediaBufferSource[index] == frame.image &&
+    g_nativeTelepromptMediaBufferPath[index] == state.mediaPath;
+  if (!scaledImageAlreadyCached) {
+    LICE_Clear_ptr(output, 0xff000000);
+    LICE_ScaledBlit_ptr(
+      output, frame.image,
+      0, 0, outputW, outputH,
+      0.0f, 0.0f,
+      static_cast<float>(sourceW),
+      static_cast<float>(sourceH),
+      1.0f, 0x100);
+    if (nativeLower(state.mediaType) == "image") {
+      g_nativeTelepromptMediaBufferSource[index] = frame.image;
+      g_nativeTelepromptMediaBufferPath[index] = state.mediaPath;
+    } else {
+      g_nativeTelepromptMediaBufferSource[index] = nullptr;
+      g_nativeTelepromptMediaBufferPath[index].clear();
+    }
+  }
 #ifdef __APPLE__
   // O ScaledBlit já converte uma source LICE invertida para o framebuffer
   // normal do SysBitmap. O BitBlt direto (inclusive Metal) não deve inverter
@@ -42774,6 +42830,8 @@ static void nativeCloseAllTelepromptWindows()
     g_nativeTelepromptMediaBuffer[index] = nullptr;
     g_nativeTelepromptMediaBufferWidth[index] = 0;
     g_nativeTelepromptMediaBufferHeight[index] = 0;
+    g_nativeTelepromptMediaBufferSource[index] = nullptr;
+    g_nativeTelepromptMediaBufferPath[index].clear();
     if (g_nativeTelepromptDecodedVideoBitmap[index] &&
         LICE_Destroy_ptr) {
       LICE_Destroy_ptr(
@@ -42786,6 +42844,10 @@ static void nativeCloseAllTelepromptWindows()
     g_nativeTelepromptDecodedVideoPath[index].clear();
     g_nativeTelepromptPlatformVideoDecoder[index].reset();
     g_nativeTelepromptPlatformVideoStatus[index].store(0);
+    g_nativeTelepromptStillImage[index] = nullptr;
+    g_nativeTelepromptStillImagePath[index].clear();
+    g_nativeTelepromptStillImageRequestWidth[index] = 0;
+    g_nativeTelepromptStillImageRequestHeight[index] = 0;
     if (g_nativeTelepromptVideoSource[index]) {
       double clearPreviewPosition = -1.0;
       g_nativeTelepromptVideoSource[index]->Extended(
@@ -48506,11 +48568,26 @@ static bool nativeReadBinaryFile(const std::string& path, std::string& out)
   if (size < 0) { std::fclose(f); return false; }
   std::fseek(f, 0, SEEK_SET);
   out.resize(static_cast<size_t>(size));
-  if (size > 0) {
-    const size_t got = std::fread(&out[0], 1, static_cast<size_t>(size), f);
-    if (got != static_cast<size_t>(size)) { std::fclose(f); out.clear(); return false; }
+  size_t totalRead = 0;
+  constexpr size_t kReadChunkBytes = 256u * 1024u;
+  while (totalRead < static_cast<size_t>(size) &&
+         g_nativeRunning.load()) {
+    const size_t wanted = std::min(
+      kReadChunkBytes, static_cast<size_t>(size) - totalRead);
+    const size_t got = std::fread(
+      &out[totalRead], 1, wanted, f);
+    if (got != wanted) {
+      std::fclose(f);
+      out.clear();
+      return false;
+    }
+    totalRead += got;
   }
   std::fclose(f);
+  if (totalRead != static_cast<size_t>(size)) {
+    out.clear();
+    return false;
+  }
   return true;
 }
 
@@ -48611,15 +48688,25 @@ static bool nativeReadBinaryFileRange(const std::string& path, size_t start, siz
     return false;
   }
   out.resize(length);
-  if (length > 0) {
-    const size_t got = std::fread(&out[0], 1, length, f);
-    if (got != length) {
+  size_t totalRead = 0;
+  constexpr size_t kReadChunkBytes = 256u * 1024u;
+  while (totalRead < length && g_nativeRunning.load()) {
+    const size_t wanted = std::min(
+      kReadChunkBytes, length - totalRead);
+    const size_t got = std::fread(
+      &out[totalRead], 1, wanted, f);
+    if (got != wanted) {
       std::fclose(f);
       out.clear();
       return false;
     }
+    totalRead += got;
   }
   std::fclose(f);
+  if (totalRead != length) {
+    out.clear();
+    return false;
+  }
   return true;
 }
 
@@ -49779,16 +49866,21 @@ static void shutdown()
 {
   if (!plugin_register_ptr || !g_state.initialized) return;
 
-  nativeCloseAppActivePanel();
-  nativeCloseAllTelepromptWindows();
-  nativeTechnicalNoticeFlushPersistenceOnMainThread();
-
+  // Interrompe primeiro os produtores de trabalho. Antes, o timer e a ponte
+  // HTTP continuavam ativos enquanto janelas e decoders eram destruídos; ao
+  // fechar o REAPER isso podia manter uma leitura de mídia ou um callback vivo
+  // e prolongar o unload da extensão.
   if (g_state.timerRegistered) {
     plugin_register_ptr("-timer", reinterpret_cast<void*>(&startupTimer));
     g_state.timerRegistered = false;
   }
 
   stopNativeBridgeServer();
+
+  nativeCloseAppActivePanel();
+  nativeCloseAllTelepromptWindows();
+  nativeTechnicalNoticeFlushPersistenceOnMainThread();
+
   unregisterNativeBridgeApi();
   vshook_jsapi::unregisterApi();
   unregisterClipboardApi();

@@ -1338,6 +1338,10 @@ struct Decoder::Impl {
     for (int attempt = 0;
          attempt < maximumSamplesPerRequest;
          ++attempt) {
+      // O destructor solicita parada antes de aguardar a worker. Sem esta
+      // verificação, um seek em vídeo com GOP longo podia consumir centenas
+      // de amostras antes de deixar o REAPER concluir o encerramento.
+      if (shouldStop()) return hasFrame;
       DWORD actualStream = 0;
       DWORD flags = 0;
       LONGLONG timestamp = 0;
@@ -1496,6 +1500,8 @@ struct Decoder::Impl {
         waitForWork(current, std::chrono::milliseconds(80));
         continue;
       }
+
+      if (shouldStop()) break;
 
       const auto now = std::chrono::steady_clock::now();
       const double elapsed =

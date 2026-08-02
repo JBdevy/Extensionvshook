@@ -36,24 +36,11 @@ cmake --build build --config Release
 O workflow do macOS compila separadamente `x86_64` para macOS 10.13+ e
 `arm64` para macOS 11+, depois combina os dois binários.
 
-## Configurações do teleprompt
-
-A interface Electron auxiliar fica em `teleprompt-settings`.
-
-```powershell
-cd teleprompt-settings
-npm ci
-npm run build:win
-```
-
-No macOS, use `npm run build:mac`.
-
 ## Estrutura
 
 - `src`: código da extensão e dos decodificadores nativos.
 - `sdk`: cabeçalhos do SDK do REAPER.
 - `WDL`: componentes WDL/SWELL necessários no macOS.
-- `teleprompt-settings`: interface de configurações e recados.
 - `tests`: testes nativos.
 - `.github/workflows`: builds oficiais de Windows e macOS.
 
