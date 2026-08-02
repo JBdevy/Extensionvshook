@@ -59,6 +59,7 @@
 #include "wingui/membitmap.h"
 
 class LICE_IBitmap;
+class AudioAccessor;
 
 #ifndef _WIN32
 // Igual ao wrapper do SWS: em SWELL, CF_TEXT precisa usar o formato registrado.
@@ -161,6 +162,10 @@ using GetMasterTrack_t = MediaTrack* (*)(ReaProject*);
 using GetTrackName_t = bool (*)(MediaTrack*, char*, int);
 using GetSetMediaTrackInfo_String_t =
   bool (*)(MediaTrack*, const char*, char*, bool);
+using CreateTrackAudioAccessor_t = AudioAccessor* (*)(MediaTrack*);
+using DestroyAudioAccessor_t = void (*)(AudioAccessor*);
+using GetAudioAccessorSamples_t =
+  int (*)(AudioAccessor*, int, int, double, int, double*);
 using SetOnlyTrackSelected_t = void (*)(MediaTrack*);
 using InsertTrackAtIndex_t = void (*)(int, bool);
 using ReorderSelectedTracks_t = bool (*)(int, int);
@@ -285,6 +290,9 @@ static GetMasterTrack_t GetMasterTrack_ptr = nullptr;
 static GetTrackName_t GetTrackName_ptr = nullptr;
 static GetSetMediaTrackInfo_String_t
   GetSetMediaTrackInfo_String_ptr = nullptr;
+static CreateTrackAudioAccessor_t CreateTrackAudioAccessor_ptr = nullptr;
+static DestroyAudioAccessor_t DestroyAudioAccessor_ptr = nullptr;
+static GetAudioAccessorSamples_t GetAudioAccessorSamples_ptr = nullptr;
 static SetOnlyTrackSelected_t SetOnlyTrackSelected_ptr = nullptr;
 static InsertTrackAtIndex_t InsertTrackAtIndex_ptr = nullptr;
 static ReorderSelectedTracks_t ReorderSelectedTracks_ptr = nullptr;
@@ -764,6 +772,7 @@ static RECT g_nativeMainParts2ListRect{0, 0, 0, 0};
 static RECT g_nativeMainTunerColumnRect{0, 0, 0, 0};
 static RECT g_nativeMainTunerResetRect{0, 0, 0, 0};
 static RECT g_nativeMainBpmColumnRect{0, 0, 0, 0};
+static RECT g_nativeMainBpmScanRect{0, 0, 0, 0};
 static std::vector<RECT> g_nativeMainBpmHits;
 struct NativeMainTunerHit {
   RECT rect{0, 0, 0, 0};
@@ -1074,6 +1083,8 @@ enum class NativeMainModalKind {
   ConfirmLive,
   ConfirmResetRegions,
   ConfirmTunerReset,
+  BpmScanSelect,
+  BpmScanResults,
   ConfirmDeletePlaylist,
   ConfirmDeletePlaylistItems,
   ConfirmCopyPlaylistChildren,
@@ -1152,6 +1163,9 @@ static RECT g_nativeMainModalConfirmRect{0, 0, 0, 0};
 static RECT g_nativeMainModalCancelRect{0, 0, 0, 0};
 static RECT g_nativeMainModalCloseRect{0, 0, 0, 0};
 static RECT g_nativeMainModalInputRect{0, 0, 0, 0};
+static std::set<std::string> g_nativeUiBpmScanSelection;
+static int g_nativeUiBpmScanScroll = 0;
+static int g_nativeUiBpmScanVisibleRows = 0;
 struct NativeMainModalButton {
   RECT rect{0, 0, 0, 0};
   std::string action;
@@ -5382,6 +5396,31 @@ struct NativePendingPlayTarget {
 };
 
 static std::vector<NativeSongWindow> g_nativeSongWindows;
+
+struct NativeBpmScanResult {
+  std::string id;
+  std::string name;
+  double bpm = 0.0;
+  int confidence = 0;
+  int detectedPeaks = 0;
+  std::string error;
+};
+
+struct NativeBpmScanJob {
+  ReaProject* project = nullptr;
+  MediaTrack* clickTrack = nullptr;
+  AudioAccessor* accessor = nullptr;
+  std::vector<NativeSongWindow> regions;
+  size_t nextIndex = 0;
+};
+
+static NativeBpmScanJob g_nativeBpmScanJob;
+static std::vector<NativeBpmScanResult> g_nativeBpmScanResults;
+static std::string g_nativeBpmScanRequestId;
+static std::string g_nativeBpmScanError;
+static uint64_t g_nativeBpmScanRevision = 0;
+static size_t g_nativeBpmScanTotal = 0;
+static bool g_nativeBpmScanRunning = false;
 static bool g_nativeCurrentTransportPlaying = false;
 static std::string g_nativeCurrentPlayingId;
 static double g_nativeCurrentSongStart = 0.0;
@@ -6985,6 +7024,419 @@ static MediaTrack* nativeFindTrackByExactName(ReaProject* project, const std::st
     }
   }
   return nullptr;
+}
+
+static void nativeDestroyBpmScanAccessor()
+{
+  if (g_nativeBpmScanJob.accessor && DestroyAudioAccessor_ptr) {
+    DestroyAudioAccessor_ptr(g_nativeBpmScanJob.accessor);
+  }
+  g_nativeBpmScanJob = NativeBpmScanJob{};
+}
+
+static double nativeBpmNormalizeCandidate(double bpm)
+{
+  if (!std::isfinite(bpm) || bpm <= 0.0) return 0.0;
+  while (bpm > 210.0) bpm *= 0.5;
+  while (bpm < 55.0) bpm *= 2.0;
+  return bpm >= 40.0 && bpm <= 240.0 ? bpm : 0.0;
+}
+
+static NativeBpmScanResult nativeAnalyzeClickRegion(
+  AudioAccessor* accessor,
+  const NativeSongWindow& region)
+{
+  NativeBpmScanResult result;
+  result.id = region.id;
+  result.name = region.name;
+  if (!accessor || !GetAudioAccessorSamples_ptr) {
+    result.error = "audio_accessor_indisponivel";
+    return result;
+  }
+
+  constexpr int sampleRate = 2000;
+  constexpr int chunkSamples = 32768;
+  constexpr double maxAnalysisSeconds = 600.0;
+  const double duration = std::min(
+    maxAnalysisSeconds,
+    std::max(0.0, region.end - region.start));
+  if (duration < 1.0) {
+    result.error = "regiao_muito_curta";
+    return result;
+  }
+
+  const size_t totalSamples = static_cast<size_t>(
+    std::ceil(duration * sampleRate));
+  std::vector<double> samples(totalSamples, 0.0);
+  std::vector<double> interleaved(
+    static_cast<size_t>(chunkSamples) * 2, 0.0);
+  size_t offset = 0;
+  bool anyAudioBlock = false;
+  while (offset < totalSamples) {
+    const int count = static_cast<int>(std::min<size_t>(
+      chunkSamples, totalSamples - offset));
+    const int read = GetAudioAccessorSamples_ptr(
+      accessor, sampleRate, 2,
+      region.start + static_cast<double>(offset) / sampleRate,
+      count, interleaved.data());
+    if (read < 0) {
+      result.error = "falha_leitura_audio";
+      return result;
+    }
+    if (read > 0) {
+      anyAudioBlock = true;
+      for (int index = 0; index < count; ++index) {
+        samples[offset + static_cast<size_t>(index)] = std::max(
+          std::fabs(interleaved[static_cast<size_t>(index) * 2]),
+          std::fabs(interleaved[static_cast<size_t>(index) * 2 + 1]));
+      }
+    }
+    offset += static_cast<size_t>(count);
+  }
+  if (!anyAudioBlock) {
+    result.error = "sem_audio_na_regiao";
+    return result;
+  }
+
+  // Envelope de 5 ms: mantém o ataque curto do click e reduz drasticamente
+  // a quantidade de pontos usados pela detecção de transientes.
+  constexpr int envelopeWindowSamples = 10;
+  std::vector<double> envelope;
+  envelope.reserve(
+    (totalSamples + envelopeWindowSamples - 1) /
+      envelopeWindowSamples);
+  double maxAmplitude = 0.0;
+  for (size_t begin = 0; begin < totalSamples;
+       begin += envelopeWindowSamples) {
+    const size_t end = std::min(
+      totalSamples, begin + envelopeWindowSamples);
+    double peak = 0.0;
+    for (size_t index = begin; index < end; ++index) {
+      peak = std::max(peak, std::fabs(samples[index]));
+    }
+    maxAmplitude = std::max(maxAmplitude, peak);
+    envelope.push_back(peak);
+  }
+  samples.clear();
+  samples.shrink_to_fit();
+  if (maxAmplitude < 0.000001 || envelope.size() < 8) {
+    result.error = "audio_sem_picos";
+    return result;
+  }
+
+  std::vector<double> sortedEnvelope = envelope;
+  const size_t p90Index = std::min(
+    sortedEnvelope.size() - 1,
+    static_cast<size_t>(sortedEnvelope.size() * 0.90));
+  std::nth_element(
+    sortedEnvelope.begin(),
+    sortedEnvelope.begin() + static_cast<long>(p90Index),
+    sortedEnvelope.end());
+  const double p90 = sortedEnvelope[p90Index];
+  const double threshold = std::min(
+    maxAmplitude * 0.45,
+    std::max(maxAmplitude * 0.06, p90 * 2.5));
+
+  constexpr double envelopeRate =
+    static_cast<double>(sampleRate) / envelopeWindowSamples;
+  const size_t refractoryFrames = static_cast<size_t>(
+    std::ceil(0.075 * envelopeRate));
+  std::vector<size_t> peaks;
+  std::vector<double> peakStrengths;
+  for (size_t index = 2; index + 2 < envelope.size(); ++index) {
+    const double value = envelope[index];
+    if (value < threshold || value < envelope[index - 1] ||
+        value < envelope[index + 1] ||
+        value < envelope[index - 2] ||
+        value < envelope[index + 2]) {
+      continue;
+    }
+    if (!peaks.empty() && index - peaks.back() < refractoryFrames) {
+      if (value > peakStrengths.back()) {
+        peaks.back() = index;
+        peakStrengths.back() = value;
+      }
+      continue;
+    }
+    peaks.push_back(index);
+    peakStrengths.push_back(value);
+  }
+  result.detectedPeaks = static_cast<int>(peaks.size());
+  if (peaks.size() < 4) {
+    result.error = "picos_insuficientes";
+    return result;
+  }
+
+  std::vector<double> candidates;
+  candidates.reserve(peaks.size() - 1);
+  std::map<int, int> histogram;
+  for (size_t index = 1; index < peaks.size(); ++index) {
+    const double interval =
+      static_cast<double>(peaks[index] - peaks[index - 1]) /
+        envelopeRate;
+    if (interval < 0.16 || interval > 2.5) continue;
+    const double candidate = nativeBpmNormalizeCandidate(60.0 / interval);
+    if (candidate <= 0.0) continue;
+    candidates.push_back(candidate);
+    ++histogram[static_cast<int>(std::lround(candidate * 2.0))];
+  }
+  if (candidates.size() < 3 || histogram.empty()) {
+    result.error = "ritmo_insuficiente";
+    return result;
+  }
+
+  int bestBin = histogram.begin()->first;
+  int bestVotes = -1;
+  for (const auto& entry : histogram) {
+    int nearbyVotes = 0;
+    for (int delta = -3; delta <= 3; ++delta) {
+      const auto nearby = histogram.find(entry.first + delta);
+      if (nearby != histogram.end()) nearbyVotes += nearby->second;
+    }
+    if (nearbyVotes > bestVotes ||
+        (nearbyVotes == bestVotes && entry.first < bestBin)) {
+      bestVotes = nearbyVotes;
+      bestBin = entry.first;
+    }
+  }
+
+  const double coarseBpm = static_cast<double>(bestBin) / 2.0;
+  std::vector<double> inliers;
+  for (double candidate : candidates) {
+    if (std::fabs(candidate - coarseBpm) <= 2.0) {
+      inliers.push_back(candidate);
+    }
+  }
+  if (inliers.size() < 3) {
+    result.error = "ritmo_inconsistente";
+    return result;
+  }
+  std::sort(inliers.begin(), inliers.end());
+  double bpm = inliers[inliers.size() / 2];
+  if ((inliers.size() % 2) == 0) {
+    bpm = (inliers[inliers.size() / 2 - 1] + bpm) * 0.5;
+  }
+
+  std::vector<double> deviations;
+  deviations.reserve(inliers.size());
+  for (double value : inliers) {
+    deviations.push_back(std::fabs(value - bpm) /
+      std::max(1.0, bpm));
+  }
+  std::sort(deviations.begin(), deviations.end());
+  const double medianDeviation = deviations[deviations.size() / 2];
+  const double inlierRatio = static_cast<double>(inliers.size()) /
+    static_cast<double>(candidates.size());
+  const double consistency = std::max(0.0,
+    std::min(1.0, 1.0 - medianDeviation / 0.035));
+  const double countScore = std::min(1.0,
+    static_cast<double>(candidates.size()) / 16.0);
+  const double prominence = std::max(0.0, std::min(1.0,
+    (maxAmplitude - threshold) / std::max(0.000001, maxAmplitude)));
+
+  result.bpm = std::round(bpm * 10.0) / 10.0;
+  result.confidence = std::max(1, std::min(100,
+    static_cast<int>(std::lround(100.0 *
+      (0.55 * inlierRatio + 0.25 * consistency +
+       0.15 * countScore + 0.05 * prominence)))));
+  return result;
+}
+
+static bool nativeApplyBpmScanCommand(const std::string& commandBody)
+{
+  const std::string type = nativeLower(nativeTrim(
+    nativeJsonExtractString(commandBody, "type")));
+  if (type != "bpm_scan_regions" &&
+      type != "scan_click_bpm") {
+    return false;
+  }
+
+  nativeDestroyBpmScanAccessor();
+  g_nativeBpmScanResults.clear();
+  g_nativeBpmScanError.clear();
+  g_nativeBpmScanTotal = 0;
+  g_nativeBpmScanRequestId = nativeJsonExtractString(
+    commandBody, "scanRequestId");
+  ++g_nativeBpmScanRevision;
+  g_nativeBpmScanRunning = false;
+
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project) {
+    g_nativeBpmScanError = "projeto_indisponivel";
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  const std::vector<std::string> rawIds = nativeSplit(
+    nativeJsonExtractString(commandBody, "regionIds"), '|');
+  std::set<std::string> requestedIds;
+  for (const std::string& rawId : rawIds) {
+    const std::string id = nativeTrim(rawId);
+    if (!id.empty()) requestedIds.insert(id);
+  }
+
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+  }
+  for (const NativeSongWindow& song : songs) {
+    if (song.isBlock || song.isHashParent || song.isHashChild ||
+        song.isRegionChild || song.end <= song.start + 0.0005) {
+      continue;
+    }
+    if (requestedIds.find(song.id) == requestedIds.end()) continue;
+    g_nativeBpmScanJob.regions.push_back(song);
+  }
+  if (g_nativeBpmScanJob.regions.empty()) {
+    g_nativeBpmScanError = "nenhuma_regiao_selecionada";
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+  g_nativeBpmScanTotal = g_nativeBpmScanJob.regions.size();
+
+  MediaTrack* clickTrack = nativeFindTrackByExactName(project, "CLICK");
+  if (!clickTrack) {
+    g_nativeBpmScanError = "pista_click_nao_encontrada";
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+  if (!CreateTrackAudioAccessor_ptr || !DestroyAudioAccessor_ptr ||
+      !GetAudioAccessorSamples_ptr) {
+    g_nativeBpmScanError = "audio_accessor_indisponivel";
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  AudioAccessor* accessor = CreateTrackAudioAccessor_ptr(clickTrack);
+  if (!accessor) {
+    g_nativeBpmScanError = "falha_abrir_pista_click";
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+  g_nativeBpmScanJob.project = project;
+  g_nativeBpmScanJob.clickTrack = clickTrack;
+  g_nativeBpmScanJob.accessor = accessor;
+  g_nativeBpmScanJob.nextIndex = 0;
+  g_nativeBpmScanRunning = true;
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
+static void nativeProcessBpmScanJobOnMainThread()
+{
+  if (!g_nativeBpmScanRunning) return;
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project || project != g_nativeBpmScanJob.project) {
+    g_nativeBpmScanError = "projeto_trocado_durante_scan";
+    g_nativeBpmScanRunning = false;
+    ++g_nativeBpmScanRevision;
+    nativeDestroyBpmScanAccessor();
+    g_nativeForceStateBuild.store(true);
+    return;
+  }
+  if (g_nativeBpmScanJob.nextIndex >=
+      g_nativeBpmScanJob.regions.size()) {
+    g_nativeBpmScanRunning = false;
+    ++g_nativeBpmScanRevision;
+    nativeDestroyBpmScanAccessor();
+    g_nativeForceStateBuild.store(true);
+    return;
+  }
+
+  const NativeSongWindow region =
+    g_nativeBpmScanJob.regions[g_nativeBpmScanJob.nextIndex];
+  g_nativeBpmScanResults.push_back(
+    nativeAnalyzeClickRegion(g_nativeBpmScanJob.accessor, region));
+  ++g_nativeBpmScanJob.nextIndex;
+  ++g_nativeBpmScanRevision;
+  if (g_nativeBpmScanJob.nextIndex >=
+      g_nativeBpmScanJob.regions.size()) {
+    g_nativeBpmScanRunning = false;
+    nativeDestroyBpmScanAccessor();
+  }
+  g_nativeForceStateBuild.store(true);
+}
+
+static std::vector<NativeSongWindow> nativeUiBpmScanEligibleSongs()
+{
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+  }
+  songs.erase(std::remove_if(songs.begin(), songs.end(),
+    [](const NativeSongWindow& song) {
+      return song.isBlock || song.isHashParent || song.isHashChild ||
+        song.isRegionChild || song.end <= song.start + 0.0005;
+    }), songs.end());
+  return songs;
+}
+
+static std::string nativeUiBpmScanErrorText(const std::string& error)
+{
+  if (error == "projeto_indisponivel") return "PROJETO INDISPONÍVEL";
+  if (error == "nenhuma_regiao_selecionada") return "NENHUMA REGIÃO SELECIONADA";
+  if (error == "pista_click_nao_encontrada") return "PISTA CLICK NÃO ENCONTRADA";
+  if (error == "audio_accessor_indisponivel") return "LEITURA DE ÁUDIO INDISPONÍVEL";
+  if (error == "falha_abrir_pista_click") return "NÃO FOI POSSÍVEL ABRIR A PISTA CLICK";
+  if (error == "projeto_trocado_durante_scan") return "A SESSÃO MUDOU DURANTE O SCAN";
+  if (error == "regiao_muito_curta") return "REGIÃO MUITO CURTA";
+  if (error == "falha_leitura_audio") return "FALHA AO LER O ÁUDIO";
+  if (error == "sem_audio_na_regiao") return "SEM ÁUDIO NA PISTA CLICK";
+  if (error == "audio_sem_picos") return "NENHUM PICO ENCONTRADO";
+  if (error == "picos_insuficientes") return "POUCOS PICOS ENCONTRADOS";
+  if (error == "ritmo_insuficiente") return "RITMO INSUFICIENTE";
+  if (error == "ritmo_inconsistente") return "RITMO INCONSISTENTE";
+  return error;
+}
+
+static void nativeUiOpenBpmScan()
+{
+  g_nativeBpmScanRunning = false;
+  nativeDestroyBpmScanAccessor();
+  g_nativeBpmScanResults.clear();
+  g_nativeBpmScanError.clear();
+  g_nativeBpmScanTotal = 0;
+  g_nativeUiBpmScanSelection.clear();
+  g_nativeUiBpmScanScroll = 0;
+  g_nativeMainModalKind = NativeMainModalKind::BpmScanSelect;
+}
+
+static bool nativeUiStartBpmScan()
+{
+  if (g_nativeUiBpmScanSelection.empty()) {
+    nativeUiShowTemporaryPopup("SELECIONE PELO MENOS UMA MÚSICA", 1.5);
+    return false;
+  }
+  std::ostringstream ids;
+  bool first = true;
+  for (const NativeSongWindow& song : nativeUiBpmScanEligibleSongs()) {
+    if (g_nativeUiBpmScanSelection.find(song.id) ==
+        g_nativeUiBpmScanSelection.end()) continue;
+    if (!first) ids << '|';
+    first = false;
+    ids << song.id;
+  }
+  if (first) {
+    nativeUiShowTemporaryPopup("NENHUMA REGIÃO SOLTA DISPONÍVEL", 1.5);
+    return false;
+  }
+  std::ostringstream command;
+  command << "{\"type\":\"bpm_scan_regions\",\"regionIds\":"
+          << nativeJsonString(ids.str()) << ",\"scanRequestId\":"
+          << nativeJsonString(std::to_string(
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch()).count()))
+          << "}";
+  nativeApplyBpmScanCommand(command.str());
+  g_nativeUiBpmScanScroll = 0;
+  g_nativeMainModalKind = NativeMainModalKind::BpmScanResults;
+  return true;
 }
 
 static std::string nativeReadMediaItemNotes(MediaItem* item)
@@ -22722,6 +23174,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     g_nativeMainTunerResetRect = RECT{0, 0, 0, 0};
     g_nativeMainTunerHits.clear();
     g_nativeMainBpmColumnRect = RECT{0, 0, 0, 0};
+    g_nativeMainBpmScanRect = RECT{0, 0, 0, 0};
     g_nativeMainBpmHits.clear();
     g_nativeMainFamilyButtonHits.clear();
     g_nativeMainVisibleRowIndices.clear();
@@ -22826,14 +23279,23 @@ static void nativePaintAppActivePanel(HWND hwnd)
       std::min(g_nativeMainBpmColumnRect.bottom,
         g_nativeMainBpmColumnRect.top + rowH)};
     nativeAppActiveFillRect(dc, bpmHeader, RGB(20, 23, 26));
+    const int scanW = std::min(42, std::max(32,
+      static_cast<int>(bpmHeader.right - bpmHeader.left) / 2));
+    g_nativeMainBpmScanRect = RECT{
+      bpmHeader.right - scanW - 4, bpmHeader.top + 2,
+      bpmHeader.right - 4,
+      bpmHeader.top + 2 + std::max(12, rowH - 4)};
     RECT bpmTitle{bpmHeader.left + 6, bpmHeader.top + 1,
-      bpmHeader.right - 6, bpmHeader.bottom - 1};
+      g_nativeMainBpmScanRect.left - 3, bpmHeader.bottom - 1};
     nativeAppActiveDrawText(dc, "BPM", bpmTitle,
       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
         DT_NOPREFIX,
       RGB(255, 255, 255), labelFont);
+    nativeUiDrawButton(dc, g_nativeMainBpmScanRect, "SCAN",
+      "add_existing", false, true, statusFont, 3);
   } else {
     g_nativeMainBpmColumnRect = RECT{0, 0, 0, 0};
+    g_nativeMainBpmScanRect = RECT{0, 0, 0, 0};
   }
   g_nativeMainTunerHits.clear();
   if (showTuner) {
@@ -24254,12 +24716,18 @@ static void nativePaintAppActivePanel(HWND hwnd)
       g_nativeMainModalKind == NativeMainModalKind::ConfirmLive;
     const bool configAccessModal =
       g_nativeMainModalKind == NativeMainModalKind::ConfigAccess;
+    const bool bpmScanModal =
+      g_nativeMainModalKind == NativeMainModalKind::BpmScanSelect ||
+      g_nativeMainModalKind == NativeMainModalKind::BpmScanResults;
     int modalW = std::max(280,
       static_cast<int>(std::floor(width * 0.82)));
     modalW = std::min(modalW, std::max(280, width - 20));
     int requestedH = std::max(140,
       static_cast<int>(std::floor(height * 0.56)));
-    if (customizeModal) {
+    if (bpmScanModal) {
+      modalW = std::min(720, std::max(340, width - 20));
+      requestedH = std::min(650, std::max(300, height - 20));
+    } else if (customizeModal) {
       modalW = std::max(300, width - 8);
       requestedH = std::max(220, height - 8);
     } else if (playlistModal) {
@@ -24423,7 +24891,182 @@ static void nativePaintAppActivePanel(HWND hwnd)
         labelFont, 5);
     };
 
-    if (g_nativeMainModalKind == NativeMainModalKind::PlaylistDropdown) {
+    if (g_nativeMainModalKind == NativeMainModalKind::BpmScanSelect) {
+      const std::vector<NativeSongWindow> songs =
+        nativeUiBpmScanEligibleSongs();
+      bool allSelected = !songs.empty();
+      for (const NativeSongWindow& song : songs) {
+        if (g_nativeUiBpmScanSelection.find(song.id) ==
+            g_nativeUiBpmScanSelection.end()) {
+          allSelected = false;
+          break;
+        }
+      }
+      RECT title{modal.left + 12, modal.top + 8,
+        modal.right - 112, modal.top + 34};
+      nativeAppActiveDrawText(dc, "SCAN BPM", title,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(248, 250, 252), nameFont);
+      addModalButton("bpm_scan_all", "TODAS",
+        RECT{modal.right - 100, modal.top + 8,
+          modal.right - 12, modal.top + 30},
+        allSelected ? "play" : "add_existing", allSelected, true);
+      RECT info{modal.left + 12, modal.top + 36,
+        modal.right - 12, modal.top + 56};
+      nativeAppActiveDrawText(dc,
+        "Regiões pai e músicas filhas não entram neste scan.", info,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+          DT_NOPREFIX,
+        RGB(148, 163, 184), statusFont);
+      const int rowH = 25;
+      const int listTop = modal.top + 62;
+      const int listBottom = modal.bottom - 42;
+      g_nativeUiBpmScanVisibleRows = std::max(1,
+        (listBottom - listTop) / rowH);
+      const int maxScroll = std::max(0,
+        static_cast<int>(songs.size()) - g_nativeUiBpmScanVisibleRows);
+      g_nativeUiBpmScanScroll = std::max(0,
+        std::min(maxScroll, g_nativeUiBpmScanScroll));
+      const int end = std::min(static_cast<int>(songs.size()),
+        g_nativeUiBpmScanScroll + g_nativeUiBpmScanVisibleRows);
+      for (int index = g_nativeUiBpmScanScroll; index < end; ++index) {
+        const NativeSongWindow& song = songs[static_cast<size_t>(index)];
+        const bool selected = g_nativeUiBpmScanSelection.find(song.id) !=
+          g_nativeUiBpmScanSelection.end();
+        const int drawIndex = index - g_nativeUiBpmScanScroll;
+        RECT row{modal.left + 12, listTop + drawIndex * rowH,
+          modal.right - 12, listTop + drawIndex * rowH + rowH - 3};
+        std::ostringstream label;
+        label << (selected ? "[x]  " : "[ ]  ");
+        if (song.sourceNumber > 0) label << song.sourceNumber << "  ";
+        label << song.name;
+        addModalButton("bpm_scan_toggle|" + song.id, label.str(), row,
+          selected ? "play" : "page", selected, true);
+      }
+      if (songs.empty()) {
+        RECT empty{modal.left + 12, listTop,
+          modal.right - 12, listBottom};
+        nativeAppActiveDrawText(dc, "NENHUMA REGIÃO SOLTA ENCONTRADA",
+          empty, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+          RGB(148, 163, 184), labelFont);
+      }
+      addModalButton("bpm_scan_confirm", "OK",
+        RECT{modal.left + 12, modal.bottom - 32,
+          modal.left + 108, modal.bottom - 10},
+        "play", true, !g_nativeUiBpmScanSelection.empty());
+      addModalButton("close", "CANCELAR",
+        RECT{modal.left + 116, modal.bottom - 32,
+          modal.left + 226, modal.bottom - 10},
+        "page", true);
+    } else if (g_nativeMainModalKind == NativeMainModalKind::BpmScanResults) {
+      RECT title{modal.left + 12, modal.top + 8,
+        modal.right - 12, modal.top + 34};
+      std::string status;
+      COLORREF statusColor = RGB(74, 222, 128);
+      if (!g_nativeBpmScanError.empty()) {
+        status = nativeUiBpmScanErrorText(g_nativeBpmScanError);
+        statusColor = RGB(248, 113, 113);
+      } else if (g_nativeBpmScanRunning) {
+        status = "ANALISANDO " +
+          std::to_string(g_nativeBpmScanResults.size()) + " DE " +
+          std::to_string(g_nativeBpmScanTotal);
+        statusColor = RGB(250, 224, 46);
+      } else {
+        status = "SCAN CONCLUÍDO";
+      }
+      nativeAppActiveDrawText(dc, "RESULTADO DO SCAN", title,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(248, 250, 252), nameFont);
+      RECT statusRect{modal.left + 12, modal.top + 34,
+        modal.right - 12, modal.top + 54};
+      nativeAppActiveDrawText(dc, status, statusRect,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+          DT_NOPREFIX,
+        statusColor, statusFont);
+      const int nameRight = modal.right - 190;
+      RECT tableHeader{modal.left + 12, modal.top + 58,
+        modal.right - 12, modal.top + 80};
+      nativeAppActiveFillRect(dc, tableHeader, RGB(10, 16, 29));
+      nativeAppActiveDrawText(dc, "NOME",
+        RECT{tableHeader.left + 6, tableHeader.top,
+          nameRight, tableHeader.bottom},
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(148, 163, 184), statusFont);
+      nativeAppActiveDrawText(dc, "BPM",
+        RECT{nameRight, tableHeader.top,
+          modal.right - 102, tableHeader.bottom},
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(148, 163, 184), statusFont);
+      nativeAppActiveDrawText(dc, "CONFIANÇA",
+        RECT{modal.right - 98, tableHeader.top,
+          modal.right - 18, tableHeader.bottom},
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(148, 163, 184), statusFont);
+      const int rowH = 28;
+      const int listTop = tableHeader.bottom + 4;
+      const int listBottom = modal.bottom - 42;
+      g_nativeUiBpmScanVisibleRows = std::max(1,
+        (listBottom - listTop) / rowH);
+      const int maxScroll = std::max(0,
+        static_cast<int>(g_nativeBpmScanResults.size()) -
+          g_nativeUiBpmScanVisibleRows);
+      g_nativeUiBpmScanScroll = std::max(0,
+        std::min(maxScroll, g_nativeUiBpmScanScroll));
+      const int end = std::min(
+        static_cast<int>(g_nativeBpmScanResults.size()),
+        g_nativeUiBpmScanScroll + g_nativeUiBpmScanVisibleRows);
+      for (int index = g_nativeUiBpmScanScroll; index < end; ++index) {
+        const NativeBpmScanResult& result =
+          g_nativeBpmScanResults[static_cast<size_t>(index)];
+        const int drawIndex = index - g_nativeUiBpmScanScroll;
+        RECT row{modal.left + 12, listTop + drawIndex * rowH,
+          modal.right - 12, listTop + drawIndex * rowH + rowH - 3};
+        nativeAppActiveFillRect(dc, row,
+          index % 2 ? RGB(36, 41, 46) : RGB(31, 36, 41));
+        std::string resultName = result.name;
+        if (!result.error.empty()) {
+          resultName += " - " + nativeUiBpmScanErrorText(result.error);
+        }
+        nativeAppActiveDrawText(dc, resultName,
+          RECT{row.left + 6, row.top, nameRight, row.bottom},
+          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+            DT_NOPREFIX,
+          result.error.empty() ? RGB(226, 232, 240) : RGB(248, 113, 113),
+          statusFont);
+        nativeAppActiveDrawText(dc,
+          result.bpm > 0.0 ? nativeNumber(result.bpm, 1) : "--",
+          RECT{nameRight, row.top, modal.right - 102, row.bottom},
+          DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+          RGB(56, 189, 248), labelFont);
+        nativeAppActiveDrawText(dc,
+          result.error.empty()
+            ? std::to_string(result.confidence) + "%" : "--",
+          RECT{modal.right - 98, row.top,
+            modal.right - 18, row.bottom},
+          DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+          RGB(134, 239, 172), labelFont);
+      }
+      if (g_nativeBpmScanResults.empty() &&
+          g_nativeBpmScanError.empty()) {
+        RECT waiting{modal.left + 12, listTop,
+          modal.right - 12, listBottom};
+        nativeAppActiveDrawText(dc, "PREPARANDO ANÁLISE...", waiting,
+          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+          RGB(148, 163, 184), labelFont);
+      }
+      addModalButton("bpm_scan_apply", "APLICAR",
+        RECT{modal.left + 12, modal.bottom - 32,
+          modal.left + 108, modal.bottom - 10},
+        "play", true, true);
+      addModalButton("bpm_scan_new", "NOVO SCAN",
+        RECT{modal.left + 116, modal.bottom - 32,
+          modal.left + 226, modal.bottom - 10},
+        "add_existing", true, true);
+      addModalButton("close", "FECHAR",
+        RECT{modal.right - 100, modal.bottom - 32,
+          modal.right - 12, modal.bottom - 10},
+        "page", true);
+    } else if (g_nativeMainModalKind == NativeMainModalKind::PlaylistDropdown) {
       if (g_nativeUiPlaylistFilterDirty.exchange(false)) {
         nativeUiOpenPlaylistDropdown();
       }
@@ -33263,6 +33906,10 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     }
     return true;
   }
+  if (PtInRect(&g_nativeMainBpmScanRect, point)) {
+    if (!rightClick) nativeUiOpenBpmScan();
+    return true;
+  }
   if (PtInRect(&g_nativeMainPreviewPageRect, point)) {
     if (!rightClick) {
       g_nativeMainPreviewSecondPage =
@@ -33789,6 +34436,49 @@ static bool nativeMainHandleModalClick(
   }
 
   if (nativeUiHandlePreviewConfigAction(action)) return true;
+
+  if (nativeStartsWith(action, "bpm_scan_toggle|")) {
+    const std::string id = action.substr(
+      std::string("bpm_scan_toggle|").size());
+    const auto found = g_nativeUiBpmScanSelection.find(id);
+    if (found == g_nativeUiBpmScanSelection.end()) {
+      g_nativeUiBpmScanSelection.insert(id);
+    } else {
+      g_nativeUiBpmScanSelection.erase(found);
+    }
+    return true;
+  }
+  if (action == "bpm_scan_all") {
+    const std::vector<NativeSongWindow> songs =
+      nativeUiBpmScanEligibleSongs();
+    bool allSelected = !songs.empty();
+    for (const NativeSongWindow& song : songs) {
+      if (g_nativeUiBpmScanSelection.find(song.id) ==
+          g_nativeUiBpmScanSelection.end()) {
+        allSelected = false;
+        break;
+      }
+    }
+    g_nativeUiBpmScanSelection.clear();
+    if (!allSelected) {
+      for (const NativeSongWindow& song : songs) {
+        g_nativeUiBpmScanSelection.insert(song.id);
+      }
+    }
+    return true;
+  }
+  if (action == "bpm_scan_confirm") {
+    nativeUiStartBpmScan();
+    return true;
+  }
+  if (action == "bpm_scan_new") {
+    nativeUiOpenBpmScan();
+    return true;
+  }
+  if (action == "bpm_scan_apply") {
+    // Nesta primeira etapa o botão é apenas visual; nenhum BPM é aplicado.
+    return true;
+  }
 
   if (action == "close") {
     nativeUiCloseMainModal();
@@ -36795,6 +37485,20 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       if (g_state.directorInterfaceBlocked || g_nativePartsRenameOpen ||
           g_nativeMixerRenameOpen) return 0;
       const short delta = static_cast<short>((wParam >> 16) & 0xffff);
+      if (g_nativeMainModalKind == NativeMainModalKind::BpmScanSelect ||
+          g_nativeMainModalKind == NativeMainModalKind::BpmScanResults) {
+        const int total = g_nativeMainModalKind ==
+            NativeMainModalKind::BpmScanSelect
+          ? static_cast<int>(nativeUiBpmScanEligibleSongs().size())
+          : static_cast<int>(g_nativeBpmScanResults.size());
+        const int maxScroll = std::max(0,
+          total - g_nativeUiBpmScanVisibleRows);
+        g_nativeUiBpmScanScroll = std::max(0,
+          std::min(maxScroll, g_nativeUiBpmScanScroll +
+            (delta > 0 ? -2 : 2)));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
       if (g_nativeMainModalKind ==
           NativeMainModalKind::PlaylistDropdown) {
         const int maxScroll = std::max(0,
@@ -38614,6 +39318,7 @@ static void nativeCloseAppActivePanel()
   g_nativeMainTunerResetRect = RECT{0, 0, 0, 0};
   g_nativeMainTunerHits.clear();
   g_nativeMainBpmColumnRect = RECT{0, 0, 0, 0};
+  g_nativeMainBpmScanRect = RECT{0, 0, 0, 0};
   g_nativeMainBpmHits.clear();
   g_nativeMainPlaylistTabRect = RECT{0, 0, 0, 0};
   g_nativeMainRegionsTabRect = RECT{0, 0, 0, 0};
@@ -49433,6 +50138,7 @@ static void startupTimer()
   // A fila HTTP precisa ser consumida antes de calcular runtimeActive: o
   // director_enter que acorda a extensao tambem chega por essa fila.
   nativeProcessHttpCommandsOnMainThread();
+  nativeProcessBpmScanJobOnMainThread();
   nativeUpdateTrackMetersOnMainThread();
 #ifndef _WIN32
   // A interface pode continuar aberta depois que o heartbeat do Diretor
@@ -49615,6 +50321,15 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetSetMediaTrackInfo_String_ptr =
     reinterpret_cast<GetSetMediaTrackInfo_String_t>(
       rec->GetFunc("GetSetMediaTrackInfo_String"));
+  CreateTrackAudioAccessor_ptr =
+    reinterpret_cast<CreateTrackAudioAccessor_t>(
+      rec->GetFunc("CreateTrackAudioAccessor"));
+  DestroyAudioAccessor_ptr =
+    reinterpret_cast<DestroyAudioAccessor_t>(
+      rec->GetFunc("DestroyAudioAccessor"));
+  GetAudioAccessorSamples_ptr =
+    reinterpret_cast<GetAudioAccessorSamples_t>(
+      rec->GetFunc("GetAudioAccessorSamples"));
   SetOnlyTrackSelected_ptr =
     reinterpret_cast<SetOnlyTrackSelected_t>(
       rec->GetFunc("SetOnlyTrackSelected"));
@@ -49882,6 +50597,7 @@ static void shutdown()
   }
 
   stopNativeBridgeServer();
+  nativeDestroyBpmScanAccessor();
 
   nativeCloseAppActivePanel();
   nativeCloseAllTelepromptWindows();
