@@ -48249,6 +48249,24 @@ static bool nativeSelectProjectFromCommand(const std::string& commandBody)
   return true;
 }
 
+static bool nativeSaveProjectFromCommand(
+  const std::string& commandBody)
+{
+  const std::string type =
+    nativeJsonExtractString(commandBody, "type");
+  if (type != "save_project" &&
+      type != "project_save" &&
+      type != "save_current_project") {
+    return false;
+  }
+  if (!Main_OnCommand_ptr) return false;
+  // REAPER: File: Save project. Se o projeto ainda nao tiver caminho, o
+  // proprio REAPER abre Save Project As na maquina do usuario.
+  Main_OnCommand_ptr(40026, 0);
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
 
 static std::string nativeRequestTarget(const std::string& req)
 {
@@ -48625,6 +48643,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     nativeApplySelectionCommand(commandBody) ||
     nativeApplyTransportCommand(commandBody) ||
     nativeApplyMarkerCommand(commandBody) ||
+    nativeSaveProjectFromCommand(commandBody) ||
     nativeSelectProjectFromCommand(commandBody);
 
   if (handledByNative) nativeMirrorCommandToLuaIfNeeded(commandType, commandBody);
