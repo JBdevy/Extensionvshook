@@ -657,12 +657,10 @@ static constexpr UINT kNativeUiFrameIdleIntervalMs = 200;
 static UINT g_nativeUiFrameTimerIntervalMs = 0;
 // Windows e macOS entregam autorepeat com ritmos diferentes. A interface
 // ignora essas repetições nativas e usa o mesmo relógio nas duas plataformas.
-static constexpr int kNativeUiNavigationRepeatDelayMs = 250;
-static constexpr int kNativeUiNavigationRepeatIntervalMs = 33;
-static constexpr int kNativeUiNavigationRepeatCatchUpLimit = 4;
+static constexpr int kNativeUiNavigationRepeatDelayMs = 220;
+static constexpr int kNativeUiNavigationRepeatIntervalMs = 25;
 static int g_nativeUiHeldNavigationKey = 0;
 static bool g_nativeUiSyntheticNavigationRepeat = false;
-static bool g_nativeUiNavigationRepeatBatch = false;
 static std::chrono::steady_clock::time_point
   g_nativeUiNextNavigationRepeatAt{};
 static HFONT g_nativeUiSharedFont = nullptr;
@@ -12559,10 +12557,6 @@ static void nativeUiRefreshNavigationNow(HWND hwnd)
   nativeUiSetFrameTimerInterval(
     hwnd, kNativeUiFrameFastIntervalMs);
   InvalidateRect(hwnd, nullptr, FALSE);
-  // Durante a recuperacao de um timer atrasado, aplica todas as selecoes
-  // primeiro e apresenta somente o estado final do lote. Redesenhar a lista
-  // para cada passo tornava a velocidade dependente do computador.
-  if (g_nativeUiNavigationRepeatBatch) return;
   // WM_PAINT/timer podem perder prioridade durante a repetição de WM_KEYDOWN
   // tanto no Win32 quanto no SWELL do macOS. Apresentar no máximo um quadro
   // a cada 16 ms mantém os dois sistemas com a mesma resposta visual.
@@ -35540,37 +35534,21 @@ static bool nativeUiAdvanceNavigationRepeat(HWND hwnd)
     return false;
   }
 
-  const auto overdueMs =
-    std::chrono::duration_cast<std::chrono::milliseconds>(
-      now - g_nativeUiNextNavigationRepeatAt).count();
-  const int dueRepeatCount = 1 + static_cast<int>(
-    overdueMs / kNativeUiNavigationRepeatIntervalMs);
-  const int repeatCount = std::min(
-    dueRepeatCount, kNativeUiNavigationRepeatCatchUpLimit);
-  if (dueRepeatCount > kNativeUiNavigationRepeatCatchUpLimit) {
-    // Depois de uma suspensao longa, recupera apenas um lote limitado para
-    // nao atravessar dezenas de musicas de uma vez.
+  g_nativeUiNextNavigationRepeatAt +=
+    std::chrono::milliseconds(
+      kNativeUiNavigationRepeatIntervalMs);
+  if (now >= g_nativeUiNextNavigationRepeatAt) {
+    // Nunca acumula varios passos no mesmo quadro: cada musica selecionada
+    // permanece visivel e a navegacao nao produz saltos.
     g_nativeUiNextNavigationRepeatAt =
       now + std::chrono::milliseconds(
         kNativeUiNavigationRepeatIntervalMs);
-  } else {
-    g_nativeUiNextNavigationRepeatAt +=
-      std::chrono::milliseconds(
-        repeatCount * kNativeUiNavigationRepeatIntervalMs);
   }
 
   const int navigationKey = g_nativeUiHeldNavigationKey;
   g_nativeUiSyntheticNavigationRepeat = true;
-  g_nativeUiNavigationRepeatBatch = true;
-  for (int repeat = 0; repeat < repeatCount; ++repeat) {
-    if (!IsWindow(hwnd) ||
-        g_nativeUiHeldNavigationKey != navigationKey) {
-      break;
-    }
-    SendMessage(hwnd, WM_KEYDOWN,
-      static_cast<WPARAM>(navigationKey), 0);
-  }
-  g_nativeUiNavigationRepeatBatch = false;
+  SendMessage(hwnd, WM_KEYDOWN,
+    static_cast<WPARAM>(navigationKey), 0);
   g_nativeUiSyntheticNavigationRepeat = false;
   if (!IsWindow(hwnd)) {
     nativeUiResetNavigationRepeat();
@@ -35946,8 +35924,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       return 0;
     case WM_TIMER:
       if (wParam == kNativeUiFrameTimerId) {
-        const bool navigationRepeated =
-          nativeUiAdvanceNavigationRepeat(hwnd);
+        nativeUiAdvanceNavigationRepeat(hwnd);
         const bool scrollChanged =
           nativeUiAdvanceSmoothScrolls();
         const bool dragScrollChanged =
@@ -35974,7 +35951,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         const bool timedRefresh =
           nativeUiNeedsTimedVisualRefresh();
         if (IsWindowVisible(hwnd) &&
-            (navigationRepeated || scrollChanged || dragScrollChanged ||
+            (scrollChanged || dragScrollChanged ||
              searchQueryCommitted ||
              navigationCommitted || localClockChanged ||
              batteryChanged || timedRefresh)) {
@@ -35982,7 +35959,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           // A animação da lista não depende da fila normal de WM_PAINT:
           // no Win32 e no SWELL do macOS, cada passo continua sendo
           // apresentado durante o autorepeat das setas.
-          if (navigationRepeated || scrollChanged || dragScrollChanged) {
+          if (scrollChanged || dragScrollChanged) {
             UpdateWindow(hwnd);
           }
         } else if (IsWindowVisible(hwnd)) {
