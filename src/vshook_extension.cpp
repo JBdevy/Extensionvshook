@@ -603,6 +603,7 @@ struct NativeAppActivePanelModel {
   bool showParts1 = false;
   bool showParts2 = false;
   bool showTuner = false;
+  bool showBpm = false;
   bool showMixerTracks = false;
   bool showMixerGroups = true;
   std::string drawerOutlineColor = "yellow";
@@ -703,6 +704,7 @@ static RECT g_nativeMainRegionsTabRect{0, 0, 0, 0};
 static RECT g_nativeMainMixerTabRect{0, 0, 0, 0};
 static RECT g_nativeMainMidiTabRect{0, 0, 0, 0};
 static RECT g_nativeMainTunerTabRect{0, 0, 0, 0};
+static RECT g_nativeMainBpmTabRect{0, 0, 0, 0};
 static RECT g_nativeMainHelpTabRect{0, 0, 0, 0};
 static RECT g_nativeMainConfigTabRect{0, 0, 0, 0};
 static RECT g_nativeMainPlaylistFieldRect{0, 0, 0, 0};
@@ -759,6 +761,8 @@ static RECT g_nativeMainParts1ListRect{0, 0, 0, 0};
 static RECT g_nativeMainParts2ListRect{0, 0, 0, 0};
 static RECT g_nativeMainTunerColumnRect{0, 0, 0, 0};
 static RECT g_nativeMainTunerResetRect{0, 0, 0, 0};
+static RECT g_nativeMainBpmColumnRect{0, 0, 0, 0};
+static std::vector<RECT> g_nativeMainBpmHits;
 struct NativeMainTunerHit {
   RECT rect{0, 0, 0, 0};
   std::string id;
@@ -12323,6 +12327,7 @@ static std::string nativeUiMainTooltipAtPoint(const POINT& point)
   if (PtInRect(&g_nativeMainMixerTabRect, point)) return "F3: Abrir Mixer.";
   if (PtInRect(&g_nativeMainMidiTabRect, point)) return "Abrir mapeamento MIDI.";
   if (PtInRect(&g_nativeMainTunerTabRect, point)) return "F7: Abrir ou fechar Tuner.";
+  if (PtInRect(&g_nativeMainBpmTabRect, point)) return "Abrir ou fechar BPM.";
   if (PtInRect(&g_nativeMainHelpTabRect, point)) return "Abrir ajuda.";
   if (PtInRect(&g_nativeMainConfigTabRect, point)) return "Abrir configuracoes.";
   if (PtInRect(&g_nativeMainPlayRect, point)) return "Play / Stop. Clique direito configura Stop e FaderOut.";
@@ -14135,7 +14140,7 @@ nativeUiDefaultButtonLayout(const std::string& rawPage)
     };
     layout["top2"] = {
       "action_play", "action_all", "action_create",
-      "action_add", "nav_tuner", "action_parts2",
+      "action_add", "nav_tuner", "nav_bpm", "action_parts2",
       "action_parts1", "action_timer"
     };
     layout["top3"] = {};
@@ -14145,7 +14150,7 @@ nativeUiDefaultButtonLayout(const std::string& rawPage)
       "nav_midi", "nav_config"
     };
     layout["top2"] = {
-      "action_loop", "action_atbl", "nav_tuner",
+      "action_loop", "action_atbl", "nav_tuner", "nav_bpm",
       "action_bypass", "nav_help"
     };
     layout["top3"] = {
@@ -17633,6 +17638,7 @@ nativeUiBackupWindowGlobalKeys()
     "BAR_VISIBILITY_V1",
     "RGB_MODE_V1",
     "SHOW_TONES_V1",
+    "SHOW_BPM_COLUMN_V1",
     "SHOW_PARTS_V1",
     "SHOW_PARTS2_V1",
     "SHOW_FOOTER_V1",
@@ -22051,7 +22057,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
       : nativeUiReadButtonLayout(visibilityPage);
   g_nativeMainPlaylistTabRect = g_nativeMainRegionsTabRect =
     g_nativeMainMixerTabRect = g_nativeMainMidiTabRect =
-    g_nativeMainTunerTabRect = g_nativeMainHelpTabRect =
+    g_nativeMainTunerTabRect = g_nativeMainBpmTabRect =
+    g_nativeMainHelpTabRect =
     g_nativeMainConfigTabRect = RECT{0, 0, 0, 0};
   g_nativeMainPlayRect = g_nativeMainAutoRect = g_nativeMainAuto2Rect =
     g_nativeMainLoopRect =
@@ -22146,6 +22153,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
         g_nativeAppActivePanelModel.showTuner ? "play" : "stop",
         g_nativeAppActivePanelModel.showTuner,
         true, 50, 34, id};
+    } else if (id == "nav_bpm") {
+      spec = {&g_nativeMainBpmTabRect, "BPM", "BPM",
+        g_nativeAppActivePanelModel.showBpm ? "play" : "stop",
+        g_nativeAppActivePanelModel.showBpm,
+        true, 48, 34, id};
     } else if (id == "nav_help") {
       spec = {&g_nativeMainHelpTabRect, "Ajuda", "Aj",
         "help_no_rgb", false, true, 48, 30, id};
@@ -22331,7 +22343,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       if (zone == "top1") {
         zoneIds = {
           "nav_playlist", "nav_regions", "nav_mixer",
-          "nav_midi", "nav_tuner", "nav_help", "nav_config"
+          "nav_midi", "nav_tuner", "nav_bpm", "nav_help", "nav_config"
         };
       } else if (zone == "top2") {
         zoneIds = {
@@ -22703,6 +22715,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
     g_nativeMainTunerColumnRect = RECT{0, 0, 0, 0};
     g_nativeMainTunerResetRect = RECT{0, 0, 0, 0};
     g_nativeMainTunerHits.clear();
+    g_nativeMainBpmColumnRect = RECT{0, 0, 0, 0};
+    g_nativeMainBpmHits.clear();
     g_nativeMainFamilyButtonHits.clear();
     g_nativeMainVisibleRowIndices.clear();
     g_nativeMainRowHits.clear();
@@ -22729,25 +22743,32 @@ static void nativePaintAppActivePanel(HWND hwnd)
     !g_nativeAppActivePanelModel.mixerPage;
   const bool showTuner = g_nativeAppActivePanelModel.showTuner &&
     !g_nativeAppActivePanelModel.mixerPage;
+  const bool showBpm = g_nativeAppActivePanelModel.showBpm &&
+    !g_nativeAppActivePanelModel.mixerPage;
   const int bodyGap = 4;
   const int bodyW = std::max(0, static_cast<int>(bodyRect.right - bodyRect.left));
   int partsColumnW = std::max(120, static_cast<int>(std::floor(bodyW * 0.22)));
   int tunerColumnW = std::max(76,
     static_cast<int>(std::floor(bodyW * 0.14)));
+  int bpmColumnW = tunerColumnW;
   const int visiblePartColumns = (showParts1 ? 1 : 0) + (showParts2 ? 1 : 0);
   const int visibleSideColumns =
-    visiblePartColumns + (showTuner ? 1 : 0);
+    visiblePartColumns + (showTuner ? 1 : 0) + (showBpm ? 1 : 0);
   int mainAvailable = bodyW - visiblePartColumns * partsColumnW -
-    (showTuner ? tunerColumnW : 0) -
+    (showTuner ? tunerColumnW : 0) - (showBpm ? bpmColumnW : 0) -
     std::max(0, visibleSideColumns) * bodyGap;
   if (visiblePartColumns > 0 && mainAvailable < 140) {
     partsColumnW = std::max(90, static_cast<int>(std::floor(bodyW * 0.18)));
   }
   mainAvailable = bodyW - visiblePartColumns * partsColumnW -
-    (showTuner ? tunerColumnW : 0) -
+    (showTuner ? tunerColumnW : 0) - (showBpm ? bpmColumnW : 0) -
     std::max(0, visibleSideColumns) * bodyGap;
   if (showTuner && mainAvailable < 140) {
     tunerColumnW = std::max(68,
+      static_cast<int>(std::floor(bodyW * 0.12)));
+  }
+  if (showBpm && mainAvailable < 140) {
+    bpmColumnW = std::max(68,
       static_cast<int>(std::floor(bodyW * 0.12)));
   }
 
@@ -22784,6 +22805,29 @@ static void nativePaintAppActivePanel(HWND hwnd)
     g_nativeParts1RowOffsets.clear();
     g_nativeParts1RowHeights.clear();
     g_nativeParts1MaxScrollPixels = 0;
+  }
+  g_nativeMainBpmHits.clear();
+  if (showBpm) {
+    g_nativeMainBpmColumnRect = RECT{
+      std::max(mainLeft, mainRight - bpmColumnW),
+      bodyRect.top, mainRight, bodyRect.bottom};
+    mainRight = g_nativeMainBpmColumnRect.left - bodyGap;
+    nativeAppActiveFillRect(dc, g_nativeMainBpmColumnRect,
+      RGB(41, 46, 51));
+    RECT bpmHeader{g_nativeMainBpmColumnRect.left,
+      g_nativeMainBpmColumnRect.top,
+      g_nativeMainBpmColumnRect.right,
+      std::min(g_nativeMainBpmColumnRect.bottom,
+        g_nativeMainBpmColumnRect.top + rowH)};
+    nativeAppActiveFillRect(dc, bpmHeader, RGB(20, 23, 26));
+    RECT bpmTitle{bpmHeader.left + 6, bpmHeader.top + 1,
+      bpmHeader.right - 6, bpmHeader.bottom - 1};
+    nativeAppActiveDrawText(dc, "BPM", bpmTitle,
+      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+        DT_NOPREFIX,
+      RGB(255, 255, 255), labelFont);
+  } else {
+    g_nativeMainBpmColumnRect = RECT{0, 0, 0, 0};
   }
   g_nativeMainTunerHits.clear();
   if (showTuner) {
@@ -23784,6 +23828,67 @@ static void nativePaintAppActivePanel(HWND hwnd)
         RECT{lineLeft, lineY - 4, lineLeft + 1, lineY + 5}, outer);
       nativeAppActiveFillRect(dc,
         RECT{lineRight - 1, lineY - 4, lineRight, lineY + 5}, outer);
+    }
+
+    if (showBpm &&
+        g_nativeMainBpmColumnRect.right >
+          g_nativeMainBpmColumnRect.left) {
+      const RECT bpmList{
+        g_nativeMainBpmColumnRect.left,
+        g_nativeMainBpmColumnRect.top + rowH,
+        g_nativeMainBpmColumnRect.right,
+        g_nativeMainBpmColumnRect.bottom};
+      const NativeUiClipState bpmClipState =
+        nativeUiBeginClipRect(dc, bpmList);
+      for (int i = g_nativeAppActiveListFirstRow;
+           i < endRow; ++i) {
+        const auto& row = g_nativeAppActivePanelModel.rows[
+          g_nativeMainVisibleRowIndices[static_cast<size_t>(i)]];
+        RECT bpmRow{bpmList.left + 1,
+          bpmList.top + g_nativeMainRowOffsets[static_cast<size_t>(i)] -
+            g_nativeAppActiveListScrollPixels,
+          bpmList.right - 1,
+          bpmList.top + g_nativeMainRowOffsets[static_cast<size_t>(i)] +
+            g_nativeMainRowHeights[static_cast<size_t>(i)] -
+            g_nativeAppActiveListScrollPixels};
+        nativeAppActiveFillRect(dc, bpmRow,
+          ((i + 1) % 2 == 0)
+            ? nativeUiBlendColor(RGB(41, 46, 51),
+                RGB(46, 51, 56), 0.58)
+            : RGB(41, 46, 51));
+        if (row.block || row.familyParent ||
+            bpmRow.top < bpmList.top || bpmRow.bottom > bpmList.bottom) {
+          continue;
+        }
+        const int innerPad = 4;
+        const int controlY = bpmRow.top + 2;
+        const int controlH = std::max(14,
+          static_cast<int>(bpmRow.bottom - bpmRow.top) - 4);
+        const int columnW = std::max(1,
+          static_cast<int>(bpmRow.right - bpmRow.left));
+        const int arrowW = std::max(16,
+          std::min(22, static_cast<int>(columnW * 0.24)));
+        const int valueGap = 2;
+        const int valueW = std::max(24,
+          columnW - innerPad * 2 - arrowW * 2 - valueGap * 2);
+        RECT minusRect{bpmRow.left + innerPad, controlY,
+          bpmRow.left + innerPad + arrowW, controlY + controlH};
+        RECT valueRect{minusRect.right + valueGap, controlY,
+          minusRect.right + valueGap + valueW, controlY + controlH};
+        RECT plusRect{valueRect.right + valueGap, controlY,
+          valueRect.right + valueGap + arrowW, controlY + controlH};
+        nativeUiDrawButton(dc, minusRect, "<", "page",
+          false, true, statusFont, 2);
+        nativeAppActiveFillRect(dc, valueRect, RGB(3, 7, 14));
+        nativeAppActiveDrawText(dc, "--", valueRect,
+          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+          RGB(250, 224, 46), statusFont);
+        nativeUiDrawButton(dc, plusRect, ">", "page",
+          false, true, statusFont, 2);
+        g_nativeMainBpmHits.push_back(minusRect);
+        g_nativeMainBpmHits.push_back(plusRect);
+      }
+      nativeUiEndClipRect(dc, bpmClipState);
     }
 
     if (showTuner &&
@@ -28663,6 +28768,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
             item = {id, "Tuner",
               g_nativeAppActivePanelModel.showTuner
                 ? "play" : "stop", false};
+          } else if (id == "nav_bpm") {
+            item = {id, "BPM",
+              g_nativeAppActivePanelModel.showBpm
+                ? "play" : "stop", false};
           } else if (id == "nav_help") {
             item = {id, "Ajuda", "help_no_rgb", false};
           } else if (id == "nav_config") {
@@ -30199,12 +30308,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
         const bool selected =
           std::find(selectedBlocks.begin(), selectedBlocks.end(), block) !=
             selectedBlocks.end();
+        const bool enabled = selected || selectedBlocks.size() < 8;
         addModalButton(
           "preview_block_toggle|" + std::to_string(block),
           std::string(selected ? "[x] " : "[ ] ") +
             std::to_string(block),
           RECT{left, top, left + buttonW, top + buttonH},
-          selected ? "play" : "page", selected);
+          selected ? "play" : (enabled ? "page" : "locked"), enabled);
       }
       const int menuY = modal.bottom - 28;
       addModalButton("preview_config_reset", "Reset",
@@ -30940,6 +31050,7 @@ static std::vector<int> nativeUiDefaultPreviewBlocks(int slot)
   for (int block = (safeSlot - 1) * 8 + 1;
        block <= safeSlot * 8; ++block) {
     blocks.push_back(block);
+    if (blocks.size() == 8) break;
   }
   return blocks;
 }
@@ -30963,6 +31074,7 @@ static std::vector<int> nativeUiReadPreviewBlocks(int slot)
       continue;
     }
     blocks.push_back(block);
+    if (blocks.size() == 8) break;
   }
   if (blocks.empty()) return nativeUiDefaultPreviewBlocks(slot);
   std::sort(blocks.begin(), blocks.end());
@@ -30976,6 +31088,7 @@ static bool nativeUiWritePreviewBlocks(
   if (!SetExtState_ptr) return false;
   std::vector<int> blocks;
   for (const int block : requestedBlocks) {
+    if (blocks.size() == 8) break;
     if (block < 1 || block > 48 ||
         std::find(blocks.begin(), blocks.end(), block) != blocks.end()) {
       continue;
@@ -31027,10 +31140,13 @@ static bool nativeUiHandlePreviewConfigAction(
         nativeUiShowTemporaryPopup(
           "O Preview precisa ter pelo menos um bloco", 1.5);
       }
-    } else if (block >= 1 && block <= 48) {
+    } else if (block >= 1 && block <= 48 && blocks.size() < 8) {
       blocks.push_back(block);
       nativeUiWritePreviewBlocks(
         g_nativeMainModalPreviewSlot, blocks);
+    } else if (block >= 1 && block <= 48) {
+      nativeUiShowTemporaryPopup(
+        "Cada Preview permite no maximo 8 blocos", 1.5);
     }
     return true;
   }
@@ -32956,6 +33072,18 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     finishPcCommand(nativeApplyAutoCommand("{\"type\":\"autoplay1_toggle\"}"));
     return true;
   }
+  if (PtInRect(&g_nativeMainBpmTabRect, point)) {
+    if (!rightClick) {
+      const bool visible = !g_nativeAppActivePanelModel.showBpm;
+      g_nativeAppActivePanelModel.showBpm = visible;
+      if (SetExtState_ptr) {
+        SetExtState_ptr(kLuaWindowExtStateSection, "SHOW_BPM_COLUMN_V1",
+          visible ? "1" : "0", true);
+      }
+      g_nativeForceStateBuild.store(true);
+    }
+    return true;
+  }
   if (PtInRect(&g_nativeMainAuto2Rect, point)) {
     if (rightClick || g_nativeAppActivePanelModel.regionsPage) return true;
     finishPcCommand(nativeApplyAutoCommand("{\"type\":\"autoplay2_toggle\"}"));
@@ -33144,6 +33272,9 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
       finishPcCommand(nativeApplyTunerCommand(command.str()));
     }
     return true;
+  }
+  for (const auto& bpmHit : g_nativeMainBpmHits) {
+    if (PtInRect(&bpmHit, point)) return true;
   }
   for (const auto& liveResetHit : g_nativeMainLiveResetHits) {
     if (!PtInRect(&liveResetHit.rect, point)) continue;
@@ -38464,11 +38595,14 @@ static void nativeCloseAppActivePanel()
   g_nativeMainTunerColumnRect = RECT{0, 0, 0, 0};
   g_nativeMainTunerResetRect = RECT{0, 0, 0, 0};
   g_nativeMainTunerHits.clear();
+  g_nativeMainBpmColumnRect = RECT{0, 0, 0, 0};
+  g_nativeMainBpmHits.clear();
   g_nativeMainPlaylistTabRect = RECT{0, 0, 0, 0};
   g_nativeMainRegionsTabRect = RECT{0, 0, 0, 0};
   g_nativeMainMixerTabRect = RECT{0, 0, 0, 0};
   g_nativeMainMidiTabRect = RECT{0, 0, 0, 0};
   g_nativeMainTunerTabRect = RECT{0, 0, 0, 0};
+  g_nativeMainBpmTabRect = RECT{0, 0, 0, 0};
   g_nativeMainHelpTabRect = RECT{0, 0, 0, 0};
   g_nativeMainConfigTabRect = RECT{0, 0, 0, 0};
   g_nativeMainPlaylistFieldRect = RECT{0, 0, 0, 0};
@@ -42959,6 +43093,8 @@ static void nativeRefreshAppActivePanelModel()
   next.showParts2 = nativeAppActiveReadWindowInt(kLuaWindowShowParts2Key, 0) != 0;
   next.showTuner =
     nativeAppActiveReadWindowInt("SHOW_TONES_V1", 0) != 0;
+  next.showBpm =
+    nativeAppActiveReadWindowInt("SHOW_BPM_COLUMN_V1", 0) != 0;
   next.showMixerTracks =
     nativeAppActiveReadWindowInt("SHOW_MIXER_TRACKS_V1", 0) != 0;
   next.showMixerGroups =
@@ -43240,6 +43376,7 @@ static void nativeRefreshAppActivePanelModel()
     next.showParts1 != g_nativeAppActivePanelModel.showParts1 ||
     next.showParts2 != g_nativeAppActivePanelModel.showParts2 ||
     next.showTuner != g_nativeAppActivePanelModel.showTuner ||
+    next.showBpm != g_nativeAppActivePanelModel.showBpm ||
     next.showMixerTracks !=
       g_nativeAppActivePanelModel.showMixerTracks ||
     next.showMixerGroups !=
