@@ -1116,6 +1116,8 @@ enum class NativeMainModalKind {
   MidiAssignCapture,
   MidiAssignConfirm,
   PreviewBinding,
+  PreviewConfig,
+  ConfirmPreviewConfigReset,
   PreviewKeyboardCapture,
   PreviewMidiCapture,
   TunerKeyboardBinding,
@@ -1474,6 +1476,7 @@ static void nativeOpenTelepromptSettings();
 static void nativeOpenRecadosApp();
 static void nativeOpenShortcutNotice();
 static void nativeCloseShortcutNotice();
+static std::vector<int> nativeUiReadPreviewBlocks(int slot);
 static void nativeRefreshAppActivePanelModel();
 static bool nativeUiSmartSearchSettingEnabled(
   const char* key);
@@ -17671,6 +17674,12 @@ nativeUiBackupNativeGlobalKeys()
     "STOP_PAUSE_MODE_ENABLED_V1",
     "LIVE_ENABLED_V1",
     "MULTILOOP_BYPASS_ENABLED_V1",
+    "PREVIEW_BLOCKS_1_V1",
+    "PREVIEW_BLOCKS_2_V1",
+    "PREVIEW_BLOCKS_3_V1",
+    "PREVIEW_BLOCKS_4_V1",
+    "PREVIEW_BLOCKS_5_V1",
+    "PREVIEW_BLOCKS_6_V1",
     kNativeSmartSearchInsertQueuePlaylistKey,
     kNativeSmartSearchScrollSelectedKey,
     kNativeSmartSearchScrollQueuedKey
@@ -20582,7 +20591,7 @@ static std::string nativeUiPreviewKeyboardKey(
 {
   return std::string("PREVIEW") +
     std::to_string(std::max(1,
-      std::min(3, slot))) +
+    std::min(6, slot))) +
     "_KEYBOARD_V1";
 }
 
@@ -20591,7 +20600,7 @@ static std::string nativeUiReadPreviewBinding(
   bool midi)
 {
   const int safeSlot =
-    std::max(1, std::min(3, slot));
+    std::max(1, std::min(6, slot));
   if (midi) {
     return nativeUiReadMidiBinding(
       std::string("preview_") +
@@ -20611,7 +20620,7 @@ static bool nativeUiWritePreviewBinding(
   const std::string& value)
 {
   const int safeSlot =
-    std::max(1, std::min(3, slot));
+    std::max(1, std::min(6, slot));
   if (midi) {
     return nativeUiWriteMidiBinding(
       std::string("preview_") +
@@ -24109,6 +24118,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
       nativeUiIsCustomizeModal(g_nativeMainModalKind);
     const bool midiListModal =
       g_nativeMainModalKind == NativeMainModalKind::MidiAssignList;
+    const bool previewConfigModal =
+      g_nativeMainModalKind == NativeMainModalKind::PreviewConfig;
     const bool compactCaptureModal =
       g_nativeMainModalKind == NativeMainModalKind::MidiAssignCapture ||
       g_nativeMainModalKind == NativeMainModalKind::MidiAssignConfirm ||
@@ -24147,6 +24158,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
       requestedH = std::min(std::max(360,
         static_cast<int>(std::floor(height * 0.72))),
         std::max(260, height - 20));
+    } else if (previewConfigModal) {
+      modalW = std::max(300, width - 8);
+      requestedH = std::max(300, height - 8);
     } else if (compactCaptureModal) {
       requestedH = std::max(190,
         static_cast<int>(std::floor(height * 0.56)));
@@ -30088,7 +30102,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       RECT title{modal.left + 10, modal.top + 8, modal.right - 10,
         modal.top + 32};
       nativeAppActiveDrawText(dc,
-        std::string("Mapear Preview ") +
+        std::string("Preview ") +
           std::to_string(g_nativeMainModalPreviewSlot),
         title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         RGB(248, 250, 252), nameFont);
@@ -30106,23 +30120,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
           DT_SINGLELINE |
           DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(168, 179, 189), statusFont);
-      RECT midi{modal.left + 10,
-        modal.top + 64, modal.right - 10,
-        modal.top + 84};
-      nativeAppActiveDrawText(dc,
-        std::string("MIDI: ") +
-          nativeUiMidiBindingLabel(
-            nativeUiReadPreviewBinding(
-              g_nativeMainModalPreviewSlot,
-              true)),
-        midi,
-        DT_LEFT | DT_VCENTER |
-          DT_SINGLELINE |
-          DT_END_ELLIPSIS | DT_NOPREFIX,
-        RGB(168, 179, 189), statusFont);
       RECT replacementInfo{modal.left + 10,
-        modal.top + 90, modal.right - 10,
-        modal.top + 111};
+        modal.top + 68, modal.right - 10,
+        modal.top + 89};
       nativeAppActiveDrawText(dc,
         g_nativeUiMidiInfo.empty()
           ? "Nova atribuicao substitui a atual automaticamente."
@@ -30140,7 +30140,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         RECT{modal.left + 10, menuY,
           modal.left + 102, menuY + 18},
         "add_existing", true);
-      addModalButton("preview_midi", "MIDI",
+      addModalButton("preview_config", "Config",
         RECT{modal.left + 106, menuY,
           modal.left + 178, menuY + 18},
         "page", true);
@@ -30154,6 +30154,92 @@ static void nativePaintAppActivePanel(HWND hwnd)
       addModalButton("close", "OK",
         g_nativeMainModalCloseRect,
         "play", true);
+    } else if (g_nativeMainModalKind ==
+               NativeMainModalKind::PreviewConfig) {
+      const std::vector<int> selectedBlocks =
+        nativeUiReadPreviewBlocks(g_nativeMainModalPreviewSlot);
+      RECT title{modal.left + 10, modal.top + 8,
+        modal.right - 10, modal.top + 32};
+      nativeAppActiveDrawText(dc,
+        "Config Preview " +
+          std::to_string(g_nativeMainModalPreviewSlot),
+        title, DT_LEFT | DT_VCENTER |
+          DT_SINGLELINE | DT_NOPREFIX,
+        RGB(248, 250, 252), nameFont);
+      RECT info{modal.left + 10, modal.top + 34,
+        modal.right - 10, modal.top + 60};
+      nativeAppActiveDrawText(dc,
+        "Marque os blocos que devem aparecer neste Preview. Selecionados: " +
+          std::to_string(selectedBlocks.size()),
+        info, DT_LEFT | DT_VCENTER |
+          DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        RGB(168, 179, 189), statusFont);
+
+      const int gap = 4;
+      const int availableW = std::max(1,
+        static_cast<int>(modal.right - modal.left) - 20);
+      const int columns = availableW >= 620 ? 8
+        : (availableW >= 440 ? 6 : 4);
+      const int rows = (48 + columns - 1) / columns;
+      const int gridTop = modal.top + 66;
+      const int gridBottom = modal.bottom - 38;
+      const int buttonW = std::max(24,
+        (availableW - gap * (columns - 1)) / columns);
+      const int buttonH = std::max(14,
+        std::min(28,
+          (std::max(1, gridBottom - gridTop) -
+           gap * (rows - 1)) / rows));
+      for (int block = 1; block <= 48; ++block) {
+        const int index = block - 1;
+        const int row = index / columns;
+        const int column = index % columns;
+        const int left = modal.left + 10 +
+          column * (buttonW + gap);
+        const int top = gridTop + row * (buttonH + gap);
+        const bool selected =
+          std::find(selectedBlocks.begin(), selectedBlocks.end(), block) !=
+            selectedBlocks.end();
+        addModalButton(
+          "preview_block_toggle|" + std::to_string(block),
+          std::string(selected ? "[x] " : "[ ] ") +
+            std::to_string(block),
+          RECT{left, top, left + buttonW, top + buttonH},
+          selected ? "play" : "page", selected);
+      }
+      const int menuY = modal.bottom - 28;
+      addModalButton("preview_config_reset", "Reset",
+        RECT{modal.left + 10, menuY,
+          modal.left + 92, menuY + 18},
+        "clear_playlist", true);
+      addModalButton("preview_config_back", "Voltar",
+        RECT{modal.right - 92, menuY,
+          modal.right - 10, menuY + 18},
+        "page", true);
+    } else if (g_nativeMainModalKind ==
+               NativeMainModalKind::ConfirmPreviewConfigReset) {
+      RECT title{modal.left + 10, modal.top + 8,
+        modal.right - 10, modal.top + 32};
+      nativeAppActiveDrawText(dc,
+        "Resetar Config Preview " +
+          std::to_string(g_nativeMainModalPreviewSlot),
+        title, DT_LEFT | DT_VCENTER |
+          DT_SINGLELINE | DT_NOPREFIX,
+        RGB(248, 250, 252), nameFont);
+      RECT question{modal.left + 10, modal.top + 42,
+        modal.right - 10, modal.bottom - 42};
+      nativeAppActiveDrawText(dc,
+        "Deseja restaurar os oito blocos originais deste Preview?",
+        question, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
+        RGB(168, 179, 189), statusFont);
+      const int menuY = modal.bottom - 28;
+      addModalButton("preview_config_reset_confirm", "Resetar",
+        RECT{modal.left + 10, menuY,
+          modal.left + 102, menuY + 18},
+        "stop", true);
+      addModalButton("preview_config_reset_cancel", "Cancelar",
+        RECT{modal.right - 102, menuY,
+          modal.right - 10, menuY + 18},
+        "page", true);
     } else if (g_nativeMainModalKind ==
                NativeMainModalKind::PreviewKeyboardCapture ||
                g_nativeMainModalKind ==
@@ -30839,6 +30925,136 @@ static bool nativeUiCommitPendingSmartSearchQuery(bool force)
   g_nativeMainSmartSearchSelectFirstPending = true;
   g_nativeForceStateBuild.store(true);
   return true;
+}
+
+static std::string nativeUiPreviewBlocksKey(int slot)
+{
+  return "PREVIEW_BLOCKS_" +
+    std::to_string(std::max(1, std::min(6, slot))) + "_V1";
+}
+
+static std::vector<int> nativeUiDefaultPreviewBlocks(int slot)
+{
+  const int safeSlot = std::max(1, std::min(6, slot));
+  std::vector<int> blocks;
+  for (int block = (safeSlot - 1) * 8 + 1;
+       block <= safeSlot * 8; ++block) {
+    blocks.push_back(block);
+  }
+  return blocks;
+}
+
+static std::vector<int> nativeUiReadPreviewBlocks(int slot)
+{
+  if (!GetExtState_ptr) return nativeUiDefaultPreviewBlocks(slot);
+  const std::string key = nativeUiPreviewBlocksKey(slot);
+  const char* rawValue = GetExtState_ptr(
+    kNativeExtStateSection, key.c_str());
+  const std::string raw = rawValue ? nativeTrim(rawValue) : "";
+  if (raw.empty()) return nativeUiDefaultPreviewBlocks(slot);
+
+  std::vector<int> blocks;
+  for (const auto& field : nativeSplit(raw, ',')) {
+    const std::string value = nativeTrim(field);
+    if (!nativeLooksNumeric(value)) continue;
+    const int block = std::atoi(value.c_str());
+    if (block < 1 || block > 48 ||
+        std::find(blocks.begin(), blocks.end(), block) != blocks.end()) {
+      continue;
+    }
+    blocks.push_back(block);
+  }
+  if (blocks.empty()) return nativeUiDefaultPreviewBlocks(slot);
+  std::sort(blocks.begin(), blocks.end());
+  return blocks;
+}
+
+static bool nativeUiWritePreviewBlocks(
+  int slot,
+  const std::vector<int>& requestedBlocks)
+{
+  if (!SetExtState_ptr) return false;
+  std::vector<int> blocks;
+  for (const int block : requestedBlocks) {
+    if (block < 1 || block > 48 ||
+        std::find(blocks.begin(), blocks.end(), block) != blocks.end()) {
+      continue;
+    }
+    blocks.push_back(block);
+  }
+  if (blocks.empty()) return false;
+  std::sort(blocks.begin(), blocks.end());
+  std::ostringstream value;
+  for (size_t index = 0; index < blocks.size(); ++index) {
+    if (index) value << ',';
+    value << blocks[index];
+  }
+  const std::string key = nativeUiPreviewBlocksKey(slot);
+  SetExtState_ptr(kNativeExtStateSection,
+    key.c_str(), value.str().c_str(), true);
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
+static void nativeUiResetPreviewBlocks(int slot)
+{
+  if (!SetExtState_ptr) return;
+  const std::string key = nativeUiPreviewBlocksKey(slot);
+  SetExtState_ptr(kNativeExtStateSection, key.c_str(), "", true);
+  g_nativeForceStateBuild.store(true);
+}
+
+static bool nativeUiHandlePreviewConfigAction(
+  const std::string& action)
+{
+  if (action == "preview_config") {
+    g_nativeMainModalKind = NativeMainModalKind::PreviewConfig;
+    return true;
+  }
+  if (nativeStartsWith(action, "preview_block_toggle|")) {
+    const int block = std::atoi(action.substr(
+      std::string("preview_block_toggle|").size()).c_str());
+    std::vector<int> blocks = nativeUiReadPreviewBlocks(
+      g_nativeMainModalPreviewSlot);
+    const auto found = std::find(
+      blocks.begin(), blocks.end(), block);
+    if (found != blocks.end()) {
+      if (blocks.size() > 1) {
+        blocks.erase(found);
+        nativeUiWritePreviewBlocks(
+          g_nativeMainModalPreviewSlot, blocks);
+      } else {
+        nativeUiShowTemporaryPopup(
+          "O Preview precisa ter pelo menos um bloco", 1.5);
+      }
+    } else if (block >= 1 && block <= 48) {
+      blocks.push_back(block);
+      nativeUiWritePreviewBlocks(
+        g_nativeMainModalPreviewSlot, blocks);
+    }
+    return true;
+  }
+  if (action == "preview_config_reset") {
+    g_nativeMainModalKind =
+      NativeMainModalKind::ConfirmPreviewConfigReset;
+    return true;
+  }
+  if (action == "preview_config_reset_confirm") {
+    nativeUiResetPreviewBlocks(g_nativeMainModalPreviewSlot);
+    g_nativeMainModalKind = NativeMainModalKind::PreviewConfig;
+    nativeUiShowTemporaryPopup(
+      "Config original do Preview restaurada", 1.5);
+    return true;
+  }
+  if (action == "preview_config_reset_cancel") {
+    g_nativeMainModalKind = NativeMainModalKind::PreviewConfig;
+    return true;
+  }
+  if (action == "preview_config_back") {
+    g_nativeMainModalKind = NativeMainModalKind::PreviewBinding;
+    return true;
+  }
+  return false;
 }
 
 static void nativeUiSmartSearchQueryChanged()
@@ -33423,6 +33639,8 @@ static bool nativeMainHandleModalClick(
     if (!hasRightClickAction) return true;
   }
 
+  if (nativeUiHandlePreviewConfigAction(action)) return true;
+
   if (action == "close") {
     nativeUiCloseMainModal();
   } else if (action == "playlist_multi_toggle") {
@@ -33770,11 +33988,8 @@ static bool nativeMainHandleModalClick(
     nativeUiWritePreviewBinding(
       g_nativeMainModalPreviewSlot,
       false, "");
-    nativeUiWritePreviewBinding(
-      g_nativeMainModalPreviewSlot,
-      true, "");
     g_nativeUiMidiInfo =
-      "Mapeamentos removidos.";
+      "Tecla removida.";
     g_nativeMainModalKind =
       NativeMainModalKind::PreviewBinding;
   } else if (action == "preview_keyboard") {
@@ -38315,7 +38530,7 @@ struct NativeTelepromptSettings {
   std::string songNameFontFamily = "Arial";
   std::string queueNameFontFamily = "Arial";
   std::string textCase = "uppercase";
-  std::string clockPosition = "top";
+  std::string clockPosition = "center-top";
   std::string localClockPosition = "right";
   std::string songNamePosition = "top";
   std::string queueNamePosition = "top";
@@ -38433,7 +38648,14 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
   state.active = state.mode > 0;
   state.enabled = state.active;
   state.pageIndex = state.active ? state.mode - 1 : 0;
-  state.firstBlockIndex = state.pageIndex * state.pageSize;
+  const std::vector<int> selectedBlockNumbers = state.active
+    ? nativeUiReadPreviewBlocks(state.mode)
+    : std::vector<int>{};
+  state.pageSize = state.active
+    ? static_cast<int>(selectedBlockNumbers.size()) : 8;
+  state.firstBlockIndex = selectedBlockNumbers.empty()
+    ? state.pageIndex * 8
+    : selectedBlockNumbers.front() - 1;
 
   // O objeto vazio continua explícito no bridge para o app distinguir uma
   // extensão nova de uma DLL antiga. Com o Preview desligado, porém, não há
@@ -38551,16 +38773,13 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
   }
 
   state.totalBlocks = static_cast<int>(allBlocks.size());
-  if (state.active &&
-      state.firstBlockIndex < state.totalBlocks) {
-    const size_t first = static_cast<size_t>(
-      state.firstBlockIndex);
-    const size_t last = std::min(
-      allBlocks.size(),
-      first + static_cast<size_t>(state.pageSize));
-    state.blocks.assign(
-      allBlocks.begin() + static_cast<std::ptrdiff_t>(first),
-      allBlocks.begin() + static_cast<std::ptrdiff_t>(last));
+  if (state.active) {
+    for (const int blockNumber : selectedBlockNumbers) {
+      const size_t index = static_cast<size_t>(blockNumber - 1);
+      if (index < allBlocks.size()) {
+        state.blocks.push_back(allBlocks[index]);
+      }
+    }
   }
 
   uint64_t hash = 1469598103934665603ull;
@@ -38568,6 +38787,9 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
   nativeUiHashValue(hash, state.pageSize);
   nativeUiHashValue(hash, state.firstBlockIndex);
   nativeUiHashValue(hash, state.totalBlocks);
+  for (const int blockNumber : selectedBlockNumbers) {
+    nativeUiHashValue(hash, blockNumber);
+  }
   // A revisão representa apenas a página publicada. Mudanças de
   // Tocando/Fila em blocos fora dela não precisam reconstruir o DOM do app.
   for (const auto& block : state.blocks) {
@@ -38798,6 +39020,20 @@ static void nativeTelepromptApplySettingsJson(
   stringValue("queueNameFontFamily", next.queueNameFontFamily);
   stringValue("textCase", next.textCase);
   stringValue("clockPosition", next.clockPosition);
+  next.clockPosition = nativeLower(nativeTrim(next.clockPosition));
+  if (next.clockPosition == "top") {
+    next.clockPosition = "center-top";
+  } else if (next.clockPosition == "bottom") {
+    next.clockPosition = "center-bottom";
+  }
+  if (next.clockPosition != "center-top" &&
+      next.clockPosition != "center-bottom" &&
+      next.clockPosition != "left-top" &&
+      next.clockPosition != "left-bottom" &&
+      next.clockPosition != "right-top" &&
+      next.clockPosition != "right-bottom") {
+    next.clockPosition = "center-top";
+  }
   stringValue("localClockPosition", next.localClockPosition);
   stringValue("songNamePosition", next.songNamePosition);
   stringValue("queueNamePosition", next.queueNamePosition);
@@ -38883,7 +39119,7 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"songNameFontFamily\":\"Arial\",";
   json << "\"queueNameFontFamily\":\"Arial\",";
   json << "\"textCase\":\"uppercase\",";
-  json << "\"clockPosition\":\"top\",";
+  json << "\"clockPosition\":\"center-top\",";
   json << "\"localClockPosition\":\"right\",";
   json << "\"songNamePosition\":\"top\",";
   json << "\"queueNamePosition\":\"top\",";
@@ -41166,8 +41402,15 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     nativeTelepromptDrawBorder(dc, client, borderColor, 4);
   }
 
+  const std::string clockPosition =
+    nativeLower(settings.clockPosition);
   const bool clockTop =
-    nativeLower(settings.clockPosition) != "bottom";
+    clockPosition.find("bottom") == std::string::npos;
+  const bool clockAtLeft =
+    clockPosition.find("left") != std::string::npos;
+  const bool clockAtRight =
+    clockPosition.find("right") != std::string::npos;
+  const bool sideClockLayout = clockAtLeft || clockAtRight;
   const int width = client.right - client.left;
   const int height = client.bottom - client.top;
   const bool portraitMode = height > width;
@@ -41216,7 +41459,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   // de escala é menor para eles caberem lado a lado.
   const double effectiveClockScale = std::min(
     settings.clockScale, portraitMode ? 0.75 : 1.0);
-  const int clockFontSize = std::max(24,
+  int clockFontSize = std::max(24,
     static_cast<int>(std::min(width / 11.0, height / 8.0) *
       effectiveClockScale));
   const int clockHeight = clockFontSize + 18;
@@ -41229,24 +41472,89 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     std::max(1, width - edge * 2),
     std::max(220, timerTextWidth + 36));
   RECT timerRect{0, 0, 0, 0};
-  if (showNoticeClock) {
+  RECT localClockRect{0, 0, 0, 0};
+  if (showNoticeClock && !sideClockLayout) {
     timerRect = allocateBand(
       clockTop, clockHeight,
       client.left + (width - timerWidth) / 2,
       client.left + (width + timerWidth) / 2);
   }
 
-  RECT localClockRect{0, 0, 0, 0};
   HFONT localClockFont = nullptr;
   std::string localTime;
   COLORREF localClockColor = nativeTelepromptColor(
     settings.localClockColor, RGB(0, 255, 85));
+
+  // Nas posições laterais, cronômetro e horário local formam uma única
+  // faixa. As duas caixas têm exatamente a mesma largura e altura. À
+  // esquerda o cronômetro abre o par; à direita ele fecha o par.
+  if (sideClockLayout &&
+      (showNoticeClock || showNoticeLocalClock)) {
+    const int visibleClockBoxes =
+      (showNoticeClock ? 1 : 0) +
+      (showNoticeLocalClock ? 1 : 0);
+    const int availableWidth = std::max(
+      1, width - edge * 2 -
+        (visibleClockBoxes > 1 ? stackGap : 0));
+    const int equalBoxWidth = std::max(
+      1, std::min(timerWidth,
+        availableWidth / std::max(1, visibleClockBoxes)));
+    const int pairWidth =
+      equalBoxWidth * visibleClockBoxes +
+      (visibleClockBoxes > 1 ? stackGap : 0);
+    const int pairLeft = clockAtRight
+      ? client.right - edge - pairWidth
+      : client.left + edge;
+    const RECT pairBand = allocateBand(
+      clockTop, clockHeight,
+      pairLeft, pairLeft + pairWidth);
+    int nextLeft = pairBand.left;
+    const auto takeClockBox = [&]() {
+      RECT box{nextLeft, pairBand.top,
+        nextLeft + equalBoxWidth, pairBand.bottom};
+      nextLeft = box.right + stackGap;
+      return box;
+    };
+    if (clockAtRight && showNoticeLocalClock) {
+      localClockRect = takeClockBox();
+    }
+    if (showNoticeClock) timerRect = takeClockBox();
+    if (clockAtLeft && showNoticeLocalClock) {
+      localClockRect = takeClockBox();
+    }
+    if (showNoticeClock) {
+      const int availableTextWidth = std::max(
+        1, static_cast<int>(timerRect.right - timerRect.left) - 24);
+      while (clockFontSize > 8 &&
+             nativeUiTextWidth(dc, "-00 : 00 : 00", clockFont) >
+               availableTextWidth) {
+        --clockFontSize;
+        clockFont = nativeTelepromptFont(
+          "Consolas", clockFontSize, FW_BOLD);
+      }
+    }
+  }
 
   // Relógio local independente do cronômetro. A posição horizontal é
   // configurável e permanece na mesma faixa do cronômetro, inclusive em
   // retrato. Se a janela ficar estreita demais, o texto diminui dentro do
   // espaço lateral disponível em vez de mudar de posição ou sobrepor.
   if (showNoticeLocalClock) {
+    localTime = nativeLocalTimeText();
+    if (sideClockLayout) {
+      int localFontSize = clockFontSize;
+      localClockFont = clockFont;
+      const int availableTextWidth = std::max(
+        1, static_cast<int>(
+          localClockRect.right - localClockRect.left) - 18);
+      while (localFontSize > 8 &&
+             nativeUiTextWidth(dc, localTime, localClockFont) >
+               availableTextWidth) {
+        --localFontSize;
+        localClockFont = nativeTelepromptFont(
+          "Consolas", localFontSize, FW_BOLD);
+      }
+    } else {
     const double localScale = nativeTelepromptClamp(
       settings.localClockDepth, 0.5,
       portraitMode ? 1.25 : 2.0);
@@ -41255,7 +41563,6 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         std::min(24, std::max(1, height) / 28) * localScale)));
     localClockFont = nativeTelepromptFont(
       "Consolas", localFontSize, FW_BOLD);
-    localTime = nativeLocalTimeText();
     int boxW = std::max(
       static_cast<int>(std::lround(78 * localScale)),
       nativeUiTextWidth(dc, localTime, localClockFont) +
@@ -41301,6 +41608,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         : client.left + baseEdge;
       localClockRect = allocateBand(
         clockTop, boxH, x, x + boxW);
+    }
     }
   }
 

@@ -16,7 +16,7 @@ const defaults = {
   songNameFontFamily: 'Arial',
   queueNameFontFamily: 'Arial',
   textCase: 'uppercase',
-  clockPosition: 'top',
+  clockPosition: 'center-top',
   localClockPosition: 'right',
   songNamePosition: 'top',
   queueNamePosition: 'top',
@@ -232,6 +232,13 @@ async function loadSettings() {
     };
     // Migra o espaçamento alto usado pelo primeiro protótipo.
     for (const slot of [1, 2]) {
+      const oldTimerPosition =
+        String(state.values[slot].clockPosition || '').toLowerCase();
+      if (oldTimerPosition === 'top') {
+        state.values[slot].clockPosition = 'center-top';
+      } else if (oldTimerPosition === 'bottom') {
+        state.values[slot].clockPosition = 'center-bottom';
+      }
       if (Number(state.values[slot].localClockDepth) > 3) {
         state.values[slot].localClockDepth = 1;
       }
