@@ -130,6 +130,7 @@ using GetRegionOrMarkerInfo_Value_t = double (*)(ReaProject*, void*, const char*
 using SetRegionOrMarkerInfo_Value_t = bool (*)(ReaProject*, void*, const char*, double);
 using GetSetRegionOrMarkerInfo_String_t = bool (*)(ReaProject*, void*, const char*, char*, bool);
 using GetProjectStateChangeCount_t = int (*)(ReaProject*);
+using IsProjectDirty_t = int (*)(ReaProject*);
 using GetPlayStateEx_t = int (*)(ReaProject*);
 using GetPlayPositionEx_t = double (*)(ReaProject*);
 using GetCursorPositionEx_t = double (*)(ReaProject*);
@@ -255,6 +256,7 @@ static GetRegionOrMarkerInfo_Value_t GetRegionOrMarkerInfo_Value_ptr = nullptr;
 static SetRegionOrMarkerInfo_Value_t SetRegionOrMarkerInfo_Value_ptr = nullptr;
 static GetSetRegionOrMarkerInfo_String_t GetSetRegionOrMarkerInfo_String_ptr = nullptr;
 static GetProjectStateChangeCount_t GetProjectStateChangeCount_ptr = nullptr;
+static IsProjectDirty_t IsProjectDirty_ptr = nullptr;
 static GetPlayStateEx_t GetPlayStateEx_ptr = nullptr;
 static GetPlayPositionEx_t GetPlayPositionEx_ptr = nullptr;
 static GetCursorPositionEx_t GetCursorPositionEx_ptr = nullptr;
@@ -6593,6 +6595,9 @@ static void nativePublishStandbyDiscoveryState()
   json << "\"projectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"currentProjectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"projectPath\":" << nativeJsonString(activeProjectPath) << ",";
+  json << "\"projectDirty\":"
+       << ((activeProject && IsProjectDirty_ptr &&
+            IsProjectDirty_ptr(activeProject) != 0) ? "true" : "false") << ",";
   json << "\"projects\":" << projectsJson << ",";
   json << "\"projectTabs\":" << projectsJson << ",";
   json << "\"openProjects\":" << projectsJson << ",";
@@ -45638,6 +45643,9 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"projectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"currentProjectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"projectPath\":" << nativeJsonString(activeProjectPath) << ",";
+  json << "\"projectDirty\":"
+       << ((activeProject && IsProjectDirty_ptr &&
+            IsProjectDirty_ptr(activeProject) != 0) ? "true" : "false") << ",";
   json << "\"projects\":" << projectsJson << ",";
   json << "\"projectTabs\":" << projectsJson << ",";
   json << "\"openProjects\":" << projectsJson << ",";
@@ -46844,15 +46852,24 @@ static bool nativeApplyLiveMarkCommand(const std::string& commandBody)
   const bool next = (type == "live_toggle" || type == "director_live_toggle" || desired.empty())
     ? !g_nativeLiveMarkEnabled
     : nativeBoolFromText(desired, g_nativeLiveMarkEnabled);
-  if (next != g_nativeLiveMarkEnabled) {
+  const bool stateChanged = next != g_nativeLiveMarkEnabled;
+  if (stateChanged) {
     g_nativeLiveMarkEnabled = next;
     nativeResetLiveTrackerLocked();
+    // Cada ativação inicia uma sessão Live limpa. Limpa também as cópias em
+    // memória para nenhuma lista reutilizar flags antigas antes do snapshot.
+    g_nativeLiveExecutedItems.clear();
+    for (auto& song : g_nativeSongWindows) song.liveExecuted = false;
+    for (auto& song : g_nativeActivePlaylistItems) song.liveExecuted = false;
+    nativePersistLiveMarksForCurrentProjectLocked();
   }
   nativeSaveLiveEnabledLocked();
-  // Ativar novamente mantém o histórico do projeto. Somente desligar o Live
-  // ou usar o R individual remove as marcações persistidas.
-  if (!next) {
+  // Um comando explícito para desligar também saneia o projeto mesmo quando
+  // a interface já o considerava desligado.
+  if (!next && !stateChanged) {
     g_nativeLiveExecutedItems.clear();
+    for (auto& song : g_nativeSongWindows) song.liveExecuted = false;
+    for (auto& song : g_nativeActivePlaylistItems) song.liveExecuted = false;
     nativePersistLiveMarksForCurrentProjectLocked();
   }
   // Ligar, desligar e limpar o Live afeta regiões, filhos, pais e as cópias
@@ -49465,6 +49482,7 @@ static bool loadApi(reaper_plugin_info_t* rec)
     reinterpret_cast<GetSetRegionOrMarkerInfo_String_t>(
       rec->GetFunc("GetSetRegionOrMarkerInfo_String"));
   GetProjectStateChangeCount_ptr = reinterpret_cast<GetProjectStateChangeCount_t>(rec->GetFunc("GetProjectStateChangeCount"));
+  IsProjectDirty_ptr = reinterpret_cast<IsProjectDirty_t>(rec->GetFunc("IsProjectDirty"));
   GetPlayStateEx_ptr = reinterpret_cast<GetPlayStateEx_t>(rec->GetFunc("GetPlayStateEx"));
   GetPlayPositionEx_ptr = reinterpret_cast<GetPlayPositionEx_t>(rec->GetFunc("GetPlayPositionEx"));
   GetCursorPositionEx_ptr = reinterpret_cast<GetCursorPositionEx_t>(rec->GetFunc("GetCursorPositionEx"));
