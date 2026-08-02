@@ -659,8 +659,10 @@ static UINT g_nativeUiFrameTimerIntervalMs = 0;
 // ignora essas repetições nativas e usa o mesmo relógio nas duas plataformas.
 static constexpr int kNativeUiNavigationRepeatDelayMs = 250;
 static constexpr int kNativeUiNavigationRepeatIntervalMs = 33;
+static constexpr int kNativeUiNavigationRepeatCatchUpLimit = 4;
 static int g_nativeUiHeldNavigationKey = 0;
 static bool g_nativeUiSyntheticNavigationRepeat = false;
+static bool g_nativeUiNavigationRepeatBatch = false;
 static std::chrono::steady_clock::time_point
   g_nativeUiNextNavigationRepeatAt{};
 static HFONT g_nativeUiSharedFont = nullptr;
@@ -12385,19 +12387,21 @@ static std::string nativeUiMainTooltipAtPoint(const POINT& point)
        it != g_nativeMainFamilyButtonHits.rend(); ++it) {
     if (PtInRect(&it->rect, point)) return "Mostrar ou ocultar as musicas filhas desta familia.";
   }
-  for (auto it = g_nativeMixerHits.rbegin();
-       it != g_nativeMixerHits.rend(); ++it) {
-    if (!PtInRect(&it->rect, point)) continue;
-    switch (it->kind) {
-      case NativeMixerHitKind::Mute: return "Mute. Clique direito para mapear MIDI ou teclado.";
-      case NativeMixerHitKind::Solo: return "Solo. Clique direito para mapear MIDI ou teclado.";
-      case NativeMixerHitKind::Route: return "Abrir roteamento da track.";
-      case NativeMixerHitKind::Volume: return "Fader de volume. Arraste para ajustar. Clique direito para mapear MIDI CC.";
-      case NativeMixerHitKind::Name: return "Nome da track. Duplo clique para renomear.";
-      case NativeMixerHitKind::ResetVolume: return "Voltar o volume da track para 0 dB.";
-      case NativeMixerHitKind::ClearBindings: return "Limpar mapeamentos desta track.";
-      case NativeMixerHitKind::Unmute: return "Desmutar as pistas configuradas.";
-      case NativeMixerHitKind::Unsolo: return "Remover Solo das pistas configuradas.";
+  if (g_nativeAppActivePanelModel.mixerPage) {
+    for (auto it = g_nativeMixerHits.rbegin();
+         it != g_nativeMixerHits.rend(); ++it) {
+      if (!PtInRect(&it->rect, point)) continue;
+      switch (it->kind) {
+        case NativeMixerHitKind::Mute: return "Mute. Clique direito para mapear MIDI ou teclado.";
+        case NativeMixerHitKind::Solo: return "Solo. Clique direito para mapear MIDI ou teclado.";
+        case NativeMixerHitKind::Route: return "Abrir roteamento da track.";
+        case NativeMixerHitKind::Volume: return "Fader de volume. Arraste para ajustar. Clique direito para mapear MIDI CC.";
+        case NativeMixerHitKind::Name: return "Nome da track. Duplo clique para renomear.";
+        case NativeMixerHitKind::ResetVolume: return "Voltar o volume da track para 0 dB.";
+        case NativeMixerHitKind::ClearBindings: return "Limpar mapeamentos desta track.";
+        case NativeMixerHitKind::Unmute: return "Desmutar as pistas configuradas.";
+        case NativeMixerHitKind::Unsolo: return "Remover Solo das pistas configuradas.";
+      }
     }
   }
   if (PtInRect(&g_nativeMainParts1HeaderRect, point) ||
@@ -12555,6 +12559,10 @@ static void nativeUiRefreshNavigationNow(HWND hwnd)
   nativeUiSetFrameTimerInterval(
     hwnd, kNativeUiFrameFastIntervalMs);
   InvalidateRect(hwnd, nullptr, FALSE);
+  // Durante a recuperacao de um timer atrasado, aplica todas as selecoes
+  // primeiro e apresenta somente o estado final do lote. Redesenhar a lista
+  // para cada passo tornava a velocidade dependente do computador.
+  if (g_nativeUiNavigationRepeatBatch) return;
   // WM_PAINT/timer podem perder prioridade durante a repetição de WM_KEYDOWN
   // tanto no Win32 quanto no SWELL do macOS. Apresentar no máximo um quadro
   // a cada 16 ms mantém os dois sistemas com a mesma resposta visual.
@@ -22705,6 +22713,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
     g_nativeMainListContentRect = RECT{0, 0, 0, 0};
     nativeUiPaintMixerPage(dc, bodyRect, labelFont, statusFont);
   } else {
+  g_nativeMixerHits.clear();
+  g_nativeMixerRowHits.clear();
+  g_nativeMixerGroupsLayout = NativeMixerAreaLayout{};
+  g_nativeMixerTracksLayout = NativeMixerAreaLayout{};
+  g_nativeMixerGroupsRect = RECT{0, 0, 0, 0};
+  g_nativeMixerTracksRect = RECT{0, 0, 0, 0};
+  g_nativeMixerRenameInputRect = RECT{0, 0, 0, 0};
   const bool showParts2 = g_nativeAppActivePanelModel.showParts2 &&
     !g_nativeAppActivePanelModel.mixerPage;
   const bool showParts1 = g_nativeAppActivePanelModel.showParts1 &&
@@ -35525,21 +35540,37 @@ static bool nativeUiAdvanceNavigationRepeat(HWND hwnd)
     return false;
   }
 
-  g_nativeUiNextNavigationRepeatAt +=
-    std::chrono::milliseconds(
-      kNativeUiNavigationRepeatIntervalMs);
-  if (now >= g_nativeUiNextNavigationRepeatAt) {
-    // Descarta apenas o atraso acumulado: nunca dispara várias músicas no
-    // mesmo quadro depois de o processo ficar suspenso.
+  const auto overdueMs =
+    std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - g_nativeUiNextNavigationRepeatAt).count();
+  const int dueRepeatCount = 1 + static_cast<int>(
+    overdueMs / kNativeUiNavigationRepeatIntervalMs);
+  const int repeatCount = std::min(
+    dueRepeatCount, kNativeUiNavigationRepeatCatchUpLimit);
+  if (dueRepeatCount > kNativeUiNavigationRepeatCatchUpLimit) {
+    // Depois de uma suspensao longa, recupera apenas um lote limitado para
+    // nao atravessar dezenas de musicas de uma vez.
     g_nativeUiNextNavigationRepeatAt =
       now + std::chrono::milliseconds(
         kNativeUiNavigationRepeatIntervalMs);
+  } else {
+    g_nativeUiNextNavigationRepeatAt +=
+      std::chrono::milliseconds(
+        repeatCount * kNativeUiNavigationRepeatIntervalMs);
   }
 
   const int navigationKey = g_nativeUiHeldNavigationKey;
   g_nativeUiSyntheticNavigationRepeat = true;
-  SendMessage(hwnd, WM_KEYDOWN,
-    static_cast<WPARAM>(navigationKey), 0);
+  g_nativeUiNavigationRepeatBatch = true;
+  for (int repeat = 0; repeat < repeatCount; ++repeat) {
+    if (!IsWindow(hwnd) ||
+        g_nativeUiHeldNavigationKey != navigationKey) {
+      break;
+    }
+    SendMessage(hwnd, WM_KEYDOWN,
+      static_cast<WPARAM>(navigationKey), 0);
+  }
+  g_nativeUiNavigationRepeatBatch = false;
   g_nativeUiSyntheticNavigationRepeat = false;
   if (!IsWindow(hwnd)) {
     nativeUiResetNavigationRepeat();
@@ -35915,7 +35946,8 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       return 0;
     case WM_TIMER:
       if (wParam == kNativeUiFrameTimerId) {
-        nativeUiAdvanceNavigationRepeat(hwnd);
+        const bool navigationRepeated =
+          nativeUiAdvanceNavigationRepeat(hwnd);
         const bool scrollChanged =
           nativeUiAdvanceSmoothScrolls();
         const bool dragScrollChanged =
@@ -35942,7 +35974,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         const bool timedRefresh =
           nativeUiNeedsTimedVisualRefresh();
         if (IsWindowVisible(hwnd) &&
-            (scrollChanged || dragScrollChanged ||
+            (navigationRepeated || scrollChanged || dragScrollChanged ||
              searchQueryCommitted ||
              navigationCommitted || localClockChanged ||
              batteryChanged || timedRefresh)) {
@@ -35950,7 +35982,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           // A animação da lista não depende da fila normal de WM_PAINT:
           // no Win32 e no SWELL do macOS, cada passo continua sendo
           // apresentado durante o autorepeat das setas.
-          if (scrollChanged || dragScrollChanged) {
+          if (navigationRepeated || scrollChanged || dragScrollChanged) {
             UpdateWindow(hwnd);
           }
         } else if (IsWindowVisible(hwnd)) {
@@ -36257,6 +36289,16 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         return 0;
       }
       if (!g_state.directorInterfaceBlocked) {
+        bool opensMixerRouteWindow = false;
+        if (g_nativeAppActivePanelModel.mixerPage) {
+          for (const auto& hit : g_nativeMixerHits) {
+            if (hit.kind == NativeMixerHitKind::Route &&
+                PtInRect(&hit.rect, point)) {
+              opensMixerRouteWindow = true;
+              break;
+            }
+          }
+        }
         const bool handled =
           nativeMainHandleControlClick(point, false);
         if (!handled) {
@@ -36266,7 +36308,9 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           nativeApplySelectionCommand(
             "{\"type\":\"clear_selection\"}");
         }
-        if (GetFocus() != hwnd) SetFocus(hwnd);
+        // A janela de roteamento do REAPER e um popup que fecha ao perder o
+        // foco. Depois de abri-la, nao devolva o foco imediatamente ao painel.
+        if (!opensMixerRouteWindow && GetFocus() != hwnd) SetFocus(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
