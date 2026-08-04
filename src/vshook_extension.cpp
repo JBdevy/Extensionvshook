@@ -113,6 +113,9 @@ using AddExtensionsMainMenu_t = bool (*)();
 using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
 using NamedCommandLookup_t = int (*)(const char*);
 using ReverseNamedCommandLookup_t = const char* (*)(int);
+using kbd_enumerateActions_t =
+  int (*)(KbdSectionInfo*, int, const char**);
+using SectionFromUniqueID_t = KbdSectionInfo* (*)(int);
 using GetExtState_t = const char* (*)(const char*, const char*);
 using SetExtState_t = void (*)(const char*, const char*, const char*, bool);
 using EnumExtState_t = bool (*)(const char*, int, char*, int, char*, int);
@@ -187,6 +190,7 @@ using ColorToNative_t = int (*)(int, int, int);
 using ColorFromNative_t = void (*)(int, int*, int*, int*);
 using GetTrackNumMediaItems_t = int (*)(MediaTrack*);
 using GetTrackMediaItem_t = MediaItem* (*)(MediaTrack*, int);
+using DeleteTrackMediaItem_t = bool (*)(MediaTrack*, MediaItem*);
 using GetMediaItemInfo_Value_t = double (*)(MediaItem*, const char*);
 using SetMediaItemInfo_Value_t = bool (*)(MediaItem*, const char*, double);
 using GetSetMediaItemInfo_String_t = bool (*)(MediaItem*, const char*, char*, bool);
@@ -221,6 +225,7 @@ using Track_GetPeakInfo_t = double (*)(MediaTrack*, int);
 using SelectProjectInstance_t = void (*)(ReaProject*);
 using TrackList_AdjustWindows_t = void (*)(bool);
 using UpdateArrange_t = void (*)();
+using PreventUIRefresh_t = void (*)(int);
 using SetEditCurPos_t = void (*)(double, bool, bool);
 using SetEditCurPos2_t = void (*)(ReaProject*, double, bool, bool);
 using GetTrackGUID_t = GUID* (*)(MediaTrack*);
@@ -251,6 +256,8 @@ static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
 static NamedCommandLookup_t NamedCommandLookup_ptr = nullptr;
 static ReverseNamedCommandLookup_t ReverseNamedCommandLookup_ptr = nullptr;
+static kbd_enumerateActions_t kbd_enumerateActions_ptr = nullptr;
+static SectionFromUniqueID_t SectionFromUniqueID_ptr = nullptr;
 static GetExtState_t GetExtState_ptr = nullptr;
 static SetExtState_t SetExtState_ptr = nullptr;
 static EnumExtState_t EnumExtState_ptr = nullptr;
@@ -320,6 +327,7 @@ static ColorToNative_t ColorToNative_ptr = nullptr;
 static ColorFromNative_t ColorFromNative_ptr = nullptr;
 static GetTrackNumMediaItems_t GetTrackNumMediaItems_ptr = nullptr;
 static GetTrackMediaItem_t GetTrackMediaItem_ptr = nullptr;
+static DeleteTrackMediaItem_t DeleteTrackMediaItem_ptr = nullptr;
 static GetMediaItemInfo_Value_t GetMediaItemInfo_Value_ptr = nullptr;
 static SetMediaItemInfo_Value_t SetMediaItemInfo_Value_ptr = nullptr;
 static GetSetMediaItemInfo_String_t GetSetMediaItemInfo_String_ptr = nullptr;
@@ -353,6 +361,7 @@ static Track_GetPeakInfo_t Track_GetPeakInfo_ptr = nullptr;
 static SelectProjectInstance_t SelectProjectInstance_ptr = nullptr;
 static TrackList_AdjustWindows_t TrackList_AdjustWindows_ptr = nullptr;
 static UpdateArrange_t UpdateArrange_ptr = nullptr;
+static PreventUIRefresh_t PreventUIRefresh_ptr = nullptr;
 static SetEditCurPos_t SetEditCurPos_ptr = nullptr;
 static SetEditCurPos2_t SetEditCurPos2_ptr = nullptr;
 static GetTrackGUID_t GetTrackGUID_ptr = nullptr;
@@ -492,6 +501,9 @@ static custom_action_register_t g_timecodeReceiveAction = {
 static custom_action_register_t g_timecodeTransmitterAction = {
   0, "VSHOOKNEWTIMECODETRANSMITTER", "VS Hook: Timecode Transmitter", nullptr
 };
+static custom_action_register_t g_addTimecodeAction = {
+  0, "VSHOOKNEWADDTIMECODE", "VS Hook: Add Timecode", nullptr
+};
 static custom_action_register_t g_projectSyncAction = {
   0, "VSHOOKNEWPROJECTSYNC", "VS Hook: Sync to project", nullptr
 };
@@ -511,6 +523,7 @@ static custom_action_register_t g_recadosAction = {
 };
 static int g_timecodeReceiveCommandId = 0;
 static int g_timecodeTransmitterCommandId = 0;
+static int g_addTimecodeCommandId = 0;
 static int g_projectSyncCommandId = 0;
 static int g_telepromptOneCommandId = 0;
 static int g_telepromptTwoCommandId = 0;
@@ -2962,6 +2975,361 @@ static void toggleTimecodeMode(const char* requestedMode)
   showComingSoonFeatureMessage();
 }
 
+struct TimecodeRegionRange {
+  double start = 0.0;
+  double end = 0.0;
+  int indexNumber = 0;
+  std::string name;
+};
+
+static std::string timecodeAsciiLower(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(),
+    [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+  return value;
+}
+
+static int findNativeSmpteGeneratorCommandId()
+{
+  if (!kbd_enumerateActions_ptr) return 0;
+
+  KbdSectionInfo* mainSection =
+    SectionFromUniqueID_ptr ? SectionFromUniqueID_ptr(0) : nullptr;
+  for (int actionIndex = 0; actionIndex < 100000; ++actionIndex) {
+    const char* actionName = nullptr;
+    const int commandId = kbd_enumerateActions_ptr(
+      mainSection, actionIndex, &actionName);
+    if (commandId == 0) break;
+    if (!actionName || !*actionName) continue;
+
+    const std::string lowerName = timecodeAsciiLower(actionName);
+    const bool isGenerator =
+      lowerName.find("generator") != std::string::npos ||
+      lowerName.find("gerador") != std::string::npos;
+    if (lowerName.find("smpte") != std::string::npos &&
+        lowerName.find("ltc") != std::string::npos &&
+        isGenerator) {
+      return commandId;
+    }
+  }
+  return 0;
+}
+
+static std::vector<TimecodeRegionRange> collectTimecodeRegionRanges(
+  ReaProject* project)
+{
+  std::vector<TimecodeRegionRange> regions;
+  if (!CountProjectMarkers_ptr || !EnumProjectMarkers3_ptr) {
+    return regions;
+  }
+
+  int markerCount = 0;
+  int regionCount = 0;
+  const int total = CountProjectMarkers_ptr(
+    project, &markerCount, &regionCount);
+  regions.reserve(static_cast<size_t>(std::max(0, regionCount)));
+  for (int index = 0; index < total; ++index) {
+    bool isRegion = false;
+    double start = 0.0;
+    double end = 0.0;
+    const char* name = nullptr;
+    int indexNumber = 0;
+    int color = 0;
+    if (EnumProjectMarkers3_ptr(project, index, &isRegion, &start, &end,
+          &name, &indexNumber, &color) == 0 ||
+        !isRegion || end <= start) {
+      continue;
+    }
+    TimecodeRegionRange range;
+    range.start = start;
+    range.end = end;
+    range.indexNumber = indexNumber;
+    range.name = name ? name : "";
+    regions.push_back(std::move(range));
+  }
+
+  std::sort(regions.begin(), regions.end(),
+    [](const TimecodeRegionRange& lhs,
+       const TimecodeRegionRange& rhs) {
+      if (lhs.start != rhs.start) return lhs.start < rhs.start;
+      if (lhs.end != rhs.end) return lhs.end < rhs.end;
+      return lhs.indexNumber < rhs.indexNumber;
+    });
+  return regions;
+}
+
+static MediaTrack* findOrCreateTimecodeTrack(
+  ReaProject* project, bool* createdOut)
+{
+  if (createdOut) *createdOut = false;
+  if (!CountTracks_ptr || !GetTrack_ptr ||
+      !GetSetMediaTrackInfo_String_ptr) {
+    return nullptr;
+  }
+
+  const int trackCount = CountTracks_ptr(project);
+  for (int index = 0; index < trackCount; ++index) {
+    MediaTrack* track = GetTrack_ptr(project, index);
+    if (!track) continue;
+    char name[512] = "";
+    GetSetMediaTrackInfo_String_ptr(
+      track, "P_NAME", name, false);
+    if (timecodeAsciiLower(name) == "timecode") {
+      return track;
+    }
+  }
+
+  if (!InsertTrackAtIndex_ptr) return nullptr;
+  InsertTrackAtIndex_ptr(trackCount, true);
+  MediaTrack* track = GetTrack_ptr(project, trackCount);
+  if (!track) return nullptr;
+
+  char trackName[] = "TIMECODE";
+  GetSetMediaTrackInfo_String_ptr(
+    track, "P_NAME", trackName, true);
+  if (createdOut) *createdOut = true;
+  return track;
+}
+
+static bool isVsHookGeneratedTimecodeItem(MediaItem* item)
+{
+  static const char* kGeneratedPrefix = "VS HOOK TIMECODE |";
+  if (!item || !GetActiveTake_ptr ||
+      !GetSetMediaItemTakeInfo_String_ptr) {
+    return false;
+  }
+  MediaItem_Take* take = GetActiveTake_ptr(item);
+  if (!take) return false;
+  char takeName[1024] = "";
+  GetSetMediaItemTakeInfo_String_ptr(
+    take, "P_NAME", takeName, false);
+  return std::strncmp(takeName, kGeneratedPrefix,
+    std::strlen(kGeneratedPrefix)) == 0;
+}
+
+static void setVsHookTimecodeItemName(
+  MediaItem* item, const TimecodeRegionRange& region)
+{
+  if (!item || !GetActiveTake_ptr ||
+      !GetSetMediaItemTakeInfo_String_ptr) {
+    return;
+  }
+  MediaItem_Take* take = GetActiveTake_ptr(item);
+  if (!take) return;
+
+  std::ostringstream name;
+  name << "VS HOOK TIMECODE | " << region.indexNumber;
+  if (!region.name.empty()) name << " | " << region.name;
+  std::string value = name.str();
+  GetSetMediaItemTakeInfo_String_ptr(
+    take, "P_NAME", &value[0], true);
+}
+
+static void addTimecodeForEveryRegion()
+{
+  if (!Main_OnCommand_ptr || !CountTracks_ptr || !GetTrack_ptr ||
+      !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr ||
+      !DeleteTrackMediaItem_ptr || !GetActiveTake_ptr ||
+      !GetSetMediaItemTakeInfo_String_ptr ||
+      !SetMediaItemInfo_Value_ptr || !SetOnlyTrackSelected_ptr ||
+      !GetMediaTrackInfo_Value_ptr || !SetMediaTrackInfo_Value_ptr ||
+      !GetCursorPositionEx_ptr || !SetEditCurPos2_ptr ||
+      !GetSet_LoopTimeRange2_ptr || !SelectAllMediaItems_ptr ||
+      !CountSelectedMediaItems_ptr || !GetSelectedMediaItem_ptr) {
+    showDiagnostic(
+      "O REAPER nao entregou todas as APIs necessarias para criar o timecode.");
+    return;
+  }
+
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project) return;
+  const std::vector<TimecodeRegionRange> regions =
+    collectTimecodeRegionRanges(project);
+  if (regions.empty()) {
+    showDiagnostic("Nao existem regioes neste projeto para criar o timecode.");
+    return;
+  }
+
+  const int smpteCommandId = findNativeSmpteGeneratorCommandId();
+  if (smpteCommandId == 0) {
+    showDiagnostic(
+      "Nao foi possivel localizar o gerador SMPTE LTC/MTC nativo do REAPER.");
+    return;
+  }
+
+  struct TrackSelectionState {
+    MediaTrack* track = nullptr;
+    bool selected = false;
+  };
+  std::vector<TrackSelectionState> originalTrackSelection;
+  if (GetMasterTrack_ptr) {
+    MediaTrack* master = GetMasterTrack_ptr(project);
+    if (master) {
+      originalTrackSelection.push_back({master,
+        GetMediaTrackInfo_Value_ptr(master, "I_SELECTED") > 0.5});
+    }
+  }
+  const int originalTrackCount = CountTracks_ptr(project);
+  for (int index = 0; index < originalTrackCount; ++index) {
+    MediaTrack* track = GetTrack_ptr(project, index);
+    if (track) {
+      originalTrackSelection.push_back({track,
+        GetMediaTrackInfo_Value_ptr(track, "I_SELECTED") > 0.5});
+    }
+  }
+
+  std::vector<MediaItem*> originalSelectedItems;
+  if (CountSelectedMediaItems_ptr && GetSelectedMediaItem_ptr) {
+    const int selectedCount = CountSelectedMediaItems_ptr(project);
+    originalSelectedItems.reserve(
+      static_cast<size_t>(std::max(0, selectedCount)));
+    for (int index = 0; index < selectedCount; ++index) {
+      MediaItem* item = GetSelectedMediaItem_ptr(project, index);
+      if (item) originalSelectedItems.push_back(item);
+    }
+  }
+
+  const double originalCursor = GetCursorPositionEx_ptr(project);
+  double originalTimeStart = 0.0;
+  double originalTimeEnd = 0.0;
+  GetSet_LoopTimeRange2_ptr(project, false, false,
+    &originalTimeStart, &originalTimeEnd, false);
+
+  if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+  if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
+
+  MediaTrack* timecodeTrack =
+    findOrCreateTimecodeTrack(project, nullptr);
+  bool succeeded = timecodeTrack != nullptr;
+  std::vector<MediaItem*> previousGeneratedItems;
+  std::vector<MediaItem*> newGeneratedItems;
+
+  if (timecodeTrack) {
+    const int nativeBlack = ColorToNative_ptr
+      ? ColorToNative_ptr(0, 0, 0)
+      : RGB(0, 0, 0);
+    SetMediaTrackInfo_Value_ptr(timecodeTrack, "I_CUSTOMCOLOR",
+      static_cast<double>(nativeBlack | 0x1000000));
+
+    const int itemCount = GetTrackNumMediaItems_ptr(timecodeTrack);
+    for (int index = 0; index < itemCount; ++index) {
+      MediaItem* item = GetTrackMediaItem_ptr(timecodeTrack, index);
+      if (isVsHookGeneratedTimecodeItem(item)) {
+        previousGeneratedItems.push_back(item);
+      }
+    }
+
+    SetOnlyTrackSelected_ptr(timecodeTrack);
+    for (const TimecodeRegionRange& region : regions) {
+      const int beforeCount =
+        GetTrackNumMediaItems_ptr(timecodeTrack);
+      std::set<MediaItem*> beforeItems;
+      for (int index = 0; index < beforeCount; ++index) {
+        MediaItem* item = GetTrackMediaItem_ptr(timecodeTrack, index);
+        if (item) beforeItems.insert(item);
+      }
+
+      double rangeStart = region.start;
+      double rangeEnd = region.end;
+      GetSet_LoopTimeRange2_ptr(project, true, false,
+        &rangeStart, &rangeEnd, false);
+      SetEditCurPos2_ptr(project, region.start, false, false);
+      Main_OnCommand_ptr(smpteCommandId, 0);
+
+      MediaItem* createdItem = nullptr;
+      const int afterCount =
+        GetTrackNumMediaItems_ptr(timecodeTrack);
+      for (int index = 0; index < afterCount; ++index) {
+        MediaItem* item = GetTrackMediaItem_ptr(timecodeTrack, index);
+        if (item && beforeItems.find(item) == beforeItems.end()) {
+          createdItem = item;
+          break;
+        }
+      }
+      if (!createdItem) {
+        succeeded = false;
+        break;
+      }
+
+      SetMediaItemInfo_Value_ptr(
+        createdItem, "D_POSITION", region.start);
+      SetMediaItemInfo_Value_ptr(
+        createdItem, "D_LENGTH", region.end - region.start);
+      SetMediaItemInfo_Value_ptr(createdItem, "B_LOOPSRC", 0.0);
+      SetMediaItemInfo_Value_ptr(
+        createdItem, "C_BEATATTACHMODE", 0.0);
+      setVsHookTimecodeItemName(createdItem, region);
+      newGeneratedItems.push_back(createdItem);
+    }
+  }
+
+  if (DeleteTrackMediaItem_ptr && timecodeTrack) {
+    const std::vector<MediaItem*>& itemsToDelete =
+      succeeded ? previousGeneratedItems : newGeneratedItems;
+    for (MediaItem* item : itemsToDelete) {
+      if (!ValidatePtr2_ptr ||
+          ValidatePtr2_ptr(project, item, "MediaItem*")) {
+        DeleteTrackMediaItem_ptr(timecodeTrack, item);
+      }
+    }
+  }
+
+  SetEditCurPos2_ptr(project, originalCursor, false, false);
+  GetSet_LoopTimeRange2_ptr(project, true, false,
+    &originalTimeStart, &originalTimeEnd, false);
+
+  MediaTrack* master = GetMasterTrack_ptr
+    ? GetMasterTrack_ptr(project) : nullptr;
+  if (master) {
+    SetMediaTrackInfo_Value_ptr(master, "I_SELECTED", 0.0);
+  }
+  const int finalTrackCount = CountTracks_ptr(project);
+  for (int index = 0; index < finalTrackCount; ++index) {
+    MediaTrack* track = GetTrack_ptr(project, index);
+    if (track) {
+      SetMediaTrackInfo_Value_ptr(track, "I_SELECTED", 0.0);
+    }
+  }
+  for (const TrackSelectionState& state : originalTrackSelection) {
+    if (state.track &&
+        (!ValidatePtr2_ptr ||
+          ValidatePtr2_ptr(project, state.track, "MediaTrack*"))) {
+      SetMediaTrackInfo_Value_ptr(
+        state.track, "I_SELECTED", state.selected ? 1.0 : 0.0);
+    }
+  }
+
+  SelectAllMediaItems_ptr(project, false);
+  for (MediaItem* item : originalSelectedItems) {
+    if (item &&
+        (!ValidatePtr2_ptr ||
+          ValidatePtr2_ptr(project, item, "MediaItem*"))) {
+      SetMediaItemInfo_Value_ptr(item, "B_UISEL", 1.0);
+    }
+  }
+
+  if (succeeded && MarkProjectDirty_ptr) {
+    MarkProjectDirty_ptr(project);
+  }
+  if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(-1);
+  if (TrackList_AdjustWindows_ptr) TrackList_AdjustWindows_ptr(false);
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+  if (Undo_EndBlock2_ptr) {
+    Undo_EndBlock2_ptr(project,
+      succeeded
+        ? "VS Hook: criar timecode SMPTE por regiao"
+        : "VS Hook: falha ao criar timecode SMPTE",
+      -1);
+  }
+
+  if (!succeeded) {
+    showDiagnostic(
+      "Nao foi possivel criar o item SMPTE em todas as regioes.");
+  }
+}
+
 static bool getProjectSyncEnabled()
 {
   // Recurso reservado para uma atualizacao futura.
@@ -3150,6 +3518,10 @@ static bool hookCommand(int command, int flag)
     toggleTimecodeMode("transmitter");
     return true;
   }
+  if (g_addTimecodeCommandId != 0 && command == g_addTimecodeCommandId) {
+    addTimecodeForEveryRegion();
+    return true;
+  }
   if (g_projectSyncCommandId != 0 && command == g_projectSyncCommandId) {
     toggleProjectSync();
     return true;
@@ -3221,6 +3593,10 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   }
   if (g_timecodeTransmitterCommandId != 0 && command == g_timecodeTransmitterCommandId) {
     toggleTimecodeMode("transmitter");
+    return true;
+  }
+  if (g_addTimecodeCommandId != 0 && command == g_addTimecodeCommandId) {
+    addTimecodeForEveryRegion();
     return true;
   }
   if (g_projectSyncCommandId != 0 && command == g_projectSyncCommandId) {
@@ -3447,6 +3823,7 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   const std::string timecodeMode = getTimecodeMode();
   appendMenuString(timecodeMenu, "Receive", g_timecodeReceiveCommandId, timecodeMode == "receive");
   appendMenuString(timecodeMenu, "Transmitter", g_timecodeTransmitterCommandId, timecodeMode == "transmitter");
+  appendMenuString(timecodeMenu, "Add Timecode", g_addTimecodeCommandId, false);
   insertMenuSubMenu(vsHookMenu, timecodeMenu, "Timecode", -1);
 
   appendMenuString(projectSyncMenu, "Sync to project", g_projectSyncCommandId, getProjectSyncEnabled());
@@ -18793,6 +19170,66 @@ static std::string nativeUiFormatDefaultBlockName(int blockNumber)
   return nativeUiFormatBlockNameForCurrentSymbol(suffix.str());
 }
 
+static size_t nativeUiPlaylistBlockInsertIndexFromCurrentScroll(
+  const std::vector<std::string>& itemLines)
+{
+  if (itemLines.empty()) return 0;
+
+  // O botão Blocos pertence ao repertório. Usa a geometria do último paint
+  // para que alturas normais/compactas e uma primeira linha parcialmente
+  // visível sejam consideradas exatamente como aparecem na tela.
+  size_t insertIndex = std::min<size_t>(4, itemLines.size());
+  if (!g_nativeAppActivePanelModel.regionsPage &&
+      !g_nativeMainVisibleRowIndices.empty()) {
+    const size_t layoutCount = std::min(
+      g_nativeMainVisibleRowIndices.size(),
+      std::min(g_nativeMainRowHeights.size(),
+        g_nativeMainRowOffsets.empty()
+          ? size_t{0}
+          : g_nativeMainRowOffsets.size() - 1));
+    size_t firstVisible = 0;
+    while (firstVisible < layoutCount &&
+           g_nativeMainRowOffsets[firstVisible] +
+             g_nativeMainRowHeights[firstVisible] <=
+               g_nativeAppActiveListScrollPixels) {
+      ++firstVisible;
+    }
+
+    // Índice 4 = quinta linha a partir do ponto atual do scroll. Inserir antes
+    // dela faz o bloco novo ocupar visualmente essa quinta posição.
+    const size_t targetVisible = firstVisible + 4;
+    if (targetVisible < layoutCount) {
+      const size_t modelIndex =
+        g_nativeMainVisibleRowIndices[targetVisible];
+      if (modelIndex < g_nativeAppActivePanelModel.rows.size()) {
+        const auto& targetRow =
+          g_nativeAppActivePanelModel.rows[modelIndex];
+        const int resolvedLine = nativeUiPlaylistLineIndexForRow(
+          itemLines, targetRow);
+        if (resolvedLine >= 0) {
+          insertIndex = static_cast<size_t>(resolvedLine);
+        } else {
+          insertIndex = static_cast<size_t>(std::max(0,
+            std::min(targetRow.order - 1,
+              static_cast<int>(itemLines.size()))));
+        }
+      }
+    } else {
+      insertIndex = itemLines.size();
+    }
+  }
+
+  // Um item bloco não pode separar uma região pai das músicas filhas. Quando
+  // a quinta linha cair dentro dessa família, usa o primeiro ponto seguro logo
+  // depois dela, igual ao drag/drop da própria lista.
+  std::vector<bool> noMovingRows(itemLines.size(), false);
+  const int safeIndex = nativeUiClampFamilyReorderTarget(
+    itemLines, noMovingRows, static_cast<int>(insertIndex),
+    nativeUiPlaylistLineFamilyInfo);
+  return static_cast<size_t>(std::max(0,
+    std::min(safeIndex, static_cast<int>(itemLines.size()))));
+}
+
 static bool nativeUiCreatePlaylistBlock()
 {
   char pathBuf[2048] = "";
@@ -18838,24 +19275,9 @@ static bool nativeUiCreatePlaylistBlock()
   }
   const int blockNumber = previousBlockNumber + 1;
 
-  size_t insertIndex = 0;
-  if (previousBlockNumber > 0) {
-    size_t previousBlockIndex = playlist.itemLines.size();
-    for (size_t index = 0;
-         index < playlist.itemLines.size(); ++index) {
-      if (blockNumberFromLine(playlist.itemLines[index]) ==
-          previousBlockNumber) {
-        previousBlockIndex = index;
-        break;
-      }
-    }
-
-    if (previousBlockIndex < playlist.itemLines.size()) {
-      // O novo bloco nasce imediatamente abaixo do cabecalho de maior numero,
-      // independentemente de onde ele esteja no repertorio.
-      insertIndex = previousBlockIndex + 1;
-    }
-  }
+  const size_t insertIndex =
+    nativeUiPlaylistBlockInsertIndexFromCurrentScroll(
+      playlist.itemLines);
 
   const std::vector<std::string> fields = {
     "ITEM", "block", std::to_string(-blockNumber),
@@ -24851,8 +25273,16 @@ static void nativePaintAppActivePanel(HWND hwnd)
       std::min(g_nativeMainBpmColumnRect.bottom,
         g_nativeMainBpmColumnRect.top + rowH)};
     nativeAppActiveFillRect(dc, bpmHeader, RGB(16, 19, 22));
-    const int scanW = std::min(42, std::max(32,
+    int scanW = std::min(42, std::max(32,
       static_cast<int>(bpmHeader.right - bpmHeader.left) / 2));
+#ifdef __APPLE__
+    // O SWELL mede/desenha esta fonte um pouco mais larga no macOS. Reserva a
+    // largura real do texto para o N final de SCAN nunca ser recortado.
+    const int scanTextW = nativeUiTextWidth(dc, "SCAN", statusFont);
+    const int scanMaxW = std::max(32,
+      static_cast<int>(bpmHeader.right - bpmHeader.left) - 48);
+    scanW = std::min(scanMaxW, std::max(scanW, scanTextW + 12));
+#endif
     g_nativeMainBpmScanRect = RECT{
       bpmHeader.right - scanW - 4, bpmHeader.top + 2,
       bpmHeader.right - 4,
@@ -52698,6 +53128,12 @@ static bool loadApi(reaper_plugin_info_t* rec)
   AddRemoveReaScript_ptr = reinterpret_cast<AddRemoveReaScript_t>(rec->GetFunc("AddRemoveReaScript"));
   NamedCommandLookup_ptr = reinterpret_cast<NamedCommandLookup_t>(rec->GetFunc("NamedCommandLookup"));
   ReverseNamedCommandLookup_ptr = reinterpret_cast<ReverseNamedCommandLookup_t>(rec->GetFunc("ReverseNamedCommandLookup"));
+  kbd_enumerateActions_ptr =
+    reinterpret_cast<kbd_enumerateActions_t>(
+      rec->GetFunc("kbd_enumerateActions"));
+  SectionFromUniqueID_ptr =
+    reinterpret_cast<SectionFromUniqueID_t>(
+      rec->GetFunc("SectionFromUniqueID"));
   GetExtState_ptr = reinterpret_cast<GetExtState_t>(rec->GetFunc("GetExtState"));
   SetExtState_ptr = reinterpret_cast<SetExtState_t>(rec->GetFunc("SetExtState"));
   EnumExtState_ptr = reinterpret_cast<EnumExtState_t>(
@@ -52825,6 +53261,9 @@ static bool loadApi(reaper_plugin_info_t* rec)
       rec->GetFunc("ColorFromNative"));
   GetTrackNumMediaItems_ptr = reinterpret_cast<GetTrackNumMediaItems_t>(rec->GetFunc("GetTrackNumMediaItems"));
   GetTrackMediaItem_ptr = reinterpret_cast<GetTrackMediaItem_t>(rec->GetFunc("GetTrackMediaItem"));
+  DeleteTrackMediaItem_ptr =
+    reinterpret_cast<DeleteTrackMediaItem_t>(
+      rec->GetFunc("DeleteTrackMediaItem"));
   GetMediaItemInfo_Value_ptr = reinterpret_cast<GetMediaItemInfo_Value_t>(rec->GetFunc("GetMediaItemInfo_Value"));
   SetMediaItemInfo_Value_ptr = reinterpret_cast<SetMediaItemInfo_Value_t>(rec->GetFunc("SetMediaItemInfo_Value"));
   GetSetMediaItemInfo_String_ptr = reinterpret_cast<GetSetMediaItemInfo_String_t>(rec->GetFunc("GetSetMediaItemInfo_String"));
@@ -52871,6 +53310,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
   SelectProjectInstance_ptr = reinterpret_cast<SelectProjectInstance_t>(rec->GetFunc("SelectProjectInstance"));
   TrackList_AdjustWindows_ptr = reinterpret_cast<TrackList_AdjustWindows_t>(rec->GetFunc("TrackList_AdjustWindows"));
   UpdateArrange_ptr = reinterpret_cast<UpdateArrange_t>(rec->GetFunc("UpdateArrange"));
+  PreventUIRefresh_ptr = reinterpret_cast<PreventUIRefresh_t>(
+    rec->GetFunc("PreventUIRefresh"));
   SetEditCurPos_ptr = reinterpret_cast<SetEditCurPos_t>(rec->GetFunc("SetEditCurPos"));
   SetEditCurPos2_ptr = reinterpret_cast<SetEditCurPos2_t>(rec->GetFunc("SetEditCurPos2"));
   GetTrackGUID_ptr = reinterpret_cast<GetTrackGUID_t>(rec->GetFunc("GetTrackGUID"));
@@ -52937,6 +53378,11 @@ static bool initialize()
   }
   g_timecodeTransmitterCommandId = plugin_register_ptr("custom_action", (void*)&g_timecodeTransmitterAction);
   if (g_timecodeTransmitterCommandId != 0) {
+    hasRegisteredAction = true;
+  }
+  g_addTimecodeCommandId =
+    plugin_register_ptr("custom_action", (void*)&g_addTimecodeAction);
+  if (g_addTimecodeCommandId != 0) {
     hasRegisteredAction = true;
   }
   g_projectSyncCommandId = plugin_register_ptr("custom_action", (void*)&g_projectSyncAction);
@@ -53112,6 +53558,10 @@ static void shutdown()
   if (g_timecodeTransmitterCommandId != 0) {
     plugin_register_ptr("-custom_action", (void*)&g_timecodeTransmitterAction);
     g_timecodeTransmitterCommandId = 0;
+  }
+  if (g_addTimecodeCommandId != 0) {
+    plugin_register_ptr("-custom_action", (void*)&g_addTimecodeAction);
+    g_addTimecodeCommandId = 0;
   }
   if (g_projectSyncCommandId != 0) {
     plugin_register_ptr("-custom_action", (void*)&g_projectSyncAction);
