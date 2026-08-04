@@ -31,6 +31,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <utility>
 
 #ifdef __APPLE__
@@ -113,9 +114,6 @@ using AddExtensionsMainMenu_t = bool (*)();
 using AddRemoveReaScript_t = int (*)(bool, int, const char*, bool);
 using NamedCommandLookup_t = int (*)(const char*);
 using ReverseNamedCommandLookup_t = const char* (*)(int);
-using kbd_enumerateActions_t =
-  int (*)(KbdSectionInfo*, int, const char**);
-using SectionFromUniqueID_t = KbdSectionInfo* (*)(int);
 using GetExtState_t = const char* (*)(const char*, const char*);
 using SetExtState_t = void (*)(const char*, const char*, const char*, bool);
 using EnumExtState_t = bool (*)(const char*, int, char*, int, char*, int);
@@ -194,6 +192,10 @@ using DeleteTrackMediaItem_t = bool (*)(MediaTrack*, MediaItem*);
 using GetMediaItemInfo_Value_t = double (*)(MediaItem*, const char*);
 using SetMediaItemInfo_Value_t = bool (*)(MediaItem*, const char*, double);
 using GetSetMediaItemInfo_String_t = bool (*)(MediaItem*, const char*, char*, bool);
+using GetItemStateChunk_t =
+  bool (*)(MediaItem*, char*, int, bool);
+using SetItemStateChunk_t =
+  bool (*)(MediaItem*, const char*, bool);
 using GetActiveTake_t = MediaItem_Take* (*)(MediaItem*);
 using GetTakeName_t = const char* (*)(MediaItem_Take*);
 using TakeIsMIDI_t = bool (*)(MediaItem_Take*);
@@ -256,8 +258,6 @@ static AddExtensionsMainMenu_t AddExtensionsMainMenu_ptr = nullptr;
 static AddRemoveReaScript_t AddRemoveReaScript_ptr = nullptr;
 static NamedCommandLookup_t NamedCommandLookup_ptr = nullptr;
 static ReverseNamedCommandLookup_t ReverseNamedCommandLookup_ptr = nullptr;
-static kbd_enumerateActions_t kbd_enumerateActions_ptr = nullptr;
-static SectionFromUniqueID_t SectionFromUniqueID_ptr = nullptr;
 static GetExtState_t GetExtState_ptr = nullptr;
 static SetExtState_t SetExtState_ptr = nullptr;
 static EnumExtState_t EnumExtState_ptr = nullptr;
@@ -331,6 +331,8 @@ static DeleteTrackMediaItem_t DeleteTrackMediaItem_ptr = nullptr;
 static GetMediaItemInfo_Value_t GetMediaItemInfo_Value_ptr = nullptr;
 static SetMediaItemInfo_Value_t SetMediaItemInfo_Value_ptr = nullptr;
 static GetSetMediaItemInfo_String_t GetSetMediaItemInfo_String_ptr = nullptr;
+static GetItemStateChunk_t GetItemStateChunk_ptr = nullptr;
+static SetItemStateChunk_t SetItemStateChunk_ptr = nullptr;
 static GetActiveTake_t GetActiveTake_ptr = nullptr;
 static GetTakeName_t GetTakeName_ptr = nullptr;
 static TakeIsMIDI_t TakeIsMIDI_ptr = nullptr;
@@ -386,6 +388,7 @@ static const char* kAutoOpenModeKey = "AUTO_OPEN_VSHOOK_MODE";
 static const char* kLegacyAutoOpenKey = "AUTO_OPEN_VSHOOK";
 static const char* kProjectAutoOpenModeKey = "PROJECT_AUTO_OPEN_VSHOOK_MODE";
 static const char* kTimecodeModeKey = "TIMECODE_MODE_V1";
+static const char* kTimecodePairCodeKey = "TIMECODE_PAIR_CODE_V1";
 static const char* kProjectSyncEnabledKey = "PROJECT_SYNC_ENABLED_V1";
 static const char* kScriptControlSection = "VS_HOOK_SCRIPT_CONTROL";
 static const char* kActiveScriptModeKey = "ACTIVE_MODE_V1";
@@ -2953,9 +2956,12 @@ static ReaProject* getCurrentProject(char* pathOut, int pathOutSize)
 
 static std::string getTimecodeMode()
 {
-  // Recurso reservado para uma atualizacao futura. Nao apresenta como ativo
-  // mesmo que uma versao de desenvolvimento tenha deixado ExtState salvo.
-  return std::string();
+  if (!GetExtState_ptr) return std::string();
+  const char* raw = GetExtState_ptr(kExtStateSection, kTimecodeModeKey);
+  const std::string mode = raw ? raw : "";
+  return mode == "receive" || mode == "transmitter"
+    ? mode
+    : std::string();
 }
 
 static void showComingSoonFeatureMessage()
@@ -2971,8 +2977,76 @@ static void showComingSoonFeatureMessage()
 
 static void toggleTimecodeMode(const char* requestedMode)
 {
-  (void)requestedMode;
-  showComingSoonFeatureMessage();
+  const std::string requested = requestedMode ? requestedMode : "";
+  if ((requested != "receive" && requested != "transmitter") ||
+      !SetExtState_ptr || !GetExtState_ptr) {
+    showDiagnostic("Nao foi possivel configurar a sincronizacao em rede.");
+    return;
+  }
+
+  const std::string current = getTimecodeMode();
+  if (current == requested) {
+    const int answer = ShowMessageBox_ptr
+      ? ShowMessageBox_ptr(
+          requested == "receive"
+            ? "Receive esta ativo. Deseja desativar a sincronizacao?"
+            : "Transmitter esta ativo. Deseja desativar a sincronizacao?",
+          "VS Hook - Timecode", 4)
+      : 6;
+    if (answer == 6) {
+      SetExtState_ptr(kExtStateSection, kTimecodeModeKey, "", true);
+      SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey, "", true);
+    }
+    return;
+  }
+
+  std::string code;
+  if (requested == "receive") {
+    const uint64_t seed =
+      static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now()
+          .time_since_epoch().count()) ^
+      static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(
+        &g_timecodeReceiveAction));
+    std::mt19937_64 generator(seed);
+    code = std::to_string(100000ULL + (generator() % 900000ULL));
+  } else {
+    char input[64] = "";
+    if (!GetUserInputs_ptr ||
+        !GetUserInputs_ptr(
+          "VS Hook - Transmitter", 1,
+          "Codigo exibido no Receive:,extrawidth=120",
+          input, static_cast<int>(sizeof(input)))) {
+      return;
+    }
+    for (char value : std::string(input)) {
+      if (value >= '0' && value <= '9') code.push_back(value);
+    }
+    if (code.size() != 6) {
+      showDiagnostic("Digite o codigo de 6 numeros exibido no computador Receive.");
+      return;
+    }
+  }
+
+  SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
+    code.c_str(), true);
+  SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
+    requested.c_str(), true);
+
+  if (ShowMessageBox_ptr) {
+    if (requested == "receive") {
+      const std::string message =
+        "Codigo do Receive: " + code +
+        "\n\nNo outro computador, abra Timecode > Transmitter e digite este codigo.\n"
+        "As duas Hook Centers precisam estar abertas na mesma rede local.";
+      ShowMessageBox_ptr(message.c_str(), "VS Hook - Receive", 0);
+    } else {
+      const std::string message =
+        "Transmitter ativado com o codigo " + code +
+        ".\n\nA Hook Center esta procurando o computador Receive na rede local.";
+      ShowMessageBox_ptr(message.c_str(), "VS Hook - Transmitter", 0);
+    }
+  }
 }
 
 struct TimecodeRegionRange {
@@ -2993,28 +3067,11 @@ static std::string timecodeAsciiLower(std::string value)
 
 static int findNativeSmpteGeneratorCommandId()
 {
-  if (!kbd_enumerateActions_ptr) return 0;
-
-  KbdSectionInfo* mainSection =
-    SectionFromUniqueID_ptr ? SectionFromUniqueID_ptr(0) : nullptr;
-  for (int actionIndex = 0; actionIndex < 100000; ++actionIndex) {
-    const char* actionName = nullptr;
-    const int commandId = kbd_enumerateActions_ptr(
-      mainSection, actionIndex, &actionName);
-    if (commandId == 0) break;
-    if (!actionName || !*actionName) continue;
-
-    const std::string lowerName = timecodeAsciiLower(actionName);
-    const bool isGenerator =
-      lowerName.find("generator") != std::string::npos ||
-      lowerName.find("gerador") != std::string::npos;
-    if (lowerName.find("smpte") != std::string::npos &&
-        lowerName.find("ltc") != std::string::npos &&
-        isGenerator) {
-      return commandId;
-    }
-  }
-  return 0;
+  // Comando nativo e estável do menu Insert do REAPER:
+  // "SMPTE LTC/MTC Timecode Generator". Ele não aparece na enumeração da
+  // Action List em algumas instalações, por isso não pode depender do texto.
+  constexpr int kInsertSmpteLtcMtcGeneratorCommandId = 40208;
+  return kInsertSmpteLtcMtcGeneratorCommandId;
 }
 
 static std::vector<TimecodeRegionRange> collectTimecodeRegionRanges(
@@ -3077,13 +3134,23 @@ static MediaTrack* findOrCreateTimecodeTrack(
     GetSetMediaTrackInfo_String_ptr(
       track, "P_NAME", name, false);
     if (timecodeAsciiLower(name) == "timecode") {
+      if (index > 0) {
+        if (!SetOnlyTrackSelected_ptr || !ReorderSelectedTracks_ptr) {
+          return nullptr;
+        }
+        SetOnlyTrackSelected_ptr(track);
+        if (!ReorderSelectedTracks_ptr(0, 0) ||
+            GetTrack_ptr(project, 0) != track) {
+          return nullptr;
+        }
+      }
       return track;
     }
   }
 
   if (!InsertTrackAtIndex_ptr) return nullptr;
-  InsertTrackAtIndex_ptr(trackCount, true);
-  MediaTrack* track = GetTrack_ptr(project, trackCount);
+  InsertTrackAtIndex_ptr(0, true);
+  MediaTrack* track = GetTrack_ptr(project, 0);
   if (!track) return nullptr;
 
   char trackName[] = "TIMECODE";
@@ -3127,13 +3194,90 @@ static void setVsHookTimecodeItemName(
     take, "P_NAME", &value[0], true);
 }
 
+static bool setSmpteGeneratorChunkToMidiMtc(std::string& chunk)
+{
+  const size_t sourceTag = chunk.find("<SOURCE LTC");
+  if (sourceTag == std::string::npos) return false;
+
+  const size_t sourceLineStart = chunk.rfind('\n', sourceTag);
+  const size_t indentStart = sourceLineStart == std::string::npos
+    ? 0
+    : sourceLineStart + 1;
+  const std::string sourceIndent =
+    chunk.substr(indentStart, sourceTag - indentStart);
+  const std::string closingLine = "\n" + sourceIndent + ">";
+  const size_t sourceEnd = chunk.find(closingLine, sourceTag);
+  if (sourceEnd == std::string::npos) return false;
+
+  size_t lineStart = chunk.find('\n', sourceTag);
+  if (lineStart == std::string::npos || lineStart >= sourceEnd) return false;
+  ++lineStart;
+  while (lineStart < sourceEnd) {
+    size_t lineEnd = chunk.find('\n', lineStart);
+    if (lineEnd == std::string::npos || lineEnd > sourceEnd) {
+      lineEnd = sourceEnd;
+    }
+    size_t contentStart = lineStart;
+    while (contentStart < lineEnd &&
+        (chunk[contentStart] == ' ' || chunk[contentStart] == '\t')) {
+      ++contentStart;
+    }
+    size_t contentEnd = lineEnd;
+    if (contentEnd > contentStart && chunk[contentEnd - 1] == '\r') {
+      --contentEnd;
+    }
+    const size_t contentLength = contentEnd - contentStart;
+    if (contentLength >= 4 &&
+        chunk.compare(contentStart, 4, "SEND") == 0 &&
+        (contentLength == 4 ||
+          chunk[contentStart + 4] == ' ' ||
+          chunk[contentStart + 4] == '\t')) {
+      // SEND e uma mascara do gerador nativo: 1 = audio LTC, 2 = MIDI MTC.
+      // Mantemos apenas o MTC, exatamente como a opcao "Send MIDI (MTC)".
+      chunk.replace(contentStart, contentLength, "SEND 2");
+      return true;
+    }
+    if (lineEnd >= sourceEnd) break;
+    lineStart = lineEnd + 1;
+  }
+
+  const std::string propertyIndent = sourceIndent + "  ";
+  chunk.insert(sourceEnd, "\n" + propertyIndent + "SEND 2");
+  return true;
+}
+
+static bool configureSmpteGeneratorForMidiMtc(MediaItem* item)
+{
+  if (!item || !GetItemStateChunk_ptr || !SetItemStateChunk_ptr) {
+    return false;
+  }
+
+  // Itens gerados pelo REAPER sao pequenos. O crescimento progressivo evita
+  // truncamento caso uma versao futura acrescente propriedades ao item.
+  for (size_t capacity = 16 * 1024;
+       capacity <= 1024 * 1024;
+       capacity *= 2) {
+    std::vector<char> buffer(capacity, '\0');
+    if (!GetItemStateChunk_ptr(
+          item, buffer.data(), static_cast<int>(buffer.size()), false)) {
+      continue;
+    }
+    std::string chunk(buffer.data());
+    if (!setSmpteGeneratorChunkToMidiMtc(chunk)) return false;
+    return SetItemStateChunk_ptr(item, chunk.c_str(), false);
+  }
+  return false;
+}
+
 static void addTimecodeForEveryRegion()
 {
   if (!Main_OnCommand_ptr || !CountTracks_ptr || !GetTrack_ptr ||
       !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr ||
       !DeleteTrackMediaItem_ptr || !GetActiveTake_ptr ||
       !GetSetMediaItemTakeInfo_String_ptr ||
+      !GetItemStateChunk_ptr || !SetItemStateChunk_ptr ||
       !SetMediaItemInfo_Value_ptr || !SetOnlyTrackSelected_ptr ||
+      !ReorderSelectedTracks_ptr ||
       !GetMediaTrackInfo_Value_ptr || !SetMediaTrackInfo_Value_ptr ||
       !GetCursorPositionEx_ptr || !SetEditCurPos2_ptr ||
       !GetSet_LoopTimeRange2_ptr || !SelectAllMediaItems_ptr ||
@@ -3262,6 +3406,10 @@ static void addTimecodeForEveryRegion()
         createdItem, "C_BEATATTACHMODE", 0.0);
       setVsHookTimecodeItemName(createdItem, region);
       newGeneratedItems.push_back(createdItem);
+      if (!configureSmpteGeneratorForMidiMtc(createdItem)) {
+        succeeded = false;
+        break;
+      }
     }
   }
 
@@ -4062,6 +4210,30 @@ static std::deque<std::string> g_nativeHttpCommandQueue;
 static std::deque<std::string> g_nativeTunerCommandQueue;
 static std::vector<std::string> g_nativeCommandHistory;
 static uint64_t g_nativeCommandSequence = 0;
+
+struct NativeTimecodeLanEvent {
+  uint64_t sequence = 0;
+  int64_t createdAtMs = 0;
+  std::string command;
+};
+
+struct NativeTimecodeLanTransport {
+  uint64_t sequence = 0;
+  int playState = 0;
+  double position = 0.0;
+  int64_t sampledAtMs = 0;
+};
+
+// A extensão conversa somente com a Hook Center em localhost. A descoberta e
+// o transporte entre computadores ficam na própria Hook Center, pela LAN.
+static std::mutex g_nativeTimecodeLanMutex;
+static std::string g_nativeTimecodeLanMode;
+static std::string g_nativeTimecodeLanCode;
+static std::deque<NativeTimecodeLanEvent> g_nativeTimecodeLanOutbox;
+static uint64_t g_nativeTimecodeLanEventSequence = 0;
+static NativeTimecodeLanTransport g_nativeTimecodeLanTransport;
+static bool g_nativeTimecodeLanPeerConnected = false;
+static std::string g_nativeTimecodeLanPeerName;
 static std::string g_nativePremixSelectedSongId;
 static double g_nativePremixSelectedSongStart = 0.0;
 static double g_nativePremixSelectedSongEnd = 0.0;
@@ -4880,6 +5052,159 @@ static int64_t nativeSystemNowMs()
     std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+static bool nativeTimecodeLanCodeIsValid(const std::string& value)
+{
+  return value.size() == 6 &&
+    std::all_of(value.begin(), value.end(),
+      [](unsigned char character) {
+        return character >= '0' && character <= '9';
+      });
+}
+
+static void nativeTimecodeLanRefreshConfigOnMainThread()
+{
+  std::string mode = getTimecodeMode();
+  std::string code;
+  if (GetExtState_ptr) {
+    const char* raw = GetExtState_ptr(
+      kExtStateSection, kTimecodePairCodeKey);
+    code = raw ? raw : "";
+  }
+  if (!nativeTimecodeLanCodeIsValid(code)) {
+    mode.clear();
+    code.clear();
+  }
+
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  if (mode == g_nativeTimecodeLanMode &&
+      code == g_nativeTimecodeLanCode) {
+    return;
+  }
+  g_nativeTimecodeLanMode = mode;
+  g_nativeTimecodeLanCode = code;
+  g_nativeTimecodeLanPeerConnected = false;
+  g_nativeTimecodeLanPeerName.clear();
+  g_nativeTimecodeLanOutbox.clear();
+  if (mode != "transmitter") {
+    g_nativeTimecodeLanEventSequence = 0;
+  }
+}
+
+static void nativeTimecodeLanRecordCommand(
+  const std::string& commandBody)
+{
+  if (commandBody.empty() || commandBody.size() > 512 * 1024) return;
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  if (g_nativeTimecodeLanMode != "transmitter") return;
+
+  // O mesmo comando pode passar pelo despachante HTTP e pela função nativa
+  // específica no mesmo ciclo. Não publica a cópia idêntica duas vezes.
+  if (!g_nativeTimecodeLanOutbox.empty()) {
+    const NativeTimecodeLanEvent& previous =
+      g_nativeTimecodeLanOutbox.back();
+    if (previous.command == commandBody &&
+        nativeSystemNowMs() - previous.createdAtMs <= 15) {
+      return;
+    }
+  }
+
+  NativeTimecodeLanEvent event;
+  event.sequence = ++g_nativeTimecodeLanEventSequence;
+  event.createdAtMs = nativeSystemNowMs();
+  event.command = commandBody;
+  if (g_nativeTimecodeLanOutbox.size() >= 4096) {
+    g_nativeTimecodeLanOutbox.pop_front();
+  }
+  g_nativeTimecodeLanOutbox.push_back(std::move(event));
+}
+
+static void nativeTimecodeLanUpdateTransportOnMainThread()
+{
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  const int playState = GetPlayStateEx_ptr && project
+    ? GetPlayStateEx_ptr(project)
+    : 0;
+  const double position = playState != 0
+    ? (GetPlayPositionEx_ptr && project
+        ? GetPlayPositionEx_ptr(project) : 0.0)
+    : (GetCursorPositionEx_ptr && project
+        ? GetCursorPositionEx_ptr(project) : 0.0);
+
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  NativeTimecodeLanTransport& state =
+    g_nativeTimecodeLanTransport;
+  if (state.playState == playState &&
+      std::fabs(state.position - position) < 0.0005 &&
+      nativeSystemNowMs() - state.sampledAtMs < 100) {
+    return;
+  }
+  state.playState = playState;
+  state.position = position;
+  state.sampledAtMs = nativeSystemNowMs();
+  ++state.sequence;
+}
+
+static std::string nativeTimecodeLanStatusJson()
+{
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  const NativeTimecodeLanTransport& transport =
+    g_nativeTimecodeLanTransport;
+  std::ostringstream json;
+  json << "{\"ok\":true,\"lanOnly\":true,"
+       << "\"hookCenterRequired\":true,"
+       << "\"mode\":"
+       << nativeJsonString(g_nativeTimecodeLanMode) << ","
+       << "\"code\":"
+       << nativeJsonString(g_nativeTimecodeLanCode) << ","
+       << "\"peerConnected\":"
+       << (g_nativeTimecodeLanPeerConnected ? "true" : "false")
+       << ",\"peerName\":"
+       << nativeJsonString(g_nativeTimecodeLanPeerName) << ","
+       << "\"eventSequence\":"
+       << g_nativeTimecodeLanEventSequence << ","
+       << "\"transport\":{\"sequence\":"
+       << transport.sequence << ",\"playState\":"
+       << transport.playState << ",\"playing\":"
+       << (transport.playState != 0 ? "true" : "false")
+       << ",\"position\":" << std::setprecision(15)
+       << transport.position << ",\"sampledAtMs\":"
+       << transport.sampledAtMs << "}}";
+  return json.str();
+}
+
+static std::string nativeTimecodeLanOutboxJson(uint64_t after)
+{
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  std::ostringstream json;
+  json << "{\"ok\":true,\"mode\":"
+       << nativeJsonString(g_nativeTimecodeLanMode)
+       << ",\"code\":"
+       << nativeJsonString(g_nativeTimecodeLanCode)
+       << ",\"latestSequence\":"
+       << g_nativeTimecodeLanEventSequence
+       << ",\"events\":[";
+  bool first = true;
+  for (const NativeTimecodeLanEvent& event :
+       g_nativeTimecodeLanOutbox) {
+    if (event.sequence <= after) continue;
+    if (!first) json << ',';
+    first = false;
+    json << "{\"sequence\":" << event.sequence
+         << ",\"createdAtMs\":" << event.createdAtMs
+         << ",\"command\":" << event.command << '}';
+  }
+  const NativeTimecodeLanTransport& transport =
+    g_nativeTimecodeLanTransport;
+  json << "],\"transport\":{\"sequence\":"
+       << transport.sequence << ",\"playState\":"
+       << transport.playState << ",\"playing\":"
+       << (transport.playState != 0 ? "true" : "false")
+       << ",\"position\":" << std::setprecision(15)
+       << transport.position << ",\"sampledAtMs\":"
+       << transport.sampledAtMs << "}}";
+  return json.str();
+}
+
 static int64_t nativeJsonInt64(
   const std::string& json,
   const char* key,
@@ -5411,6 +5736,7 @@ static bool nativeApplyTechnicalNoticeSettingsCommand(
       type != "save_technical_notice_settings") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     nativeTechnicalNoticeApplySettingsJsonLocked(
@@ -6149,6 +6475,8 @@ static bool nativeIsRuntimeControlActive()
   return nativeAppActivePanelIsOpen() ||
          nativeTelepromptWindowIsOpen(1) ||
          nativeTelepromptWindowIsOpen(2) ||
+         getTimecodeMode() == "receive" ||
+         getTimecodeMode() == "transmitter" ||
          nativeIsLuaControlActive() ||
          nativeIsDirectorControlActive();
 }
@@ -6526,6 +6854,7 @@ static bool nativeApplyTunerCommand(const std::string& commandBody)
 {
   const std::string type = nativeLower(nativeJsonExtractString(commandBody, "type"));
   if (type != "tuner_adjust" && type != "tuner_set" && type != "tuner_reset" && type != "tuner_focus" && type != "set_tuner_visibility") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
   if (type == "tuner_focus" || type == "set_tuner_visibility") {
     const bool visible = type == "tuner_focus" || nativeBoolFromText(
       nativeJsonExtractString(commandBody, "visible"), false);
@@ -9101,6 +9430,7 @@ static bool nativeApplyBpmCommand(const std::string& commandBody)
       type != "bpm_focus" && type != "set_bpm_visibility") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
   if (type == "bpm_focus" || type == "set_bpm_visibility") {
     const bool visible = type == "bpm_focus" || nativeBoolFromText(
       nativeJsonExtractString(commandBody, "visible"), false);
@@ -9909,6 +10239,7 @@ static bool nativeApplyPlaylistMultiCommand(
       type != "playlist_multi_toggle") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
 
   const bool current =
     g_nativeMultiProjectPlaylistsEnabled.load();
@@ -9948,6 +10279,7 @@ static bool nativeApplyPlaylistCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "select_playlist" && type != "playlist_select" && type != "set_playlist" && type != "set_active_playlist") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
   if (!SetProjExtState_ptr) return false;
 
   char pathBuf[2048] = "";
@@ -11344,6 +11676,7 @@ static bool nativeApplyManualStopFadeoutCommand(const std::string& commandBody)
   const bool isGenericSet = type == "manual_stop_fadeout_set" || type == "faderout_set";
   if (!isGenericSet && type != "manual_stop_fadeout_set_enabled" && type != "manual_stop_fadeout_set_duration" &&
       type != "manual_stop_fadeout_toggle_track" && type != "manual_stop_fadeout_set_all_tracks") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
   if (!SetExtState_ptr) return false;
 
   bool changed = false;
@@ -11502,6 +11835,7 @@ static bool nativeApplyPlaylistNumberSortCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "sort_playlist_by_number" && type != "playlist_sort_number" && type != "sort_repertoire_by_number") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
   if (!SetProjExtState_ptr) return false;
 
   char pathBuf[2048] = "";
@@ -16990,6 +17324,7 @@ static bool nativeApplyPlayProtectionCommand(
       type != "play_protection_toggle") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
   const bool current = nativePlayProtectionEnabled();
   std::string value =
     nativeJsonExtractString(commandBody, "enabled");
@@ -35007,6 +35342,7 @@ static bool nativeApplySmartSearchCommand(
       type != "smart_search_activate") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
 
   if (type == "smart_search_close") {
     if (g_nativeMainSearchFocused) {
@@ -42978,6 +43314,7 @@ static bool nativeApplyTelepromptSettingsCommand(
     const std::string action = nativeLower(nativeTrim(
       nativeJsonExtractString(commandBody, "action")));
     if (slot < 1 || slot > 2) return false;
+    nativeTimecodeLanRecordCommand(commandBody);
     if (action == "open") return nativeOpenTelepromptWindow(slot);
     if (action == "close") {
       nativeCloseTelepromptWindow(slot);
@@ -42991,6 +43328,7 @@ static bool nativeApplyTelepromptSettingsCommand(
       type != "lyrics_settings") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
   const std::string slotRaw =
     nativeJsonExtractString(commandBody, "slot");
   const int slot = nativeLooksNumeric(slotRaw)
@@ -49761,6 +50099,7 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
       type != "mixer_bulk_unsolo") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
   if (!EnumProjects_ptr) return false;
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
@@ -49908,6 +50247,7 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "queue_playlist_song" && type != "queue_region_song" && type != "clear_queue" && type != "clear_queued_song") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
 
   if (type == "clear_queue" || type == "clear_queued_song") {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -50092,6 +50432,7 @@ static bool nativeApplyAutoCommand(const std::string& commandBody)
     type == "auto_stop_set" || type == "autostop_set" || type == "set_auto_stop" || type == "set_autostop" ||
     type == "toggle_auto_stop" || type == "toggle_autostop" || type == "auto_stop" || type == "autostop");
   if (!isAuto && !isAuto2 && !isAtBl && !isAutoStop) return false;
+  nativeTimecodeLanRecordCommand(commandBody);
 
   std::string desired = nativeJsonExtractString(commandBody, "desiredState");
   if (isAutoStop) {
@@ -50167,6 +50508,7 @@ static bool nativeApplyPreviewCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "preview_set" && type != "preview_toggle" && type != "preview_clear") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
 
   if (type == "preview_clear") {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -50203,6 +50545,7 @@ static bool nativeApplyLiveMarkCommand(const std::string& commandBody)
 {
   const std::string type = nativeLower(nativeJsonExtractString(commandBody, "type"));
   if (type == "live_reset_item" || type == "director_live_reset_item") {
+    nativeTimecodeLanRecordCommand(commandBody);
     std::string id = nativeJsonExtractString(commandBody, "songId");
     if (id.empty()) id = nativeJsonExtractString(commandBody, "targetId");
     if (id.empty()) id = nativeJsonExtractString(commandBody, "id");
@@ -50225,6 +50568,7 @@ static bool nativeApplyLiveMarkCommand(const std::string& commandBody)
     return true;
   }
   if (type != "live_set" && type != "live_toggle" && type != "director_live_set" && type != "director_live_toggle") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
 
   std::string desired = nativeJsonExtractString(commandBody, "enabled");
   if (desired.empty()) desired = nativeJsonExtractString(commandBody, "live");
@@ -50265,6 +50609,7 @@ static bool nativeApplyLoopCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "loop_toggle" && type != "loop_set" && type != "director_loop_toggle") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
 
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
@@ -50307,6 +50652,7 @@ static bool nativeApplyMultiLoopCommand(const std::string& commandBody)
 {
   const std::string type = nativeLower(nativeJsonExtractString(commandBody, "type"));
   if (!nativeStartsWith(type, "multiloop") && !nativeStartsWith(type, "multi_loop")) return false;
+  nativeTimecodeLanRecordCommand(commandBody);
   nativeLoadMultiLoopState();
   if (type == "multiloop_focus" || type == "multiloop_open" || type == "multi_loop_focus" || type == "multi_loop_open") {
     std::string id = nativeJsonExtractString(commandBody, "songId");
@@ -50500,6 +50846,7 @@ static bool nativeApplyPremixCommand(const std::string& commandBody)
 {
   const std::string type = nativeLower(nativeJsonExtractString(commandBody, "type"));
   if (!nativeStartsWith(type, "premix")) return false;
+  nativeTimecodeLanRecordCommand(commandBody);
 
   if (type == "premix_focus_song" || type == "premix_item_open" || type == "premix_open_song" || type == "premix_open") {
     std::string songId = nativeJsonExtractString(commandBody, "songId");
@@ -50649,6 +50996,7 @@ static bool nativeApplyTimerCommand(const std::string& commandBody)
       type != "timer_config" && type != "timer_set_target") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
 
   std::string modeValue = nativeJsonExtractString(commandBody, "timerMode");
   if (modeValue.empty()) modeValue = nativeJsonExtractString(commandBody, "mode");
@@ -50765,6 +51113,7 @@ static bool nativeApplyDirectorFamilyDrawersCommand(const std::string& commandBo
       type != "director_drawers_sync") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
 
   if (viewCommand) {
     std::string value =
@@ -50960,6 +51309,7 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "edit_cursor_move" && type != "select_playlist_song" && type != "select_region" && type != "clear_selection" && type != "clear_selected_song" && type != "set_page") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
 
   if (type == "set_page") {
     std::string page = nativeJsonExtractString(commandBody, "page");
@@ -51133,6 +51483,7 @@ static bool nativeApplyStopPauseModeCommand(const std::string& commandBody)
 {
   const std::string type = nativeLower(nativeJsonExtractString(commandBody, "type"));
   if (type != "stop_pause_mode_set" && type != "stop_pause_mode_toggle" && type != "edit_mode_stop_pause_set") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
 
   nativeRefreshStopPauseModeFromExtState();
   bool enabled = !g_stopPauseModeEnabled.load();
@@ -51155,6 +51506,7 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
       type != "director_play_no_seek" && type != "director_stop_no_seek" && type != "director_stop_break" && type != "stop_break" && type != "director_pause") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
   if (!Main_OnCommand_ptr) return false;
 
   char pathBuf[2048] = "";
@@ -51667,6 +52019,7 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
       type != "marker_cancel" && type != "escape_key" && type != "esc" && type != "key_escape") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
   if (!EnumProjects_ptr) return false;
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
@@ -51778,6 +52131,7 @@ static bool nativeSelectProjectFromCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "set_project_tab" && type != "select_project_tab" && type != "switch_project_tab" && type != "project_tab_select") return false;
+  nativeTimecodeLanRecordCommand(commandBody);
   if (!EnumProjects_ptr || !SelectProjectInstance_ptr) return false;
   std::string idxValue = nativeJsonExtractString(commandBody, "projectTabIndex");
   if (idxValue.empty()) idxValue = nativeJsonExtractString(commandBody, "tabIndex");
@@ -51823,6 +52177,7 @@ static bool nativeSaveProjectFromCommand(
       type != "save_current_project") {
     return false;
   }
+  nativeTimecodeLanRecordCommand(commandBody);
   if (!Main_OnCommand_ptr) return false;
   // REAPER: File: Save project. Se o projeto ainda nao tiver caminho, o
   // proprio REAPER abre Save Project As na maquina do usuario.
@@ -52104,13 +52459,109 @@ static std::string nativeBuildTpMediaResponse(const std::string& req)
 static void nativeQueueHttpCommand(const std::string& commandBody)
 {
   if (commandBody.empty()) return;
+  const bool replacePendingTransportPulse =
+    nativeLower(nativeTrim(nativeJsonExtractString(
+      commandBody, "type"))) == "timecode_transport_sync";
   std::lock_guard<std::mutex> lock(g_nativeMutex);
+  if (replacePendingTransportPulse) {
+    g_nativeHttpCommandQueue.erase(
+      std::remove_if(
+        g_nativeHttpCommandQueue.begin(),
+        g_nativeHttpCommandQueue.end(),
+        [](const std::string& queuedCommand) {
+          return nativeLower(nativeTrim(nativeJsonExtractString(
+            queuedCommand, "type"))) == "timecode_transport_sync";
+        }),
+      g_nativeHttpCommandQueue.end());
+  }
   // Limite defensivo: em uso normal o timer esvazia esta fila no ciclo
   // seguinte. O teto impede um cliente abandonado de consumir memoria sem fim.
   if (g_nativeHttpCommandQueue.size() >= 1024) {
     g_nativeHttpCommandQueue.pop_front();
   }
   g_nativeHttpCommandQueue.push_back(commandBody);
+}
+
+static bool nativeApplyTimecodeLanCommand(
+  const std::string& commandBody)
+{
+  const std::string type = nativeLower(nativeTrim(
+    nativeJsonExtractString(commandBody, "type")));
+  if (type == "timecode_peer_status") {
+    const bool connected = nativeJsonBoolValue(
+      commandBody, "connected", false);
+    const std::string peerName = nativeTrim(
+      nativeJsonExtractString(commandBody, "peerName"));
+    std::lock_guard<std::mutex> lock(
+      g_nativeTimecodeLanMutex);
+    g_nativeTimecodeLanPeerConnected = connected;
+    g_nativeTimecodeLanPeerName = connected
+      ? peerName
+      : std::string();
+    return true;
+  }
+
+  if (type != "timecode_transport_sync") return false;
+
+  bool receiveMode = false;
+  {
+    std::lock_guard<std::mutex> lock(
+      g_nativeTimecodeLanMutex);
+    receiveMode = g_nativeTimecodeLanMode == "receive";
+  }
+  if (!receiveMode) return true;
+
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project || !Main_OnCommand_ptr) return true;
+
+  const int sourcePlayState = static_cast<int>(nativeJsonInt64(
+    commandBody, "playState", 0));
+  const bool sourceActive = sourcePlayState != 0;
+  const bool sourcePaused = (sourcePlayState & 2) == 2;
+  const std::string positionValue = nativeJsonExtractString(
+    commandBody, "position");
+  const double sourcePosition = nativeLooksNumeric(positionValue)
+    ? std::max(0.0, std::atof(positionValue.c_str()))
+    : 0.0;
+
+  const int localPlayState = GetPlayStateEx_ptr
+    ? GetPlayStateEx_ptr(project)
+    : 0;
+  const bool localActive = localPlayState != 0;
+  const bool localPaused = (localPlayState & 2) == 2;
+  const double localPosition = localActive && GetPlayPositionEx_ptr
+    ? GetPlayPositionEx_ptr(project)
+    : (GetCursorPositionEx_ptr
+        ? GetCursorPositionEx_ptr(project) : 0.0);
+  const double drift = std::fabs(localPosition - sourcePosition);
+
+  if (!sourceActive) {
+    if (localActive) Main_OnCommand_ptr(1016, 0);
+    if (SetEditCurPos2_ptr && drift > 0.025) {
+      SetEditCurPos2_ptr(project, sourcePosition, true, false);
+    }
+  } else if (!localActive) {
+    if (SetEditCurPos2_ptr) {
+      SetEditCurPos2_ptr(project, sourcePosition, true, false);
+    }
+    Main_OnCommand_ptr(1007, 0);
+    if (sourcePaused) Main_OnCommand_ptr(1008, 0);
+  } else {
+    if (sourcePaused != localPaused) {
+      Main_OnCommand_ptr(1008, 0);
+    }
+    // A pulsação corrige somente deriva perceptível. Enquanto os dois PCs
+    // estão próximos, não faz seek e não interfere no áudio.
+    if (!sourcePaused && !localPaused &&
+        SetEditCurPos2_ptr && drift > 0.090) {
+      SetEditCurPos2_ptr(project, sourcePosition, true, true);
+    } else if (sourcePaused && SetEditCurPos2_ptr && drift > 0.025) {
+      SetEditCurPos2_ptr(project, sourcePosition, true, false);
+    }
+  }
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+  g_nativeForceStateBuild.store(true);
+  return true;
 }
 
 // Executado exclusivamente pelo startupTimer, portanto na thread principal do
@@ -52208,6 +52659,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
   }
 
   const bool handledByNative =
+    nativeApplyTimecodeLanCommand(commandBody) ||
     handledAccessControlCommand ||
     nativeApplySmartSearchCommand(commandBody) ||
     nativeApplyTechnicalNoticeSettingsCommand(commandBody) ||
@@ -52331,6 +52783,50 @@ static void nativeHandleClient(native_socket_t client)
       meters = g_nativeMetersJson;
     }
     body = nativeHttpResponse(200, meters);
+  } else if (path == "/timecode/status" ||
+             path == "/timecode/status.json") {
+    body = nativeHttpResponse(200, nativeTimecodeLanStatusJson());
+  } else if (path == "/timecode/outbox" &&
+             nativeRequestIsPost(req)) {
+    const std::string requestBody =
+      nativeTrim(nativeRequestBody(req));
+    const uint64_t after = static_cast<uint64_t>(std::max<int64_t>(
+      0, nativeJsonInt64(requestBody, "after", 0)));
+    body = nativeHttpResponse(
+      200, nativeTimecodeLanOutboxJson(after));
+  } else if (path == "/timecode/inbox" &&
+             nativeRequestIsPost(req)) {
+    bool receiveMode = false;
+    {
+      std::lock_guard<std::mutex> lock(
+        g_nativeTimecodeLanMutex);
+      receiveMode = g_nativeTimecodeLanMode == "receive";
+    }
+    if (!receiveMode) {
+      body = nativeHttpResponse(
+        409,
+        "{\"ok\":false,\"error\":\"receive_not_active\"}");
+    } else {
+      const std::string requestBody = nativeRequestBody(req);
+      size_t start = 0;
+      size_t queued = 0;
+      while (start < requestBody.size() && queued < 256) {
+        size_t end = requestBody.find('\n', start);
+        if (end == std::string::npos) end = requestBody.size();
+        std::string command = nativeTrim(
+          requestBody.substr(start, end - start));
+        if (!command.empty() && command.size() <= 512 * 1024 &&
+            command.front() == '{') {
+          nativeQueueHttpCommand(command);
+          ++queued;
+        }
+        start = end + 1;
+      }
+      std::ostringstream response;
+      response << "{\"ok\":true,\"queued\":"
+               << queued << '}';
+      body = nativeHttpResponse(200, response.str());
+    }
   } else if (path == "/command" && nativeRequestIsPost(req)) {
     const std::string commandBody = nativeTrim(nativeRequestBody(req));
     if (!commandBody.empty()) nativeQueueHttpCommand(commandBody);
@@ -52973,6 +53469,8 @@ static void startupTimer()
 
   nativeTechnicalNoticeExpireOnMainThread();
   nativeTechnicalNoticeFlushPersistenceOnMainThread();
+  nativeTimecodeLanRefreshConfigOnMainThread();
+  nativeTimecodeLanUpdateTransportOnMainThread();
 
   const std::string projectSignature =
     getCurrentProjectSignature();
@@ -53128,12 +53626,6 @@ static bool loadApi(reaper_plugin_info_t* rec)
   AddRemoveReaScript_ptr = reinterpret_cast<AddRemoveReaScript_t>(rec->GetFunc("AddRemoveReaScript"));
   NamedCommandLookup_ptr = reinterpret_cast<NamedCommandLookup_t>(rec->GetFunc("NamedCommandLookup"));
   ReverseNamedCommandLookup_ptr = reinterpret_cast<ReverseNamedCommandLookup_t>(rec->GetFunc("ReverseNamedCommandLookup"));
-  kbd_enumerateActions_ptr =
-    reinterpret_cast<kbd_enumerateActions_t>(
-      rec->GetFunc("kbd_enumerateActions"));
-  SectionFromUniqueID_ptr =
-    reinterpret_cast<SectionFromUniqueID_t>(
-      rec->GetFunc("SectionFromUniqueID"));
   GetExtState_ptr = reinterpret_cast<GetExtState_t>(rec->GetFunc("GetExtState"));
   SetExtState_ptr = reinterpret_cast<SetExtState_t>(rec->GetFunc("SetExtState"));
   EnumExtState_ptr = reinterpret_cast<EnumExtState_t>(
@@ -53267,6 +53759,10 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetMediaItemInfo_Value_ptr = reinterpret_cast<GetMediaItemInfo_Value_t>(rec->GetFunc("GetMediaItemInfo_Value"));
   SetMediaItemInfo_Value_ptr = reinterpret_cast<SetMediaItemInfo_Value_t>(rec->GetFunc("SetMediaItemInfo_Value"));
   GetSetMediaItemInfo_String_ptr = reinterpret_cast<GetSetMediaItemInfo_String_t>(rec->GetFunc("GetSetMediaItemInfo_String"));
+  GetItemStateChunk_ptr = reinterpret_cast<GetItemStateChunk_t>(
+    rec->GetFunc("GetItemStateChunk"));
+  SetItemStateChunk_ptr = reinterpret_cast<SetItemStateChunk_t>(
+    rec->GetFunc("SetItemStateChunk"));
   GetActiveTake_ptr = reinterpret_cast<GetActiveTake_t>(rec->GetFunc("GetActiveTake"));
   GetTakeName_ptr = reinterpret_cast<GetTakeName_t>(rec->GetFunc("GetTakeName"));
   TakeIsMIDI_ptr = reinterpret_cast<TakeIsMIDI_t>(
@@ -53422,6 +53918,7 @@ static bool initialize()
   vshook_jsapi::registerApi(plugin_register_ptr, plugin_getapi_ptr);
   registerNativeBridgeApi();
   nativeTelepromptLoadSettings();
+  nativeTimecodeLanRefreshConfigOnMainThread();
   nativeTechnicalNoticeLoadState();
   nativeTechnicalNoticeRefreshAuthCache(
     nativeDirectorPasswordHash(nativeReadDirectorPassword()),
