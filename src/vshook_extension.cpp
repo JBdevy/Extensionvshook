@@ -26,6 +26,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cwchar>
+#include <cwctype>
 #include <ctime>
 #include <fstream>
 #include <limits>
@@ -44,6 +45,7 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
+  #include <commctrl.h>
 #else
   #include <sys/stat.h>
   #include <sys/types.h>
@@ -126,6 +128,14 @@ using DeleteProjectMarkerByIndex_t = bool (*)(ReaProject*, int);
 using Undo_BeginBlock2_t = void (*)(ReaProject*);
 using Undo_EndBlock2_t = int (*)(ReaProject*, const char*, int);
 using UpdateTimeline_t = void (*)();
+using CountTempoTimeSigMarkers_t = int (*)(ReaProject*);
+using GetTempoTimeSigMarker_t = bool (*)(ReaProject*, int, double*, int*,
+  double*, double*, int*, int*, bool*);
+using SetTempoTimeSigMarker_t = bool (*)(ReaProject*, int, double, int,
+  double, double, int, int, bool);
+using DeleteTempoTimeSigMarker_t = bool (*)(ReaProject*, int);
+using projectconfig_var_getoffs_t = int (*)(const char*, int*);
+using projectconfig_var_addr_t = void* (*)(ReaProject*, int);
 using GetRegionOrMarker_t = void* (*)(ReaProject*, int, const char*);
 using GetRegionOrMarkerInfo_Value_t = double (*)(ReaProject*, void*, const char*);
 using SetRegionOrMarkerInfo_Value_t = bool (*)(ReaProject*, void*, const char*, double);
@@ -256,6 +266,12 @@ static DeleteProjectMarkerByIndex_t DeleteProjectMarkerByIndex_ptr = nullptr;
 static Undo_BeginBlock2_t Undo_BeginBlock2_ptr = nullptr;
 static Undo_EndBlock2_t Undo_EndBlock2_ptr = nullptr;
 static UpdateTimeline_t UpdateTimeline_ptr = nullptr;
+static CountTempoTimeSigMarkers_t CountTempoTimeSigMarkers_ptr = nullptr;
+static GetTempoTimeSigMarker_t GetTempoTimeSigMarker_ptr = nullptr;
+static SetTempoTimeSigMarker_t SetTempoTimeSigMarker_ptr = nullptr;
+static DeleteTempoTimeSigMarker_t DeleteTempoTimeSigMarker_ptr = nullptr;
+static projectconfig_var_getoffs_t projectconfig_var_getoffs_ptr = nullptr;
+static projectconfig_var_addr_t projectconfig_var_addr_ptr = nullptr;
 static GetRegionOrMarker_t GetRegionOrMarker_ptr = nullptr;
 static GetRegionOrMarkerInfo_Value_t GetRegionOrMarkerInfo_Value_ptr = nullptr;
 static SetRegionOrMarkerInfo_Value_t SetRegionOrMarkerInfo_Value_ptr = nullptr;
@@ -492,15 +508,6 @@ static custom_action_register_t g_recadosAction = {
   0, "VSHOOKNEWRECADOS",
   "VS Hook: Recados", nullptr
 };
-static int g_repeatShortcutCommandId = 0;
-static gaccel_register_t g_repeatShortcutL = {
-  { FVIRTKEY, 'L', 0 },
-  "VS Hook: Repeat do REAPER (L/R)"
-};
-static gaccel_register_t g_repeatShortcutR = {
-  { FVIRTKEY, 'R', 0 },
-  "VS Hook: Repeat do REAPER (L/R)"
-};
 static int g_timecodeReceiveCommandId = 0;
 static int g_timecodeTransmitterCommandId = 0;
 static int g_projectSyncCommandId = 0;
@@ -516,9 +523,8 @@ struct State {
   bool toggleActionRegistered = false;
   bool menuHookRegistered = false;
   bool acceleratorRegistered = false;
-  bool repeatShortcutLRegistered = false;
-  bool repeatShortcutRRegistered = false;
   bool timerRegistered = false;
+  bool projectConfigRegistered = false;
   bool apiRegistered = false;
   bool cfSetClipboardAliasRegistered = false;
   int startupTimerTicks = 0;
@@ -669,11 +675,17 @@ static UINT g_nativeUiFrameTimerIntervalMs = 0;
 // Windows e macOS entregam autorepeat com ritmos diferentes. A interface
 // ignora essas repetições nativas e usa o mesmo relógio nas duas plataformas.
 static constexpr int kNativeUiNavigationRepeatDelayMs = 220;
-static constexpr int kNativeUiNavigationRepeatIntervalMs = 25;
+// 25 passos/s preservam a navegacao rapida sem atravessar duas musicas entre
+// quadros em maquinas cujo paint varia entre 16 e 25 ms.
+static constexpr int kNativeUiNavigationRepeatIntervalMs = 40;
+// Toda opção apresentada como Cinza usa exatamente o mesmo tom do fundo
+// escuro padrão das listas.
+static const COLORREF kNativeUiUnifiedDarkGray = RGB(34, 38, 43);
 static int g_nativeUiHeldNavigationKey = 0;
 static bool g_nativeUiSyntheticNavigationRepeat = false;
 static std::chrono::steady_clock::time_point
   g_nativeUiNextNavigationRepeatAt{};
+
 static HFONT g_nativeUiSharedFont = nullptr;
 static HFONT g_nativeUiTimerFont = nullptr;
 static HFONT g_nativeUiInfoStripFont = nullptr;
@@ -773,7 +785,23 @@ static RECT g_nativeMainTunerColumnRect{0, 0, 0, 0};
 static RECT g_nativeMainTunerResetRect{0, 0, 0, 0};
 static RECT g_nativeMainBpmColumnRect{0, 0, 0, 0};
 static RECT g_nativeMainBpmScanRect{0, 0, 0, 0};
-static std::vector<RECT> g_nativeMainBpmHits;
+struct NativeMainBpmHit {
+  RECT rect{0, 0, 0, 0};
+  std::string id;
+  std::string name;
+  double start = 0.0;
+  double end = 0.0;
+  int delta = 0; // -1/1 = controle; 0 = campo editável.
+};
+static std::vector<NativeMainBpmHit> g_nativeMainBpmHits;
+static bool g_nativeMainBpmEditOpen = false;
+static std::string g_nativeMainBpmEditId;
+static std::string g_nativeMainBpmEditName;
+static std::string g_nativeMainBpmEditInput;
+static size_t g_nativeMainBpmEditCursor = 0;
+static double g_nativeMainBpmEditStart = 0.0;
+static double g_nativeMainBpmEditEnd = 0.0;
+static RECT g_nativeMainBpmEditRect{0, 0, 0, 0};
 struct NativeMainTunerHit {
   RECT rect{0, 0, 0, 0};
   std::string id;
@@ -843,7 +871,8 @@ enum class NativeUiTextInputKind {
   CreatePlaylist,
   RenameRow,
   PartsRename,
-  TimerCountdown
+  TimerCountdown,
+  BpmValue
 };
 static NativeUiTextInputKind g_nativeUiTextSelectionKind =
   NativeUiTextInputKind::None;
@@ -931,7 +960,7 @@ struct NativeMainRowHit {
   RECT rect{0, 0, 0, 0};
   int visibleIndex = -1;
   size_t sourceIndex = 0;
-  COLORREF rowFill = RGB(41, 46, 51);
+  COLORREF rowFill = RGB(34, 38, 43);
 };
 static std::vector<NativeMainRowHit> g_nativeMainRowHits;
 struct NativeMainLiveResetHit {
@@ -1484,6 +1513,7 @@ static bool resumePcAccessFromAppActiveScreen();
 static bool nativeAppActivePanelIsOpen();
 static bool nativeOpenAppActivePanel();
 static void nativeCloseAppActivePanel();
+static void nativePreparePanelForProjectTransition();
 static bool nativeTelepromptWindowIsOpen(int slot);
 static bool nativeOpenTelepromptWindow(int slot);
 static void nativeCloseTelepromptWindow(
@@ -1510,6 +1540,9 @@ static bool nativeApplyQueueCommand(const std::string& commandBody);
 static bool nativeApplySelectionCommand(const std::string& commandBody);
 static bool nativeUiSetMainPageFromShortcut(const char* page);
 static bool nativeApplyTransportCommand(const std::string& commandBody);
+static bool nativeUiTransportActive();
+static bool nativePlayProtectionShouldAllow(
+  const std::string& requestedAction);
 static bool nativeApplyPlaylistMultiCommand(
   const std::string& commandBody);
 static bool nativeRefreshMultiProjectPlaylistsAvailability();
@@ -1540,6 +1573,10 @@ static void nativeClosePartsRenameModal();
 static void nativeUiCancelMixerInlineRename();
 static void nativeUiShowTemporaryPopup(
   const std::string& text, double durationSeconds);
+static int nativeUiTextWidth(
+  HDC dc, const std::string& text, HFONT font);
+static void nativeSetTunerColumnVisible(bool visible);
+static void nativeSetBpmColumnVisible(bool visible);
 static std::string nativeAppActiveFormatDuration(
   double seconds);
 static void nativeMoveEditCursorAndSeek(ReaProject* project, double pos, bool seekPlayback);
@@ -1915,95 +1952,6 @@ static bool writeTextFileAtomically(
   }
 #endif
   return true;
-}
-
-static bool parseReaperKeyBinding(
-  const std::string& line,
-  int& flags,
-  int& key,
-  std::string& command,
-  int& section)
-{
-  std::istringstream input(line);
-  std::string kind;
-  if (!(input >> kind >> flags >> key >> command >> section)) return false;
-  return kind == "KEY";
-}
-
-static bool ensurePersistentRepeatShortcuts()
-{
-  if (!GetResourcePath_ptr) return false;
-  const char* resourcePath = GetResourcePath_ptr();
-  if (!resourcePath || !*resourcePath) return false;
-
-  const std::string keyboardPath =
-    joinPath(resourcePath, "reaper-kb.ini");
-  const std::string original = readTextFile(keyboardPath);
-  const std::string newline =
-    original.find("\r\n") != std::string::npos ? "\r\n" : "\n";
-
-  std::vector<std::string> outputLines;
-  bool hasL = false;
-  bool hasR = false;
-  bool changed = false;
-
-  std::istringstream lines(original);
-  std::string line;
-  while (std::getline(lines, line)) {
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-
-    int flags = 0;
-    int key = 0;
-    int section = -1;
-    std::string command;
-    const bool isBinding =
-      parseReaperKeyBinding(line, flags, key, command, section);
-    const bool isBareMainL =
-      isBinding && flags == 1 && key == 'L' && section == 0;
-    const bool isBareMainR =
-      isBinding && flags == 1 && key == 'R' && section == 0;
-
-    if (!isBareMainL && !isBareMainR) {
-      outputLines.push_back(line);
-      continue;
-    }
-
-    bool& alreadyAdded = isBareMainL ? hasL : hasR;
-    if (alreadyAdded) {
-      // Um mesmo atalho nao pode apontar para duas actions. Remove somente
-      // duplicatas de L/R sem modificadores na secao Main.
-      changed = true;
-      continue;
-    }
-
-    alreadyAdded = true;
-    const int keyCode = isBareMainL ? 'L' : 'R';
-    const std::string wanted =
-      std::string("KEY 1 ") + std::to_string(keyCode) +
-      " 1068 0";
-    if (command == "1068") {
-      outputLines.push_back(line);
-    } else {
-      outputLines.push_back(wanted);
-      changed = true;
-    }
-  }
-
-  if (!hasL) {
-    outputLines.push_back("KEY 1 76 1068 0");
-    changed = true;
-  }
-  if (!hasR) {
-    outputLines.push_back("KEY 1 82 1068 0");
-    changed = true;
-  }
-  if (!changed) return true;
-
-  std::ostringstream updated;
-  for (const std::string& outputLine : outputLines) {
-    updated << outputLine << newline;
-  }
-  return writeTextFileAtomically(keyboardPath, updated.str());
 }
 
 static bool nativeEnsurePluginLicense()
@@ -3159,16 +3107,29 @@ static void toggleNativeInterface()
   else nativeOpenAppActivePanel();
 }
 
+static bool nativeCommandStartsProjectTransition(int command)
+{
+  switch (command) {
+    case 40023: // File: New project
+    case 40025: // File: Open project
+    case 40859: // File: New project tab
+    case 40860: // File: Close current project tab
+    case 41929: // File: New project tab (ignore default template)
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Necessario para cliques vindos do menu Extensions e tambem chamadas normais da action list.
 static bool hookCommand(int command, int flag)
 {
   (void)flag;
 
-  if (g_repeatShortcutCommandId != 0 &&
-      command == g_repeatShortcutCommandId) {
-    if (Main_OnCommand_ptr) Main_OnCommand_ptr(1068, 0);
-    return true;
+  if (nativeCommandStartsProjectTransition(command)) {
+    nativePreparePanelForProjectTransition();
   }
+
   if (handleTransportQueueStopCommand(command)) return true;
   if (g_nativeInterfaceCommandId != 0 && command == g_nativeInterfaceCommandId) {
     toggleNativeInterface();
@@ -3238,11 +3199,10 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   (void)relmode;
   (void)hwnd;
 
-  if (g_repeatShortcutCommandId != 0 &&
-      command == g_repeatShortcutCommandId) {
-    if (Main_OnCommand_ptr) Main_OnCommand_ptr(1068, 0);
-    return true;
+  if (nativeCommandStartsProjectTransition(command)) {
+    nativePreparePanelForProjectTransition();
   }
+
   if (handleTransportQueueStopCommand(command)) return true;
   if (g_nativeInterfaceCommandId != 0 && command == g_nativeInterfaceCommandId) {
     toggleNativeInterface();
@@ -4254,7 +4214,8 @@ static std::string nativeBlockColorHexFromKey(const std::string& rawKey, int blo
   if (key == "pink")   return nativeRgbHex(0.95, 0.38, 0.72);
   if (key == "olive")  return nativeRgbHex(0.58, 0.70, 0.18);
   if (key == "orange") return nativeRgbHex(0.96, 0.56, 0.16);
-  if (key == "white")  return nativeRgbHex(0.62, 0.62, 0.62);
+  if (key == "white")  return nativeRgbHex(
+    34.0 / 255.0, 38.0 / 255.0, 43.0 / 255.0);
 
   static const double palette[][3] = {
     {1.00, 0.74, 0.12}, {0.18, 0.74, 0.36}, {0.20, 0.52, 1.00}, {0.56, 0.34, 0.94},
@@ -5383,6 +5344,10 @@ struct NativeSongWindow {
   int parentEnumIndex = -1;
   int premixNumber = 0;
   int tunerValue = 0;
+  double bpmValue = 0.0;
+  double bpmOriginal = 0.0;
+  bool bpmAvailable = false;
+  bool bpmGeneric = false;
 };
 
 struct NativePendingPlayTarget {
@@ -5400,11 +5365,37 @@ static std::vector<NativeSongWindow> g_nativeSongWindows;
 struct NativeBpmScanResult {
   std::string id;
   std::string name;
+  double start = 0.0;
+  double end = 0.0;
   double bpm = 0.0;
+  // Valor detectado originalmente pelo Scan. O BPM atual pode ser editado,
+  // mas esta base permanece fixa para desenhar + ou - na coluna.
+  double originalBpm = 0.0;
   int confidence = 0;
   int detectedPeaks = 0;
   std::string error;
 };
+
+static void nativeEnsureGenericBpmFallback(
+  NativeBpmScanResult& result)
+{
+  // Toda falha individual do Scan continua exibindo o motivo, mas recebe
+  // 120 BPM como valor genérico editável/aplicável. Assim nenhuma música,
+  // solta ou filha, fica sem marcador só porque a análise não achou o ritmo.
+  if (!result.error.empty() || !std::isfinite(result.bpm) ||
+      result.bpm <= 0.0) {
+    if (result.error.empty()) result.error = "bpm_nao_encontrado";
+    result.bpm = 120.0;
+    result.originalBpm = 120.0;
+    result.confidence = 0;
+  }
+}
+
+static bool nativeBpmScanResultHasUsableValue(
+  const NativeBpmScanResult& result)
+{
+  return std::isfinite(result.bpm) && result.bpm > 0.0;
+}
 
 struct NativeBpmScanJob {
   ReaProject* project = nullptr;
@@ -5421,6 +5412,20 @@ static std::string g_nativeBpmScanError;
 static uint64_t g_nativeBpmScanRevision = 0;
 static size_t g_nativeBpmScanTotal = 0;
 static bool g_nativeBpmScanRunning = false;
+static std::string g_nativeUiBpmScanSelectedId;
+static ReaProject* g_nativeBpmScanResultProject = nullptr;
+static bool g_nativeUiBpmScanForceRescan = false;
+// NOVO SCAN/Rescan só substitui o mapa ao clicar APLICAR, depois que o
+// usuário conferiu os resultados.
+static bool g_nativeBpmReplaceAllTempoMarkersOnApply = false;
+static bool g_nativeUiBpmScannedAvailable = false;
+static ReaProject* g_nativeBpmPaintCacheProject = nullptr;
+static std::string g_nativeBpmPaintCachePath;
+static std::map<std::string, NativeBpmScanResult>
+  g_nativeBpmPaintCache;
+// A audição dentro do resultado do scan é deliberadamente isolada do Auto:
+// serve apenas para conferir o click/BPM e nunca arma a próxima música.
+static bool g_nativeBpmScanPreviewPlaybackActive = false;
 static bool g_nativeCurrentTransportPlaying = false;
 static std::string g_nativeCurrentPlayingId;
 static double g_nativeCurrentSongStart = 0.0;
@@ -5491,11 +5496,13 @@ struct NativeMultiLoopTrackPreset {
   bool fadeLimitSet = false;
   double fadeLimitDb = 0.0;
 };
+static constexpr int kNativeMultiLoopSlotCount = 4;
 struct NativeMultiLoopSongState {
-  bool loop[2] = {false, false};
-  bool ms[2] = {false, false};
-  int fadeSec[2] = {3, 3};
-  std::map<std::string, NativeMultiLoopTrackPreset> tracks[2];
+  bool loop[kNativeMultiLoopSlotCount] = {};
+  bool ms[kNativeMultiLoopSlotCount] = {};
+  int fadeSec[kNativeMultiLoopSlotCount] = {3, 3, 3, 3};
+  std::map<std::string, NativeMultiLoopTrackPreset>
+    tracks[kNativeMultiLoopSlotCount];
 };
 struct NativeMultiLoopPair {
   bool valid = false;
@@ -5788,6 +5795,16 @@ static std::string nativeMultiLoopSongKey(const NativeSongWindow& item)
 }
 
 static std::string nativeGetProjExtStateString(ReaProject* project, const char* section, const char* key);
+static std::string nativeEscapeExtField(const std::string& value);
+
+static const char* kBpmScanProjectSection = "VS_HOOK_BPM_SCAN_V1";
+static const char* kBpmScanResultsKey = "RESULTS_V1";
+
+static std::map<std::string, NativeBpmScanResult>
+nativeLoadBpmScanCache(ReaProject* project);
+static void nativeSaveBpmScanCacheResult(
+  ReaProject* project,
+  const NativeBpmScanResult& result);
 
 static const char* kTunerProjectSection = "CHATGPT_REGION_PLAYLIST";
 static const char* kTunerOffsetsKey = "TUNER_OFFSETS_V1";
@@ -6125,7 +6142,12 @@ static bool nativeApplyTunerCommand(const std::string& commandBody)
 {
   const std::string type = nativeLower(nativeJsonExtractString(commandBody, "type"));
   if (type != "tuner_adjust" && type != "tuner_set" && type != "tuner_reset" && type != "tuner_focus" && type != "set_tuner_visibility") return false;
-  if (type == "tuner_focus" || type == "set_tuner_visibility") return true;
+  if (type == "tuner_focus" || type == "set_tuner_visibility") {
+    const bool visible = type == "tuner_focus" || nativeBoolFromText(
+      nativeJsonExtractString(commandBody, "visible"), false);
+    nativeSetTunerColumnVisible(visible);
+    return true;
+  }
   { std::lock_guard<std::mutex> lock(g_nativeMutex); if (g_nativeTunerCommandQueue.size() > 100) g_nativeTunerCommandQueue.pop_front(); g_nativeTunerCommandQueue.push_back(commandBody); }
   g_nativeForceSnapshotBuild.store(true);
   g_nativeForceStateBuild.store(true);
@@ -6304,6 +6326,15 @@ static std::string nativeSongToJson(const NativeSongWindow& item, int index)
   oss << "\"tunerValue\":" << item.tunerValue << ",";
   oss << "\"tunerAvailable\":" << (!item.isBlock && !item.isHashParent ? "true" : "false") << ",";
   oss << "\"tunerControllable\":" << (!item.isBlock && !item.isHashParent ? "true" : "false") << ",";
+  oss << "\"bpmValue\":" << (item.bpmAvailable
+    ? nativeNumber(item.bpmValue, 0) : std::string("null")) << ",";
+  oss << "\"bpmOriginal\":" << (item.bpmAvailable
+    ? nativeNumber(item.bpmOriginal, 0) : std::string("null")) << ",";
+  oss << "\"bpmAvailable\":" << (item.bpmAvailable ? "true" : "false") << ",";
+  oss << "\"bpmGeneric\":" << (item.bpmGeneric ? "true" : "false") << ",";
+  oss << "\"bpmControllable\":" <<
+    (item.bpmAvailable && !item.isBlock && !item.isHashParent
+      ? "true" : "false") << ",";
   oss << "\"blockColorKey\":" << nativeJsonString(item.blockColorKey) << ",";
   oss << "\"blockColorHex\":" << nativeJsonString(item.blockColorHex) << ",";
   oss << "\"bridgeBlockColorHex\":" << nativeJsonString(item.blockColorHex) << ",";
@@ -6327,6 +6358,127 @@ static std::string nativeGetProjExtStateString(ReaProject* project, const char* 
   const size_t n = buffer.find('\0');
   if (n != std::string::npos) buffer.resize(n);
   return buffer;
+}
+
+static std::map<std::string, NativeBpmScanResult>
+nativeLoadBpmScanCache(ReaProject* project)
+{
+  std::map<std::string, NativeBpmScanResult> cache;
+  if (!project) return cache;
+  const std::string packed = nativeGetProjExtStateString(
+    project, kBpmScanProjectSection, kBpmScanResultsKey);
+  for (const std::string& line : nativeSplit(packed, '\n')) {
+    if (line.empty()) continue;
+    const std::vector<std::string> fields = nativeSplit(line, '\t');
+    if (fields.size() < 8) continue;
+    NativeBpmScanResult result;
+    result.id = nativeUnescapeExtField(fields[0]);
+    result.name = nativeUnescapeExtField(fields[1]);
+    result.start = std::strtod(fields[2].c_str(), nullptr);
+    result.end = std::strtod(fields[3].c_str(), nullptr);
+    result.bpm = std::strtod(fields[4].c_str(), nullptr);
+    result.confidence = std::max(0, std::min(100,
+      std::atoi(fields[5].c_str())));
+    result.detectedPeaks = std::max(0, std::atoi(fields[6].c_str()));
+    result.error = nativeUnescapeExtField(fields[7]);
+    result.originalBpm = fields.size() >= 9
+      ? std::strtod(fields[8].c_str(), nullptr)
+      : result.bpm;
+    if (result.id.empty() || !std::isfinite(result.start) ||
+        !std::isfinite(result.end)) {
+      continue;
+    }
+    nativeEnsureGenericBpmFallback(result);
+    if (!std::isfinite(result.originalBpm) || result.originalBpm <= 0.0) {
+      result.originalBpm = result.bpm;
+    }
+    cache[result.id] = result;
+  }
+  return cache;
+}
+
+static const std::map<std::string, NativeBpmScanResult>&
+nativeBpmScanCacheForPaint(
+  ReaProject* project,
+  const std::string& projectPath)
+{
+  if (project != g_nativeBpmPaintCacheProject ||
+      projectPath != g_nativeBpmPaintCachePath) {
+    g_nativeBpmPaintCache = nativeLoadBpmScanCache(project);
+    g_nativeBpmPaintCacheProject = project;
+    g_nativeBpmPaintCachePath = projectPath;
+  }
+  return g_nativeBpmPaintCache;
+}
+
+static void nativeWriteBpmScanCache(
+  ReaProject* project,
+  const std::map<std::string, NativeBpmScanResult>& cache)
+{
+  if (!project || !SetProjExtState_ptr) return;
+  std::ostringstream packed;
+  bool first = true;
+  for (const auto& entry : cache) {
+    const NativeBpmScanResult& result = entry.second;
+    if (result.id.empty()) continue;
+    if (!first) packed << '\n';
+    first = false;
+    packed << nativeEscapeExtField(result.id) << '\t'
+      << nativeEscapeExtField(result.name) << '\t'
+      << std::setprecision(15) << result.start << '\t'
+      << std::setprecision(15) << result.end << '\t'
+      << std::setprecision(15) << result.bpm << '\t'
+      << result.confidence << '\t'
+      << result.detectedPeaks << '\t'
+      << nativeEscapeExtField(result.error) << '\t'
+      << std::setprecision(15) << result.originalBpm;
+  }
+  SetProjExtState_ptr(project, kBpmScanProjectSection,
+    kBpmScanResultsKey, packed.str().c_str());
+  // O próximo paint relê uma vez o novo mapa. Nunca consultamos um ExtState
+  // de até 1 MB em cada quadro da lista.
+  g_nativeBpmPaintCacheProject = nullptr;
+  g_nativeBpmPaintCachePath.clear();
+  g_nativeBpmPaintCache.clear();
+  if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+}
+
+static void nativeSaveBpmScanCacheResult(
+  ReaProject* project,
+  const NativeBpmScanResult& result)
+{
+  if (!project || result.id.empty()) return;
+  std::map<std::string, NativeBpmScanResult> cache =
+    nativeLoadBpmScanCache(project);
+  cache[result.id] = result;
+  nativeWriteBpmScanCache(project, cache);
+}
+
+static void nativePublishGenericBpmScanResults(
+  ReaProject* project,
+  const std::vector<NativeSongWindow>& songs,
+  const std::string& error)
+{
+  if (!project || songs.empty()) return;
+  std::map<std::string, NativeBpmScanResult> cache =
+    nativeLoadBpmScanCache(project);
+  for (const NativeSongWindow& song : songs) {
+    NativeBpmScanResult result;
+    result.id = song.id;
+    result.name = song.name;
+    result.start = song.start;
+    result.end = song.end;
+    result.error = error.empty() ? "bpm_nao_encontrado" : error;
+    nativeEnsureGenericBpmFallback(result);
+    cache[result.id] = result;
+    g_nativeBpmScanResults.push_back(result);
+  }
+  nativeWriteBpmScanCache(project, cache);
+  g_nativeBpmScanError = error;
+  g_nativeBpmScanRunning = false;
+  ++g_nativeBpmScanRevision;
+  g_nativeForceSnapshotBuild.store(true);
+  g_nativeForceStateBuild.store(true);
 }
 
 static std::string nativePackLiveExecutedItemsLocked()
@@ -7042,6 +7194,271 @@ static double nativeBpmNormalizeCandidate(double bpm)
   return bpm >= 40.0 && bpm <= 240.0 ? bpm : 0.0;
 }
 
+static bool nativeEstimateBpmFromOnsetAutocorrelation(
+  const std::vector<double>& onset,
+  double onsetRate,
+  double& bpmOut,
+  int& confidenceOut)
+{
+  bpmOut = 0.0;
+  confidenceOut = 0;
+  if (onsetRate <= 0.0 || onset.size() < 32) return false;
+
+  double maxOnset = 0.0;
+  std::vector<double> sortedOnset = onset;
+  for (double value : onset) maxOnset = std::max(maxOnset, value);
+  if (maxOnset <= 0.000000001) return false;
+  const size_t p95Index = std::min(
+    sortedOnset.size() - 1,
+    static_cast<size_t>(sortedOnset.size() * 0.95));
+  std::nth_element(sortedOnset.begin(),
+    sortedOnset.begin() + static_cast<long>(p95Index),
+    sortedOnset.end());
+  // Limitar os ataques muito fortes impede uma contagem ou uma virada isolada
+  // de valer mais do que dezenas de batidas regulares do click.
+  const double cap = std::max(maxOnset * 0.08,
+    sortedOnset[p95Index] * 3.0);
+  const size_t analysisFrames = std::min(onset.size(),
+    static_cast<size_t>(std::ceil(onsetRate * 240.0)));
+  std::vector<double> normalized(analysisFrames, 0.0);
+  double mean = 0.0;
+  for (size_t index = 0; index < analysisFrames; ++index) {
+    normalized[index] = std::sqrt(std::max(0.0,
+      std::min(onset[index], cap) / std::max(cap, 0.000000001)));
+    mean += normalized[index];
+  }
+  mean /= static_cast<double>(analysisFrames);
+
+  const int minLag = std::max(1, static_cast<int>(
+    std::floor(onsetRate * 60.0 / 210.0)));
+  const int maxLag = std::min(
+    static_cast<int>(analysisFrames) - 2,
+    static_cast<int>(std::ceil(onsetRate * 60.0 / 55.0)));
+  if (maxLag <= minLag) return false;
+  std::vector<double> scores(static_cast<size_t>(maxLag + 1), -1.0);
+  int bestLag = 0;
+  double bestScore = -1.0;
+  for (int lag = minLag; lag <= maxLag; ++lag) {
+    double cross = 0.0;
+    double leftEnergy = 0.0;
+    double rightEnergy = 0.0;
+    for (size_t index = static_cast<size_t>(lag);
+         index < analysisFrames; ++index) {
+      const double left = normalized[index] - mean;
+      const double right = normalized[index - static_cast<size_t>(lag)] - mean;
+      cross += left * right;
+      leftEnergy += left * left;
+      rightEnergy += right * right;
+    }
+    const double energy = std::sqrt(leftEnergy * rightEnergy);
+    const double score = energy > 0.000000001 ? cross / energy : -1.0;
+    scores[static_cast<size_t>(lag)] = score;
+    if (score > bestScore) {
+      bestScore = score;
+      bestLag = lag;
+    }
+  }
+  if (bestLag <= 0 || bestScore < 0.015) return false;
+
+  // Se a metade do atraso tem praticamente a mesma periodicidade, ela e a
+  // batida real e o atraso maior e apenas o meio-tempo do mesmo click.
+  for (int divisor = 2; divisor <= 3; ++divisor) {
+    const int fasterLag = static_cast<int>(std::lround(
+      static_cast<double>(bestLag) / divisor));
+    if (fasterLag < minLag || fasterLag > maxLag) continue;
+    const double fasterScore = scores[static_cast<size_t>(fasterLag)];
+    if (fasterScore >= bestScore * 0.88) {
+      bestLag = fasterLag;
+      bestScore = fasterScore;
+    }
+  }
+
+  double refinedLag = static_cast<double>(bestLag);
+  if (bestLag > minLag && bestLag < maxLag) {
+    const double left = scores[static_cast<size_t>(bestLag - 1)];
+    const double center = scores[static_cast<size_t>(bestLag)];
+    const double right = scores[static_cast<size_t>(bestLag + 1)];
+    const double denominator = left - 2.0 * center + right;
+    if (std::fabs(denominator) > 0.000000001) {
+      refinedLag += std::max(-0.5, std::min(0.5,
+        0.5 * (left - right) / denominator));
+    }
+  }
+  const double bpm = nativeBpmNormalizeCandidate(
+    60.0 * onsetRate / refinedLag);
+  if (bpm <= 0.0) return false;
+
+  double competingScore = -1.0;
+  for (int lag = minLag; lag <= maxLag; ++lag) {
+    if (std::abs(lag - bestLag) <= 4) continue;
+    competingScore = std::max(competingScore,
+      scores[static_cast<size_t>(lag)]);
+  }
+  const double separation = std::max(0.0,
+    bestScore - std::max(0.0, competingScore));
+  bpmOut = std::round(bpm);
+  confidenceOut = std::max(1, std::min(100,
+    static_cast<int>(std::lround(100.0 *
+      (0.82 * std::max(0.0, bestScore) +
+       0.18 * std::min(1.0, separation * 4.0))))));
+  return true;
+}
+
+static bool nativeEstimateStableBpmFromPeaks(
+  const std::vector<size_t>& peaks,
+  double peakRate,
+  double& bpmOut,
+  int& confidenceOut,
+  bool& tempoVariableOut)
+{
+  bpmOut = 0.0;
+  confidenceOut = 0;
+  tempoVariableOut = false;
+  if (peakRate <= 0.0 || peaks.size() < 4) return false;
+
+  struct TimedInterval {
+    double seconds = 0.0;
+    double midpointFrame = 0.0;
+  };
+  std::vector<TimedInterval> intervals;
+  intervals.reserve(peaks.size() - 1);
+  for (size_t index = 1; index < peaks.size(); ++index) {
+    const double frames = static_cast<double>(
+      peaks[index] - peaks[index - 1]);
+    const double seconds = frames / peakRate;
+    if (seconds < 0.16 || seconds > 2.5) continue;
+    intervals.push_back({seconds,
+      (static_cast<double>(peaks[index]) +
+       static_cast<double>(peaks[index - 1])) * 0.5});
+  }
+  if (intervals.size() < 3) return false;
+
+  auto robustIntervalMean = [](
+      const std::vector<double>& values,
+      double& meanOut,
+      double& inlierRatioOut) -> bool {
+    meanOut = 0.0;
+    inlierRatioOut = 0.0;
+    if (values.size() < 3) return false;
+    std::vector<double> sorted = values;
+    std::sort(sorted.begin(), sorted.end());
+    const double median = sorted[sorted.size() / 2];
+    if (!std::isfinite(median) || median <= 0.0) return false;
+    const double minimum = median * 0.78;
+    const double maximum = median * 1.22;
+    double sum = 0.0;
+    size_t count = 0;
+    for (double value : values) {
+      if (value < minimum || value > maximum) continue;
+      sum += value;
+      ++count;
+    }
+    if (count < 3) return false;
+    meanOut = sum / static_cast<double>(count);
+    inlierRatioOut = static_cast<double>(count) /
+      static_cast<double>(values.size());
+    return std::isfinite(meanOut) && meanOut > 0.0;
+  };
+
+  // Mede o tempo em janelas curtas e sobrepostas. Usar somente percentis de
+  // janelas de 16 s deixava uma seção curta em outro andamento desaparecer
+  // quando o BPM principal ocupava a maior parte da música.
+  const double windowFrames = peakRate * 8.0;
+  const double windowStepFrames = peakRate * 4.0;
+  const double firstFrame = static_cast<double>(peaks.front());
+  const double lastFrame = static_cast<double>(peaks.back());
+  std::vector<double> windowBpms;
+  for (double windowStart = firstFrame;
+       windowStart < lastFrame;
+       windowStart += windowStepFrames) {
+    const double windowEnd = windowStart + windowFrames;
+    std::vector<double> localIntervals;
+    for (const TimedInterval& interval : intervals) {
+      if (interval.midpointFrame >= windowStart &&
+          interval.midpointFrame < windowEnd) {
+        localIntervals.push_back(interval.seconds);
+      }
+    }
+    if (localIntervals.size() < 4) continue;
+    double localMean = 0.0;
+    double localInlierRatio = 0.0;
+    if (!robustIntervalMean(localIntervals,
+          localMean, localInlierRatio) ||
+        localInlierRatio < 0.62) {
+      continue;
+    }
+    const double localBpm = nativeBpmNormalizeCandidate(
+      60.0 / localMean);
+    if (localBpm > 0.0) windowBpms.push_back(localBpm);
+  }
+
+  double windowSpread = 0.0;
+  if (windowBpms.size() >= 3) {
+    std::vector<double> sortedWindowBpms = windowBpms;
+    std::sort(sortedWindowBpms.begin(), sortedWindowBpms.end());
+    const size_t lowIndex = static_cast<size_t>(std::floor(
+      static_cast<double>(sortedWindowBpms.size() - 1) * 0.20));
+    const size_t highIndex = static_cast<size_t>(std::ceil(
+      static_cast<double>(sortedWindowBpms.size() - 1) * 0.80));
+    const double windowMedian =
+      sortedWindowBpms[sortedWindowBpms.size() / 2];
+    windowSpread =
+      sortedWindowBpms[highIndex] - sortedWindowBpms[lowIndex];
+    const double variableThreshold = std::max(
+      2.0, windowMedian * 0.015);
+
+    // Duas janelas sobrepostas equivalem a uma alteração sustentada por
+    // aproximadamente 8 segundos. Uma única janela divergente é ignorada
+    // como virada/contagem; duas ou mais já caracterizam outro andamento,
+    // mesmo que todas as demais janelas pertençam ao BPM principal.
+    int divergentWindows = 0;
+    int consecutiveDivergent = 0;
+    int maximumConsecutiveDivergent = 0;
+    for (double localBpm : windowBpms) {
+      if (std::fabs(localBpm - windowMedian) > variableThreshold) {
+        ++divergentWindows;
+        maximumConsecutiveDivergent = std::max(
+          maximumConsecutiveDivergent, ++consecutiveDivergent);
+      } else {
+        consecutiveDivergent = 0;
+      }
+    }
+    if (maximumConsecutiveDivergent >= 2 ||
+        divergentWindows >= 3) {
+      tempoVariableOut = true;
+      return false;
+    }
+  }
+
+  std::vector<double> allIntervals;
+  allIntervals.reserve(intervals.size());
+  for (const TimedInterval& interval : intervals) {
+    allIntervals.push_back(interval.seconds);
+  }
+  double stableMean = 0.0;
+  double stableRatio = 0.0;
+  if (!robustIntervalMean(
+        allIntervals, stableMean, stableRatio) ||
+      stableRatio < 0.55) {
+    return false;
+  }
+  const double bpm = nativeBpmNormalizeCandidate(60.0 / stableMean);
+  if (bpm <= 0.0) return false;
+
+  const double consistency = windowBpms.size() < 4
+    ? 0.65
+    : std::max(0.0, std::min(1.0,
+        1.0 - windowSpread / std::max(2.0, bpm * 0.015)));
+  const double countScore = std::min(1.0,
+    static_cast<double>(intervals.size()) / 64.0);
+  bpmOut = std::round(bpm);
+  confidenceOut = std::max(1, std::min(100,
+    static_cast<int>(std::lround(100.0 *
+      (0.50 * stableRatio + 0.30 * consistency +
+       0.20 * countScore)))));
+  return true;
+}
+
 static NativeBpmScanResult nativeAnalyzeClickRegion(
   AudioAccessor* accessor,
   const NativeSongWindow& region)
@@ -7049,12 +7466,17 @@ static NativeBpmScanResult nativeAnalyzeClickRegion(
   NativeBpmScanResult result;
   result.id = region.id;
   result.name = region.name;
+  result.start = region.start;
+  result.end = region.end;
   if (!accessor || !GetAudioAccessorSamples_ptr) {
     result.error = "audio_accessor_indisponivel";
     return result;
   }
 
-  constexpr int sampleRate = 2000;
+  // 2 kHz eliminava grande parte do espectro de clicks agudos durante o
+  // resample do accessor. 12 kHz preserva o ataque sem carregar o áudio na
+  // resolução integral de 44.1/48 kHz.
+  constexpr int sampleRate = 12000;
   constexpr int chunkSamples = 32768;
   constexpr double maxAnalysisSeconds = 600.0;
   const double duration = std::min(
@@ -7100,7 +7522,7 @@ static NativeBpmScanResult nativeAnalyzeClickRegion(
 
   // Envelope de 5 ms: mantém o ataque curto do click e reduz drasticamente
   // a quantidade de pontos usados pela detecção de transientes.
-  constexpr int envelopeWindowSamples = 10;
+  constexpr int envelopeWindowSamples = 60;
   std::vector<double> envelope;
   envelope.reserve(
     (totalSamples + envelopeWindowSamples - 1) /
@@ -7124,31 +7546,59 @@ static NativeBpmScanResult nativeAnalyzeClickRegion(
     return result;
   }
 
-  std::vector<double> sortedEnvelope = envelope;
-  const size_t p90Index = std::min(
-    sortedEnvelope.size() - 1,
-    static_cast<size_t>(sortedEnvelope.size() * 0.90));
-  std::nth_element(
-    sortedEnvelope.begin(),
-    sortedEnvelope.begin() + static_cast<long>(p90Index),
-    sortedEnvelope.end());
-  const double p90 = sortedEnvelope[p90Index];
-  const double threshold = std::min(
-    maxAmplitude * 0.45,
-    std::max(maxAmplitude * 0.06, p90 * 2.5));
-
   constexpr double envelopeRate =
     static_cast<double>(sampleRate) / envelopeWindowSamples;
+  // Mede a subida em relação aos 100 ms anteriores, em vez de exigir que o
+  // click seja uma porcentagem fixa do maior pico da música. Isso mantém o
+  // click detectável em arquivos CLICK BASE e diante de uma contagem forte.
+  constexpr size_t baselineFrames = 20;
+  std::vector<double> onset(envelope.size(), 0.0);
+  double baselineSum = 0.0;
+  double maxOnset = 0.0;
+  for (size_t index = 0; index < envelope.size(); ++index) {
+    const size_t baselineCount = std::min(index, baselineFrames);
+    const double baseline = baselineCount > 0
+      ? baselineSum / static_cast<double>(baselineCount)
+      : envelope[index];
+    onset[index] = std::max(0.0, envelope[index] - baseline);
+    maxOnset = std::max(maxOnset, onset[index]);
+    baselineSum += envelope[index];
+    if (index >= baselineFrames) {
+      baselineSum -= envelope[index - baselineFrames];
+    }
+  }
+  if (maxOnset <= 0.000000001) {
+    result.error = "audio_sem_picos";
+    return result;
+  }
+  std::vector<double> sortedOnset = onset;
+  const size_t p90Index = std::min(
+    sortedOnset.size() - 1,
+    static_cast<size_t>(sortedOnset.size() * 0.90));
+  const size_t p98Index = std::min(
+    sortedOnset.size() - 1,
+    static_cast<size_t>(sortedOnset.size() * 0.98));
+  std::nth_element(sortedOnset.begin(),
+    sortedOnset.begin() + static_cast<long>(p90Index),
+    sortedOnset.end());
+  const double p90 = sortedOnset[p90Index];
+  std::nth_element(sortedOnset.begin(),
+    sortedOnset.begin() + static_cast<long>(p98Index),
+    sortedOnset.end());
+  const double p98 = sortedOnset[p98Index];
+  const double threshold = std::max(maxOnset * 0.003,
+    std::min(maxOnset * 0.25, p90 + (p98 - p90) * 0.20));
+
   const size_t refractoryFrames = static_cast<size_t>(
     std::ceil(0.075 * envelopeRate));
   std::vector<size_t> peaks;
   std::vector<double> peakStrengths;
-  for (size_t index = 2; index + 2 < envelope.size(); ++index) {
-    const double value = envelope[index];
-    if (value < threshold || value < envelope[index - 1] ||
-        value < envelope[index + 1] ||
-        value < envelope[index - 2] ||
-        value < envelope[index + 2]) {
+  for (size_t index = 2; index + 2 < onset.size(); ++index) {
+    const double value = onset[index];
+    if (value < threshold || value < onset[index - 1] ||
+        value < onset[index + 1] ||
+        value < onset[index - 2] ||
+        value < onset[index + 2]) {
       continue;
     }
     if (!peaks.empty() && index - peaks.back() < refractoryFrames) {
@@ -7162,7 +7612,25 @@ static NativeBpmScanResult nativeAnalyzeClickRegion(
     peakStrengths.push_back(value);
   }
   result.detectedPeaks = static_cast<int>(peaks.size());
+  bool tempoVariable = false;
+  if (nativeEstimateStableBpmFromPeaks(
+        peaks, envelopeRate, result.bpm,
+        result.confidence, tempoVariable)) {
+    return result;
+  }
+  if (tempoVariable) {
+    // Não existe um BPM único correto. Mantém o aviso, mas fornece um ponto
+    // de partida editável para a coluna BPM e para os controles +/-.
+    result.bpm = 120.0;
+    result.confidence = 0;
+    result.error = "alteracao_bpm_nao_encontrada";
+    return result;
+  }
   if (peaks.size() < 4) {
+    if (nativeEstimateBpmFromOnsetAutocorrelation(
+          onset, envelopeRate, result.bpm, result.confidence)) {
+      return result;
+    }
     result.error = "picos_insuficientes";
     return result;
   }
@@ -7181,6 +7649,10 @@ static NativeBpmScanResult nativeAnalyzeClickRegion(
     ++histogram[static_cast<int>(std::lround(candidate * 2.0))];
   }
   if (candidates.size() < 3 || histogram.empty()) {
+    if (nativeEstimateBpmFromOnsetAutocorrelation(
+          onset, envelopeRate, result.bpm, result.confidence)) {
+      return result;
+    }
     result.error = "ritmo_insuficiente";
     return result;
   }
@@ -7208,6 +7680,10 @@ static NativeBpmScanResult nativeAnalyzeClickRegion(
     }
   }
   if (inliers.size() < 3) {
+    if (nativeEstimateBpmFromOnsetAutocorrelation(
+          onset, envelopeRate, result.bpm, result.confidence)) {
+      return result;
+    }
     result.error = "ritmo_inconsistente";
     return result;
   }
@@ -7232,9 +7708,9 @@ static NativeBpmScanResult nativeAnalyzeClickRegion(
   const double countScore = std::min(1.0,
     static_cast<double>(candidates.size()) / 16.0);
   const double prominence = std::max(0.0, std::min(1.0,
-    (maxAmplitude - threshold) / std::max(0.000001, maxAmplitude)));
+    (maxOnset - threshold) / std::max(0.000001, maxOnset)));
 
-  result.bpm = std::round(bpm * 10.0) / 10.0;
+  result.bpm = std::round(bpm);
   result.confidence = std::max(1, std::min(100,
     static_cast<int>(std::lround(100.0 *
       (0.55 * inlierRatio + 0.25 * consistency +
@@ -7253,8 +7729,10 @@ static bool nativeApplyBpmScanCommand(const std::string& commandBody)
 
   nativeDestroyBpmScanAccessor();
   g_nativeBpmScanResults.clear();
+  g_nativeBpmScanResultProject = nullptr;
   g_nativeBpmScanError.clear();
   g_nativeBpmScanTotal = 0;
+  g_nativeBpmReplaceAllTempoMarkersOnApply = false;
   g_nativeBpmScanRequestId = nativeJsonExtractString(
     commandBody, "scanRequestId");
   ++g_nativeBpmScanRevision;
@@ -7268,6 +7746,10 @@ static bool nativeApplyBpmScanCommand(const std::string& commandBody)
     g_nativeForceStateBuild.store(true);
     return true;
   }
+  g_nativeBpmScanResultProject = project;
+  const bool forceRescan =
+    commandBody.find("\"forceRescan\":true") != std::string::npos;
+  g_nativeBpmReplaceAllTempoMarkersOnApply = forceRescan;
 
   const std::vector<std::string> rawIds = nativeSplit(
     nativeJsonExtractString(commandBody, "regionIds"), '|');
@@ -7282,38 +7764,65 @@ static bool nativeApplyBpmScanCommand(const std::string& commandBody)
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     songs = g_nativeSongWindows;
   }
+  std::vector<NativeSongWindow> selectedSongs;
   for (const NativeSongWindow& song : songs) {
-    if (song.isBlock || song.isHashParent || song.isHashChild ||
-        song.isRegionChild || song.end <= song.start + 0.0005) {
+    // Região filha segue exatamente a mesma análise de uma região solta.
+    // Somente o pai fica fora: cada filha receberá seu marcador próprio.
+    if (song.isBlock || song.isHashParent ||
+        song.end <= song.start + 0.0005) {
       continue;
     }
     if (requestedIds.find(song.id) == requestedIds.end()) continue;
-    g_nativeBpmScanJob.regions.push_back(song);
+    selectedSongs.push_back(song);
   }
-  if (g_nativeBpmScanJob.regions.empty()) {
+  if (selectedSongs.empty()) {
     g_nativeBpmScanError = "nenhuma_regiao_selecionada";
     g_nativeForceStateBuild.store(true);
     return true;
   }
-  g_nativeBpmScanTotal = g_nativeBpmScanJob.regions.size();
+  g_nativeBpmScanTotal = selectedSongs.size();
+
+  const std::map<std::string, NativeBpmScanResult> cache =
+    nativeLoadBpmScanCache(project);
+  for (const NativeSongWindow& song : selectedSongs) {
+    const auto cached = cache.find(song.id);
+    const bool sameSong = cached != cache.end();
+    if (!forceRescan && sameSong) {
+      NativeBpmScanResult result = cached->second;
+      // A posição e o nome vêm sempre da região atual. O valor analisado é
+      // reaproveitado mesmo quando a região foi movida no projeto.
+      result.name = song.name;
+      result.start = song.start;
+      result.end = song.end;
+      g_nativeBpmScanResults.push_back(result);
+    } else {
+      g_nativeBpmScanJob.regions.push_back(song);
+    }
+  }
+  if (g_nativeBpmScanJob.regions.empty()) {
+    g_nativeBpmScanRunning = false;
+    ++g_nativeBpmScanRevision;
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
 
   MediaTrack* clickTrack = nativeFindTrackByExactName(project, "CLICK");
   if (!clickTrack) {
-    g_nativeBpmScanError = "pista_click_nao_encontrada";
-    g_nativeForceStateBuild.store(true);
+    nativePublishGenericBpmScanResults(project,
+      g_nativeBpmScanJob.regions, "pista_click_nao_encontrada");
     return true;
   }
   if (!CreateTrackAudioAccessor_ptr || !DestroyAudioAccessor_ptr ||
       !GetAudioAccessorSamples_ptr) {
-    g_nativeBpmScanError = "audio_accessor_indisponivel";
-    g_nativeForceStateBuild.store(true);
+    nativePublishGenericBpmScanResults(project,
+      g_nativeBpmScanJob.regions, "audio_accessor_indisponivel");
     return true;
   }
 
   AudioAccessor* accessor = CreateTrackAudioAccessor_ptr(clickTrack);
   if (!accessor) {
-    g_nativeBpmScanError = "falha_abrir_pista_click";
-    g_nativeForceStateBuild.store(true);
+    nativePublishGenericBpmScanResults(project,
+      g_nativeBpmScanJob.regions, "falha_abrir_pista_click");
     return true;
   }
   g_nativeBpmScanJob.project = project;
@@ -7350,8 +7859,22 @@ static void nativeProcessBpmScanJobOnMainThread()
 
   const NativeSongWindow region =
     g_nativeBpmScanJob.regions[g_nativeBpmScanJob.nextIndex];
-  g_nativeBpmScanResults.push_back(
-    nativeAnalyzeClickRegion(g_nativeBpmScanJob.accessor, region));
+  NativeBpmScanResult result =
+    nativeAnalyzeClickRegion(g_nativeBpmScanJob.accessor, region);
+  nativeEnsureGenericBpmFallback(result);
+  if (nativeBpmScanResultHasUsableValue(result)) {
+    result.originalBpm = std::round(result.bpm);
+  }
+  auto existing = std::find_if(g_nativeBpmScanResults.begin(),
+    g_nativeBpmScanResults.end(), [&](const NativeBpmScanResult& item) {
+      return item.id == result.id;
+    });
+  if (existing == g_nativeBpmScanResults.end()) {
+    g_nativeBpmScanResults.push_back(result);
+  } else {
+    *existing = result;
+  }
+  nativeSaveBpmScanCacheResult(project, result);
   ++g_nativeBpmScanJob.nextIndex;
   ++g_nativeBpmScanRevision;
   if (g_nativeBpmScanJob.nextIndex >=
@@ -7360,6 +7883,101 @@ static void nativeProcessBpmScanJobOnMainThread()
     nativeDestroyBpmScanAccessor();
   }
   g_nativeForceStateBuild.store(true);
+}
+
+using NativeTempoMarkerBpmValues =
+  std::vector<std::pair<double, double>>;
+
+// Ao editar um ponto de tempo diretamente na régua, o REAPER pode
+// normalizar sua posição com uma pequena diferença de ponto flutuante. A
+// associação da música não pode desaparecer por causa desses poucos ms.
+static constexpr double kNativeBpmTempoMarkerMatchToleranceSec = 0.050;
+
+static NativeTempoMarkerBpmValues nativeCollectTempoMarkerBpmValues(
+  ReaProject* project)
+{
+  NativeTempoMarkerBpmValues values;
+  if (!project || !CountTempoTimeSigMarkers_ptr ||
+      !GetTempoTimeSigMarker_ptr) {
+    return values;
+  }
+  const int count = CountTempoTimeSigMarkers_ptr(project);
+  values.reserve(static_cast<size_t>(std::max(0, count)));
+  for (int index = 0; index < count; ++index) {
+    double position = 0.0;
+    double beatPosition = 0.0;
+    double bpm = 0.0;
+    int measurePosition = 0;
+    int numerator = 0;
+    int denominator = 0;
+    bool linearTempo = false;
+    if (!GetTempoTimeSigMarker_ptr(project, index, &position,
+          &measurePosition, &beatPosition, &bpm, &numerator,
+          &denominator, &linearTempo) ||
+        !std::isfinite(position) || !std::isfinite(bpm) || bpm <= 0.0) {
+      continue;
+    }
+    values.emplace_back(position, bpm);
+  }
+  return values;
+}
+
+static uint64_t nativeTempoMarkerBpmValuesSignature(
+  const NativeTempoMarkerBpmValues& values)
+{
+  uint64_t hash = 1469598103934665603ull;
+  const auto mixDouble = [&](double value) {
+    uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value),
+      "double e uint64_t precisam ter o mesmo tamanho");
+    std::memcpy(&bits, &value, sizeof(bits));
+    hash ^= bits;
+    hash *= 1099511628211ull;
+  };
+  hash ^= static_cast<uint64_t>(values.size());
+  hash *= 1099511628211ull;
+  for (const auto& value : values) {
+    mixDouble(value.first);
+    mixDouble(value.second);
+  }
+  return hash;
+}
+
+static bool nativeTempoMarkerBpmAtOrBeforePosition(
+  const NativeTempoMarkerBpmValues& values,
+  double position,
+  double& bpmOut,
+  double* markerPositionOut = nullptr)
+{
+  if (!std::isfinite(position)) return false;
+  double nearestPosition = -std::numeric_limits<double>::infinity();
+  bool found = false;
+  for (const auto& value : values) {
+    // Nunca herda um ponto que já esteja dentro da região. A margem de meio
+    // milissegundo cobre apenas a normalização numérica do próprio início.
+    if (value.first > position + 0.0005 ||
+        value.first < nearestPosition) {
+      continue;
+    }
+    nearestPosition = value.first;
+    bpmOut = value.second;
+    found = true;
+  }
+  if (found && markerPositionOut) {
+    *markerPositionOut = nearestPosition;
+  }
+  return found;
+}
+
+static bool nativeTempoMarkerBpmAtOrBeforePosition(
+  ReaProject* project,
+  double position,
+  double& bpmOut,
+  double* markerPositionOut = nullptr)
+{
+  return nativeTempoMarkerBpmAtOrBeforePosition(
+    nativeCollectTempoMarkerBpmValues(project), position, bpmOut,
+    markerPositionOut);
 }
 
 static std::vector<NativeSongWindow> nativeUiBpmScanEligibleSongs()
@@ -7371,10 +7989,71 @@ static std::vector<NativeSongWindow> nativeUiBpmScanEligibleSongs()
   }
   songs.erase(std::remove_if(songs.begin(), songs.end(),
     [](const NativeSongWindow& song) {
-      return song.isBlock || song.isHashParent || song.isHashChild ||
-        song.isRegionChild || song.end <= song.start + 0.0005;
+      return song.isBlock || song.isHashParent ||
+        song.end <= song.start + 0.0005;
     }), songs.end());
   return songs;
+}
+
+static bool nativeUiFindBpmScanSong(
+  const std::string& id,
+  NativeSongWindow& songOut)
+{
+  if (id.empty()) return false;
+  for (const NativeSongWindow& song :
+       nativeUiBpmScanEligibleSongs()) {
+    if (song.id != id) continue;
+    songOut = song;
+    return true;
+  }
+  return false;
+}
+
+static bool nativeUiSelectBpmScanResult(const std::string& id)
+{
+  NativeSongWindow song;
+  if (!nativeUiFindBpmScanSong(id, song)) return false;
+  g_nativeUiBpmScanSelectedId = song.id;
+  std::ostringstream command;
+  command << "{\"type\":\"select_region\",\"targetId\":"
+          << nativeJsonString(song.id)
+          << ",\"songId\":" << nativeJsonString(song.id)
+          << ",\"startPos\":" << std::setprecision(15) << song.start
+          << ",\"endPos\":" << std::setprecision(15) << song.end
+          << ",\"activeTab\":\"regions\",\"page\":\"regions\"}";
+  return nativeApplySelectionCommand(command.str());
+}
+
+static bool nativeUiToggleBpmScanPreviewPlayback()
+{
+  NativeSongWindow song;
+  if (!nativeUiFindBpmScanSong(
+        g_nativeUiBpmScanSelectedId, song)) {
+    nativeUiShowTemporaryPopup(
+      "SELECIONE UMA MÚSICA NO RESULTADO", 1.6);
+    return true;
+  }
+
+  const bool transportActive = nativeUiTransportActive();
+  if (!nativePlayProtectionShouldAllow(
+        transportActive ? "stop" : "play")) {
+    return true;
+  }
+
+  // Remove qualquer fila anterior antes da audição e mantém o bloqueio ativo
+  // enquanto esse transporte estiver rodando. O estado do Auto não é alterado.
+  nativeApplyQueueCommand("{\"type\":\"clear_queue\"}");
+  g_nativeBpmScanPreviewPlaybackActive = true;
+  std::ostringstream command;
+  command << "{\"type\":\""
+          << (transportActive ? "stop" : "play_start") << "\""
+          << ",\"targetId\":" << nativeJsonString(song.id)
+          << ",\"songId\":" << nativeJsonString(song.id)
+          << ",\"startPos\":" << std::setprecision(15) << song.start
+          << ",\"endPos\":" << std::setprecision(15) << song.end
+          << ",\"activeTab\":\"regions\",\"page\":\"regions\""
+          << ",\"suppressAutoQueue\":true}";
+  return nativeApplyTransportCommand(command.str());
 }
 
 static std::string nativeUiBpmScanErrorText(const std::string& error)
@@ -7392,17 +8071,100 @@ static std::string nativeUiBpmScanErrorText(const std::string& error)
   if (error == "picos_insuficientes") return "POUCOS PICOS ENCONTRADOS";
   if (error == "ritmo_insuficiente") return "RITMO INSUFICIENTE";
   if (error == "ritmo_inconsistente") return "RITMO INCONSISTENTE";
+  if (error == "alteracao_bpm_nao_encontrada") {
+    return "TEMPO VARIÁVEL, NÃO ENCONTRADO";
+  }
   return error;
 }
 
-static void nativeUiOpenBpmScan()
+static std::vector<NativeBpmScanResult>
+nativeUiLoadScannedBpmResults(ReaProject* project)
+{
+  std::vector<NativeBpmScanResult> results;
+  if (!project) return results;
+  const std::map<std::string, NativeBpmScanResult> cache =
+    nativeLoadBpmScanCache(project);
+  const NativeTempoMarkerBpmValues tempoMarkers =
+    nativeCollectTempoMarkerBpmValues(project);
+  for (const NativeSongWindow& song : nativeUiBpmScanEligibleSongs()) {
+    const auto found = cache.find(song.id);
+    NativeBpmScanResult result;
+    const bool cached = found != cache.end();
+    if (cached) result = found->second;
+    result.name = song.name;
+    result.id = song.id;
+    result.start = song.start;
+    result.end = song.end;
+    double markerBpm = 0.0;
+    const bool markerFound =
+      nativeTempoMarkerBpmAtOrBeforePosition(
+        tempoMarkers, song.start, markerBpm);
+    if (!cached && !markerFound) continue;
+    if (markerFound) {
+      result.bpm = std::round(markerBpm);
+      if (!cached) {
+        // Um marcador existente é uma leitura exata do projeto, não um
+        // fallback genérico. Ele entra em SCANEADAS com confiança total.
+        result.originalBpm = result.bpm;
+        result.confidence = 100;
+        result.detectedPeaks = 0;
+        result.error.clear();
+      }
+    }
+    results.push_back(result);
+  }
+  return results;
+}
+
+static void nativeUiRefreshScannedBpmAvailability()
+{
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  g_nativeUiBpmScannedAvailable =
+    !nativeUiLoadScannedBpmResults(project).empty();
+}
+
+static bool nativeUiOpenScannedBpmResults()
+{
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  std::vector<NativeBpmScanResult> results =
+    nativeUiLoadScannedBpmResults(project);
+  g_nativeUiBpmScannedAvailable = !results.empty();
+  if (results.empty()) {
+    nativeUiShowTemporaryPopup(
+      "NENHUMA MÚSICA ESCANEADA AINDA", 1.8);
+    return false;
+  }
+
+  g_nativeBpmScanRunning = false;
+  nativeDestroyBpmScanAccessor();
+  g_nativeBpmReplaceAllTempoMarkersOnApply = false;
+  g_nativeBpmScanResults = std::move(results);
+  g_nativeBpmScanResultProject = project;
+  g_nativeBpmScanError.clear();
+  g_nativeBpmScanTotal = g_nativeBpmScanResults.size();
+  g_nativeUiBpmScanSelectedId.clear();
+  g_nativeUiBpmScanScroll = 0;
+  g_nativeMainModalKind = NativeMainModalKind::BpmScanResults;
+  return true;
+}
+
+static void nativeUiOpenBpmScan(bool forceRescan = false)
 {
   g_nativeBpmScanRunning = false;
   nativeDestroyBpmScanAccessor();
   g_nativeBpmScanResults.clear();
+  g_nativeBpmScanResultProject = nullptr;
   g_nativeBpmScanError.clear();
   g_nativeBpmScanTotal = 0;
   g_nativeUiBpmScanSelection.clear();
+  g_nativeUiBpmScanSelectedId.clear();
+  g_nativeUiBpmScanForceRescan = forceRescan;
+  g_nativeBpmReplaceAllTempoMarkersOnApply = false;
+  nativeUiRefreshScannedBpmAvailability();
   g_nativeUiBpmScanScroll = 0;
   g_nativeMainModalKind = NativeMainModalKind::BpmScanSelect;
 }
@@ -7423,7 +8185,7 @@ static bool nativeUiStartBpmScan()
     ids << song.id;
   }
   if (first) {
-    nativeUiShowTemporaryPopup("NENHUMA REGIÃO SOLTA DISPONÍVEL", 1.5);
+    nativeUiShowTemporaryPopup("NENHUMA REGIÃO DISPONÍVEL", 1.5);
     return false;
   }
   std::ostringstream command;
@@ -7432,10 +8194,574 @@ static bool nativeUiStartBpmScan()
           << nativeJsonString(std::to_string(
                std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now().time_since_epoch()).count()))
+          << ",\"forceRescan\":"
+          << (g_nativeUiBpmScanForceRescan ? "true" : "false")
           << "}";
   nativeApplyBpmScanCommand(command.str());
+  g_nativeUiBpmScanForceRescan = false;
   g_nativeUiBpmScanScroll = 0;
   g_nativeMainModalKind = NativeMainModalKind::BpmScanResults;
+  return true;
+}
+
+static int nativeFindTempoMarkerAtPosition(
+  ReaProject* project,
+  double position)
+{
+  if (!project || !CountTempoTimeSigMarkers_ptr ||
+      !GetTempoTimeSigMarker_ptr) {
+    return -1;
+  }
+  const int count = CountTempoTimeSigMarkers_ptr(project);
+  int nearestIndex = -1;
+  double nearestDistance =
+    kNativeBpmTempoMarkerMatchToleranceSec + 1.0;
+  for (int index = 0; index < count; ++index) {
+    double markerPosition = 0.0;
+    double beatPosition = 0.0;
+    double bpm = 0.0;
+    int measurePosition = 0;
+    int numerator = 0;
+    int denominator = 0;
+    bool linearTempo = false;
+    if (!GetTempoTimeSigMarker_ptr(project, index, &markerPosition,
+          &measurePosition, &beatPosition, &bpm, &numerator,
+          &denominator, &linearTempo)) {
+      continue;
+    }
+    const double distance = std::fabs(markerPosition - position);
+    if (distance <= kNativeBpmTempoMarkerMatchToleranceSec &&
+        distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = index;
+    }
+  }
+  return nearestIndex;
+}
+
+static int nativeFindTempoMarkerAtOrBeforePosition(
+  ReaProject* project,
+  double position)
+{
+  if (!project || !CountTempoTimeSigMarkers_ptr ||
+      !GetTempoTimeSigMarker_ptr || !std::isfinite(position)) {
+    return -1;
+  }
+  const int count = CountTempoTimeSigMarkers_ptr(project);
+  int nearestIndex = -1;
+  double nearestPosition = -std::numeric_limits<double>::infinity();
+  for (int index = 0; index < count; ++index) {
+    double markerPosition = 0.0;
+    double beatPosition = 0.0;
+    double bpm = 0.0;
+    int measurePosition = 0;
+    int numerator = 0;
+    int denominator = 0;
+    bool linearTempo = false;
+    if (!GetTempoTimeSigMarker_ptr(project, index, &markerPosition,
+          &measurePosition, &beatPosition, &bpm, &numerator,
+          &denominator, &linearTempo)) {
+      continue;
+    }
+    if (markerPosition <= position + 0.0005 &&
+        markerPosition >= nearestPosition) {
+      nearestPosition = markerPosition;
+      nearestIndex = index;
+    }
+  }
+  return nearestIndex;
+}
+
+static bool nativeUpdateTempoMarkerBpmByIndex(
+  ReaProject* project,
+  int markerIndex,
+  double bpm)
+{
+  if (!project || markerIndex < 0 || !GetTempoTimeSigMarker_ptr ||
+      !SetTempoTimeSigMarker_ptr || !std::isfinite(bpm) || bpm <= 0.0) {
+    return false;
+  }
+  double markerPosition = 0.0;
+  double beatPosition = 0.0;
+  double oldBpm = 0.0;
+  int measurePosition = 0;
+  int numerator = 0;
+  int denominator = 0;
+  bool linearTempo = false;
+  if (!GetTempoTimeSigMarker_ptr(project, markerIndex,
+        &markerPosition, &measurePosition, &beatPosition, &oldBpm,
+        &numerator, &denominator, &linearTempo)) {
+    return false;
+  }
+  return SetTempoTimeSigMarker_ptr(project, markerIndex,
+    markerPosition, -1, -1.0, bpm, numerator, denominator,
+    linearTempo);
+}
+
+static bool nativeSetTempoMarkerAtPosition(
+  ReaProject* project,
+  double position,
+  double bpm)
+{
+  if (!project || !SetTempoTimeSigMarker_ptr ||
+      !std::isfinite(position) || !std::isfinite(bpm) || bpm <= 0.0) {
+    return false;
+  }
+  const int existingIndex = nativeFindTempoMarkerAtPosition(
+    project, position);
+  if (existingIndex < 0) {
+    return SetTempoTimeSigMarker_ptr(project, -1, position,
+      -1, -1.0, bpm, 0, 0, false);
+  }
+
+  double oldPosition = position;
+  double oldBeatPosition = 0.0;
+  double oldBpm = bpm;
+  int oldMeasurePosition = -1;
+  int numerator = 0;
+  int denominator = 0;
+  bool linearTempo = false;
+  if (!GetTempoTimeSigMarker_ptr(project, existingIndex,
+        &oldPosition, &oldMeasurePosition, &oldBeatPosition, &oldBpm,
+        &numerator, &denominator, &linearTempo)) {
+    return false;
+  }
+  return SetTempoTimeSigMarker_ptr(project, existingIndex, position,
+    -1, -1.0, bpm, numerator, denominator, linearTempo);
+}
+
+static bool nativeSetProjectItemsTimebase(
+  ReaProject* project,
+  int timebase)
+{
+  if (!project || !projectconfig_var_getoffs_ptr ||
+      !projectconfig_var_addr_ptr || timebase < 0 || timebase > 2) {
+    return false;
+  }
+  int valueSize = 0;
+  const int offset = projectconfig_var_getoffs_ptr(
+    "itemtimelock", &valueSize);
+  if (offset == 0 || valueSize != static_cast<int>(sizeof(int))) {
+    return false;
+  }
+  void* address = projectconfig_var_addr_ptr(project, offset);
+  if (!address) return false;
+  *reinterpret_cast<int*>(address) = timebase;
+
+  // PROJECT_TIMEBASE é somente leitura, mas serve para confirmar que a
+  // alteração da variável de projeto realmente entrou antes de continuar.
+  if (GetSetProjectInfo_ptr) {
+    const int confirmed = static_cast<int>(std::lround(
+      GetSetProjectInfo_ptr(project, "PROJECT_TIMEBASE", 0.0, false)));
+    return confirmed == timebase;
+  }
+  return true;
+}
+
+static bool nativeUiBpmSongIsCurrentlyPlaying(const std::string& id)
+{
+  return g_nativeCurrentTransportPlaying && !id.empty() &&
+    id == g_nativeCurrentPlayingId;
+}
+
+static bool nativeUiApplyBpmScanResults()
+{
+  if (g_nativeBpmScanRunning) {
+    nativeUiShowTemporaryPopup("AGUARDE O SCAN TERMINAR", 1.5);
+    return false;
+  }
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project || project != g_nativeBpmScanResultProject) {
+    nativeUiShowTemporaryPopup(
+      "O RESULTADO PERTENCE A OUTRA SESSÃO", 2.0);
+    return false;
+  }
+  if (!CountTempoTimeSigMarkers_ptr ||
+      !GetTempoTimeSigMarker_ptr || !SetTempoTimeSigMarker_ptr) {
+    nativeUiShowTemporaryPopup(
+      "API DE MARCADORES DE TEMPO INDISPONÍVEL", 2.0);
+    return false;
+  }
+  const bool replaceAllTempoMarkers =
+    g_nativeBpmReplaceAllTempoMarkersOnApply;
+  if (replaceAllTempoMarkers && !DeleteTempoTimeSigMarker_ptr) {
+    nativeUiShowTemporaryPopup(
+      "API PARA RECRIAR MARCADORES INDISPONÍVEL", 2.2);
+    return false;
+  }
+  if (replaceAllTempoMarkers && nativeUiTransportActive()) {
+    nativeUiShowTemporaryPopup(
+      "PARE A REPRODUÇÃO ANTES DE RECRIAR OS MARCADORES", 2.2);
+    return false;
+  }
+
+  std::vector<NativeBpmScanResult> applicable;
+  for (const NativeBpmScanResult& result : g_nativeBpmScanResults) {
+    if (!nativeBpmScanResultHasUsableValue(result) ||
+        !std::isfinite(result.start) ||
+        nativeUiBpmSongIsCurrentlyPlaying(result.id)) {
+      continue;
+    }
+    applicable.push_back(result);
+  }
+  if (applicable.empty()) {
+    nativeUiShowTemporaryPopup("NENHUM BPM VÁLIDO PARA APLICAR", 1.8);
+    return false;
+  }
+  std::sort(applicable.begin(), applicable.end(),
+    [](const NativeBpmScanResult& left,
+       const NativeBpmScanResult& right) {
+      return left.start < right.start;
+  });
+
+  if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+  // Durante a criação do mapa as posições precisam ficar ancoradas em tempo.
+  // itemtimelock: 0=Time, 1=Beats (position, length, rate), 2=position only.
+  if (!nativeSetProjectItemsTimebase(project, 0)) {
+    if (Undo_EndBlock2_ptr) {
+      Undo_EndBlock2_ptr(project,
+        "VS Hook: aplicar BPMs detectados", -1);
+    }
+    nativeUiShowTemporaryPopup(
+      "NÃO FOI POSSÍVEL MUDAR O TIMEBASE PARA TIME", 2.2);
+    return false;
+  }
+  if (replaceAllTempoMarkers) {
+    bool deletedAll = true;
+    for (int markerIndex = CountTempoTimeSigMarkers_ptr(project) - 1;
+         markerIndex >= 0; --markerIndex) {
+      if (!DeleteTempoTimeSigMarker_ptr(project, markerIndex)) {
+        deletedAll = false;
+        break;
+      }
+    }
+    if (!deletedAll) {
+      nativeSetProjectItemsTimebase(project, 1);
+      if (Undo_EndBlock2_ptr) {
+        Undo_EndBlock2_ptr(project,
+          "VS Hook: recriar marcadores de BPM", -1);
+      }
+      if (UpdateTimeline_ptr) UpdateTimeline_ptr();
+      if (UpdateArrange_ptr) UpdateArrange_ptr();
+      nativeUiShowTemporaryPopup(
+        "NÃO FOI POSSÍVEL APAGAR TODOS OS MARCADORES", 2.4);
+      return false;
+    }
+  }
+
+  int applied = 0;
+  std::vector<NativeBpmScanResult> appliedResults;
+  for (const NativeBpmScanResult& result : applicable) {
+    if (nativeSetTempoMarkerAtPosition(
+          project, result.start, std::round(result.bpm))) {
+      ++applied;
+      appliedResults.push_back(result);
+    }
+  }
+  const bool restoredBeats = nativeSetProjectItemsTimebase(project, 1);
+  if (replaceAllTempoMarkers) {
+    std::map<std::string, NativeBpmScanResult> rebuiltCache;
+    for (const NativeBpmScanResult& result : appliedResults) {
+      rebuiltCache[result.id] = result;
+    }
+    nativeWriteBpmScanCache(project, rebuiltCache);
+  }
+  if (applied > 0 && MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+  if (Undo_EndBlock2_ptr) {
+    Undo_EndBlock2_ptr(project,
+      "VS Hook: aplicar BPMs detectados", -1);
+  }
+  if (UpdateTimeline_ptr) UpdateTimeline_ptr();
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+
+  if (!restoredBeats) {
+    nativeUiShowTemporaryPopup(
+      "BPMS APLICADOS, MAS NÃO FOI POSSÍVEL VOLTAR PARA BEATS", 2.8);
+    return false;
+  }
+
+  if (applied <= 0) {
+    nativeUiShowTemporaryPopup(
+      "NÃO FOI POSSÍVEL CRIAR OS MARCADORES", 2.0);
+    return false;
+  }
+  if (replaceAllTempoMarkers) {
+    g_nativeBpmReplaceAllTempoMarkersOnApply = false;
+  }
+  nativeUiShowTemporaryPopup(
+    std::to_string(applied) +
+      (applied == 1 ? " BPM APLICADO" : " BPMS APLICADOS"),
+    1.8);
+  return true;
+}
+
+static bool nativeUiCachedBpmForSong(
+  ReaProject* project,
+  const std::string& id,
+  const std::string& name,
+  double currentStart,
+  NativeBpmScanResult& resultOut)
+{
+  if (!project || id.empty()) return false;
+  const auto cache = nativeLoadBpmScanCache(project);
+  const auto found = cache.find(id);
+  const bool cached = found != cache.end();
+  if (cached) resultOut = found->second;
+  resultOut.id = id;
+  resultOut.name = name;
+  if (std::isfinite(currentStart)) resultOut.start = currentStart;
+  double markerBpm = 0.0;
+  const bool markerFound =
+    nativeTempoMarkerBpmAtOrBeforePosition(
+      project, resultOut.start, markerBpm);
+  if (!cached && !markerFound) return false;
+  if (markerFound) {
+    // O cache guarda o BPM original do Scan. O valor atual vem sempre do
+    // marcador real mais próximo à esquerda, inclusive em projetos antigos.
+    resultOut.bpm = std::round(markerBpm);
+    if (!cached) {
+      resultOut.originalBpm = resultOut.bpm;
+      resultOut.confidence = 100;
+      resultOut.error.clear();
+    }
+  }
+  return true;
+}
+
+static void nativeUiUpdateVisibleBpmResult(
+  const NativeBpmScanResult& result)
+{
+  for (NativeBpmScanResult& visible : g_nativeBpmScanResults) {
+    if (visible.id == result.id) visible = result;
+  }
+  g_nativeUiBpmScannedAvailable = true;
+  ++g_nativeBpmScanRevision;
+  // O App do Diretor lê o BPM nas cópias de regiões/repertório do snapshot
+  // pesado. Depois de um ajuste, reconstrói essas cópias imediatamente para
+  // confirmar no app exatamente o mesmo valor exibido pela extensão.
+  g_nativeForceSnapshotBuild.store(true);
+  g_nativeForceStateBuild.store(true);
+}
+
+static bool nativeUiStoreBpmValue(
+  const std::string& id,
+  const std::string& name,
+  double start,
+  double end,
+  int bpm)
+{
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project || id.empty() || bpm < 10 || bpm > 960) return false;
+  if (nativeUiBpmSongIsCurrentlyPlaying(id)) {
+    nativeUiShowTemporaryPopup(
+      "NÃO É POSSÍVEL ALTERAR O BPM DA MÚSICA TOCANDO", 2.0);
+    return false;
+  }
+
+  // Captura a base antes de alterar o marcador. Para projetos antigos sem
+  // cache, esse é o BPM original usado pelo indicador +1/-1.
+  NativeBpmScanResult result;
+  nativeUiCachedBpmForSong(project, id, name, start, result);
+
+  // A coluna controla o marcador mais próximo à esquerda do início da música,
+  // inclusive quando ele já existia antes da instalação do VS Hook. Sem
+  // marcador anterior, ela continua editando o resultado que será aplicado.
+  const int tempoMarkerIndex = nativeFindTempoMarkerAtOrBeforePosition(
+    project, start);
+  if (tempoMarkerIndex >= 0) {
+    if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+    // O marcador precisa ser alterado enquanto o projeto está em Beats
+    // (position, length, rate). Assim os itens acompanham o novo andamento e
+    // aceleram ou desaceleram; em Time suas durações ficariam preservadas.
+    const bool changedToBeats = nativeSetProjectItemsTimebase(project, 1);
+    const bool markerUpdated = changedToBeats &&
+      nativeUpdateTempoMarkerBpmByIndex(
+        project, tempoMarkerIndex, static_cast<double>(bpm));
+    if (markerUpdated && MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+    if (Undo_EndBlock2_ptr) {
+      Undo_EndBlock2_ptr(project,
+        "VS Hook: alterar BPM da música", -1);
+    }
+    if (markerUpdated) {
+      if (UpdateTimeline_ptr) UpdateTimeline_ptr();
+      if (UpdateArrange_ptr) UpdateArrange_ptr();
+    }
+    if (!markerUpdated) {
+      nativeUiShowTemporaryPopup(
+        "NÃO FOI POSSÍVEL ALTERAR O MARCADOR DE BPM", 2.0);
+      return false;
+    }
+  }
+
+  result.id = id;
+  result.name = name;
+  result.start = start;
+  result.end = end;
+  if (!std::isfinite(result.originalBpm) || result.originalBpm <= 0.0) {
+    result.originalBpm = result.bpm > 0.0
+      ? std::round(result.bpm)
+      : static_cast<double>(bpm);
+  }
+  result.bpm = static_cast<double>(bpm);
+  // Se o Scan usou o fallback genérico, mantém essa origem depois de uma
+  // edição manual. Somente um novo Scan bem-sucedido muda o valor para azul.
+  nativeSaveBpmScanCacheResult(project, result);
+  nativeUiUpdateVisibleBpmResult(result);
+  return true;
+}
+
+static bool nativeUiAdjustBpmValue(const NativeMainBpmHit& hit)
+{
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  NativeBpmScanResult result;
+  if (nativeUiBpmSongIsCurrentlyPlaying(hit.id)) {
+    nativeUiShowTemporaryPopup(
+      "NÃO É POSSÍVEL ALTERAR O BPM DA MÚSICA TOCANDO", 2.0);
+    return false;
+  }
+  if (!nativeUiCachedBpmForSong(
+        project, hit.id, hit.name, hit.start, result) ||
+      !nativeBpmScanResultHasUsableValue(result)) {
+    nativeUiShowTemporaryPopup("BPM NÃO ENCONTRADO", 1.5);
+    return false;
+  }
+  const int current = static_cast<int>(std::lround(result.bpm));
+  const int next = std::max(10, std::min(960,
+    current + (hit.delta < 0 ? -1 : 1)));
+  return nativeUiStoreBpmValue(hit.id, hit.name,
+    hit.start, hit.end, next);
+}
+
+static size_t nativeUiTextCursorFromPoint(
+  HWND hwnd,
+  const RECT& rect,
+  const std::string& text,
+  int pointX,
+  int leftPadding,
+  UINT flags);
+
+static void nativeUiOpenBpmValueEdit(
+  const NativeMainBpmHit& hit,
+  int pointX = -1)
+{
+  if (nativeUiBpmSongIsCurrentlyPlaying(hit.id)) {
+    nativeUiShowTemporaryPopup(
+      "NÃO É POSSÍVEL ALTERAR O BPM DA MÚSICA TOCANDO", 2.0);
+    return;
+  }
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  NativeBpmScanResult result;
+  const bool found = nativeUiCachedBpmForSong(
+    project, hit.id, hit.name, hit.start, result) &&
+    nativeBpmScanResultHasUsableValue(result);
+  g_nativeMainBpmEditOpen = true;
+  g_nativeMainBpmEditId = hit.id;
+  g_nativeMainBpmEditName = hit.name;
+  g_nativeMainBpmEditStart = hit.start;
+  g_nativeMainBpmEditEnd = hit.end;
+  g_nativeMainBpmEditRect = hit.rect;
+  g_nativeMainBpmEditInput = found
+    ? std::to_string(static_cast<int>(std::lround(result.bpm)))
+    : std::string();
+  g_nativeMainBpmEditCursor = pointX >= 0
+    ? nativeUiTextCursorFromPoint(
+        g_nativeAppActivePanelHwnd, hit.rect,
+        g_nativeMainBpmEditInput, pointX, 4, DT_CENTER)
+    : g_nativeMainBpmEditInput.size();
+  g_nativeUiTextSelectionKind = NativeUiTextInputKind::BpmValue;
+  g_nativeUiTextSelectionAnchor = g_nativeMainBpmEditCursor;
+}
+
+static void nativeUiCancelBpmValueEdit()
+{
+  g_nativeMainBpmEditOpen = false;
+  g_nativeMainBpmEditId.clear();
+  g_nativeMainBpmEditName.clear();
+  g_nativeMainBpmEditInput.clear();
+  g_nativeMainBpmEditCursor = 0;
+  g_nativeMainBpmEditRect = RECT{0, 0, 0, 0};
+  if (g_nativeUiTextSelectionKind == NativeUiTextInputKind::BpmValue) {
+    g_nativeUiTextSelectionKind = NativeUiTextInputKind::None;
+    g_nativeUiTextSelectionAnchor = 0;
+  }
+}
+
+static bool nativeUiCommitBpmValueEdit()
+{
+  if (!g_nativeMainBpmEditOpen) return true;
+  const int bpm = std::atoi(g_nativeMainBpmEditInput.c_str());
+  if (g_nativeMainBpmEditInput.size() < 2 || bpm < 10 || bpm > 960) {
+    nativeUiShowTemporaryPopup("INFORME UM BPM ENTRE 10 E 960", 1.8);
+    return false;
+  }
+  const bool stored = nativeUiStoreBpmValue(
+    g_nativeMainBpmEditId, g_nativeMainBpmEditName,
+    g_nativeMainBpmEditStart, g_nativeMainBpmEditEnd, bpm);
+  if (stored) nativeUiCancelBpmValueEdit();
+  return stored;
+}
+
+static bool nativeApplyBpmCommand(const std::string& commandBody)
+{
+  const std::string type = nativeLower(
+    nativeJsonExtractString(commandBody, "type"));
+  if (type != "bpm_set" && type != "bpm_adjust" &&
+      type != "bpm_focus" && type != "set_bpm_visibility") {
+    return false;
+  }
+  if (type == "bpm_focus" || type == "set_bpm_visibility") {
+    const bool visible = type == "bpm_focus" || nativeBoolFromText(
+      nativeJsonExtractString(commandBody, "visible"), false);
+    nativeSetBpmColumnVisible(visible);
+    return true;
+  }
+
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project) return true;
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+  }
+  const NativeSongWindow* song = nativeResolveTunerSong(
+    songs, commandBody);
+  if (!song || nativeUiBpmSongIsCurrentlyPlaying(song->id)) {
+    return true;
+  }
+
+  NativeBpmScanResult result;
+  if (!nativeUiCachedBpmForSong(
+        project, song->id, song->name, song->start, result) ||
+      !nativeBpmScanResultHasUsableValue(result)) {
+    return true;
+  }
+  int next = static_cast<int>(std::lround(result.bpm));
+  if (type == "bpm_adjust") {
+    next += std::atoi(
+      nativeJsonExtractString(commandBody, "delta").c_str());
+  } else {
+    std::string value = nativeJsonExtractString(commandBody, "value");
+    if (value.empty()) value = nativeJsonExtractString(commandBody, "bpm");
+    if (value.empty()) return true;
+    next = std::atoi(value.c_str());
+  }
+  next = std::max(10, std::min(960, next));
+  const bool changed = nativeUiStoreBpmValue(
+    song->id, song->name, song->start, song->end, next);
+  if (changed) {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    nativeBumpSharedRevisionLocked("director");
+  }
   return true;
 }
 
@@ -10649,7 +11975,19 @@ static bool nativeQueuedSongIsSameAsPlayingLocked(const std::string& playingId, 
 
 static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, const std::string& playingId, double playPos, double songStart, double songEnd, const std::vector<NativeSongWindow>& activeItems, const std::vector<NativeSongWindow>& projectSongs)
 {
-  if (!project || nativeIsLuaControlActive()) return false;
+  if (!project) return false;
+  if (g_nativeBpmScanPreviewPlaybackActive) {
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      nativeClearAllQueueStateLocked();
+    }
+    // Após o Stop, encerra somente o bloqueio temporário. Auto 1/2 continuam
+    // com a configuração que tinham e voltam a funcionar no próximo Play.
+    if (!playing) g_nativeBpmScanPreviewPlaybackActive = false;
+    g_nativeForceStateBuild.store(true);
+    return false;
+  }
+  if (nativeIsLuaControlActive()) return false;
 
   if (!playing || playingId.empty()) {
     std::string queuedId;
@@ -11807,6 +13145,83 @@ static void nativeAppActiveDrawText(HDC dc, const std::string& text, RECT rect, 
   if (oldFont) SelectObject(dc, oldFont);
 }
 
+static int nativeAppActiveMeasureTextHeight(
+  HDC dc,
+  const std::string& text,
+  int width,
+  UINT flags,
+  HFONT font)
+{
+  RECT measured{0, 0, std::max(1, width), 1};
+  HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+#ifdef _WIN32
+  const int required = MultiByteToWideChar(
+    CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+  if (required > 0) {
+    std::vector<wchar_t> wide(
+      static_cast<size_t>(required), L'\0');
+    MultiByteToWideChar(
+      CP_UTF8, 0, text.c_str(), -1, wide.data(), required);
+    DrawTextW(dc, wide.data(), -1, &measured,
+      flags | DT_CALCRECT);
+  }
+#else
+  DrawText(dc, text.c_str(), -1, &measured,
+    flags | DT_CALCRECT);
+#endif
+  if (oldFont) SelectObject(dc, oldFont);
+  return std::max(1, static_cast<int>(
+    measured.bottom - measured.top));
+}
+
+static std::vector<std::string> nativeAppActiveWrapPopupText(
+  HDC dc,
+  const std::string& text,
+  int maximumWidth,
+  HFONT font)
+{
+  std::vector<std::string> lines;
+  maximumWidth = std::max(1, maximumWidth);
+  for (const std::string& paragraph : nativeSplit(text, '\n')) {
+    if (paragraph.empty()) {
+      lines.emplace_back();
+      continue;
+    }
+    std::string line;
+    size_t cursor = 0;
+    while (cursor < paragraph.size()) {
+      while (cursor < paragraph.size() &&
+             (paragraph[cursor] == ' ' ||
+              paragraph[cursor] == '\t' ||
+              paragraph[cursor] == '\r')) {
+        ++cursor;
+      }
+      if (cursor >= paragraph.size()) break;
+      const size_t wordStart = cursor;
+      while (cursor < paragraph.size() &&
+             paragraph[cursor] != ' ' &&
+             paragraph[cursor] != '\t' &&
+             paragraph[cursor] != '\r') {
+        ++cursor;
+      }
+      const std::string word = paragraph.substr(
+        wordStart, cursor - wordStart);
+      const std::string candidate = line.empty()
+        ? word : line + " " + word;
+      if (!line.empty() &&
+          nativeUiTextWidth(dc, candidate, font) > maximumWidth) {
+        lines.push_back(line);
+        line = word;
+      } else {
+        line = candidate;
+      }
+    }
+    if (!line.empty()) lines.push_back(line);
+  }
+  if (lines.empty()) lines.emplace_back();
+  return lines;
+}
+
 static std::string nativeAppActiveSongNameForState(
   const std::vector<NativeSongWindow>& playlistItems,
   const std::vector<NativeSongWindow>& songs,
@@ -11861,7 +13276,10 @@ static std::string nativeAppActiveArmedPartName(ReaProject* project, const std::
     if (!EnumProjectMarkers3_ptr(project, i, &isRegion, &pos, &end, &rawName, &number, &color)) continue;
     if (isRegion || number != wantedNumber) continue;
     std::string name = nativeTrim(rawName ? rawName : "");
-    if (nativeStartsWith(name, "*1") || nativeStartsWith(name, "*2")) name = nativeTrim(name.substr(2));
+    if (nativeStartsWith(name, "*1") || nativeStartsWith(name, "*2") ||
+        nativeStartsWith(name, "*3") || nativeStartsWith(name, "*4")) {
+      name = nativeTrim(name.substr(2));
+    }
     else if (!name.empty() && (name[0] == '$' || name[0] == '!')) name = nativeTrim(name.substr(1));
     while (!name.empty() && (name[0] == '-' || name[0] == ':' || name[0] == ' ')) name.erase(name.begin());
     return nativeTrim(name);
@@ -11889,7 +13307,7 @@ static bool nativeParsePartsMarkerLabel(
       ++digitIndex;
     }
     if (digitIndex >= name.size() ||
-        (name[digitIndex] != '1' && name[digitIndex] != '2')) {
+        (name[digitIndex] < '1' || name[digitIndex] > '4')) {
       return false;
     }
     prefixOut = std::string("*") + name[digitIndex];
@@ -12024,7 +13442,7 @@ static double nativeResolvePartsRegressTrigger(
     }
 
     // vshook_marker_belongs_to_cancel_region usa a mesma regra de Parts:
-    // somente $ / *1 / *2 e nunca markers iniciados por !.
+    // somente $ / *1 / *2 / *3 / *4 e nunca markers iniciados por !.
     std::string prefix;
     std::string label;
     if (!nativeParsePartsMarkerLabel(
@@ -12199,7 +13617,9 @@ static COLORREF nativeDrawerColor(const std::string& raw)
   if (value == "orange") return RGB(255, 133, 20);
   if (value == "cyan") return RGB(31, 235, 255);
   if (value == "white") return RGB(235, 242, 255);
-  if (value == "gray" || value == "grey") return RGB(143, 153, 168);
+  if (value == "gray" || value == "grey") {
+    return kNativeUiUnifiedDarkGray;
+  }
   return RGB(255, 240, 46);
 }
 
@@ -12269,6 +13689,10 @@ static uint64_t nativeUiRowsSourceSignature(
     nativeUiHashValue(hash, item.sourceNumber);
     nativeUiHashValue(hash, item.enumIndex);
     nativeUiHashValue(hash, item.tunerValue);
+    nativeUiHashValue(hash, item.bpmAvailable);
+    nativeUiHashValue(hash, item.bpmValue);
+    nativeUiHashValue(hash, item.bpmOriginal);
+    nativeUiHashValue(hash, item.bpmGeneric);
     nativeUiHashValue(hash, item.isBlock);
     nativeUiHashValue(hash, item.isHashChild);
     nativeUiHashValue(hash, item.isRegionChild);
@@ -12436,7 +13860,7 @@ static void nativePaintPartsColumn(
 
   RECT titleRect{columnRect.left, columnRect.top, columnRect.right,
     std::min(columnRect.bottom, columnRect.top + titleH)};
-  nativeAppActiveFillRect(dc, titleRect, RGB(20, 23, 26));
+  nativeAppActiveFillRect(dc, titleRect, RGB(16, 19, 22));
   RECT titleText{titleRect.left + 7, titleRect.top + 1, titleRect.right - 6, titleRect.bottom - 1};
   nativeAppActiveDrawText(dc, parts2 ? "Parts 2" : "Parts 1", titleText,
     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
@@ -13063,15 +14487,25 @@ static size_t nativeUiTextCursorFromPoint(
   const RECT& rect,
   const std::string& text,
   int pointX,
-  int leftPadding)
+  int leftPadding,
+  UINT flags = DT_LEFT)
 {
   if (text.empty()) return 0;
-  const int targetX = std::max(0,
-    pointX - (static_cast<int>(rect.left) + leftPadding));
   HDC dc = hwnd ? GetDC(hwnd) : nullptr;
   if (!dc) return text.size();
 
   const HFONT font = nativeUiSharedFont();
+  const int textWidth = nativeUiTextWidth(dc, text, font);
+  int textOriginX = static_cast<int>(rect.left) + leftPadding;
+  if ((flags & DT_CENTER) != 0) {
+    textOriginX = static_cast<int>(rect.left) +
+      std::max(0, (static_cast<int>(rect.right - rect.left) -
+        textWidth) / 2);
+  } else if ((flags & DT_RIGHT) != 0) {
+    textOriginX = static_cast<int>(rect.right) -
+      leftPadding - textWidth;
+  }
+  const int targetX = std::max(0, pointX - textOriginX);
   size_t result = text.size();
   size_t cursor = 0;
   int previousWidth = 0;
@@ -13106,6 +14540,10 @@ static bool nativeUiTextCommandModifierDown()
 
 static NativeUiTextInputKind nativeUiFocusedTextInputKind()
 {
+  if (g_nativeMainBpmEditOpen &&
+      g_nativeMainModalKind == NativeMainModalKind::None) {
+    return NativeUiTextInputKind::BpmValue;
+  }
   if (g_nativeMixerRenameOpen &&
       g_nativeMainModalKind == NativeMainModalKind::None) {
     return NativeUiTextInputKind::MixerRename;
@@ -13153,6 +14591,8 @@ static std::string* nativeUiTextInputValue(
       return &g_nativePartsRenameInput;
     case NativeUiTextInputKind::TimerCountdown:
       return &g_nativeUiTimerDigits;
+    case NativeUiTextInputKind::BpmValue:
+      return &g_nativeMainBpmEditInput;
     case NativeUiTextInputKind::None:
       break;
   }
@@ -13178,6 +14618,8 @@ static size_t nativeUiTextInputCursor(
     case NativeUiTextInputKind::TimerCountdown:
       return static_cast<size_t>(std::max(
         0, std::min(6, g_nativeUiTimerDigitCursor)));
+    case NativeUiTextInputKind::BpmValue:
+      return g_nativeMainBpmEditCursor;
     case NativeUiTextInputKind::None:
       break;
   }
@@ -13214,6 +14656,9 @@ static void nativeUiSetTextInputCursor(
       g_nativeUiTimerDigitCursor = static_cast<int>(
         std::min<size_t>(6, cursor));
       break;
+    case NativeUiTextInputKind::BpmValue:
+      g_nativeMainBpmEditCursor = cursor;
+      break;
     case NativeUiTextInputKind::None:
       break;
   }
@@ -13229,6 +14674,8 @@ static size_t nativeUiTextInputMaximumBytes(
       return 80;
     case NativeUiTextInputKind::TimerCountdown:
       return 6;
+    case NativeUiTextInputKind::BpmValue:
+      return 3;
     case NativeUiTextInputKind::SmartSearch:
     case NativeUiTextInputKind::RenameRow:
     case NativeUiTextInputKind::PartsRename:
@@ -13379,6 +14826,30 @@ static bool nativeUiInsertTextValue(
   std::string* text = nativeUiTextInputValue(kind);
   if (!text) return false;
   nativeUiEnsureTextSelectionKind(kind);
+
+  if (kind == NativeUiTextInputKind::BpmValue) {
+    std::string digits;
+    for (char value : rawValue) {
+      if (value >= '0' && value <= '9') digits.push_back(value);
+    }
+    if (digits.empty()) return false;
+    size_t first = 0;
+    size_t last = 0;
+    if (!nativeUiTextSelectionRange(kind, first, last)) {
+      first = last = std::min(
+        nativeUiTextInputCursor(kind), text->size());
+    }
+    const size_t currentWithoutSelection =
+      text->size() - (last - first);
+    const size_t available = currentWithoutSelection < 3
+      ? 3 - currentWithoutSelection : 0;
+    const size_t accepted = std::min(available, digits.size());
+    if (first == last && accepted == 0) return false;
+    text->erase(first, last - first);
+    text->insert(first, digits.substr(0, accepted));
+    nativeUiCollapseTextSelection(kind, first + accepted);
+    return true;
+  }
 
   if (kind == NativeUiTextInputKind::TimerCountdown) {
     std::string digits;
@@ -13559,8 +15030,15 @@ static bool nativeUiInsertActiveTextCodepoint(
   if (nativeUiTextCommandModifierDown()) return true;
   if (codepoint < 0x20 || codepoint == 0x7f) return true;
 
-  if (kind == NativeUiTextInputKind::TimerCountdown) {
+  if (kind == NativeUiTextInputKind::TimerCountdown ||
+      kind == NativeUiTextInputKind::BpmValue) {
     if (codepoint < '0' || codepoint > '9') return true;
+    if (kind == NativeUiTextInputKind::BpmValue) {
+      nativeUiInsertTextValue(kind,
+        std::string(1, static_cast<char>(codepoint)));
+      nativeUiRefreshTextInputNow(hwnd);
+      return true;
+    }
     nativeUiEnsureTextSelectionKind(kind);
     size_t first = 0;
     size_t last = 0;
@@ -13594,7 +15072,8 @@ static bool nativeUiInsertActiveMacKeyText(HWND hwnd)
     VSHookMacReadCurrentKeyText(utf8, sizeof(utf8));
   if (length == 0) return false;
 
-  if (kind == NativeUiTextInputKind::TimerCountdown) {
+  if (kind == NativeUiTextInputKind::TimerCountdown ||
+      kind == NativeUiTextInputKind::BpmValue) {
     // Mantem o campo regressivo estritamente numerico, mas passa pelo mesmo
     // editor com cursor e selecao usado no Windows.
     if (length == 1 && utf8[0] >= '0' && utf8[0] <= '9') {
@@ -13627,6 +15106,15 @@ static void nativeUiDrawEditableText(
   if (!dc) return;
   const NativeUiClipState clipState =
     nativeUiBeginClipRect(dc, textRect);
+  const int textWidth = nativeUiTextWidth(dc, text, font);
+  int textOriginX = static_cast<int>(textRect.left);
+  if ((flags & DT_CENTER) != 0) {
+    textOriginX += std::max(0,
+      (static_cast<int>(textRect.right - textRect.left) -
+        textWidth) / 2);
+  } else if ((flags & DT_RIGHT) != 0) {
+    textOriginX = static_cast<int>(textRect.right) - textWidth;
+  }
 
   size_t first = 0;
   size_t last = 0;
@@ -13637,9 +15125,9 @@ static void nativeUiDrawEditableText(
     const int lastWidth = nativeUiTextWidth(
       dc, text.substr(0, last), font);
     RECT highlight{
-      textRect.left + firstWidth,
+      textOriginX + firstWidth,
       textRect.top + 2,
-      textRect.left + lastWidth,
+      textOriginX + lastWidth,
       textRect.bottom - 2};
     nativeAppActiveFillRect(
       dc, highlight, RGB(37, 99, 235));
@@ -13656,7 +15144,7 @@ static void nativeUiDrawEditableText(
   if (focused && caretVisible) {
     const size_t cursor = std::min(
       nativeUiTextInputCursor(kind), text.size());
-    const int caretX = textRect.left +
+    const int caretX = textOriginX +
       nativeUiTextWidth(dc, text.substr(0, cursor), font);
     if (caretX >= textRect.left &&
         caretX < textRect.right) {
@@ -13733,10 +15221,10 @@ static void nativeUiDistributeWidths(
 }
 
 struct NativeUiButtonColors {
-  COLORREF fill = RGB(61, 66, 77);
-  COLORREF edge = RGB(41, 46, 51);
+  COLORREF fill = RGB(54, 59, 68);
+  COLORREF edge = RGB(34, 38, 43);
   COLORREF text = RGB(235, 240, 242);
-  COLORREF hover = RGB(77, 82, 92);
+  COLORREF hover = RGB(69, 74, 84);
 };
 
 static NativeUiButtonColors nativeUiButtonColors(
@@ -13746,8 +15234,8 @@ static NativeUiButtonColors nativeUiButtonColors(
   NativeUiButtonColors colors;
   style = nativeLower(nativeTrim(style));
   if (!enabled) {
-    colors.fill = RGB(41, 43, 46);
-    colors.edge = RGB(31, 33, 36);
+    colors.fill = RGB(35, 38, 42);
+    colors.edge = RGB(27, 29, 32);
     colors.text = RGB(117, 122, 128);
     colors.hover = colors.fill;
     return colors;
@@ -13806,8 +15294,8 @@ static NativeUiButtonColors nativeUiButtonColors(
       RGB(235, 240, 242), RGB(255, 87, 179)};
   } else if (style == "rgb") {
     // O preenchimento em faixas e desenhado em nativeUiDrawButton.
-    colors = {RGB(61, 66, 77), RGB(41, 46, 51),
-      RGB(20, 20, 20), RGB(77, 82, 92)};
+    colors = {RGB(54, 59, 68), RGB(34, 38, 43),
+      RGB(20, 20, 20), RGB(69, 74, 84)};
   } else if (style == "danger") {
     colors = {RGB(209, 31, 26), RGB(115, 10, 10),
       RGB(255, 255, 255), RGB(240, 46, 36)};
@@ -13815,8 +15303,8 @@ static NativeUiButtonColors nativeUiButtonColors(
     colors = {RGB(245, 148, 46), RGB(158, 82, 20),
       RGB(20, 20, 20), RGB(250, 163, 61)};
   } else if (style == "locked") {
-    colors = {RGB(43, 46, 51), RGB(56, 59, 64),
-      RGB(122, 128, 135), RGB(48, 51, 56)};
+    colors = {RGB(36, 40, 45), RGB(48, 52, 58),
+      RGB(122, 128, 135), RGB(42, 46, 51)};
   } else if (style == "backup_yellow_text") {
     colors.text = RGB(255, 235, 46);
   }
@@ -15326,7 +16814,7 @@ static COLORREF nativeUiNamedVisualColor(
   if (mode == "cyan") return RGB(31, 235, 255);
   if (mode == "white") return RGB(235, 242, 255);
   if (mode == "gray" || mode == "grey") {
-    return RGB(143, 153, 168);
+    return kNativeUiUnifiedDarkGray;
   }
   return RGB(255, 240, 46);
 }
@@ -15391,7 +16879,7 @@ static COLORREF nativeUiNumberBarColor(
   const std::string mode = nativeLower(
     nativeUiVisualPref(values,
       "number_bar_bg_mode", "gray"));
-  if (mode == "gray") return RGB(46, 48, 54);
+  if (mode == "gray") return kNativeUiUnifiedDarkGray;
   if (mode == "purple") return RGB(36, 15, 61);
   if (mode == "blue") return RGB(10, 26, 59);
   if (mode == "wine") return RGB(61, 10, 26);
@@ -15407,10 +16895,10 @@ static COLORREF nativeUiInterfaceBackgroundColor(
     nativeUiVisualPref(values,
       "interface_bg_mode", "medium"));
   if (mode == "black") return RGB(10, 13, 17);
-  if (mode == "dark") return RGB(28, 31, 34);
-  if (mode == "medium") return RGB(46, 48, 54);
-  if (mode == "medium") return RGB(46, 48, 54);
-  if (mode == "light") return RGB(61, 65, 73);
+  if (mode == "dark" || mode == "medium" || mode == "light" ||
+      mode == "gray" || mode == "grey") {
+    return kNativeUiUnifiedDarkGray;
+  }
   if (mode == "slate") return RGB(33, 41, 51);
   if (mode == "navy") return RGB(10, 20, 46);
   if (mode == "blue") return RGB(13, 31, 71);
@@ -15419,7 +16907,7 @@ static COLORREF nativeUiInterfaceBackgroundColor(
   if (mode == "green") return RGB(10, 41, 26);
   if (mode == "teal") return RGB(8, 41, 43);
   if (mode == "brown") return RGB(51, 31, 13);
-  return RGB(46, 48, 54);
+  return kNativeUiUnifiedDarkGray;
 }
 
 static COLORREF nativeUiListPanelBackgroundColor(
@@ -15429,8 +16917,10 @@ static COLORREF nativeUiListPanelBackgroundColor(
     nativeUiVisualPref(values,
       "list_panel_bg_mode", "default"));
   if (mode == "black") return RGB(10, 13, 17);
-  if (mode == "dark") return RGB(28, 31, 34);
-  if (mode == "light") return RGB(82, 87, 97);
+  if (mode == "dark" || mode == "medium" || mode == "light" ||
+      mode == "gray" || mode == "grey") {
+    return kNativeUiUnifiedDarkGray;
+  }
   if (mode == "slate") return RGB(33, 41, 51);
   if (mode == "navy") return RGB(10, 20, 46);
   if (mode == "blue") return RGB(13, 31, 71);
@@ -15439,7 +16929,7 @@ static COLORREF nativeUiListPanelBackgroundColor(
   if (mode == "green") return RGB(10, 41, 26);
   if (mode == "teal") return RGB(8, 41, 43);
   if (mode == "brown") return RGB(51, 31, 13);
-  return RGB(41, 46, 51);
+  return kNativeUiUnifiedDarkGray;
 }
 
 static COLORREF nativeUiTransportFillColor(
@@ -15448,8 +16938,10 @@ static COLORREF nativeUiTransportFillColor(
   const std::string mode = nativeLower(
     nativeUiVisualPref(values,
       "transport_panel_bg_mode", "gray"));
-  if (mode == "gray") return RGB(46, 48, 54);
-  if (mode == "light_gray") return RGB(82, 87, 97);
+  if (mode == "gray" || mode == "light_gray" ||
+      mode == "grey" || mode == "light_grey") {
+    return kNativeUiUnifiedDarkGray;
+  }
   if (mode == "purple") return RGB(46, 20, 77);
   if (mode == "blue") return RGB(13, 31, 71);
   if (mode == "wine") return RGB(77, 13, 31);
@@ -18550,20 +20042,23 @@ static int nativeUiConverterColor(int red, int green, int blue)
   return color | 0x01000000;
 }
 
-static bool nativeUiConverterSpecialMarker(const std::string& name)
-{
-  const std::string value = nativeTrim(name);
-  if (value.empty()) return false;
-  return value.front() == '$' || value.front() == '*' ||
-    value.front() == '!';
-}
-
 static bool nativeUiConverterLoopMarker(const std::string& name)
 {
   const std::string value = nativeTrim(name);
   if (value.size() < 2 || value.front() != '*') return false;
   const int number = std::atoi(value.c_str() + 1);
   return number == 1 || number == 2;
+}
+
+static bool nativeUiConverterSpecialMarker(const std::string& name)
+{
+  const std::string value = nativeTrim(name);
+  if (value.empty()) return false;
+  // No Converter, somente os markers reservados para Parts/loops e os
+  // desativados com ! ficam fora da criação de regiões. Outros nomes que
+  // eventualmente começam com * continuam sendo markers comuns.
+  return value.front() == '$' || value.front() == '!' ||
+    nativeUiConverterLoopMarker(value);
 }
 
 static bool nativeUiConverterExplicitParent(const std::string& name)
@@ -19225,6 +20720,18 @@ static int nativeUiConverterPartsSelectedCount()
   return count;
 }
 
+static void nativeUiConverterPartsSelectAll()
+{
+  g_nativeUiConverterPartsSelection.clear();
+  for (size_t index = 0;
+       index < g_nativeUiConverterPartsEntries.size(); ++index) {
+    g_nativeUiConverterPartsSelection[
+      static_cast<int>(index)] = true;
+  }
+  g_nativeUiConverterPartsAnchor =
+    g_nativeUiConverterPartsEntries.empty() ? -1 : 0;
+}
+
 static bool nativeUiOpenConverterParts()
 {
   g_nativeUiConverterPartsEntries.clear();
@@ -19303,6 +20810,26 @@ static bool nativeUiApplyConverterParts()
     return false;
   }
 
+  // Uma seleção mista nunca pode desconverter os markers que já são Parts.
+  // Enquanto existir ao menos um marker sem $, esta operação somente adiciona
+  // o prefixo aos que faltam. A remoção acontece apenas quando todos os
+  // selecionados já começam com $.
+  bool addPartsPrefix = false;
+  for (size_t index = 0;
+       index < g_nativeUiConverterPartsEntries.size(); ++index) {
+    const auto selected = g_nativeUiConverterPartsSelection.find(
+      static_cast<int>(index));
+    if (selected == g_nativeUiConverterPartsSelection.end() ||
+        !selected->second) {
+      continue;
+    }
+    if (!nativeUiConverterPartsHasPrefix(
+          g_nativeUiConverterPartsEntries[index].name)) {
+      addPartsPrefix = true;
+      break;
+    }
+  }
+
   if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
   int changed = 0;
   for (size_t index = 0;
@@ -19320,6 +20847,9 @@ static bool nativeUiApplyConverterParts()
           marker.name)) {
       continue;
     }
+    const bool hasPrefix =
+      nativeUiConverterPartsHasPrefix(marker.name);
+    if (addPartsPrefix && hasPrefix) continue;
     const std::string nextName =
       nativeUiConverterPartsToggleName(marker.name);
     if (nextName == marker.name) continue;
@@ -19342,7 +20872,9 @@ static bool nativeUiApplyConverterParts()
   nativeUiCloseMainModal();
   nativeUiShowTemporaryPopup(
     "Converter/Parts: " + std::to_string(changed) +
-      " marker(s) alterado(s)", 2.2);
+      (addPartsPrefix
+        ? " marker(s) convertido(s)"
+        : " marker(s) desconvertido(s)"), 2.2);
   return true;
 }
 
@@ -19975,7 +21507,7 @@ static bool nativeUiOpenMultiLoopTracks(int slot)
 {
   if (g_nativeMultiLoopFocusKey.empty()) return false;
   g_nativeUiMultiLoopSlot =
-    std::max(0, std::min(1, slot));
+    std::max(0, std::min(kNativeMultiLoopSlotCount - 1, slot));
   g_nativeUiMultiLoopTrackScroll = 0;
   nativeUiRefreshMultiLoopTracks();
   g_nativeMainModalKind =
@@ -20883,6 +22415,7 @@ nativeUiHelpTopicContent(const std::string& topic)
       "$ no inicio do nome do marker tambem entra em Parts, mas o simbolo nao aparece na lista.",
       "*1 no inicio do nome do marker entra em Parts 1, mas o simbolo nao aparece na lista.",
       "*2 no inicio do nome do marker entra em Parts 2, mas o simbolo nao aparece na lista.",
+      "*3 e *4 criam os pares dos Multi Loops 3 e 4; os simbolos nao aparecem na lista.",
       "! no inicio do nome do marker oculta o marker em todas as listas e Parts.",
       "# no inicio do nome da pista permite que o VS Hook controle o ReaPitch daquela pista.",
       "Texto escrito entre ( ) nao e forcado para caixa alta. Exemplo: INTRO (voz baixa) mantem o texto dentro dos parenteses como foi digitado."
@@ -21351,8 +22884,8 @@ static COLORREF nativeUiTrackTint(
     hasTint = false;
     knobTint = RGB(255, 224, 46);
     // COLORS.zebra (0.18, 0.20, 0.22, 0.58) sobre COLORS.panel.
-    return nativeUiBlendColor(RGB(41, 46, 51),
-      RGB(46, 51, 56), 0.58);
+    return nativeUiBlendColor(RGB(34, 38, 43),
+      RGB(39, 43, 48), 0.58);
   }
   hasTint = true;
   int red = raw & 0xff;
@@ -21362,7 +22895,7 @@ static COLORREF nativeUiTrackTint(
     ColorFromNative_ptr(raw, &red, &green, &blue);
   }
   knobTint = RGB(red, green, blue);
-  return nativeUiBlendColor(RGB(41, 46, 51),
+  return nativeUiBlendColor(RGB(34, 38, 43),
     RGB(red, green, blue), 0.34);
 }
 
@@ -21879,10 +23412,10 @@ static void nativeUiPaintMixerColumn(
   constexpr int rowHeight = 54;
   constexpr int rowPitch = rowHeight + rowGap;
   nativeAppActiveFillRoundRect(dc, column,
-    RGB(41, 46, 51), RGB(74, 82, 89), 0);
+    RGB(34, 38, 43), RGB(74, 82, 89), 0);
   RECT header{column.left, column.top, column.right,
     std::min(column.bottom, column.top + titleH)};
-  nativeAppActiveFillRect(dc, header, RGB(20, 23, 26));
+  nativeAppActiveFillRect(dc, header, RGB(16, 19, 22));
   const COLORREF columnEdge = RGB(74, 82, 89);
   nativeAppActiveFillRect(dc,
     RECT{header.left, header.top,
@@ -22044,7 +23577,7 @@ static void nativeUiPaintMixerPage(
     RECT masterPanel{body.left, body.top, body.right,
       std::min(body.bottom, body.top + masterHeight)};
     nativeAppActiveFillRoundRect(dc, masterPanel,
-      RGB(41, 46, 51), RGB(74, 82, 89), 0);
+      RGB(34, 38, 43), RGB(74, 82, 89), 0);
     RECT masterRow{masterPanel.left + 4,
       masterPanel.top + masterPad,
       masterPanel.right - 4,
@@ -23048,9 +24581,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
         nativeUiVisualPrefBool(paintVisualPrefs,
           current ? "status_current_bottom" : "status_queue_bottom", true));
     }
-    const bool lightTransport = nativeLower(nativeUiVisualPref(
-      paintVisualPrefs, "transport_panel_bg_mode", "black")) ==
-      "light_gray";
+    // O antigo light_gray é migrado visualmente para o mesmo cinza escuro.
+    const bool lightTransport = false;
     const COLORREF textColor = lightTransport
       ? RGB(20, 18, 10)
       : (multiLoop
@@ -23209,7 +24741,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
   int partsColumnW = std::max(120, static_cast<int>(std::floor(bodyW * 0.22)));
   int tunerColumnW = std::max(76,
     static_cast<int>(std::floor(bodyW * 0.14)));
-  int bpmColumnW = tunerColumnW;
+  // BPM mostra controles, diferença relativa e o valor real do marcador.
+  // Por isso precisa ser mais largo que a coluna simples do Tuner.
+  int bpmColumnW = std::max(148,
+    static_cast<int>(std::floor(bodyW * 0.20)));
   const int visiblePartColumns = (showParts1 ? 1 : 0) + (showParts2 ? 1 : 0);
   const int visibleSideColumns =
     visiblePartColumns + (showTuner ? 1 : 0) + (showBpm ? 1 : 0);
@@ -23227,8 +24762,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
       static_cast<int>(std::floor(bodyW * 0.12)));
   }
   if (showBpm && mainAvailable < 140) {
-    bpmColumnW = std::max(68,
-      static_cast<int>(std::floor(bodyW * 0.12)));
+    bpmColumnW = std::max(132,
+      static_cast<int>(std::floor(bodyW * 0.17)));
   }
 
   int mainLeft = bodyRect.left;
@@ -23272,13 +24807,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
       bodyRect.top, mainRight, bodyRect.bottom};
     mainRight = g_nativeMainBpmColumnRect.left - bodyGap;
     nativeAppActiveFillRect(dc, g_nativeMainBpmColumnRect,
-      RGB(41, 46, 51));
+      RGB(34, 38, 43));
     RECT bpmHeader{g_nativeMainBpmColumnRect.left,
       g_nativeMainBpmColumnRect.top,
       g_nativeMainBpmColumnRect.right,
       std::min(g_nativeMainBpmColumnRect.bottom,
         g_nativeMainBpmColumnRect.top + rowH)};
-    nativeAppActiveFillRect(dc, bpmHeader, RGB(20, 23, 26));
+    nativeAppActiveFillRect(dc, bpmHeader, RGB(16, 19, 22));
     const int scanW = std::min(42, std::max(32,
       static_cast<int>(bpmHeader.right - bpmHeader.left) / 2));
     g_nativeMainBpmScanRect = RECT{
@@ -23296,6 +24831,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
   } else {
     g_nativeMainBpmColumnRect = RECT{0, 0, 0, 0};
     g_nativeMainBpmScanRect = RECT{0, 0, 0, 0};
+    if (g_nativeMainBpmEditOpen) nativeUiCancelBpmValueEdit();
   }
   g_nativeMainTunerHits.clear();
   if (showTuner) {
@@ -23304,13 +24840,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
       bodyRect.top, mainRight, bodyRect.bottom};
     mainRight = g_nativeMainTunerColumnRect.left - bodyGap;
     nativeAppActiveFillRect(dc, g_nativeMainTunerColumnRect,
-      RGB(41, 46, 51));
+      RGB(34, 38, 43));
     RECT tunerHeader{g_nativeMainTunerColumnRect.left,
       g_nativeMainTunerColumnRect.top,
       g_nativeMainTunerColumnRect.right,
       std::min(g_nativeMainTunerColumnRect.bottom,
         g_nativeMainTunerColumnRect.top + rowH)};
-    nativeAppActiveFillRect(dc, tunerHeader, RGB(20, 23, 26));
+    nativeAppActiveFillRect(dc, tunerHeader, RGB(16, 19, 22));
     RECT tunerTitle{tunerHeader.left + 6, tunerHeader.top + 1,
       tunerHeader.right - 40, tunerHeader.bottom - 1};
     nativeAppActiveDrawText(dc, "Tuner", tunerTitle,
@@ -23348,7 +24884,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
   RECT listHeader{listRect.left, listRect.top, listRect.right,
     std::min(listRect.bottom, listRect.top + listHeaderH)};
   nativeAppActiveFillOutlinedRect(dc, listHeader,
-    RGB(34, 39, 43), RGB(74, 82, 89));
+    RGB(28, 32, 36), RGB(74, 82, 89));
   RECT listTitleRect{listHeader.left + 8, listHeader.top + 1,
     listHeader.right - 4, listHeader.bottom - 1};
   nativeAppActiveDrawText(dc,
@@ -23852,12 +25388,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
           listLayout);
 
       const COLORREF panelFill = listPanelFill;
-      const COLORREF zebraFill =
-        nativeUiBlendColor(panelFill,
-          RGB(46, 51, 56), 0.58);
-      COLORREF rowFill =
-        ((i + 1) % 2 == 0)
-          ? zebraFill : panelFill;
+      // Repertório e Músicas usam um fundo único. Estados funcionais como
+      // bloco, Live, seleção, fila e reprodução continuam substituindo-o.
+      COLORREF rowFill = panelFill;
       COLORREF textColor = RGB(255, 255, 255);
       if (!g_nativeAppActivePanelModel.regionsPage &&
           !hasBlock) {
@@ -24301,6 +25834,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
     if (showBpm &&
         g_nativeMainBpmColumnRect.right >
           g_nativeMainBpmColumnRect.left) {
+      char bpmProjectPath[2048] = "";
+      ReaProject* bpmProject = getCurrentProject(
+        bpmProjectPath, static_cast<int>(sizeof(bpmProjectPath)));
+      const auto& bpmCache = nativeBpmScanCacheForPaint(
+        bpmProject, bpmProjectPath);
+      // Lê a régua de tempo uma única vez por quadro. Fazer essa leitura por
+      // linha deixaria a navegação pesada em projetos com muitos marcadores.
+      const NativeTempoMarkerBpmValues bpmTempoMarkers =
+        nativeCollectTempoMarkerBpmValues(bpmProject);
       const RECT bpmList{
         g_nativeMainBpmColumnRect.left,
         g_nativeMainBpmColumnRect.top + rowH,
@@ -24319,11 +25861,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           bpmList.top + g_nativeMainRowOffsets[static_cast<size_t>(i)] +
             g_nativeMainRowHeights[static_cast<size_t>(i)] -
             g_nativeAppActiveListScrollPixels};
-        nativeAppActiveFillRect(dc, bpmRow,
-          ((i + 1) % 2 == 0)
-            ? nativeUiBlendColor(RGB(41, 46, 51),
-                RGB(46, 51, 56), 0.58)
-            : RGB(41, 46, 51));
+        nativeAppActiveFillRect(dc, bpmRow, listPanelFill);
         if (row.block || row.familyParent ||
             bpmRow.top < bpmList.top || bpmRow.bottom > bpmList.bottom) {
           continue;
@@ -24335,26 +25873,113 @@ static void nativePaintAppActivePanel(HWND hwnd)
         const int columnW = std::max(1,
           static_cast<int>(bpmRow.right - bpmRow.left));
         const int arrowW = std::max(16,
-          std::min(22, static_cast<int>(columnW * 0.24)));
+          std::min(22, static_cast<int>(columnW * 0.14)));
         const int valueGap = 2;
-        const int valueW = std::max(24,
-          columnW - innerPad * 2 - arrowW * 2 - valueGap * 2);
+        const int deltaW = std::max(24,
+          std::min(42, static_cast<int>(columnW * 0.20)));
+        const int bpmValueW = std::max(48,
+          columnW - innerPad * 2 - arrowW * 2 - deltaW -
+            valueGap * 3);
         RECT minusRect{bpmRow.left + innerPad, controlY,
           bpmRow.left + innerPad + arrowW, controlY + controlH};
-        RECT valueRect{minusRect.right + valueGap, controlY,
-          minusRect.right + valueGap + valueW, controlY + controlH};
-        RECT plusRect{valueRect.right + valueGap, controlY,
-          valueRect.right + valueGap + arrowW, controlY + controlH};
+        RECT deltaRect{minusRect.right + valueGap, controlY,
+          minusRect.right + valueGap + deltaW, controlY + controlH};
+        RECT plusRect{deltaRect.right + valueGap, controlY,
+          deltaRect.right + valueGap + arrowW, controlY + controlH};
+        const int bpmValueRight = std::min(
+          static_cast<int>(bpmRow.right) - innerPad,
+          static_cast<int>(plusRect.right) + valueGap + bpmValueW);
+        RECT bpmValueRect{plusRect.right + valueGap, controlY,
+          bpmValueRight, controlY + controlH};
+        NativeBpmScanResult bpmResult;
+        const auto cachedBpm = bpmCache.find(row.id);
+        const bool cachedBpmFound = cachedBpm != bpmCache.end() &&
+          nativeBpmScanResultHasUsableValue(cachedBpm->second);
+        if (cachedBpmFound) bpmResult = cachedBpm->second;
+        double markerBpm = 0.0;
+        const bool markerBpmFound =
+          nativeTempoMarkerBpmAtOrBeforePosition(
+            bpmTempoMarkers, row.start, markerBpm);
+        const bool bpmFound = cachedBpmFound || markerBpmFound;
+        if (markerBpmFound) {
+          bpmResult.bpm = std::round(markerBpm);
+          if (!cachedBpmFound) {
+            bpmResult.originalBpm = bpmResult.bpm;
+            bpmResult.confidence = 100;
+            bpmResult.error.clear();
+          }
+        }
+        const bool bpmGeneric = cachedBpmFound &&
+          !cachedBpm->second.error.empty();
+        const bool bpmLocked = nativeUiBpmSongIsCurrentlyPlaying(row.id);
         nativeUiDrawButton(dc, minusRect, "<", "page",
-          false, true, statusFont, 2);
-        nativeAppActiveFillRect(dc, valueRect, RGB(3, 7, 14));
-        nativeAppActiveDrawText(dc, "--", valueRect,
-          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-          RGB(250, 224, 46), statusFont);
+          false, !bpmLocked, statusFont, 2);
+        nativeAppActiveFillRect(dc, deltaRect, RGB(3, 7, 14));
+        nativeAppActiveFillRect(dc, bpmValueRect, RGB(3, 7, 14));
+        if (bpmLocked && g_nativeMainBpmEditOpen &&
+            g_nativeMainBpmEditId == row.id) {
+          nativeUiCancelBpmValueEdit();
+        }
+        const bool editingThis = g_nativeMainBpmEditOpen &&
+          g_nativeMainBpmEditId == row.id && !bpmLocked;
+        if (editingThis) {
+          g_nativeMainBpmEditRect = bpmValueRect;
+          nativeUiDrawEditableText(dc,
+            RECT{bpmValueRect.left + 4, bpmValueRect.top,
+              bpmValueRect.right - 3, bpmValueRect.bottom},
+            g_nativeMainBpmEditInput,
+            NativeUiTextInputKind::BpmValue, true,
+            cursorVisible,
+            bpmGeneric ? RGB(239, 68, 68) : RGB(56, 189, 248),
+            statusFont,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            "--", RGB(148, 163, 184));
+        } else {
+          std::string deltaLabel = "--";
+          std::string bpmLabel = "--";
+          if (bpmFound) {
+            const int currentBpm = static_cast<int>(
+              std::lround(bpmResult.bpm));
+            const int originalBpm = static_cast<int>(std::lround(
+              bpmResult.originalBpm > 0.0
+                ? bpmResult.originalBpm
+                : bpmResult.bpm));
+            const int difference = currentBpm - originalBpm;
+            deltaLabel = difference > 0
+              ? "+" + std::to_string(difference)
+              : std::to_string(difference);
+            bpmLabel = std::to_string(currentBpm) + " BPM";
+          }
+          nativeAppActiveDrawText(dc,
+            deltaLabel,
+            deltaRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            bpmLocked ? RGB(100, 116, 139)
+              : (bpmFound ? RGB(250, 224, 46) : RGB(148, 163, 184)),
+            statusFont);
+          nativeAppActiveDrawText(dc,
+            bpmLabel,
+            bpmValueRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            bpmLocked ? RGB(100, 116, 139)
+              : (bpmFound
+                  ? (bpmGeneric ? RGB(239, 68, 68)
+                                : RGB(56, 189, 248))
+                  : RGB(148, 163, 184)),
+            statusFont);
+        }
         nativeUiDrawButton(dc, plusRect, ">", "page",
-          false, true, statusFont, 2);
-        g_nativeMainBpmHits.push_back(minusRect);
-        g_nativeMainBpmHits.push_back(plusRect);
+          false, !bpmLocked, statusFont, 2);
+        // Mantém os alvos mesmo desativados para consumir o clique sobre a
+        // coluna, mostrar o aviso e não deixar o evento cair na linha abaixo.
+        g_nativeMainBpmHits.push_back(
+          {minusRect, row.id, row.name, row.start, row.end, -1});
+        g_nativeMainBpmHits.push_back(
+          {deltaRect, row.id, row.name, row.start, row.end, 2});
+        g_nativeMainBpmHits.push_back(
+          {plusRect, row.id, row.name, row.start, row.end, 1});
+        g_nativeMainBpmHits.push_back(
+          {bpmValueRect, row.id, row.name, row.start, row.end, 0});
       }
       nativeUiEndClipRect(dc, bpmClipState);
     }
@@ -24385,12 +26010,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
             g_nativeMainRowHeights[
               static_cast<size_t>(i)] -
             g_nativeAppActiveListScrollPixels};
-        nativeAppActiveFillRect(dc, tunerRow,
-          ((i + 1) % 2 == 0)
-            ? nativeUiBlendColor(
-                RGB(41, 46, 51),
-                RGB(46, 51, 56), 0.58)
-            : RGB(41, 46, 51));
+        nativeAppActiveFillRect(dc, tunerRow, listPanelFill);
         if (row.block || row.familyParent) continue;
         const bool controlsFullyVisible =
           tunerRow.top >= tunerList.top &&
@@ -24679,6 +26299,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
       g_nativeMainModalKind == NativeMainModalKind::BlockColorSelect;
     const bool multiLoopTracksModal =
       g_nativeMainModalKind == NativeMainModalKind::MultiLoopTracks;
+    const bool multiLoopSongModal =
+      g_nativeMainModalKind == NativeMainModalKind::MultiLoopSong;
     const bool timerConfigModal =
       g_nativeMainModalKind == NativeMainModalKind::TimerConfig;
     const bool manualStopConfigModal =
@@ -24766,6 +26388,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
       requestedH = std::min(std::max(440,
         static_cast<int>(std::floor(height * 0.76))),
         std::max(330, height - 20));
+    } else if (multiLoopSongModal) {
+      modalW = std::min(560, std::max(320, width - 20));
+      requestedH = std::min(420, std::max(360, height - 20));
     } else if (multiLoopTracksModal) {
       modalW = std::min(560, std::max(280, width - 20));
       requestedH = std::min(
@@ -24843,7 +26468,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     RECT modal{modalLeft, modalTop, modalLeft + modalW, modalTop + modalH};
     // COLORS.modal_panel do Lua: todos os modais usam o mesmo cinza-base.
     // Campos, listas e previews continuam com suas cores funcionais proprias.
-    nativeAppActiveFillRect(dc, modal, RGB(41, 46, 51));
+    nativeAppActiveFillRect(dc, modal, RGB(34, 38, 43));
     if (mixerBulkConfigModal || mixerBulkTracksModal ||
         mixerBulkCaptureModal || manualStopConfigModal ||
         manualStopTracksModal) {
@@ -24903,18 +26528,23 @@ static void nativePaintAppActivePanel(HWND hwnd)
         }
       }
       RECT title{modal.left + 12, modal.top + 8,
-        modal.right - 112, modal.top + 34};
+        modal.right - 184, modal.top + 30};
       nativeAppActiveDrawText(dc, "SCAN BPM", title,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         RGB(248, 250, 252), nameFont);
+      addModalButton("bpm_scan_scanned", "SCANEADAS",
+        RECT{modal.right - 178, modal.top + 9,
+          modal.right - 82, modal.top + 27},
+        g_nativeUiBpmScannedAvailable ? "play" : "locked",
+        g_nativeUiBpmScannedAvailable, true);
       addModalButton("bpm_scan_all", "TODAS",
-        RECT{modal.right - 100, modal.top + 8,
-          modal.right - 12, modal.top + 30},
+        RECT{modal.right - 76, modal.top + 9,
+          modal.right - 12, modal.top + 27},
         allSelected ? "play" : "add_existing", allSelected, true);
       RECT info{modal.left + 12, modal.top + 36,
         modal.right - 12, modal.top + 56};
       nativeAppActiveDrawText(dc,
-        "Regiões pai e músicas filhas não entram neste scan.", info,
+        "Regiões pai não entram; músicas soltas e filhas podem ser selecionadas.", info,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
           DT_NOPREFIX,
         RGB(148, 163, 184), statusFont);
@@ -24946,17 +26576,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
       if (songs.empty()) {
         RECT empty{modal.left + 12, listTop,
           modal.right - 12, listBottom};
-        nativeAppActiveDrawText(dc, "NENHUMA REGIÃO SOLTA ENCONTRADA",
+        nativeAppActiveDrawText(dc, "NENHUMA REGIÃO DISPONÍVEL",
           empty, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
           RGB(148, 163, 184), labelFont);
       }
       addModalButton("bpm_scan_confirm", "OK",
-        RECT{modal.left + 12, modal.bottom - 32,
-          modal.left + 108, modal.bottom - 10},
+        RECT{modal.left + 12, modal.bottom - 29,
+          modal.left + 66, modal.bottom - 11},
         "play", true, !g_nativeUiBpmScanSelection.empty());
       addModalButton("close", "CANCELAR",
-        RECT{modal.left + 116, modal.bottom - 32,
-          modal.left + 226, modal.bottom - 10},
+        RECT{modal.left + 72, modal.bottom - 29,
+          modal.left + 150, modal.bottom - 11},
         "page", true);
     } else if (g_nativeMainModalKind == NativeMainModalKind::BpmScanResults) {
       RECT title{modal.left + 12, modal.top + 8,
@@ -25021,8 +26651,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
         const int drawIndex = index - g_nativeUiBpmScanScroll;
         RECT row{modal.left + 12, listTop + drawIndex * rowH,
           modal.right - 12, listTop + drawIndex * rowH + rowH - 3};
-        nativeAppActiveFillRect(dc, row,
-          index % 2 ? RGB(36, 41, 46) : RGB(31, 36, 41));
+        const bool selected =
+          result.id == g_nativeUiBpmScanSelectedId;
+        nativeAppActiveFillRect(dc, row, selected
+          ? RGB(20, 74, 105)
+          : (index % 2 ? RGB(36, 41, 46) : RGB(31, 36, 41)));
+        // A linha inteira é o alvo do clique; os textos continuam sendo
+        // desenhados por coluna, sem transformar cada célula em um botão.
+        g_nativeMainModalButtons.push_back({row,
+          "bpm_scan_result_select|" + result.id, result.name});
         std::string resultName = result.name;
         if (!result.error.empty()) {
           resultName += " - " + nativeUiBpmScanErrorText(result.error);
@@ -25034,7 +26671,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           result.error.empty() ? RGB(226, 232, 240) : RGB(248, 113, 113),
           statusFont);
         nativeAppActiveDrawText(dc,
-          result.bpm > 0.0 ? nativeNumber(result.bpm, 1) : "--",
+          result.bpm > 0.0 ? nativeNumber(result.bpm, 0) : "--",
           RECT{nameRight, row.top, modal.right - 102, row.bottom},
           DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
           RGB(56, 189, 248), labelFont);
@@ -25054,17 +26691,28 @@ static void nativePaintAppActivePanel(HWND hwnd)
           DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
           RGB(148, 163, 184), labelFont);
       }
+      const bool canApplyBpmScan = !g_nativeBpmScanRunning &&
+        std::any_of(g_nativeBpmScanResults.begin(),
+          g_nativeBpmScanResults.end(),
+          [](const NativeBpmScanResult& result) {
+            return nativeBpmScanResultHasUsableValue(result) &&
+              !nativeUiBpmSongIsCurrentlyPlaying(result.id);
+          });
       addModalButton("bpm_scan_apply", "APLICAR",
-        RECT{modal.left + 12, modal.bottom - 32,
-          modal.left + 108, modal.bottom - 10},
-        "play", true, true);
+        RECT{modal.left + 12, modal.bottom - 29,
+          modal.left + 82, modal.bottom - 11},
+        "play", true, canApplyBpmScan);
       addModalButton("bpm_scan_new", "NOVO SCAN",
-        RECT{modal.left + 116, modal.bottom - 32,
-          modal.left + 226, modal.bottom - 10},
+        RECT{modal.left + 88, modal.bottom - 29,
+          modal.left + 178, modal.bottom - 11},
         "add_existing", true, true);
+      addModalButton("bpm_scan_back", "VOLTAR",
+        RECT{modal.left + 184, modal.bottom - 29,
+          modal.left + 250, modal.bottom - 11},
+        "page", true, true);
       addModalButton("close", "FECHAR",
-        RECT{modal.right - 100, modal.bottom - 32,
-          modal.right - 12, modal.bottom - 10},
+        RECT{modal.right - 76, modal.bottom - 29,
+          modal.right - 12, modal.bottom - 11},
         "page", true);
     } else if (g_nativeMainModalKind == NativeMainModalKind::PlaylistDropdown) {
       if (g_nativeUiPlaylistFilterDirty.exchange(false)) {
@@ -25884,7 +27532,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         {"pink", "Rosa", RGB(242, 97, 184), true},
         {"olive", "Oliva", RGB(148, 179, 46), true},
         {"orange", "Laranja", RGB(245, 143, 41), true},
-        {"white", "Cinza", RGB(158, 158, 158), true},
+        {"white", "Cinza escuro", kNativeUiUnifiedDarkGray, true},
         {"auto", "Automática", RGB(128, 133, 140), false}
       };
       RECT title{modal.left + 10, modal.top + 8,
@@ -25964,14 +27612,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
           DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(148, 163, 184), statusFont);
       nativeAppActiveDrawText(dc,
-        "Loop 1: par de marcadores *1",
+        "Pares de marcadores: *1, *2, *3 e *4",
         RECT{modal.left + 10, modal.top + 49,
-          modal.right - 10, modal.top + 65},
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        RGB(148, 163, 184), statusFont);
-      nativeAppActiveDrawText(dc,
-        "Loop 2: par de marcadores *2",
-        RECT{modal.left + 10, modal.top + 65,
           modal.right - 10, modal.top + 81},
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         RGB(148, 163, 184), statusFont);
@@ -25989,10 +27631,14 @@ static void nativePaintAppActivePanel(HWND hwnd)
       const int buttonW = (modalW - 34) / 2;
       const int buttonH = 28;
       const int startX = modal.left + 10;
-      const int loopY = modal.top + 92;
-      const int msY = loopY + buttonH + 18;
-      for (int slot = 0; slot < 2; ++slot) {
-        const int x = startX + slot * (buttonW + buttonGap);
+      const int firstGroupY = modal.top + 76;
+      const int groupGapY = 92;
+      for (int slot = 0; slot < kNativeMultiLoopSlotCount; ++slot) {
+        const int column = slot % 2;
+        const int row = slot / 2;
+        const int x = startX + column * (buttonW + buttonGap);
+        const int loopY = firstGroupY + row * groupGapY;
+        const int msY = loopY + buttonH + 18;
         const bool loopActive = state.loop[slot];
         const bool msActive = loopActive && state.ms[slot];
         const NativeMultiLoopPair pair =
@@ -26002,12 +27648,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
             g_nativeMultiLoopFocusEnd, slot);
         addModalButton("multiloop_slot|" +
             std::to_string(slot),
-          slot == 0 ? "Loop 1" : "Loop 2",
+          "Loop " + std::to_string(slot + 1),
           RECT{x, loopY, x + buttonW, loopY + buttonH},
           loopActive ? "play" : "stop", loopActive);
         addModalButton("multiloop_ms|" +
             std::to_string(slot),
-          slot == 0 ? "M/S 1" : "M/S 2",
+          "M/S " + std::to_string(slot + 1),
           RECT{x, msY, x + buttonW, msY + buttonH},
           msActive ? "play" : "stop", msActive);
         const std::string status = loopActive
@@ -26021,15 +27667,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
       }
       nativeAppActiveDrawText(dc,
         "Clique direito em M/S para configurar M, S e Auto Fader das tracks.",
-        RECT{modal.left + 10, modal.top + 177,
-          modal.right - 10, modal.top + 194},
+        RECT{modal.left + 10, modal.top + 258,
+          modal.right - 10, modal.top + 275},
         DT_LEFT | DT_VCENTER | DT_SINGLELINE |
           DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(148, 163, 184), statusFont);
       nativeAppActiveDrawText(dc,
-        "O preset aplica ao armar e restaura após o marcador 2.",
-        RECT{modal.left + 10, modal.top + 193,
-          modal.right - 10, modal.top + 210},
+        "O preset aplica ao armar e restaura após o segundo marcador do par.",
+        RECT{modal.left + 10, modal.top + 274,
+          modal.right - 10, modal.top + 291},
         DT_LEFT | DT_VCENTER | DT_SINGLELINE |
           DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(148, 163, 184), statusFont);
@@ -27402,7 +29048,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       RECT info2{modal.left + 10, modal.top + 47,
         modal.right - 10, modal.top + 64};
       nativeAppActiveDrawText(dc,
-        "OK alterna $ nos markers selecionados. Markers * e ! nao aparecem aqui.",
+        "OK adiciona $. So remove quando todos os selecionados ja possuem $.",
         info2, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
           DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(148, 163, 184), statusFont);
@@ -27517,6 +29163,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
           modal.left + 90, modal.bottom - 10},
         "play", true,
         nativeUiConverterPartsSelectedCount() > 0);
+      addModalButton("converter_parts_all", "Todos",
+        RECT{modal.left + (modalW - 80) / 2, modal.bottom - 28,
+          modal.left + (modalW - 80) / 2 + 80,
+          modal.bottom - 10},
+        "access", true,
+        !g_nativeUiConverterPartsEntries.empty());
       addModalButton("close", "Cancelar",
         RECT{modal.right - 90, modal.bottom - 28,
           modal.right - 10, modal.bottom - 10},
@@ -27654,7 +29306,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         // Voltar/Fechar em janelas estreitas.
         const RECT footerFloor{modal.left, navY - 6,
           modal.right, modal.bottom};
-        nativeAppActiveFillRect(dc, footerFloor, RGB(41, 46, 51));
+        nativeAppActiveFillRect(dc, footerFloor, RGB(34, 38, 43));
         nativeAppActiveFillRect(dc,
           RECT{footerFloor.left, footerFloor.top,
             footerFloor.right, footerFloor.top + 1},
@@ -27674,7 +29326,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           {"blue", "Azul"}, {"purple", "Roxo"},
           {"red", "Vermelho"}, {"orange", "Laranja"},
           {"cyan", "Ciano"}, {"white", "Branco"},
-          {"gray", "Cinza"}
+          {"gray", "Cinza escuro"}
         };
       auto addChoiceGrid = [&] (
           const std::vector<std::pair<std::string, std::string>>& options,
@@ -28246,8 +29898,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
         auto previewInterfaceColor = [&](std::string mode) {
           mode = nativeLower(nativeTrim(mode));
           if (mode == "black") return RGB(10, 13, 17);
-          if (mode == "dark") return RGB(28, 31, 34);
-          if (mode == "light") return RGB(61, 65, 73);
+          if (mode == "dark" || mode == "medium" || mode == "light" ||
+              mode == "gray" || mode == "grey") {
+            return kNativeUiUnifiedDarkGray;
+          }
           if (mode == "slate") return RGB(33, 41, 51);
           if (mode == "navy") return RGB(10, 20, 46);
           if (mode == "blue") return RGB(13, 31, 71);
@@ -28256,12 +29910,14 @@ static void nativePaintAppActivePanel(HWND hwnd)
           if (mode == "green") return RGB(10, 41, 26);
           if (mode == "teal") return RGB(8, 41, 43);
           if (mode == "brown") return RGB(51, 31, 13);
-          return RGB(46, 48, 54);
+          return kNativeUiUnifiedDarkGray;
         };
         auto previewTransportColor = [&](std::string mode) {
           mode = nativeLower(nativeTrim(mode));
-          if (mode == "gray") return RGB(46, 48, 54);
-          if (mode == "light_gray") return RGB(82, 87, 97);
+          if (mode == "gray" || mode == "light_gray" ||
+              mode == "grey" || mode == "light_grey") {
+            return kNativeUiUnifiedDarkGray;
+          }
           if (mode == "purple") return RGB(46, 20, 77);
           if (mode == "blue") return RGB(13, 31, 71);
           if (mode == "wine") return RGB(77, 13, 31);
@@ -28271,7 +29927,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
         };
         auto previewNumberColor = [&](std::string mode) {
           mode = nativeLower(nativeTrim(mode));
-          if (mode == "gray") return RGB(46, 48, 54);
+          if (mode == "gray" || mode == "grey") {
+            return kNativeUiUnifiedDarkGray;
+          }
           if (mode == "purple") return RGB(36, 15, 61);
           if (mode == "blue") return RGB(10, 26, 59);
           if (mode == "wine") return RGB(61, 10, 26);
@@ -28571,16 +30229,24 @@ static void nativePaintAppActivePanel(HWND hwnd)
         drawCustomHeader("Cor de fundo da lista",
           "Escolha a cor do fundo completo das listas.");
         const std::vector<std::pair<std::string, std::string>> options = {
-          {"default", "Padrao da lista"},
-          {"black", "Preto profundo"}, {"dark", "Cinza escuro"},
-          {"medium", "Cinza medio"}, {"light", "Cinza claro"},
+          {"default", "Cinza escuro"},
+          {"black", "Preto profundo"},
           {"slate", "Grafite azulado"}, {"navy", "Azul marinho"},
           {"blue", "Azul escuro"}, {"purple", "Roxo escuro"},
           {"wine", "Vinho escuro"}, {"green", "Verde escuro"},
           {"teal", "Petroleo"}, {"brown", "Marrom escuro"}
         };
+        std::string selectedListPanel = nativeLower(
+          nativeUiVisualRawValue(visual, "list_panel_bg_mode"));
+        if (selectedListPanel == "dark" ||
+            selectedListPanel == "medium" ||
+            selectedListPanel == "light" ||
+            selectedListPanel == "gray" ||
+            selectedListPanel == "grey") {
+          selectedListPanel = "default";
+        }
         const int optionsBottom = addChoiceGrid(options,
-          nativeUiVisualRawValue(visual, "list_panel_bg_mode"),
+          selectedListPanel,
           "custom_set|list_panel_bg_mode|",
           modal.top + 62,
           panelWidth >= 720 ? 3 : (panelWidth >= 420 ? 2 : 1),
@@ -28691,15 +30357,22 @@ static void nativePaintAppActivePanel(HWND hwnd)
         drawCustomHeader("Cor do fundo da interface",
           "Escolha a cor do fundo geral do script.");
         const std::vector<std::pair<std::string, std::string>> options = {
-          {"black", "Preto profundo"}, {"dark", "Cinza escuro"},
-          {"medium", "Cinza medio"}, {"light", "Cinza claro"},
+          {"black", "Preto profundo"}, {"medium", "Cinza escuro"},
           {"slate", "Grafite azulado"}, {"navy", "Azul marinho"},
           {"blue", "Azul escuro"}, {"purple", "Roxo escuro"},
           {"wine", "Vinho escuro"}, {"green", "Verde escuro"},
           {"teal", "Petroleo"}, {"brown", "Marrom escuro"}
         };
+        std::string selectedInterface = nativeLower(
+          nativeUiVisualRawValue(visual, "interface_bg_mode"));
+        if (selectedInterface == "dark" ||
+            selectedInterface == "light" ||
+            selectedInterface == "gray" ||
+            selectedInterface == "grey") {
+          selectedInterface = "medium";
+        }
         const int optionsBottom = addChoiceGrid(options,
-          nativeUiVisualRawValue(visual, "interface_bg_mode"),
+          selectedInterface,
           "custom_set|interface_bg_mode|",
           modal.top + 62,
           panelWidth >= 720 ? 3 : (panelWidth >= 420 ? 2 : 1),
@@ -28734,7 +30407,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           RECT sample{preview.left + 10, rowTop,
             preview.right - 10, rowTop + sampleHeight - 1};
           nativeAppActiveFillRect(dc, sample,
-            index == 1 ? RGB(64, 42, 20) : RGB(46, 48, 54));
+            index == 1 ? RGB(64, 42, 20) : kNativeUiUnifiedDarkGray);
           nativeAppActiveDrawText(dc, samples[index], sample,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             RGB(248, 250, 252), statusFont);
@@ -28754,19 +30427,19 @@ static void nativePaintAppActivePanel(HWND hwnd)
             ? "Escolha o fundo do painel Tocando Agora/Fila de Espera."
             : "Escolha o fundo da barra esquerda onde aparecem os numeros.");
         std::vector<std::pair<std::string, std::string>> options = {
-          {"gray", "Cinza"}, {"black", "Preto"},
+          {"gray", "Cinza escuro"}, {"black", "Preto"},
           {"purple", "Roxo"}, {"blue", "Azul escuro"},
           {"wine", "Vinho"}, {"green", "Verde escuro"},
           {"orange", "Laranja escuro"}
         };
-        if (transport) {
-          options.insert(options.begin() + 1,
-            {"light_gray", "Cinza claro"});
-        }
         const std::string key = transport
           ? "transport_panel_bg_mode" : "number_bar_bg_mode";
-        const std::string selected =
-          nativeUiVisualRawValue(visual, key);
+        std::string selected = nativeLower(
+          nativeUiVisualRawValue(visual, key));
+        if (selected == "light_gray" || selected == "light_grey" ||
+            selected == "grey") {
+          selected = "gray";
+        }
         if (transport) {
           const int optionsBottom = addChoiceGrid(options, selected,
             "custom_set|" + key + "|", modal.top + 62,
@@ -29158,7 +30831,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
         int rowTop = preview.top + 9;
         const RECT firstMusic{preview.left + 9, rowTop,
           preview.right - 9, rowTop + musicHeight};
-        nativeAppActiveFillRect(dc, firstMusic, RGB(46, 48, 54));
+        nativeAppActiveFillRect(dc, firstMusic,
+          kNativeUiUnifiedDarkGray);
         nativeAppActiveDrawText(dc, "01  MÚSICA DA LISTA",
           firstMusic,
           DT_LEFT | DT_VCENTER | DT_SINGLELINE |
@@ -29200,7 +30874,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
             rowTop + musicHeight)};
         if (secondMusic.bottom > secondMusic.top) {
           nativeAppActiveFillRect(dc, secondMusic,
-            RGB(41, 46, 51));
+            RGB(34, 38, 43));
           nativeAppActiveDrawText(dc,
             "02  PRÓXIMA MÚSICA", secondMusic,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE |
@@ -29801,7 +31475,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           {"blue", "Azul"}, {"purple", "Roxo"},
           {"red", "Vermelho"}, {"orange", "Laranja"},
           {"cyan", "Ciano"}, {"white", "Branco"},
-          {"gray", "Cinza"}
+          {"gray", "Cinza escuro"}
         };
         const std::string outlineColor = nativeUiVisualRawValue(
           visual, "drawer_outline_color_mode");
@@ -31184,7 +32858,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     const RECT popup{popupX, popupY,
       popupX + popupW, popupY + popupH};
     nativeAppActiveFillRoundRect(dc, popup,
-      RGB(41, 46, 51), RGB(249, 115, 22), 6);
+      RGB(34, 38, 43), RGB(249, 115, 22), 6);
 
     const double remainingSec = std::max(0.0,
       fadeoutDurationSec * (1.0 - fadeoutProgress));
@@ -31226,7 +32900,25 @@ static void nativePaintAppActivePanel(HWND hwnd)
       const int popupW = std::max(150,
         std::min(width - 20,
           static_cast<int>(std::floor(width * 0.62))));
-      const int popupH = 68;
+      const HFONT popupFont = nativeUiPopupFont();
+      const std::vector<std::string> popupLines =
+        nativeAppActiveWrapPopupText(
+          dc, g_nativeUiTemporaryPopupText,
+          std::max(1, popupW - 28), popupFont);
+      const int popupLineH = nativeAppActiveMeasureTextHeight(
+        dc, "Ágj", std::max(1, popupW - 28),
+        DT_SINGLELINE | DT_NOPREFIX, popupFont);
+      const int popupLineGap = 2;
+      const int measuredTextH =
+        static_cast<int>(popupLines.size()) * popupLineH +
+        std::max(0, static_cast<int>(popupLines.size()) - 1) *
+          popupLineGap;
+      // A caixa antiga tinha 68 px fixos e cortava a terceira linha em
+      // mensagens maiores (BPM tocando, Multi etc.). A altura agora acompanha
+      // o texto real, com folga para ascendentes/descendentes da fonte.
+      const int popupH = std::min(
+        std::max(1, height - 16),
+        std::max(74, measuredTextH + 28));
       const int popupX = (width - popupW) / 2;
       int popupY = static_cast<int>(
         std::floor(height * 0.72 - popupH * 0.5));
@@ -31244,16 +32936,23 @@ static void nativePaintAppActivePanel(HWND hwnd)
         ? RGB(255, 224, 46) : popupFill;
       nativeAppActiveFillRoundRect(dc, popup,
         popupFill, popupBorder, 7);
-      RECT popupText{popup.left + 14, popup.top + 8,
-        popup.right - 14, popup.bottom - 8};
-      nativeAppActiveDrawText(dc,
-        g_nativeUiTemporaryPopupText, popupText,
-        DT_CENTER | DT_VCENTER | DT_WORDBREAK |
-          DT_NOPREFIX,
-        standardNotice
-          ? RGB(255, 224, 46)
-          : RGB(255, 255, 255),
-        nativeUiPopupFont());
+      int lineTop = popup.top + std::max(
+        10, (popupH - measuredTextH) / 2);
+      for (const std::string& line : popupLines) {
+        RECT popupText{popup.left + 14, lineTop,
+          popup.right - 14,
+          std::min(static_cast<int>(popup.bottom - 8),
+            lineTop + popupLineH)};
+        nativeAppActiveDrawText(dc,
+          line, popupText,
+          DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+            DT_END_ELLIPSIS | DT_NOPREFIX,
+          standardNotice
+            ? RGB(255, 224, 46)
+            : RGB(255, 255, 255),
+          popupFont);
+        lineTop += popupLineH + popupLineGap;
+      }
     } else {
       g_nativeUiTemporaryPopupText.clear();
       g_nativeUiTemporaryPopupColorMode.clear();
@@ -31283,7 +32982,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       RECT modal{modalLeft, modalTop,
         modalLeft + modalW, modalTop + modalH};
       nativeAppActiveFillRoundRect(dc, modal,
-        RGB(41, 46, 51), RGB(250, 204, 21), 9);
+        RGB(34, 38, 43), RGB(250, 204, 21), 9);
 
       RECT noticeTitle{modal.left + 14, modal.top + 11,
         modal.right - 14, modal.top + 39};
@@ -31325,7 +33024,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       const int modalLeft = (width - modalW) / 2;
       const int modalTop = (height - modalH) / 2;
       RECT modal{modalLeft, modalTop, modalLeft + modalW, modalTop + modalH};
-      nativeAppActiveFillRoundRect(dc, modal, RGB(41, 46, 51), RGB(250, 204, 21), 9);
+      nativeAppActiveFillRoundRect(dc, modal, RGB(34, 38, 43), RGB(250, 204, 21), 9);
 
       RECT renameTitle{modal.left + 14, modal.top + 10, modal.right - 14, modal.top + 38};
       nativeAppActiveDrawText(dc, "RENOMEAR PART", renameTitle,
@@ -31333,7 +33032,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         RGB(250, 204, 21), titleFont);
       RECT renameInfo{modal.left + 16, renameTitle.bottom,
         modal.right - 16, renameTitle.bottom + 24};
-      nativeAppActiveDrawText(dc, "O prefixo $ / *1 / *2 será preservado.", renameInfo,
+      nativeAppActiveDrawText(dc, "O prefixo $ / *1 / *2 / *3 / *4 será preservado.", renameInfo,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(203, 213, 225), labelFont);
 
@@ -32519,7 +34218,8 @@ static bool nativeNavigateMainRows(int step)
           NativeUiSmoothScrollState{};
       }
     }
-    g_nativeForceStateBuild.store(true);
+    // A selecao e o scroll ja foram atualizados localmente. O comando
+    // selectionOnly abaixo sera publicado pela cadencia normal do bridge.
     return true;
   }
   return false;
@@ -32826,6 +34526,195 @@ static bool nativeUiActivateSmartSearchResult(
   return true;
 }
 
+// O App do Diretor nao replica a regra da Lupa. Ele apenas dirige a mesma
+// busca inteligente usada pela janela nativa, inclusive a troca automatica
+// Repertorio -> Musicas e a insercao opcional abaixo da musica em execucao.
+static bool nativeApplySmartSearchCommand(
+  const std::string& commandBody)
+{
+  const std::string type = nativeLower(nativeTrim(
+    nativeJsonExtractString(commandBody, "type")));
+  if (type != "smart_search_open" &&
+      type != "smart_search_query" &&
+      type != "smart_search_close" &&
+      type != "smart_search_activate") {
+    return false;
+  }
+
+  if (type == "smart_search_close") {
+    if (g_nativeMainSearchFocused) {
+      nativeUiCloseSmartSearch(true);
+    }
+    return true;
+  }
+
+  if (!g_nativeMainSearchFocused) {
+    nativeUiToggleSmartSearch();
+  }
+
+  if (type == "smart_search_open") {
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  if (type == "smart_search_query") {
+    std::string query = nativeJsonExtractString(
+      commandBody, "query");
+    // Limite defensivo equivalente a um campo de pesquisa humano, sem cortar
+    // consultas normais nem fazer a fila HTTP crescer com textos enormes.
+    if (query.size() > 2048) query.resize(2048);
+    g_nativeMainSearchText = query;
+    g_nativeMainSearchCursor =
+      g_nativeMainSearchText.size();
+    nativeUiSmartSearchQueryChanged();
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+
+  // Confirma sempre a consulta digitada antes de procurar a linha. Isso cobre
+  // o toque imediato em um resultado enquanto o debounce nativo ainda esta em
+  // andamento e mantem o comportamento identico ao Enter da extensao.
+  const std::string activationQuery = nativeJsonExtractString(
+    commandBody, "query");
+  if (g_nativeMainSearchText != activationQuery) {
+    g_nativeMainSearchText = activationQuery;
+    g_nativeMainSearchCursor =
+      g_nativeMainSearchText.size();
+    nativeUiSmartSearchQueryChanged();
+  }
+  nativeUiCommitPendingSmartSearchQuery(true);
+  g_nativeUiLastModelRefreshAt =
+    std::chrono::steady_clock::time_point{};
+  nativeRefreshAppActivePanelModel();
+  g_nativeMainVisibleRowIndices =
+    nativeUiBuildVisibleRowIndices();
+
+  const std::string wantedId = nativeJsonExtractString(
+    commandBody, "resultId");
+  if (wantedId.empty()) return true;
+  const std::string wantedStartText = nativeTrim(
+    nativeJsonExtractString(commandBody, "resultStart"));
+  const bool hasWantedStart = !wantedStartText.empty();
+  const double wantedStart = hasWantedStart
+    ? std::atof(wantedStartText.c_str()) : 0.0;
+  const auto matches = [&](
+      const NativeAppActivePanelModel::Row& row) {
+    return !row.block && row.id == wantedId &&
+      (!hasWantedStart ||
+       std::fabs(row.start - wantedStart) <= 0.003);
+  };
+
+  for (const size_t sourceIndex :
+       g_nativeMainVisibleRowIndices) {
+    if (sourceIndex >=
+        g_nativeAppActivePanelModel.rows.size()) {
+      continue;
+    }
+    const auto& row =
+      g_nativeAppActivePanelModel.rows[sourceIndex];
+    if (matches(row)) {
+      return nativeUiActivateSmartSearchResult(
+        row, g_nativeAppActivePanelModel.regionsPage);
+    }
+  }
+  // Fallback apenas para a pequena janela entre a troca automatica de pagina
+  // e a reconstrução do modelo. A identidade e o inicio impedem escolher uma
+  // linha homonima por engano.
+  for (const auto& row :
+       g_nativeAppActivePanelModel.rows) {
+    if (matches(row)) {
+      return nativeUiActivateSmartSearchResult(
+        row, g_nativeAppActivePanelModel.regionsPage);
+    }
+  }
+  return true;
+}
+
+static std::string nativeBuildSmartSearchStateJson()
+{
+  const bool modelReady = g_nativeMainSearchFocused &&
+    !g_nativeAppActivePanelModel.mixerPage &&
+    g_nativeAppActivePanelModel.regionsPage ==
+      g_nativeMainSmartSearchExpectedRegionsPage;
+  std::ostringstream json;
+  json << "{\"open\":"
+       << (g_nativeMainSearchFocused ? "true" : "false")
+       << ",\"query\":"
+       << nativeJsonString(g_nativeMainSearchText)
+       << ",\"appliedQuery\":"
+       << nativeJsonString(g_nativeMainSearchAppliedText)
+       << ",\"page\":"
+       << nativeJsonString(
+            g_nativeAppActivePanelModel.regionsPage
+              ? "regions" : "playlist")
+       << ",\"sourcePlaylistName\":"
+       << nativeJsonString(
+            g_nativeMainSmartSearchSourcePlaylistName)
+       << ",\"ready\":"
+       << (modelReady ? "true" : "false")
+       << ",\"insertQueuedBelowPlaying\":"
+       << (nativeUiSmartSearchSettingEnabled(
+             kNativeSmartSearchInsertQueuePlaylistKey)
+             ? "true" : "false")
+       << ",\"scrollSelected\":"
+       << (nativeUiSmartSearchSettingEnabled(
+             kNativeSmartSearchScrollSelectedKey)
+             ? "true" : "false")
+       << ",\"scrollQueued\":"
+       << (nativeUiSmartSearchSettingEnabled(
+             kNativeSmartSearchScrollQueuedKey)
+             ? "true" : "false")
+       << ",\"results\":[";
+
+  if (modelReady) {
+    std::map<std::string, std::string> parentNames;
+    for (const auto& row :
+         g_nativeAppActivePanelModel.rows) {
+      if (row.familyParent && !row.id.empty()) {
+        parentNames[row.id] = row.name;
+      }
+    }
+    const std::vector<size_t> visible =
+      nativeUiBuildVisibleRowIndices();
+    bool first = true;
+    for (const size_t sourceIndex : visible) {
+      if (sourceIndex >=
+          g_nativeAppActivePanelModel.rows.size()) {
+        continue;
+      }
+      const auto& row =
+        g_nativeAppActivePanelModel.rows[sourceIndex];
+      if (row.block) continue;
+      if (!first) json << ',';
+      first = false;
+      const auto parent = parentNames.find(row.parentId);
+      json << "{\"id\":" << nativeJsonString(row.id)
+           << ",\"name\":" << nativeJsonString(row.name)
+           << ",\"parentId\":"
+           << nativeJsonString(row.parentId)
+           << ",\"parentName\":"
+           << nativeJsonString(parent == parentNames.end()
+                ? std::string() : parent->second)
+           << ",\"isChild\":"
+           << (row.child ? "true" : "false")
+           << ",\"familyParent\":"
+           << (row.familyParent ? "true" : "false")
+           << ",\"regionsPage\":"
+           << (g_nativeAppActivePanelModel.regionsPage
+                ? "true" : "false")
+           << ",\"start\":" << nativeNumber(row.start)
+           << ",\"end\":" << nativeNumber(row.end)
+           << ",\"durationSec\":"
+           << nativeNumber(std::max(0.0, row.end - row.start))
+           << ",\"sourceNumber\":" << row.sourceNumber
+           << ",\"displayNumber\":" << row.displayNumber
+           << '}';
+    }
+  }
+  json << "]}";
+  return json.str();
+}
+
 static bool nativeTriggerSelectedParts(bool parts2)
 {
   std::string armedMarkerId;
@@ -33040,6 +34929,15 @@ static bool nativeUiTextInputHitInfo(
   rect = RECT{0, 0, 0, 0};
   leftPadding = 0;
 
+  if (g_nativeMainBpmEditOpen &&
+      g_nativeMainModalKind == NativeMainModalKind::None &&
+      PtInRect(&g_nativeMainBpmEditRect, point)) {
+    kind = NativeUiTextInputKind::BpmValue;
+    rect = g_nativeMainBpmEditRect;
+    leftPadding = 4;
+    return true;
+  }
+
   if (g_nativeMixerRenameOpen &&
       g_nativeMainModalKind == NativeMainModalKind::None &&
       PtInRect(&g_nativeMixerRenameInputRect, point)) {
@@ -33138,7 +35036,9 @@ static size_t nativeUiTextCursorForMousePoint(
   if (!text) return 0;
   return nativeUiTextCursorFromPoint(
     g_nativeAppActivePanelHwnd,
-    rect, *text, pointX, leftPadding);
+    rect, *text, pointX, leftPadding,
+    kind == NativeUiTextInputKind::BpmValue
+      ? DT_CENTER : DT_LEFT);
 }
 
 static bool nativeUiBeginTextMouseSelection(
@@ -33219,6 +35119,10 @@ static void nativeUiUpdateTextMouseSelection(
     }
     case NativeUiTextInputKind::TimerCountdown:
       rect = g_nativeMainModalInputRect;
+      break;
+    case NativeUiTextInputKind::BpmValue:
+      rect = g_nativeMainBpmEditRect;
+      leftPadding = 4;
       break;
     case NativeUiTextInputKind::None:
       return;
@@ -33632,6 +35536,18 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     }
     return handled;
   };
+  if (!rightClick && g_nativeMainBpmEditOpen) {
+    if (PtInRect(&g_nativeMainBpmEditRect, point)) {
+      g_nativeMainBpmEditCursor = nativeUiTextCursorFromPoint(
+        g_nativeAppActivePanelHwnd,
+        g_nativeMainBpmEditRect,
+        g_nativeMainBpmEditInput, point.x, 4, DT_CENTER);
+      g_nativeUiTextSelectionKind = NativeUiTextInputKind::BpmValue;
+      g_nativeUiTextSelectionAnchor = g_nativeMainBpmEditCursor;
+      return true;
+    }
+    if (!nativeUiCommitBpmValueEdit()) return true;
+  }
   // A lupa tem prioridade sobre o campo de repertorio. Isso tambem protege o
   // clique durante resize/dock, quando um frame antigo ainda pode ter deixado
   // retangulos de hit-test sobrepostos.
@@ -33694,12 +35610,7 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
   if (PtInRect(&g_nativeMainTunerTabRect, point)) {
     if (!rightClick) {
       const bool visible = !g_nativeAppActivePanelModel.showTuner;
-      g_nativeAppActivePanelModel.showTuner = visible;
-      if (SetExtState_ptr) {
-        SetExtState_ptr(kLuaWindowExtStateSection, "SHOW_TONES_V1",
-          visible ? "1" : "0", true);
-      }
-      g_nativeForceStateBuild.store(true);
+      nativeSetTunerColumnVisible(visible);
     }
     return true;
   }
@@ -33736,12 +35647,7 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
   if (PtInRect(&g_nativeMainBpmTabRect, point)) {
     if (!rightClick) {
       const bool visible = !g_nativeAppActivePanelModel.showBpm;
-      g_nativeAppActivePanelModel.showBpm = visible;
-      if (SetExtState_ptr) {
-        SetExtState_ptr(kLuaWindowExtStateSection, "SHOW_BPM_COLUMN_V1",
-          visible ? "1" : "0", true);
-      }
-      g_nativeForceStateBuild.store(true);
+      nativeSetBpmColumnVisible(visible);
     }
     return true;
   }
@@ -33939,7 +35845,15 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     return true;
   }
   for (const auto& bpmHit : g_nativeMainBpmHits) {
-    if (PtInRect(&bpmHit, point)) return true;
+    if (!PtInRect(&bpmHit.rect, point)) continue;
+    if (rightClick) return true;
+    if (bpmHit.delta == 0) {
+      nativeUiOpenBpmValueEdit(bpmHit, point.x);
+    } else if (bpmHit.delta == -1 || bpmHit.delta == 1) {
+      nativeUiAdjustBpmValue(bpmHit);
+    }
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    return true;
   }
   for (const auto& liveResetHit : g_nativeMainLiveResetHits) {
     if (!PtInRect(&liveResetHit.rect, point)) continue;
@@ -34437,6 +36351,12 @@ static bool nativeMainHandleModalClick(
 
   if (nativeUiHandlePreviewConfigAction(action)) return true;
 
+  if (nativeStartsWith(action,
+        "bpm_scan_result_select|")) {
+    nativeUiSelectBpmScanResult(action.substr(
+      std::string("bpm_scan_result_select|").size()));
+    return true;
+  }
   if (nativeStartsWith(action, "bpm_scan_toggle|")) {
     const std::string id = action.substr(
       std::string("bpm_scan_toggle|").size());
@@ -34467,16 +36387,24 @@ static bool nativeMainHandleModalClick(
     }
     return true;
   }
+  if (action == "bpm_scan_scanned") {
+    nativeUiOpenScannedBpmResults();
+    return true;
+  }
   if (action == "bpm_scan_confirm") {
     nativeUiStartBpmScan();
     return true;
   }
   if (action == "bpm_scan_new") {
-    nativeUiOpenBpmScan();
+    nativeUiOpenBpmScan(true);
+    return true;
+  }
+  if (action == "bpm_scan_back") {
+    nativeUiOpenBpmScan(false);
     return true;
   }
   if (action == "bpm_scan_apply") {
-    // Nesta primeira etapa o botão é apenas visual; nenhum BPM é aplicado.
+    nativeUiApplyBpmScanResults();
     return true;
   }
 
@@ -34611,7 +36539,7 @@ static bool nativeMainHandleModalClick(
     nativeUiOpenMultiLoopFromRename();
   } else if (nativeStartsWith(action,
                "multiloop_slot|")) {
-    const int slot = std::max(0, std::min(1,
+    const int slot = std::max(0, std::min(kNativeMultiLoopSlotCount - 1,
       std::atoi(action.substr(std::string(
         "multiloop_slot|").size()).c_str())));
     std::ostringstream command;
@@ -34620,7 +36548,7 @@ static bool nativeMainHandleModalClick(
     nativeApplyMultiLoopCommand(command.str());
   } else if (nativeStartsWith(action,
                "multiloop_ms|")) {
-    const int slot = std::max(0, std::min(1,
+    const int slot = std::max(0, std::min(kNativeMultiLoopSlotCount - 1,
       std::atoi(action.substr(std::string(
         "multiloop_ms|").size()).c_str())));
     std::ostringstream command;
@@ -34629,7 +36557,7 @@ static bool nativeMainHandleModalClick(
     nativeApplyMultiLoopCommand(command.str());
   } else if (nativeStartsWith(action,
                "multiloop_open_tracks|")) {
-    const int slot = std::max(0, std::min(1,
+    const int slot = std::max(0, std::min(kNativeMultiLoopSlotCount - 1,
       std::atoi(action.substr(std::string(
         "multiloop_open_tracks|").size()).c_str())));
     nativeUiOpenMultiLoopTracks(slot);
@@ -35156,6 +37084,8 @@ static bool nativeMainHandleModalClick(
     nativeUiRequestConverter();
   } else if (action == "config_converter_parts") {
     nativeUiOpenConverterParts();
+  } else if (action == "converter_parts_all") {
+    nativeUiConverterPartsSelectAll();
   } else if (action == "converter_parts_apply") {
     nativeUiApplyConverterParts();
   } else if (action == "config_customize") {
@@ -35607,6 +37537,22 @@ static void nativeSetTunerColumnVisible(bool visible)
       "SHOW_TONES_V1", visible ? "1" : "0", true);
   }
   g_nativeForceStateBuild.store(true);
+  if (g_nativeAppActivePanelHwnd) {
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
+}
+
+static void nativeSetBpmColumnVisible(bool visible)
+{
+  g_nativeAppActivePanelModel.showBpm = visible;
+  if (SetExtState_ptr) {
+    SetExtState_ptr(kLuaWindowExtStateSection,
+      "SHOW_BPM_COLUMN_V1", visible ? "1" : "0", true);
+  }
+  g_nativeForceStateBuild.store(true);
+  if (g_nativeAppActivePanelHwnd) {
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
 }
 
 static bool nativeUiMidiBindingMatches(
@@ -36885,6 +38831,7 @@ static bool nativeUiNeedsTimedVisualRefresh()
     g_nativeMainSearchFocused ||
     g_nativePartsRenameOpen ||
     g_nativeMixerRenameOpen ||
+    g_nativeMainBpmEditOpen ||
     timerModalCaret ||
     fadeoutActive ||
     fadeoutRestorePending ||
@@ -37700,6 +39647,28 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             hwnd, wParam)) {
         return 0;
       }
+      if (!g_state.directorInterfaceBlocked &&
+          g_nativeMainBpmEditOpen &&
+          g_nativeMainModalKind == NativeMainModalKind::None) {
+        if (wParam == VK_RETURN || wParam == VK_TAB) {
+          nativeUiCommitBpmValueEdit();
+          nativeUiRefreshTextInputNow(hwnd);
+          return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+          nativeUiCancelBpmValueEdit();
+          nativeUiRefreshTextInputNow(hwnd);
+          return 0;
+        }
+#ifdef _WIN32
+        // O caractere chega no WM_CHAR; impede que a mesma tecla numérica
+        // execute um atalho da interface antes disso.
+        if ((wParam >= 0x20 && wParam <= 0x7e) ||
+            (wParam >= VK_NUMPAD0 && wParam <= VK_NUMPAD9)) {
+          return 0;
+        }
+#endif
+      }
 #ifdef __APPLE__
       // O SWELL não entrega WM_CHAR para estas views customizadas no macOS.
       // Lê o texto real do NSEvent no WM_KEYDOWN (incluindo layout, Shift e
@@ -37769,6 +39738,14 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       if (!g_state.directorInterfaceBlocked &&
           wParam != VK_UP && wParam != VK_DOWN) {
         nativeUiCommitPendingMusicNavigation(true);
+      }
+      if (!g_state.directorInterfaceBlocked &&
+          g_nativeMainModalKind ==
+            NativeMainModalKind::BpmScanResults &&
+          wParam == VK_SPACE) {
+        nativeUiToggleBpmScanPreviewPlayback();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
       }
       if (!g_state.directorInterfaceBlocked &&
           wParam == VK_SPACE) {
@@ -38821,8 +40798,14 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_DESTROY:
     case WM_NCDESTROY:
       nativeUiResetNavigationRepeat();
-      if (message == WM_DESTROY && DockWindowRemove_ptr) {
-        // Como na SWS, remover e sempre seguro mesmo para janela flutuante.
+      if (message == WM_DESTROY && DockWindowRemove_ptr &&
+          !g_nativeAppActivePanelClosing) {
+        // Fechamentos iniciados pela extensao ja removeram a janela do Docker
+        // antes de DestroyWindow. Repetir DockWindowRemove durante o unload do
+        // REAPER pode esperar o encerramento interno do Docker por dezenas de
+        // segundos em algumas maquinas. Quando o host destroi a janela por
+        // conta propria, a flag permanece falsa e esta chamada continua sendo
+        // feita exatamente uma vez.
         DockWindowRemove_ptr(hwnd);
       }
       KillTimer(hwnd, kNativeUiFrameTimerId);
@@ -39320,6 +41303,7 @@ static void nativeCloseAppActivePanel()
   g_nativeMainBpmColumnRect = RECT{0, 0, 0, 0};
   g_nativeMainBpmScanRect = RECT{0, 0, 0, 0};
   g_nativeMainBpmHits.clear();
+  nativeUiCancelBpmValueEdit();
   g_nativeMainPlaylistTabRect = RECT{0, 0, 0, 0};
   g_nativeMainRegionsTabRect = RECT{0, 0, 0, 0};
   g_nativeMainMixerTabRect = RECT{0, 0, 0, 0};
@@ -43909,8 +45893,11 @@ static void nativeRefreshAppActivePanelModel()
     if (!song) return false;
     const std::string key = nativeMultiLoopSongKey(*song);
     const auto found = g_nativeMultiLoopStates.find(key);
-    return found != g_nativeMultiLoopStates.end() &&
-      (found->second.loop[0] || found->second.loop[1]);
+    if (found == g_nativeMultiLoopStates.end()) return false;
+    for (int slot = 0; slot < kNativeMultiLoopSlotCount; ++slot) {
+      if (found->second.loop[slot]) return true;
+    }
+    return false;
   };
   next.selectedOrPlayingMultiLoopActive =
     (next.playing && songHasActiveMultiLoop(
@@ -44250,7 +46237,10 @@ static void nativeClearLoopTimeRange(ReaProject* project)
 static std::string nativeLoopMarkerDisplayName(std::string name)
 {
   name = nativeTrim(name);
-  if (nativeStartsWith(name, "*1") || nativeStartsWith(name, "*2")) name = nativeTrim(name.substr(2));
+  if (nativeStartsWith(name, "*1") || nativeStartsWith(name, "*2") ||
+      nativeStartsWith(name, "*3") || nativeStartsWith(name, "*4")) {
+    name = nativeTrim(name.substr(2));
+  }
   else if (nativeStartsWith(name, "$") || nativeStartsWith(name, "!")) name = nativeTrim(name.substr(1));
   while (!name.empty() && (name.front() == '-' || name.front() == ':' || name.front() == ' ' || name.front() == '\t')) name.erase(name.begin());
   return nativeTrim(name);
@@ -45020,8 +47010,16 @@ static void nativeParseMultiLoopState(const std::string& raw)
         if (f[0] == "E") {
           state.loop[0] = f[2] == "1"; state.loop[1] = f[3] == "1";
           state.ms[0] = f[4] == "1"; state.ms[1] = f[5] == "1";
+          // O formato antigo termina no campo 5. Os quatro campos extras
+          // preservam a leitura de projetos anteriores e acrescentam slots 3/4.
+          if (f.size() >= 10) {
+            state.loop[2] = f[6] == "1"; state.loop[3] = f[7] == "1";
+            state.ms[2] = f[8] == "1"; state.ms[3] = f[9] == "1";
+          }
         } else if ((f[0] == "P" || f[0] == "F" || f[0] == "L") && nativeLooksNumeric(f[2])) {
-          const int slot = std::max(0, std::min(1, std::atoi(f[2].c_str()) - 1));
+          const int slot = std::max(0, std::min(
+            kNativeMultiLoopSlotCount - 1,
+            std::atoi(f[2].c_str()) - 1));
           const std::string guid = nativeMultiLoopUnescape(f[3]);
           if (!guid.empty()) {
             NativeMultiLoopTrackPreset& row = state.tracks[slot][guid];
@@ -45038,7 +47036,9 @@ static void nativeParseMultiLoopState(const std::string& raw)
             }
           }
         } else if (f[0] == "T" && nativeLooksNumeric(f[2])) {
-          const int slot = std::max(0, std::min(1, std::atoi(f[2].c_str()) - 1));
+          const int slot = std::max(0, std::min(
+            kNativeMultiLoopSlotCount - 1,
+            std::atoi(f[2].c_str()) - 1));
           state.fadeSec[slot] = std::max(1, std::min(5, std::atoi(f[3].c_str())));
         }
       }
@@ -45117,10 +47117,22 @@ static void nativeSaveMultiLoopState()
   for (const auto& songEntry : g_nativeMultiLoopStates) {
     const std::string key = nativeMultiLoopEscape(songEntry.first);
     const NativeMultiLoopSongState& state = songEntry.second;
-    if (state.loop[0] || state.loop[1] || state.ms[0] || state.ms[1]) {
-      mainLines.push_back("E\t" + key + "\t" + (state.loop[0] ? "1" : "0") + "\t" + (state.loop[1] ? "1" : "0") + "\t" + (state.ms[0] ? "1" : "0") + "\t" + (state.ms[1] ? "1" : "0"));
+    bool hasEnabledState = false;
+    for (int slot = 0; slot < kNativeMultiLoopSlotCount; ++slot) {
+      hasEnabledState = hasEnabledState || state.loop[slot] || state.ms[slot];
     }
-    for (int slot = 0; slot < 2; ++slot) {
+    if (hasEnabledState) {
+      mainLines.push_back("E\t" + key +
+        "\t" + (state.loop[0] ? "1" : "0") +
+        "\t" + (state.loop[1] ? "1" : "0") +
+        "\t" + (state.ms[0] ? "1" : "0") +
+        "\t" + (state.ms[1] ? "1" : "0") +
+        "\t" + (state.loop[2] ? "1" : "0") +
+        "\t" + (state.loop[3] ? "1" : "0") +
+        "\t" + (state.ms[2] ? "1" : "0") +
+        "\t" + (state.ms[3] ? "1" : "0"));
+    }
+    for (int slot = 0; slot < kNativeMultiLoopSlotCount; ++slot) {
       if (state.fadeSec[slot] != 3) msLines.push_back("T\t" + key + "\t" + std::to_string(slot + 1) + "\t" + std::to_string(state.fadeSec[slot]) + "\t0\t0");
       for (const auto& trackEntry : state.tracks[slot]) {
         const NativeMultiLoopTrackPreset& row = trackEntry.second;
@@ -45164,7 +47176,8 @@ static NativeMultiLoopPair nativeFindMultiLoopPair(ReaProject* project, const st
   const std::string cacheKey = cacheKeyStream.str();
   const auto cached = cache.find(cacheKey);
   if (cached != cache.end()) return cached->second;
-  const std::string prefix = slot == 1 ? "*2" : "*1";
+  if (slot < 0 || slot >= kNativeMultiLoopSlotCount) return pair;
+  const std::string prefix = "*" + std::to_string(slot + 1);
   std::vector<double> points;
   int markerCount = 0, regionCount = 0;
   const int total = CountProjectMarkers_ptr(project, &markerCount, &regionCount);
@@ -45437,7 +47450,7 @@ static void nativeProcessMultiLoops(ReaProject* project, const std::vector<Nativ
     const auto warningStateIt = g_nativeMultiLoopStates.find(warningSongKey);
     if (warningStateIt != g_nativeMultiLoopStates.end()) {
       const NativeMultiLoopSongState& warningState = warningStateIt->second;
-      for (int slot = 0; slot < 2; ++slot) if (warningState.loop[slot]) {
+      for (int slot = 0; slot < kNativeMultiLoopSlotCount; ++slot) if (warningState.loop[slot]) {
         const NativeMultiLoopPair pair = nativeFindMultiLoopPair(project, warningSongKey, songStart, songEnd, slot);
         const double remaining = pair.start - playPos;
         if (pair.valid && remaining >= -0.0005 && remaining <= kNativeMultiLoopBypassWarningLeadSec + 0.0005
@@ -45484,7 +47497,7 @@ static void nativeProcessMultiLoops(ReaProject* project, const std::vector<Nativ
   }
   const NativeMultiLoopSongState& state = stateIt->second;
   std::vector<NativeMultiLoopPair> enabledPairs;
-  for (int slot = 0; slot < 2; ++slot) if (state.loop[slot]) {
+  for (int slot = 0; slot < kNativeMultiLoopSlotCount; ++slot) if (state.loop[slot]) {
     const NativeMultiLoopPair pair = nativeFindMultiLoopPair(project, songKey, songStart, songEnd, slot);
     if (!pair.valid) continue;
     enabledPairs.push_back(pair);
@@ -45704,7 +47717,10 @@ static std::string nativeBuildMultiLoopsJson(ReaProject* project)
              << ",\"bypassWarningKey\":" << nativeJsonString(g_nativeMultiLoopBypassWarningPairKey)
              << ",\"bypassWarningSongKey\":" << nativeJsonString(g_nativeMultiLoopBypassWarningSongKey)
              << ",\"bypassWarningStartPos\":" << nativeNumber(g_nativeMultiLoopBypassWarningStartPos)
-             << ",\"loop1Enabled\":false,\"loop2Enabled\":false,\"ms1Enabled\":false,\"ms2Enabled\":false,\"loop1Available\":false,\"loop2Available\":false,\"fade1Sec\":3,\"fade2Sec\":3,\"tracks\":[]}";
+             << ",\"loop1Enabled\":false,\"loop2Enabled\":false,\"loop3Enabled\":false,\"loop4Enabled\":false"
+             << ",\"ms1Enabled\":false,\"ms2Enabled\":false,\"ms3Enabled\":false,\"ms4Enabled\":false"
+             << ",\"loop1Available\":false,\"loop2Available\":false,\"loop3Available\":false,\"loop4Available\":false"
+             << ",\"fade1Sec\":3,\"fade2Sec\":3,\"fade3Sec\":3,\"fade4Sec\":3,\"tracks\":[]}";
     cachedJson = emptyOut.str();
     return cachedJson;
   }
@@ -45713,6 +47729,8 @@ static std::string nativeBuildMultiLoopsJson(ReaProject* project)
   const NativeMultiLoopSongState& state = it == g_nativeMultiLoopStates.end() ? empty : it->second;
   const NativeMultiLoopPair pair1 = nativeFindMultiLoopPair(project, g_nativeMultiLoopFocusKey, g_nativeMultiLoopFocusStart, g_nativeMultiLoopFocusEnd, 0);
   const NativeMultiLoopPair pair2 = nativeFindMultiLoopPair(project, g_nativeMultiLoopFocusKey, g_nativeMultiLoopFocusStart, g_nativeMultiLoopFocusEnd, 1);
+  const NativeMultiLoopPair pair3 = nativeFindMultiLoopPair(project, g_nativeMultiLoopFocusKey, g_nativeMultiLoopFocusStart, g_nativeMultiLoopFocusEnd, 2);
+  const NativeMultiLoopPair pair4 = nativeFindMultiLoopPair(project, g_nativeMultiLoopFocusKey, g_nativeMultiLoopFocusStart, g_nativeMultiLoopFocusEnd, 3);
   std::ostringstream tracks;
   tracks << "[";
   const int count = (project && CountTracks_ptr) ? CountTracks_ptr(project) : 0;
@@ -45750,7 +47768,7 @@ static std::string nativeBuildMultiLoopsJson(ReaProject* project)
            << ",\"group\":" << (group ? "true" : "false")
            << ",\"hasCustomColor\":" << (hasCustomColor ? "true" : "false")
            << ",\"color\":" << nativeJsonString(nativeColorRefHex(displayColor));
-    for (int slot = 0; slot < 2; ++slot) {
+    for (int slot = 0; slot < kNativeMultiLoopSlotCount; ++slot) {
       const auto rowIt = state.tracks[slot].find(guid);
       const NativeMultiLoopTrackPreset row = rowIt == state.tracks[slot].end() ? NativeMultiLoopTrackPreset() : rowIt->second;
       tracks << ",\"auto" << (slot + 1) << "\":" << (row.autoFader ? "true" : "false")
@@ -45771,9 +47789,13 @@ static std::string nativeBuildMultiLoopsJson(ReaProject* project)
       << ",\"bypassWarningSongKey\":" << nativeJsonString(g_nativeMultiLoopBypassWarningSongKey)
       << ",\"bypassWarningStartPos\":" << nativeNumber(g_nativeMultiLoopBypassWarningStartPos)
       << ",\"loop1Enabled\":" << (state.loop[0] ? "true" : "false") << ",\"loop2Enabled\":" << (state.loop[1] ? "true" : "false")
+      << ",\"loop3Enabled\":" << (state.loop[2] ? "true" : "false") << ",\"loop4Enabled\":" << (state.loop[3] ? "true" : "false")
       << ",\"ms1Enabled\":" << (state.ms[0] && state.loop[0] ? "true" : "false") << ",\"ms2Enabled\":" << (state.ms[1] && state.loop[1] ? "true" : "false")
+      << ",\"ms3Enabled\":" << (state.ms[2] && state.loop[2] ? "true" : "false") << ",\"ms4Enabled\":" << (state.ms[3] && state.loop[3] ? "true" : "false")
       << ",\"loop1Available\":" << (pair1.valid ? "true" : "false") << ",\"loop2Available\":" << (pair2.valid ? "true" : "false")
-      << ",\"fade1Sec\":" << state.fadeSec[0] << ",\"fade2Sec\":" << state.fadeSec[1] << ",\"tracks\":" << tracks.str() << "}";
+      << ",\"loop3Available\":" << (pair3.valid ? "true" : "false") << ",\"loop4Available\":" << (pair4.valid ? "true" : "false")
+      << ",\"fade1Sec\":" << state.fadeSec[0] << ",\"fade2Sec\":" << state.fadeSec[1]
+      << ",\"fade3Sec\":" << state.fadeSec[2] << ",\"fade4Sec\":" << state.fadeSec[3] << ",\"tracks\":" << tracks.str() << "}";
   cachedSignature = signature.str();
   cachedJson = out.str();
   return cachedJson;
@@ -45813,6 +47835,7 @@ static void nativeRebuildState(bool forceSnapshot)
   // a cada heartbeat, deixando o desenho e o zoom do Grid livres.
   static ReaProject* cachedSnapshotProject = nullptr;
   static int cachedSnapshotChangeCount = -1;
+  static uint64_t cachedTempoMarkerBpmSignature = 0;
   static int observedProjectChangeCount = -1;
   static std::chrono::steady_clock::time_point observedProjectChangeAt;
   static std::vector<NativeSongWindow> cachedSongs;
@@ -45835,6 +47858,15 @@ static void nativeRebuildState(bool forceSnapshot)
     : -1;
   const auto snapshotNow = std::chrono::steady_clock::now();
   const bool snapshotProjectChanged = cachedSnapshotProject != activeProject;
+  // Alguns caminhos de edição da régua de tempo não acordam imediatamente o
+  // snapshot pelo contador geral do projeto. A assinatura dos próprios pontos
+  // garante que extensão e App Diretor recebam o BPM manual no ciclo seguinte.
+  const NativeTempoMarkerBpmValues currentTempoMarkers =
+    nativeCollectTempoMarkerBpmValues(activeProject);
+  const uint64_t currentTempoMarkerBpmSignature =
+    nativeTempoMarkerBpmValuesSignature(currentTempoMarkers);
+  const bool tempoMarkerBpmChanged = snapshotProjectChanged ||
+    cachedTempoMarkerBpmSignature != currentTempoMarkerBpmSignature;
   const bool onlyLightweightRuntimeMutation = !snapshotProjectChanged
     && g_nativeLightweightMutationProject == activeProject
     && g_nativeLightweightMutationChangeCount == projectChangeCount;
@@ -45857,21 +47889,51 @@ static void nativeRebuildState(bool forceSnapshot)
   const bool projectRevisionSettled = cachedSnapshotChangeCount != projectChangeCount &&
     observedProjectChangeAt.time_since_epoch().count() != 0 &&
     std::chrono::duration_cast<std::chrono::milliseconds>(snapshotNow - observedProjectChangeAt).count() >= 300;
-  const bool rebuildSnapshot = forceSnapshot || snapshotProjectChanged || projectRevisionSettled || cachedSongs.empty();
+  const bool rebuildSnapshot = forceSnapshot || snapshotProjectChanged ||
+    tempoMarkerBpmChanged || projectRevisionSettled || cachedSongs.empty();
   if (rebuildSnapshot) {
     ++g_nativeMultiLoopPairCacheRevision;
     cachedSnapshotProject = activeProject;
     cachedSnapshotChangeCount = projectChangeCount;
+    cachedTempoMarkerBpmSignature = currentTempoMarkerBpmSignature;
     cachedSongs = nativeCollectProjectSongs(activeProject, cachedMarkersJson);
     nativeProcessTunerCommands(activeProject, cachedSongs);
     const auto tunerOffsets = nativeLoadTunerOffsets(activeProject);
+    const auto bpmResults = nativeLoadBpmScanCache(activeProject);
+    const NativeTempoMarkerBpmValues& bpmTempoMarkers =
+      currentTempoMarkers;
     for (auto& song : cachedSongs) {
       if (song.isBlock || song.isHashParent) {
         song.tunerValue = 0;
+      } else {
+        const auto it = tunerOffsets.find(nativeTunerKey(song));
+        song.tunerValue = it == tunerOffsets.end() ? 0 : it->second;
+      }
+      song.bpmAvailable = false;
+      song.bpmValue = 0.0;
+      song.bpmOriginal = 0.0;
+      song.bpmGeneric = false;
+      if (song.isBlock || song.isHashParent) {
         continue;
       }
-      const auto it = tunerOffsets.find(nativeTunerKey(song));
-      song.tunerValue = it == tunerOffsets.end() ? 0 : it->second;
+      const auto bpmIt = bpmResults.find(song.id);
+      const bool cachedBpmFound = bpmIt != bpmResults.end() &&
+        nativeBpmScanResultHasUsableValue(bpmIt->second);
+      double markerBpm = 0.0;
+      const bool markerBpmFound =
+        nativeTempoMarkerBpmAtOrBeforePosition(
+          bpmTempoMarkers, song.start, markerBpm);
+      if (!cachedBpmFound && !markerBpmFound) continue;
+      song.bpmAvailable = true;
+      song.bpmGeneric = cachedBpmFound &&
+        !bpmIt->second.error.empty();
+      const double currentBpm = markerBpmFound
+        ? markerBpm : bpmIt->second.bpm;
+      song.bpmValue = std::round(currentBpm);
+      song.bpmOriginal = cachedBpmFound
+        ? std::round(bpmIt->second.originalBpm > 0.0
+            ? bpmIt->second.originalBpm : bpmIt->second.bpm)
+        : song.bpmValue;
     }
   }
   std::string markersJson = cachedMarkersJson;
@@ -46423,6 +48485,8 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"projectTabs\":" << projectsJson << ",";
   json << "\"openProjects\":" << projectsJson << ",";
   json << "\"activeProjectTabIndex\":" << activeProjectIndex << ",";
+  json << "\"smartSearch\":"
+       << nativeBuildSmartSearchStateJson() << ",";
   json << "\"regions\":" << regionsJson << ",";
   json << "\"markers\":" << markersJson << ",";
   json << "\"playlists\":" << playlistsJson << ",";
@@ -46744,6 +48808,12 @@ static void nativePublishCommandsToExtState()
 static void nativeBridgeTick()
 {
   nativePublishCommandsToExtState();
+  // A selecao e o scroll das setas sao inteiramente locais durante o
+  // autorepeat. Reconstruir o estado completo aqui varre TP1/TP2, mixer e o
+  // projeto por cerca de 110 ms nesta maquina, bloqueando o mesmo thread que
+  // entrega teclado e pintura. Mantem qualquer pedido de force pendente e
+  // publica tudo uma unica vez assim que a tecla for solta.
+  if (g_nativeUiHeldNavigationKey != 0) return;
   const auto now = std::chrono::steady_clock::now();
   const bool forceLive = g_nativeForceStateBuild.exchange(false);
   const bool forceSnapshot = g_nativeForceSnapshotBuild.exchange(false);
@@ -47763,7 +49833,7 @@ static bool nativeApplyMultiLoopCommand(const std::string& commandBody)
   int slot = 1;
   std::string slotText = nativeJsonExtractString(commandBody, "slot");
   if (nativeLooksNumeric(slotText)) slot = std::atoi(slotText.c_str());
-  slot = std::max(1, std::min(2, slot)) - 1;
+  slot = std::max(1, std::min(kNativeMultiLoopSlotCount, slot)) - 1;
   NativeMultiLoopSongState& state = g_nativeMultiLoopStates[key];
   std::string desiredText = nativeJsonExtractString(commandBody, "enabled");
   if (desiredText.empty()) desiredText = nativeJsonExtractString(commandBody, "desiredState");
@@ -48322,15 +50392,29 @@ static void nativeProcessPendingSelectionOnMainThread()
      command.type == "select_region");
   // O modal cursor-only tambem ignora movimento enquanto o transporte toca.
   // Toda chamada ao REAPER acontece aqui, na thread principal registrada pelo timer.
+  bool editCursorChanged = false;
   if (!command.selectionOnly &&
       !musicSelectionOnlyWhilePlaying &&
       !(cursorOnly && transportPlaying) &&
       hasTargetPos && targetPos >= 0.0) {
-    if (SetEditCurPos2_ptr) SetEditCurPos2_ptr(project, targetPos, true, false);
-    else if (SetEditCurPos_ptr) SetEditCurPos_ptr(targetPos, true, false);
+    if (SetEditCurPos2_ptr) {
+      SetEditCurPos2_ptr(project, targetPos, true, false);
+      editCursorChanged = true;
+    } else if (SetEditCurPos_ptr) {
+      SetEditCurPos_ptr(targetPos, true, false);
+      editCursorChanged = true;
+    }
   }
-  if (UpdateArrange_ptr) UpdateArrange_ptr();
-  g_nativeForceStateBuild.store(true);
+  // A repeticao das setas publica selectionOnly em cada passo. UpdateArrange
+  // nesse caminho nao representa nenhuma mudanca do REAPER e obrigava a
+  // timeline a redesenhar imagens e videos dezenas de vezes por segundo. O
+  // redesenho fica reservado ao commit final, quando o cursor realmente muda.
+  if (editCursorChanged && UpdateArrange_ptr) UpdateArrange_ptr();
+  // selectionOnly e produzido continuamente pelas setas. A selecao externa
+  // continua sendo publicada pelo tick normal; o commit final força o estado.
+  if (!command.selectionOnly) {
+    g_nativeForceStateBuild.store(true);
+  }
 }
 
 static bool nativeApplySelectionCommand(const std::string& commandBody)
@@ -48426,7 +50510,9 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
     // Uma unica solicitacao pendente. O ultimo toque substitui o anterior.
     g_nativePendingSelection = command;
   }
-  g_nativeForceStateBuild.store(true);
+  if (!command.selectionOnly) {
+    g_nativeForceStateBuild.store(true);
+  }
   return true;
 }
 
@@ -48536,6 +50622,8 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
   const int playState = GetPlayStateEx_ptr ? GetPlayStateEx_ptr(project) : 0;
   const bool isPlaying = playState != 0;
+  const bool suppressAutoQueue = nativeBoolFromText(
+    nativeJsonExtractString(commandBody, "suppressAutoQueue"), false);
 
   if (type == "director_pause") {
     nativeClearPendingPlayTarget();
@@ -48564,6 +50652,16 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
       wantsPlay = !isPlaying;
       wantsStop = isPlaying;
     }
+  }
+
+  if (suppressAutoQueue) {
+    g_nativeBpmScanPreviewPlaybackActive = true;
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    nativeClearAllQueueStateLocked();
+  } else if (wantsPlay && !wantsStop && !isPlaying) {
+    // Um Play normal posterior encerra qualquer audição antiga que tenha sido
+    // interrompida fora do modal do scan.
+    g_nativeBpmScanPreviewPlaybackActive = false;
   }
 
   if (wantsPlay && !wantsStop && !isPlaying &&
@@ -48759,7 +50857,7 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
         hasPlayTunerSong = true;
       }
     }
-    if (playPlaylistOrder > 0) {
+    if (!suppressAutoQueue && playPlaylistOrder > 0) {
       VS_Hook_Native_ArmAutoQueueFromPlaylistOrder(playPlaylistOrder);
     }
 
@@ -49572,6 +51670,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
 
   const bool handledByNative =
     handledAccessControlCommand ||
+    nativeApplySmartSearchCommand(commandBody) ||
     nativeApplyTechnicalNoticeSettingsCommand(commandBody) ||
     nativeApplyTelepromptSettingsCommand(commandBody) ||
     nativeApplyDirectorListScrollCommand(commandBody) ||
@@ -49579,6 +51678,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     nativeApplyStopPauseModeCommand(commandBody) ||
     nativeApplyPlayProtectionCommand(commandBody) ||
     nativeApplyManualStopFadeoutCommand(commandBody) ||
+    nativeApplyBpmCommand(commandBody) ||
     nativeApplyTunerCommand(commandBody) ||
     nativeApplyMixerCommand(commandBody) ||
     nativeApplyQueueCommand(commandBody) ||
@@ -49988,6 +52088,244 @@ static void nativeReleaseRuntimeControlOnMainThread()
   }
 }
 
+static bool g_nativePanelWasOpenBeforeProjectLoad = false;
+static bool g_nativeProjectLoadAwaitingPanelRestore = false;
+static std::chrono::steady_clock::time_point
+  g_nativeProjectLoadPanelClosedAt{};
+
+static void nativePreparePanelForProjectTransition()
+{
+  if (nativeAppActivePanelIsOpen()) {
+    g_nativePanelWasOpenBeforeProjectLoad = true;
+    nativeCloseAppActivePanel();
+  }
+  if (g_nativePanelWasOpenBeforeProjectLoad &&
+      !g_nativeProjectLoadAwaitingPanelRestore) {
+    g_nativeProjectLoadAwaitingPanelRestore = true;
+    g_nativeProjectLoadPanelClosedAt =
+      std::chrono::steady_clock::now();
+  }
+}
+
+static bool nativeProjectConfigProcessExtensionLine(
+  const char* line,
+  ProjectStateContext* context,
+  bool isUndo,
+  project_config_extension_t* registration)
+{
+  (void)line;
+  (void)context;
+  (void)isUndo;
+  (void)registration;
+  return false;
+}
+
+static void nativeProjectConfigSaveExtensionConfig(
+  ProjectStateContext* context,
+  bool isUndo,
+  project_config_extension_t* registration)
+{
+  (void)context;
+  (void)isUndo;
+  (void)registration;
+}
+
+static void nativeProjectConfigBeginLoadProjectState(
+  bool isUndo,
+  project_config_extension_t* registration)
+{
+  (void)registration;
+  // Undo tambem passa pelo callback de projeto, mas nao troca o RPP ativo e
+  // nunca deve fazer a janela piscar ou perder o foco.
+  if (isUndo) return;
+  nativePreparePanelForProjectTransition();
+}
+
+static project_config_extension_t g_nativeProjectConfigExtension = {
+  nativeProjectConfigProcessExtensionLine,
+  nativeProjectConfigSaveExtensionConfig,
+  nativeProjectConfigBeginLoadProjectState,
+  nullptr
+};
+
+static void nativeRestorePanelAfterProjectLoadIfReady()
+{
+  if (!g_nativeProjectLoadAwaitingPanelRestore ||
+      !g_nativePanelWasOpenBeforeProjectLoad) {
+    return;
+  }
+  if (g_state.projectStableTicks < 2 ||
+      g_nativeProjectLoadPanelClosedAt.time_since_epoch().count() == 0 ||
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() -
+          g_nativeProjectLoadPanelClosedAt).count() < 150) {
+    return;
+  }
+  HWND mainWindow = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
+  if (!mainWindow || !IsWindow(mainWindow) ||
+      !IsWindowVisible(mainWindow) || !IsWindowEnabled(mainWindow)) {
+    return;
+  }
+  if (nativeOpenAppActivePanel()) {
+    g_nativePanelWasOpenBeforeProjectLoad = false;
+    g_nativeProjectLoadAwaitingPanelRestore = false;
+    g_nativeProjectLoadPanelClosedAt =
+      std::chrono::steady_clock::time_point{};
+  }
+}
+
+#ifdef _WIN32
+// Em algumas maquinas mais lentas, manter o painel ativo enquanto o host fecha
+// prende o processamento da janela por dezenas de segundos, esteja ela
+// flutuante ou no Docker. Ao receber o inicio real do fechamento da janela
+// principal, encerramos o painel primeiro, como quando o usuario fecha a
+// interface manualmente antes de sair do REAPER.
+static constexpr UINT_PTR kNativeReaperMainSubclassId =
+  static_cast<UINT_PTR>(0x5653484D);
+static HWND g_nativeReaperMainSubclassHwnd = nullptr;
+static bool g_nativePanelClosedForHostClose = false;
+static std::chrono::steady_clock::time_point
+  g_nativePanelClosedForHostCloseAt{};
+
+static bool nativeMenuLabelLooksLikeRecentProjects(
+  std::wstring label)
+{
+  std::transform(label.begin(), label.end(), label.begin(),
+    [](wchar_t value) { return std::towlower(value); });
+  return label.find(L"recent") != std::wstring::npos;
+}
+
+static bool nativeMenuCommandIsRecentProjectRecursive(
+  HMENU menu,
+  UINT command,
+  bool insideRecentProjects)
+{
+  if (!menu) return false;
+  const int itemCount = GetMenuItemCount(menu);
+  for (int index = 0; index < itemCount; ++index) {
+    wchar_t labelBuffer[1024] = {};
+    MENUITEMINFOW item{};
+    item.cbSize = sizeof(item);
+    item.fMask = MIIM_ID | MIIM_SUBMENU | MIIM_STRING |
+      MIIM_FTYPE;
+    item.dwTypeData = labelBuffer;
+    item.cch = static_cast<UINT>(
+      sizeof(labelBuffer) / sizeof(labelBuffer[0]) - 1);
+    if (!GetMenuItemInfoW(menu,
+          static_cast<UINT>(index), TRUE, &item)) {
+      continue;
+    }
+    const std::wstring label(labelBuffer);
+    const bool recentBranch = insideRecentProjects ||
+      nativeMenuLabelLooksLikeRecentProjects(label);
+    if (item.hSubMenu &&
+        nativeMenuCommandIsRecentProjectRecursive(
+          item.hSubMenu, command, recentBranch)) {
+      return true;
+    }
+    if (!item.hSubMenu && item.wID == command && recentBranch) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool nativeMainMenuCommandIsRecentProject(
+  HWND mainWindow,
+  UINT command)
+{
+  return mainWindow &&
+    nativeMenuCommandIsRecentProjectRecursive(
+      GetMenu(mainWindow), command, false);
+}
+
+static LRESULT CALLBACK nativeReaperMainSubclassProc(
+  HWND hwnd,
+  UINT message,
+  WPARAM wParam,
+  LPARAM lParam,
+  UINT_PTR subclassId,
+  DWORD_PTR referenceData)
+{
+  (void)referenceData;
+  if (message == WM_COMMAND &&
+      nativeMainMenuCommandIsRecentProject(
+        hwnd, LOWORD(wParam))) {
+    nativePreparePanelForProjectTransition();
+  } else if (message == WM_CLOSE) {
+    if (nativeAppActivePanelIsOpen()) {
+      g_nativePanelClosedForHostClose = true;
+      g_nativePanelClosedForHostCloseAt =
+        std::chrono::steady_clock::now();
+      nativeCloseAppActivePanel();
+    }
+  } else if (message == WM_NCDESTROY) {
+    RemoveWindowSubclass(
+      hwnd, nativeReaperMainSubclassProc, subclassId);
+    if (g_nativeReaperMainSubclassHwnd == hwnd) {
+      g_nativeReaperMainSubclassHwnd = nullptr;
+    }
+  }
+  return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
+static void nativeInstallReaperMainWindowSubclass()
+{
+  if (g_nativeReaperMainSubclassHwnd &&
+      IsWindow(g_nativeReaperMainSubclassHwnd)) {
+    return;
+  }
+  HWND mainWindow = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
+  if (!mainWindow || !IsWindow(mainWindow)) return;
+  if (SetWindowSubclass(mainWindow,
+        nativeReaperMainSubclassProc,
+        kNativeReaperMainSubclassId, 0)) {
+    g_nativeReaperMainSubclassHwnd = mainWindow;
+  }
+}
+
+static void nativeRemoveReaperMainWindowSubclass()
+{
+  HWND mainWindow = g_nativeReaperMainSubclassHwnd;
+  g_nativeReaperMainSubclassHwnd = nullptr;
+  g_nativePanelClosedForHostClose = false;
+  g_nativePanelClosedForHostCloseAt =
+    std::chrono::steady_clock::time_point{};
+  if (mainWindow && IsWindow(mainWindow)) {
+    RemoveWindowSubclass(mainWindow,
+      nativeReaperMainSubclassProc,
+      kNativeReaperMainSubclassId);
+  }
+}
+
+static void nativeRestorePanelAfterCancelledHostClose()
+{
+  if (!g_nativePanelClosedForHostClose) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (g_nativePanelClosedForHostCloseAt.time_since_epoch().count() != 0 &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - g_nativePanelClosedForHostCloseAt).count() < 350) {
+    return;
+  }
+  HWND mainWindow = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
+  if (!mainWindow || !IsWindow(mainWindow) ||
+      !IsWindowVisible(mainWindow) || !IsWindowEnabled(mainWindow)) {
+    return;
+  }
+  // O timer do plugin so volta a executar depois que WM_CLOSE retornou. Se a
+  // janela principal continua viva, o usuario cancelou a saida (por exemplo,
+  // na confirmacao para salvar o projeto), portanto restauramos o painel.
+  g_nativePanelClosedForHostClose = false;
+  g_nativePanelClosedForHostCloseAt =
+    std::chrono::steady_clock::time_point{};
+  nativeOpenAppActivePanel();
+}
+#else
+static void nativeInstallReaperMainWindowSubclass() {}
+static void nativeRemoveReaperMainWindowSubclass() {}
+static void nativeRestorePanelAfterCancelledHostClose() {}
+#endif
+
 static void nativeUiResetForProjectTabChange()
 {
   // Se a aba anterior ainda existe, restaura nela qualquer estado temporário
@@ -50075,6 +52413,9 @@ static void startupTimer()
   static bool runtimeLicenseValid = true;
   static std::chrono::steady_clock::time_point nextLicenseCheck{};
 
+  nativeInstallReaperMainWindowSubclass();
+  nativeRestorePanelAfterCancelledHostClose();
+
   const auto licenseNow = std::chrono::steady_clock::now();
   if (nextLicenseCheck.time_since_epoch().count() == 0 ||
       licenseNow >= nextLicenseCheck) {
@@ -50107,6 +52448,7 @@ static void startupTimer()
   } else {
     ++g_state.projectStableTicks;
   }
+  nativeRestorePanelAfterProjectLoadIfReady();
   nativeLoadLiveMarksForCurrentProject(projectSignature);
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -50272,6 +52614,24 @@ static bool loadApi(reaper_plugin_info_t* rec)
     rec->GetFunc("Undo_EndBlock2"));
   UpdateTimeline_ptr = reinterpret_cast<UpdateTimeline_t>(
     rec->GetFunc("UpdateTimeline"));
+  CountTempoTimeSigMarkers_ptr =
+    reinterpret_cast<CountTempoTimeSigMarkers_t>(
+      rec->GetFunc("CountTempoTimeSigMarkers"));
+  GetTempoTimeSigMarker_ptr =
+    reinterpret_cast<GetTempoTimeSigMarker_t>(
+      rec->GetFunc("GetTempoTimeSigMarker"));
+  SetTempoTimeSigMarker_ptr =
+    reinterpret_cast<SetTempoTimeSigMarker_t>(
+      rec->GetFunc("SetTempoTimeSigMarker"));
+  DeleteTempoTimeSigMarker_ptr =
+    reinterpret_cast<DeleteTempoTimeSigMarker_t>(
+      rec->GetFunc("DeleteTempoTimeSigMarker"));
+  projectconfig_var_getoffs_ptr =
+    reinterpret_cast<projectconfig_var_getoffs_t>(
+      rec->GetFunc("projectconfig_var_getoffs"));
+  projectconfig_var_addr_ptr =
+    reinterpret_cast<projectconfig_var_addr_t>(
+      rec->GetFunc("projectconfig_var_addr"));
   GetRegionOrMarker_ptr = reinterpret_cast<GetRegionOrMarker_t>(rec->GetFunc("GetRegionOrMarker"));
   GetRegionOrMarkerInfo_Value_ptr = reinterpret_cast<GetRegionOrMarkerInfo_Value_t>(rec->GetFunc("GetRegionOrMarkerInfo_Value"));
   SetRegionOrMarkerInfo_Value_ptr =
@@ -50489,26 +52849,6 @@ static bool initialize()
       "custom_action", (void*)&g_recadosAction);
   if (g_recadosCommandId != 0) hasRegisteredAction = true;
 
-  // L e R ficam gravados diretamente na action nativa 1068 (Repeat) dentro do
-  // reaper-kb.ini. A rotina altera somente essas duas teclas sem modificadores,
-  // na secao Main, preservando todos os demais atalhos do usuario. O gaccel
-  // abaixo garante o mesmo comportamento imediatamente na primeira carga,
-  // antes de um novo ciclo de inicializacao do REAPER.
-  ensurePersistentRepeatShortcuts();
-  g_repeatShortcutCommandId =
-    plugin_register_ptr("command_id", (void*)"_VSHOOK_REPEAT_REAPER");
-  if (g_repeatShortcutCommandId != 0) {
-    hasRegisteredAction = true;
-    g_repeatShortcutL.accel.cmd = g_repeatShortcutCommandId;
-    g_repeatShortcutR.accel.cmd = g_repeatShortcutCommandId;
-    if (plugin_register_ptr("gaccel", (void*)&g_repeatShortcutL)) {
-      g_state.repeatShortcutLRegistered = true;
-    }
-    if (plugin_register_ptr("gaccel", (void*)&g_repeatShortcutR)) {
-      g_state.repeatShortcutRRegistered = true;
-    }
-  }
-
   for (ScriptEntry& script : g_scripts) {
     script.commandId = plugin_register_ptr("custom_action", (void*)&script.action);
     if (script.commandId != 0) {
@@ -50565,6 +52905,12 @@ static bool initialize()
     AddExtensionsMainMenu_ptr();
   }
 
+  if (plugin_register_ptr("projectconfig",
+        reinterpret_cast<void*>(
+          &g_nativeProjectConfigExtension))) {
+    g_state.projectConfigRegistered = true;
+  }
+
   // O timer fica ativo de forma leve para suportar auto-inicio por projeto
   // quando o usuario troca/abre projetos depois do REAPER ja estar rodando.
   g_state.startupTimerTicks = 0;
@@ -50585,7 +52931,22 @@ static bool initialize()
 
 static void shutdown()
 {
-  if (!plugin_register_ptr || !g_state.initialized) return;
+  if (!plugin_register_ptr || !g_state.initialized) {
+    return;
+  }
+
+  nativeRemoveReaperMainWindowSubclass();
+
+  if (g_state.projectConfigRegistered) {
+    plugin_register_ptr("-projectconfig",
+      reinterpret_cast<void*>(
+        &g_nativeProjectConfigExtension));
+    g_state.projectConfigRegistered = false;
+  }
+  g_nativePanelWasOpenBeforeProjectLoad = false;
+  g_nativeProjectLoadAwaitingPanelRestore = false;
+  g_nativeProjectLoadPanelClosedAt =
+    std::chrono::steady_clock::time_point{};
 
   // Interrompe primeiro os produtores de trabalho. Antes, o timer e a ponte
   // HTTP continuavam ativos enquanto janelas e decoders eram destruídos; ao
@@ -50612,18 +52973,6 @@ static void shutdown()
     g_state.acceleratorRegistered = false;
   }
 
-  if (g_state.repeatShortcutRRegistered) {
-    plugin_register_ptr("-gaccel", (void*)&g_repeatShortcutR);
-    g_state.repeatShortcutRRegistered = false;
-  }
-  if (g_state.repeatShortcutLRegistered) {
-    plugin_register_ptr("-gaccel", (void*)&g_repeatShortcutL);
-    g_state.repeatShortcutLRegistered = false;
-  }
-  g_repeatShortcutCommandId = 0;
-  g_repeatShortcutL.accel.cmd = 0;
-  g_repeatShortcutR.accel.cmd = 0;
-
   if (g_state.menuHookRegistered) {
     plugin_register_ptr("-hookcustommenu", reinterpret_cast<void*>(&menuHook));
     g_state.menuHookRegistered = false;
@@ -50643,7 +52992,6 @@ static void shutdown()
     plugin_register_ptr("-hookcommand", reinterpret_cast<void*>(&hookCommand));
     g_state.commandHookRegistered = false;
   }
-
   if (g_nativeInterfaceCommandId != 0) {
     plugin_register_ptr("-custom_action", (void*)&g_nativeInterfaceAction);
     g_nativeInterfaceCommandId = 0;
@@ -50699,7 +53047,6 @@ static void shutdown()
       entry.commandId = 0;
     }
   }
-
   g_state.activeProjectSignature.clear();
   g_state.autoOpenedProjectSignature.clear();
   rememberActiveScriptMode("");
