@@ -31,6 +31,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <utility>
 
 #ifdef __APPLE__
   #include <CoreGraphics/CoreGraphics.h>
@@ -1465,6 +1466,7 @@ static int g_nativeUiLastMidiSequence = 0;
 struct NativeUiMidiEvent {
   int sequence = 0;
   int device = -1;
+  std::string deviceName;
   int status = 0;
   int channel = 0;
   int data1 = 0;
@@ -1472,6 +1474,11 @@ struct NativeUiMidiEvent {
   std::string type;
   bool press = false;
   bool release = false;
+};
+struct NativeUiRawMidiEvent {
+  int sequence = 0;
+  int device = -1;
+  std::vector<unsigned char> bytes;
 };
 static std::map<std::string, bool> g_nativeUiMidiActionLatch;
 static std::map<std::string, bool> g_nativeUiMidiMusicHeld;
@@ -21217,7 +21224,7 @@ static std::map<int, std::string> nativeUiLoadBlockMidiBindings()
     const int blockNumber = std::atoi(fields[0].c_str());
     if (blockNumber <= 0) continue;
     bindings[blockNumber] = nativeUiJoinFields(
-      std::vector<std::string>(fields.begin() + 1, fields.begin() + 6));
+      std::vector<std::string>(fields.begin() + 1, fields.end()));
   }
   const char* rawIndex = GetExtState_ptr(
     kMidiBindingExtSection, "BLOCK_BINDINGS_INDEX_V2");
@@ -21279,8 +21286,10 @@ static std::string nativeUiBlockMidiFromGeneric(
 {
   const auto fields = nativeSplit(generic, '|');
   if (fields.size() < 6) return "";
-  return nativeUiJoinFields({fields[0], fields[2], fields[3],
-    fields[4], fields[5]});
+  // V3 preserva tambem o nome do dispositivo. Indices WinMM/CoreMIDI nao
+  // sao necessariamente iguais, inclusive ao importar um backup no Mac.
+  return nativeUiJoinFields({fields[0], fields[1], fields[2],
+    fields[3], fields[4], fields[5]});
 }
 
 static std::string nativeUiGenericMidiFromBlock(
@@ -21288,6 +21297,10 @@ static std::string nativeUiGenericMidiFromBlock(
 {
   const auto fields = nativeSplit(block, '\t');
   if (fields.size() < 5) return "";
+  if (fields.size() >= 6) {
+    return fields[0] + "|" + fields[1] + "|" + fields[2] +
+      "|" + fields[3] + "|" + fields[4] + "|" + fields[5];
+  }
   const int device = std::atoi(fields[0].c_str());
   char deviceName[256] = "";
   if (GetMIDIInputName_ptr && device >= 0) {
@@ -21299,6 +21312,25 @@ static std::string nativeUiGenericMidiFromBlock(
   }
   return fields[0] + "|" + deviceName + "|" + fields[1] +
     "|" + fields[2] + "|" + fields[3] + "|" + fields[4];
+}
+
+static bool nativeUiMidiBindingsEquivalent(
+  const std::string& first,
+  const std::string& second)
+{
+  const auto a = nativeSplit(first, '|');
+  const auto b = nativeSplit(second, '|');
+  if (a.size() < 6 || b.size() < 6 ||
+      a[2] != b[2] || a[3] != b[3] || a[4] != b[4]) {
+    return false;
+  }
+  if ((std::atoi(a[0].c_str()) & 0xffff) ==
+      (std::atoi(b[0].c_str()) & 0xffff)) {
+    return true;
+  }
+  const std::string aName = nativeUpperAscii(nativeTrim(a[1]));
+  const std::string bName = nativeUpperAscii(nativeTrim(b[1]));
+  return !aName.empty() && aName == bName;
 }
 
 static std::string nativeUiBlockMidiLabel(int blockNumber)
@@ -21315,8 +21347,13 @@ static std::string nativeUiFindBlockMidiConflict(
   const std::string& blockBinding)
 {
   const auto bindings = nativeUiLoadBlockMidiBindings();
+  const std::string genericBinding =
+    nativeUiGenericMidiFromBlock(blockBinding);
   for (const auto& entry : bindings) {
-    if (entry.first != blockNumber && entry.second == blockBinding) {
+    if (entry.first != blockNumber &&
+        nativeUiMidiBindingsEquivalent(
+          nativeUiGenericMidiFromBlock(entry.second),
+          genericBinding)) {
       char label[64] = "";
       std::snprintf(label, sizeof(label), "BLOCO %02d", entry.first);
       return label;
@@ -21327,7 +21364,7 @@ static std::string nativeUiFindBlockMidiConflict(
       const char* raw = GetExtState_ptr(
         kMidiBindingExtSection, action.storageKey);
       if (raw && *raw &&
-          nativeUiBlockMidiFromGeneric(raw) == blockBinding) {
+          nativeUiMidiBindingsEquivalent(raw, genericBinding)) {
         return action.label;
       }
     }
@@ -37348,7 +37385,8 @@ static bool nativeUiCaptureMixerKeyboard(
   return true;
 }
 
-static int nativeUiReadLatestMidiEvent(
+static int nativeUiReadMidiEventAt(
+  int index,
   char* bytes,
   int& size,
   int& device)
@@ -37358,8 +37396,118 @@ static int nativeUiReadLatestMidiEvent(
   double projectPosition = 0.0;
   int projectLoopCount = 0;
   return MIDI_GetRecentInputEvent_ptr(
-    0, bytes, &size, &timestamp, &device,
+    index, bytes, &size, &timestamp, &device,
     &projectPosition, &projectLoopCount);
+}
+
+static int nativeUiReadLatestMidiEvent(
+  char* bytes,
+  int& size,
+  int& device)
+{
+  return nativeUiReadMidiEventAt(0, bytes, size, device);
+}
+
+static std::string nativeUiMidiDeviceName(int device)
+{
+  char deviceName[256] = "";
+  device &= 0xffff;
+  if (GetMIDIInputName_ptr && device >= 0) {
+    GetMIDIInputName_ptr(
+      device, deviceName,
+      static_cast<int>(sizeof(deviceName)));
+  }
+  if (deviceName[0] == '\0') {
+    std::snprintf(deviceName, sizeof(deviceName),
+      "MIDI %d", device);
+  }
+  return deviceName;
+}
+
+static bool nativeUiParseMidiEvent(
+  const NativeUiRawMidiEvent& raw,
+  NativeUiMidiEvent& event)
+{
+  if (raw.bytes.size() < 2) return false;
+  event = NativeUiMidiEvent{};
+  event.sequence = raw.sequence;
+  event.device = raw.device & 0xffff;
+  event.deviceName = nativeUiMidiDeviceName(event.device);
+  event.status = raw.bytes[0];
+  const int message = event.status & 0xf0;
+  event.channel = (event.status & 0x0f) + 1;
+  event.data1 = raw.bytes[1];
+  event.data2 = raw.bytes.size() > 2 ? raw.bytes[2] : 0;
+  if (message == 0x90) {
+    event.type = "note";
+    event.press = event.data2 > 0;
+    event.release = !event.press;
+  } else if (message == 0x80) {
+    event.type = "note";
+    event.release = true;
+  } else if (message == 0xb0) {
+    event.type = "cc";
+    event.press = event.data2 > 0;
+    event.release = !event.press;
+  } else if (message == 0xc0) {
+    event.type = "pc";
+    event.press = true;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+static std::vector<NativeUiRawMidiEvent>
+nativeUiCollectPendingMidiEvents()
+{
+  // A API entrega primeiro o evento mais novo. O CoreMIDI pode entregar
+  // Note On e Note Off no mesmo ciclo; ler somente idx=0 perdia o release.
+  constexpr int kMaxMidiEventsPerTick = 256;
+  std::vector<NativeUiRawMidiEvent> newestFirst;
+  newestFirst.reserve(16);
+  for (int index = 0; index < kMaxMidiEventsPerTick; ++index) {
+    char bytes[256] = {};
+    int size = static_cast<int>(sizeof(bytes));
+    int device = -1;
+    const int sequence =
+      nativeUiReadMidiEventAt(index, bytes, size, device);
+    if (sequence == 0 || sequence == g_nativeUiLastMidiSequence) break;
+    size = std::max(0, std::min(
+      size, static_cast<int>(sizeof(bytes))));
+    NativeUiRawMidiEvent event;
+    event.sequence = sequence;
+    event.device = device;
+    event.bytes.reserve(static_cast<size_t>(size));
+    for (int byteIndex = 0; byteIndex < size; ++byteIndex) {
+      event.bytes.push_back(
+        static_cast<unsigned char>(bytes[byteIndex]));
+    }
+    newestFirst.push_back(std::move(event));
+  }
+  if (!newestFirst.empty()) {
+    g_nativeUiLastMidiSequence = newestFirst.front().sequence;
+    std::reverse(newestFirst.begin(), newestFirst.end());
+  }
+  return newestFirst;
+}
+
+static void nativeUiResetMidiRuntimeState(bool baselineLatest)
+{
+  g_nativeUiMidiActionLatch.clear();
+  g_nativeUiMidiMusicHeld.clear();
+  g_nativeUiMidiHoldStartedAt.clear();
+  g_nativeUiMidiHoldRepeatedAt.clear();
+  g_nativeUiBlockMidiLatch.clear();
+  g_nativeUiPendingBlockMidiNumber = 0;
+  g_nativeUiLastMidiSequence = 0;
+  if (baselineLatest) {
+    char bytes[256] = {};
+    int size = static_cast<int>(sizeof(bytes));
+    int device = -1;
+    g_nativeUiLastMidiSequence =
+      nativeUiReadLatestMidiEvent(bytes, size, device);
+  }
 }
 
 static void nativeUiArmMidiCapture()
@@ -37400,55 +37548,29 @@ static void nativeUiProcessMidiCapture()
     return;
   }
 
-  char bytes[256] = {};
-  int size = static_cast<int>(sizeof(bytes));
-  int device = -1;
-  const int sequence =
-    nativeUiReadLatestMidiEvent(bytes, size, device);
-  if (sequence == 0 ||
-      sequence == g_nativeUiLastMidiSequence) {
-    return;
+  const auto events = nativeUiCollectPendingMidiEvents();
+  NativeUiMidiEvent captured;
+  bool foundEvent = false;
+  for (const auto& raw : events) {
+    if (nativeUiParseMidiEvent(raw, captured)) {
+      foundEvent = true;
+      break;
+    }
   }
-  g_nativeUiLastMidiSequence = sequence;
-  if (size < 2) return;
-
-  const unsigned char status =
-    static_cast<unsigned char>(bytes[0]);
-  const unsigned char message = status & 0xf0;
-  device &= 0xffff;
-  const int channel = (status & 0x0f) + 1;
-  const int data1 =
-    static_cast<unsigned char>(bytes[1]);
-  const int data2 = size > 2
-    ? static_cast<unsigned char>(bytes[2]) : 0;
-  std::string type;
-  if (message == 0x90 || message == 0x80) type = "note";
-  else if (message == 0xb0) type = "cc";
-  else if (message == 0xc0) type = "pc";
-  else return;
+  if (!foundEvent) return;
 
   if (mixerCapture &&
       g_nativeUiMixerAction == "volume" &&
-      type != "cc") {
+      captured.type != "cc") {
     g_nativeUiMixerInfo =
       "Volume aceita apenas MIDI CC.";
     return;
   }
-  char deviceName[256] = "";
-  if (GetMIDIInputName_ptr && device >= 0) {
-    GetMIDIInputName_ptr(
-      device, deviceName,
-      static_cast<int>(sizeof(deviceName)));
-  }
-  if (deviceName[0] == '\0') {
-    std::snprintf(deviceName, sizeof(deviceName),
-      "MIDI %d", device);
-  }
   std::ostringstream serialized;
-  serialized << device << '|' << deviceName << '|'
-             << type << '|' << channel << '|'
-             << data1 << '|'
-             << static_cast<int>(status);
+  serialized << captured.device << '|' << captured.deviceName << '|'
+             << captured.type << '|' << captured.channel << '|'
+             << captured.data1 << '|'
+             << captured.status;
   const std::string value = serialized.str();
   const std::string label =
     nativeUiMidiBindingLabel(value);
@@ -37569,7 +37691,19 @@ static bool nativeUiMidiBindingMatches(
     fields[separator == '|' ? 3 : 2].c_str());
   const int data1 = std::atoi(
     fields[separator == '|' ? 4 : 3].c_str());
-  return device == event.device &&
+  bool deviceMatches = device == event.device;
+  if (!deviceMatches && separator == '|' && fields.size() >= 6) {
+    // O indice CoreMIDI/WinMM pode mudar entre computadores e sistemas.
+    // O nome salvo mantem a atribuicao valida quando o mesmo dispositivo
+    // aparece com outro indice no macOS ou no Windows.
+    const std::string storedName =
+      nativeUpperAscii(nativeTrim(fields[1]));
+    const std::string currentName =
+      nativeUpperAscii(nativeTrim(event.deviceName));
+    deviceMatches = !storedName.empty() &&
+      storedName == currentName;
+  }
+  return deviceMatches &&
     type == event.type &&
     channel == event.channel &&
     data1 == event.data1;
@@ -38119,7 +38253,7 @@ static bool nativeUiProcessBlockMidiTrigger(
   const auto bindings = nativeUiLoadBlockMidiBindings();
   for (const auto& entry : bindings) {
     if (!nativeUiMidiBindingMatches(
-          entry.second, event, '\t')) {
+          nativeUiGenericMidiFromBlock(entry.second), event)) {
       continue;
     }
     const int blockNumber = entry.first;
@@ -38240,7 +38374,9 @@ static bool nativeUiProcessMainMidiTrigger(
     }
 
     bool shouldTrigger = event.type == "pc" || event.press;
+    const bool canRelease = event.type != "pc";
     if (shouldTrigger &&
+        canRelease &&
         (action == "music_up" || action == "music_down")) {
       const auto now = std::chrono::steady_clock::now();
       const bool wasHeld = g_nativeUiMidiMusicHeld[action];
@@ -38250,6 +38386,7 @@ static bool nativeUiProcessMainMidiTrigger(
         g_nativeUiMidiHoldRepeatedAt[action] = now;
       }
     } else if (shouldTrigger &&
+               canRelease &&
                nativeUiMidiActionUsesLatch(action)) {
       if (g_nativeUiMidiActionLatch[action]) {
         shouldTrigger = false;
@@ -38303,48 +38440,15 @@ static void nativeUiProcessBoundMidiTriggers()
     g_nativeMainModalKind == NativeMainModalKind::BlockMidiCapture;
   if (captureActive) return;
 
-  char bytes[256] = {};
-  int size = static_cast<int>(sizeof(bytes));
-  int device = -1;
-  const int sequence =
-    nativeUiReadLatestMidiEvent(bytes, size, device);
-  if (sequence == 0 || sequence == g_nativeUiLastMidiSequence) {
-    nativeUiProcessMidiHoldRepeats();
-    return;
+  const auto events = nativeUiCollectPendingMidiEvents();
+  for (const auto& raw : events) {
+    NativeUiMidiEvent event;
+    if (!nativeUiParseMidiEvent(raw, event)) continue;
+    if (nativeUiProcessBlockMidiTrigger(event)) continue;
+    if (nativeUiProcessMixerMidiTrigger(event)) continue;
+    nativeUiProcessMainMidiTrigger(event);
   }
-  g_nativeUiLastMidiSequence = sequence;
-  if (size < 2) return;
-
-  NativeUiMidiEvent event;
-  event.sequence = sequence;
-  event.device = device & 0xffff;
-  event.status = static_cast<unsigned char>(bytes[0]);
-  const int message = event.status & 0xf0;
-  event.channel = (event.status & 0x0f) + 1;
-  event.data1 = static_cast<unsigned char>(bytes[1]);
-  event.data2 = size > 2
-    ? static_cast<unsigned char>(bytes[2]) : 0;
-  if (message == 0x90) {
-    event.type = "note";
-    event.press = event.data2 > 0;
-    event.release = !event.press;
-  } else if (message == 0x80) {
-    event.type = "note";
-    event.release = true;
-  } else if (message == 0xb0) {
-    event.type = "cc";
-    event.press = event.data2 > 0;
-    event.release = !event.press;
-  } else if (message == 0xc0) {
-    event.type = "pc";
-    event.press = true;
-  } else {
-    return;
-  }
-
-  if (nativeUiProcessBlockMidiTrigger(event)) return;
-  if (nativeUiProcessMixerMidiTrigger(event)) return;
-  nativeUiProcessMainMidiTrigger(event);
+  nativeUiProcessMidiHoldRepeats();
 }
 
 static void nativeUiProcessPendingBulkSpaceActions()
@@ -41180,6 +41284,9 @@ static bool nativeOpenAppActivePanel()
 
   g_nativeAppActivePanelHwnd = hwnd;
   g_nativeAppActivePanelClosing = false;
+  // Nao execute evento MIDI antigo ao reabrir a interface e nao preserve
+  // latch de uma tecla cuja soltura ocorreu enquanto o painel estava fechado.
+  nativeUiResetMidiRuntimeState(true);
   nativeRefreshInterfaceToggle();
   g_nativeAppActiveResumeConfirmOpen = false;
   g_nativeAppActiveControlBlockedNoticeOpen = false;
@@ -41249,6 +41356,7 @@ static void nativeCloseAppActivePanel()
   nativeCloseShortcutNotice();
   if (!nativeAppActivePanelIsOpen()) {
     g_nativeAppActivePanelHwnd = nullptr;
+    nativeUiResetMidiRuntimeState(false);
     return;
   }
 
@@ -41258,6 +41366,7 @@ static void nativeCloseAppActivePanel()
   if (DockWindowRemove_ptr) DockWindowRemove_ptr(hwnd);
   if (IsWindow(hwnd)) DestroyWindow(hwnd);
   g_nativeAppActivePanelHwnd = nullptr;
+  nativeUiResetMidiRuntimeState(false);
   g_nativeAppActivePanelClosing = false;
   nativeRefreshInterfaceToggle();
   g_nativeAppActiveResumeConfirmOpen = false;
