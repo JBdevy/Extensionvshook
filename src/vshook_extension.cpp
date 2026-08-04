@@ -29895,7 +29895,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           return fallback == nativeUiVisualDefaults().end()
             ? std::string() : fallback->second;
         };
-        auto previewInterfaceColor = [&](std::string mode) {
+        auto previewInterfaceColor = [&](std::string mode) -> COLORREF {
           mode = nativeLower(nativeTrim(mode));
           if (mode == "black") return RGB(10, 13, 17);
           if (mode == "dark" || mode == "medium" || mode == "light" ||
@@ -29912,7 +29912,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           if (mode == "brown") return RGB(51, 31, 13);
           return kNativeUiUnifiedDarkGray;
         };
-        auto previewTransportColor = [&](std::string mode) {
+        auto previewTransportColor = [&](std::string mode) -> COLORREF {
           mode = nativeLower(nativeTrim(mode));
           if (mode == "gray" || mode == "light_gray" ||
               mode == "grey" || mode == "light_grey") {
@@ -29925,7 +29925,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           if (mode == "orange") return RGB(97, 46, 8);
           return RGB(10, 15, 26);
         };
-        auto previewNumberColor = [&](std::string mode) {
+        auto previewNumberColor = [&](std::string mode) -> COLORREF {
           mode = nativeLower(nativeTrim(mode));
           if (mode == "gray" || mode == "grey") {
             return kNativeUiUnifiedDarkGray;
