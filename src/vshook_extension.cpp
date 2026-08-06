@@ -19459,17 +19459,21 @@ static bool nativeUiRemoveSelectedPlaylistItems()
     return false;
   }
 
+  auto& lines = playlists[static_cast<size_t>(playlistIndex)].itemLines;
   std::vector<int> itemIndices;
-  std::map<int, bool> emitted;
+  std::vector<bool> claimed(lines.size(), false);
   for (const auto* row : nativeUiSelectedPlaylistRowsForEdit()) {
     if (!row) continue;
-    const int index = row->order - 1;
-    if (index < 0 || emitted[index]) continue;
-    emitted[index] = true;
+    // Number/0-9 pode reorganizar a representação visual antes da próxima
+    // reconstrução do modelo. Nunca usa a posição desenhada para excluir:
+    // resolve novamente a linha persistida pelo ID, limites e nome da música.
+    const int index = nativeUiPlaylistLineIndexForRow(
+      lines, *row, &claimed);
+    if (index < 0 || index >= static_cast<int>(lines.size())) continue;
+    claimed[static_cast<size_t>(index)] = true;
     itemIndices.push_back(index);
   }
   if (itemIndices.empty()) return false;
-  auto& lines = playlists[static_cast<size_t>(playlistIndex)].itemLines;
   std::sort(itemIndices.begin(), itemIndices.end(),
     std::greater<int>());
   bool changed = false;
