@@ -704,6 +704,7 @@ static std::chrono::steady_clock::time_point
   g_nativeUiNextNavigationRepeatAt{};
 
 static HFONT g_nativeUiSharedFont = nullptr;
+static HFONT g_nativeUiBlockTimeFont = nullptr;
 static HFONT g_nativeUiTimerFont = nullptr;
 static HFONT g_nativeUiInfoStripFont = nullptr;
 static HFONT g_nativeUiMultiLoopFont = nullptr;
@@ -1354,6 +1355,7 @@ static int g_nativeUiRenamePlaylistOrder = 0;
 static double g_nativeUiRenameStart = 0.0;
 static double g_nativeUiRenameEnd = 0.0;
 static std::string g_nativeUiRenameId;
+static std::string g_nativeUiRenameOriginalName;
 static std::string g_nativeUiRenameInput;
 static size_t g_nativeUiRenameInputCursor = 0;
 static std::string g_nativeUiTimerMode = "progressive";
@@ -13618,6 +13620,24 @@ static HFONT nativeUiConfiguredFont(const std::string& rawMode)
   return font;
 }
 
+static HFONT nativeUiBlockTimeEmphasisFont()
+{
+  if (g_nativeUiBlockTimeFont) return g_nativeUiBlockTimeFont;
+#ifdef __APPLE__
+  constexpr int fontSize = 18;
+  const char* fontName = "Arial";
+#else
+  constexpr int fontSize = 17;
+  const char* fontName = "Segoe UI";
+#endif
+  g_nativeUiBlockTimeFont = CreateFont(fontSize, 0, 0, 0,
+    FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+    DEFAULT_QUALITY, DEFAULT_PITCH, fontName);
+  return g_nativeUiBlockTimeFont
+    ? g_nativeUiBlockTimeFont : nativeUiSharedFont();
+}
+
 static HFONT nativeUiCompactBlockFont(const std::string& rawMode)
 {
   std::string mode = nativeLower(nativeTrim(rawMode));
@@ -13799,6 +13819,10 @@ static void nativeUiReleasePaintResources()
   if (g_nativeUiSharedFont) {
     DeleteObject(g_nativeUiSharedFont);
     g_nativeUiSharedFont = nullptr;
+  }
+  if (g_nativeUiBlockTimeFont) {
+    DeleteObject(g_nativeUiBlockTimeFont);
+    g_nativeUiBlockTimeFont = nullptr;
   }
 }
 
@@ -17994,14 +18018,16 @@ static NativeUiMainRowMetrics nativeUiMeasureMainRow(
   }
   metrics.timeText =
     nativeAppActiveFormatDuration(duration);
+  HFONT timeFont = row.block
+    ? nativeUiBlockTimeEmphasisFont() : font;
   metrics.timeWidth = metrics.timeText.empty()
     ? 0
-    : nativeUiTextWidth(dc, metrics.timeText, font);
+    : nativeUiTextWidth(dc, metrics.timeText, timeFont);
   const int childIndent = row.child ? 12 : 0;
   const int labelStartOffset = 28 + 7 + childIndent;
   int rightPadding = metrics.timeText.empty()
     ? 11
-    : metrics.timeWidth + 14;
+    : metrics.timeWidth + (row.block ? 26 : 14);
   if (familyControlVisible) {
 #ifdef __APPLE__
     rightPadding += 74;
@@ -18705,6 +18731,88 @@ static int nativeUiPlaylistLineIndexForRow(
   return bestIndex;
 }
 
+static bool nativeUiBlockHasAutomaticNumber(const std::string& rawName)
+{
+  const std::string value = nativeTrim(rawName);
+  const std::string upper = nativeUpperNamePtBr(value);
+  const size_t blockPos = upper.find("BLOCO");
+  if (blockPos == std::string::npos) return false;
+  for (size_t i = 0; i < blockPos; ++i) {
+    const char c = value[i];
+    if (c != ':' && c != '=' && c != '>' && c != '<' &&
+        c != '-' && c != ' ' && c != '\t') {
+      return false;
+    }
+  }
+  std::string suffix = nativeTrim(value.substr(blockPos + 5));
+  while (!suffix.empty()) {
+    const char c = suffix.front();
+    if (c == ':' || c == '=' || c == '>' || c == '<' ||
+        c == '-' || c == ' ') suffix.erase(suffix.begin());
+    else break;
+  }
+  while (!suffix.empty()) {
+    const char c = suffix.back();
+    if (c == ':' || c == '=' || c == '>' || c == '<' ||
+        c == '-' || c == ' ') suffix.pop_back();
+    else break;
+  }
+  return !suffix.empty() && std::all_of(
+    suffix.begin(), suffix.end(), [](unsigned char c) {
+      return std::isdigit(c) != 0;
+    });
+}
+
+static bool nativeUiRenumberPlaylistBlocks(
+  std::vector<std::string>& itemLines)
+{
+  bool changed = false;
+  int blockNumber = 0;
+  for (std::string& line : itemLines) {
+    auto fields = nativeSplit(line, '\t');
+    if (fields.size() < 3 || fields[0] != "ITEM") continue;
+    const int sourceNumber = std::atoi(fields[2].c_str());
+    const bool isBlock =
+      (fields.size() > 1 && fields[1] == "block") || sourceNumber < 0;
+    if (!isBlock) continue;
+    ++blockNumber;
+    while (fields.size() < 6) fields.push_back("");
+    const std::string storedNumber = std::to_string(-blockNumber);
+    if (fields[2] != storedNumber) {
+      fields[2] = storedNumber;
+      changed = true;
+    }
+    const std::string rawName = nativeUnescapeExtField(fields[5]);
+    if (nativeUiBlockHasAutomaticNumber(rawName)) {
+      std::ostringstream name;
+      name << "BLOCO " << std::setw(2) << std::setfill('0')
+           << blockNumber;
+      const std::string storedName = nativeEscapeExtField(name.str());
+      if (fields[5] != storedName) {
+        fields[5] = storedName;
+        changed = true;
+      }
+    }
+    line = nativeUiJoinFields(fields);
+  }
+  return changed;
+}
+
+static int nativeUiRenamePlaylistLineIndex(
+  const std::vector<std::string>& lines)
+{
+  NativeAppActivePanelModel::Row row;
+  row.id = g_nativeUiRenameId;
+  row.name = g_nativeUiRenameOriginalName;
+  row.sourceNumber = g_nativeUiRenameSourceNumber;
+  row.enumIndex = g_nativeUiRenameEnumIndex;
+  row.order = g_nativeUiRenamePlaylistOrder;
+  row.start = g_nativeUiRenameStart;
+  row.end = g_nativeUiRenameEnd;
+  row.block = g_nativeUiRenameBlock;
+  return nativeUiPlaylistLineIndexForRow(lines, row);
+}
+
 static bool nativeUiReorderPlaylistRows(
   int sourceModelIndex,
   int targetModelIndex)
@@ -18782,6 +18890,7 @@ static bool nativeUiReorderPlaylistRows(
     itemLines, selected, targetLineIndex);
   reordered = nativeUiNormalizeFamilyOrder(
     reordered, nativeUiPlaylistLineFamilyInfo);
+  nativeUiRenumberPlaylistBlocks(reordered);
   if (reordered == itemLines) return true;
   itemLines = reordered;
   if (!nativeUiSavePlaylistRecords(project, playlists)) return false;
@@ -19482,11 +19591,11 @@ static bool nativeUiRemoveSelectedPlaylistItems()
     lines.erase(lines.begin() + index);
     changed = true;
   }
+  if (changed) nativeUiRenumberPlaylistBlocks(lines);
   if (!changed || !nativeUiSavePlaylistRecords(project, playlists)) {
     return false;
   }
   nativeUiClearMainRowSelection();
-  g_nativeAppActiveListScrollPixels = 0;
   return true;
 }
 
@@ -19628,6 +19737,7 @@ static bool nativeUiCreatePlaylistBlock()
   playlist.itemLines.insert(
     playlist.itemLines.begin() + static_cast<std::ptrdiff_t>(insertIndex),
     blockLine);
+  nativeUiRenumberPlaylistBlocks(playlist.itemLines);
   return nativeUiSavePlaylistRecords(project, playlists);
 }
 
@@ -21919,7 +22029,7 @@ static bool nativeUiOpenBlockColor()
   }
   const auto& lines = playlists[static_cast<size_t>(
     playlistIndex)].itemLines;
-  const int itemIndex = g_nativeUiRenamePlaylistOrder - 1;
+  const int itemIndex = nativeUiRenamePlaylistLineIndex(lines);
   if (itemIndex < 0 || itemIndex >= static_cast<int>(lines.size())) {
     return false;
   }
@@ -21949,7 +22059,7 @@ static bool nativeUiApplyBlockColor(const std::string& rawKey)
   }
   auto& lines = playlists[static_cast<size_t>(
     playlistIndex)].itemLines;
-  const int itemIndex = g_nativeUiRenamePlaylistOrder - 1;
+  const int itemIndex = nativeUiRenamePlaylistLineIndex(lines);
   if (itemIndex < 0 || itemIndex >= static_cast<int>(lines.size())) {
     return false;
   }
@@ -22421,6 +22531,7 @@ static void nativeUiCloseMainModal()
   g_nativeUiTextMouseSelecting = false;
   g_nativeUiTargetPlaylistRowHits.clear();
   g_nativeUiRenameId.clear();
+  g_nativeUiRenameOriginalName.clear();
   g_nativeUiRenameInput.clear();
   g_nativeUiRenameInputCursor = 0;
   g_nativeUiRenameBlockCustomName = false;
@@ -22885,6 +22996,7 @@ static void nativeUiOpenRowRename(
   g_nativeUiRenameStart = row.start;
   g_nativeUiRenameEnd = row.end;
   g_nativeUiRenameId = row.id;
+  g_nativeUiRenameOriginalName = row.name;
   if (row.block) {
     g_nativeUiRenameInput = g_nativeUiRenameBlockCustomName
       ? nativeTrim(row.name)
@@ -22941,7 +23053,7 @@ static bool nativeUiApplyRowRename()
         playlistIndex >= static_cast<int>(playlists.size())) return false;
     auto& itemLines =
       playlists[static_cast<size_t>(playlistIndex)].itemLines;
-    const int itemIndex = g_nativeUiRenamePlaylistOrder - 1;
+    const int itemIndex = nativeUiRenamePlaylistLineIndex(itemLines);
     if (itemIndex < 0 || itemIndex >= static_cast<int>(itemLines.size())) {
       return false;
     }
@@ -26080,6 +26192,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
       break;
     }
 
+    std::vector<int> blockOrdinals(
+      g_nativeAppActivePanelModel.rows.size(), 0);
+    int nextBlockOrdinal = 0;
+    for (size_t modelIndex = 0;
+         modelIndex < g_nativeAppActivePanelModel.rows.size();
+         ++modelIndex) {
+      if (g_nativeAppActivePanelModel.rows[modelIndex].block) {
+        blockOrdinals[modelIndex] = ++nextBlockOrdinal;
+      }
+    }
+
     for (int i = g_nativeAppActiveListFirstRow; i < endRow; ++i) {
       const size_t sourceIndex = g_nativeMainVisibleRowIndices[static_cast<size_t>(i)];
       const NativeAppActivePanelModel::Row& row =
@@ -26374,7 +26497,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
         row.searchRevealedChild;
       if (row.block) {
         std::snprintf(displayNumberText,
-          sizeof(displayNumberText), "--");
+          sizeof(displayNumberText), "%d°",
+          sourceIndex < blockOrdinals.size()
+            ? std::max(1, blockOrdinals[sourceIndex])
+            : 1);
       } else if (!searchOpenedHiddenChild) {
         std::snprintf(displayNumberText,
           sizeof(displayNumberText), "%02d", displayNumber);
@@ -26389,10 +26515,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
            rowLineHeight) / 2);
       const int timeX = rowRect.right -
         rowMetrics.timeWidth - 8;
+      const int timeLineHeight = row.block
+        ? std::min(
+            static_cast<int>(rowRect.bottom - rowRect.top), 20)
+        : rowLineHeight;
+      const int timeTextTop = rowRect.top + std::max(0,
+        (static_cast<int>(rowRect.bottom - rowRect.top) -
+         timeLineHeight) / 2);
       RECT durationRect{timeX,
-        centeredTextTop,
+        timeTextTop,
         timeX + rowMetrics.timeWidth,
-        centeredTextTop + rowLineHeight};
+        timeTextTop + timeLineHeight};
       const bool rowControlsFullyVisible =
         rowRect.top >= listInnerTop &&
         rowRect.bottom <= listInnerBottom;
@@ -26529,12 +26662,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
         // igual nos aplicativos do Diretor e dos Músicos.
         if (row.block) {
           timeColor = RGB(34, 197, 94);
+          nativeUiDrawSelectionArrow(dc,
+            durationRect.left - 12,
+            (durationRect.top + durationRect.bottom) / 2,
+            RGB(255, 224, 46));
         }
         nativeAppActiveDrawText(dc,
           rowMetrics.timeText, durationRect,
           DT_LEFT | DT_TOP | DT_SINGLELINE |
             DT_NOPREFIX | DT_NOCLIP,
-          timeColor, rowFont);
+          timeColor,
+          row.block ? nativeUiBlockTimeEmphasisFont() : rowFont);
       }
       RECT numberRect{rowRect.left,
         centeredTextTop,
@@ -26605,6 +26743,14 @@ static void nativePaintAppActivePanel(HWND hwnd)
         nativeAppActiveFillRect(dc,
           RECT{rowRect.right - 1, rowRect.top,
             rowRect.right, rowRect.bottom}, blockEdge);
+      } else {
+        // Fundo uniforme, mas com uma linha discreta separando cada música.
+        nativeAppActiveFillRect(dc,
+          RECT{rowRect.left + indexColumnW,
+            rowRect.bottom - 1,
+            rowRect.right,
+            rowRect.bottom},
+          RGB(54, 58, 64));
       }
     }
     nativeUiEndClipRect(dc, rowsClipState);
@@ -42271,6 +42417,9 @@ struct NativeTelepromptSettings {
   bool queueNameEnabled = true;
   bool progressEnabled = false;
   bool previewEnabled = true;
+  bool previewSongDurationEnabled = true;
+  bool previewBlockDurationEnabled = true;
+  bool previewUnderlineEnabled = true;
   bool clearMode = false;
   bool rgbWindowBorderEnabled = false;
   bool rgbClockBorderEnabled = false;
@@ -42298,6 +42447,7 @@ struct NativeTelepromptPreviewSong {
   std::string id;
   std::string name;
   std::string colorHex;
+  double durationSec = 0.0;
   bool playing = false;
   bool queued = false;
 };
@@ -42307,6 +42457,7 @@ struct NativeTelepromptPreviewBlock {
   std::string name;
   std::string colorHex;
   std::string colorKey;
+  double durationSec = 0.0;
   std::vector<NativeTelepromptPreviewSong> songs;
 };
 
@@ -42399,6 +42550,7 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
       block.id = nativeTelepromptPreviewItemId(
         item, "block-", itemIndex);
       block.name = nativeTrim(item.name);
+      block.durationSec = std::max(0.0, item.blockDurationSec);
       if (block.name.empty()) {
         block.name = "BLOCO " +
           std::to_string(allBlocks.size() + 1);
@@ -42475,6 +42627,7 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
     song.id = nativeTelepromptPreviewItemId(
       item, "song-", itemIndex);
     song.name = name;
+    song.durationSec = std::max(0.0, nativeRawDurationSec(item));
     // Dentro do Preview todas as músicas herdam deliberadamente a cor do
     // contorno/nome do bloco, inclusive durante Tocando e Fila.
     song.colorHex = current->colorHex;
@@ -42517,11 +42670,15 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
     nativeUiHashString(hash, block.name);
     nativeUiHashString(hash, block.colorHex);
     nativeUiHashString(hash, block.colorKey);
+    nativeUiHashValue(hash, static_cast<long long>(
+      std::llround(block.durationSec * 1000.0)));
     nativeUiHashValue(hash, block.songs.size());
     for (const auto& song : block.songs) {
       nativeUiHashString(hash, song.id);
       nativeUiHashString(hash, song.name);
       nativeUiHashString(hash, song.colorHex);
+      nativeUiHashValue(hash, static_cast<long long>(
+        std::llround(song.durationSec * 1000.0)));
       nativeUiHashValue(hash, song.playing);
       nativeUiHashValue(hash, song.queued);
     }
@@ -42569,6 +42726,8 @@ static std::string nativeTelepromptPreviewStateJson(
          << nativeJsonString(block.colorKey) << ",";
     json << "\"blockColorKey\":"
          << nativeJsonString(block.colorKey) << ",";
+    json << "\"durationSec\":"
+         << nativeNumber(block.durationSec, 3) << ",";
     json << "\"songs\":[";
     for (size_t songIndex = 0;
          songIndex < block.songs.size(); ++songIndex) {
@@ -42577,6 +42736,8 @@ static std::string nativeTelepromptPreviewStateJson(
       json << "{";
       json << "\"id\":" << nativeJsonString(song.id) << ",";
       json << "\"name\":" << nativeJsonString(song.name) << ",";
+      json << "\"durationSec\":"
+           << nativeNumber(song.durationSec, 3) << ",";
       json << "\"playing\":"
            << (song.playing ? "true" : "false") << ",";
       json << "\"queued\":"
@@ -42817,6 +42978,14 @@ static void nativeTelepromptApplySettingsJson(
     json, "progressEnabled", next.progressEnabled);
   next.previewEnabled = nativeTelepromptJsonBool(
     json, "previewEnabled", next.previewEnabled);
+  const bool legacyPreviewDurationEnabled = nativeTelepromptJsonBool(
+    json, "previewDurationEnabled", true);
+  next.previewSongDurationEnabled = nativeTelepromptJsonBool(
+    json, "previewSongDurationEnabled", legacyPreviewDurationEnabled);
+  next.previewBlockDurationEnabled = nativeTelepromptJsonBool(
+    json, "previewBlockDurationEnabled", legacyPreviewDurationEnabled);
+  next.previewUnderlineEnabled = nativeTelepromptJsonBool(
+    json, "previewUnderlineEnabled", next.previewUnderlineEnabled);
   next.clearMode = nativeTelepromptJsonBool(
     json, "clearMode", next.clearMode);
   const bool legacyRgb = nativeTelepromptJsonBool(
@@ -42871,6 +43040,9 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"queueNameEnabled\":true,";
   json << "\"progressEnabled\":false,";
   json << "\"previewEnabled\":" << (slot == 1 ? "true" : "false") << ",";
+  json << "\"previewSongDurationEnabled\":true,";
+  json << "\"previewBlockDurationEnabled\":true,";
+  json << "\"previewUnderlineEnabled\":true,";
   json << "\"clearMode\":false,";
   json << "\"rgbWindowBorderEnabled\":false,";
   json << "\"rgbClockBorderEnabled\":false,";
@@ -42962,6 +43134,12 @@ static std::string nativeTelepromptSettingsToJson(
        << boolean(settings.progressEnabled) << ",";
   json << "\"previewEnabled\":"
        << boolean(settings.previewEnabled) << ",";
+  json << "\"previewSongDurationEnabled\":"
+       << boolean(settings.previewSongDurationEnabled) << ",";
+  json << "\"previewBlockDurationEnabled\":"
+       << boolean(settings.previewBlockDurationEnabled) << ",";
+  json << "\"previewUnderlineEnabled\":"
+       << boolean(settings.previewUnderlineEnabled) << ",";
   json << "\"clearMode\":"
        << boolean(settings.clearMode) << ",";
   json << "\"rgbWindowBorderEnabled\":"
@@ -43972,7 +44150,8 @@ static void nativeTelepromptDrawPreviewLines(
   int lineHeight,
   bool centered,
   COLORREF color,
-  HFONT font)
+  HFONT font,
+  bool underline)
 {
   int top = rect.top;
   for (const auto& line : lines) {
@@ -43989,6 +44168,23 @@ static void nativeTelepromptDrawPreviewLines(
         (centered ? DT_CENTER : DT_LEFT) |
           DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         color, font);
+      if (underline) {
+        const int textWidth = std::min(
+          static_cast<int>(lineRect.right - lineRect.left),
+          nativeUiTextWidth(dc, line, font));
+        const int lineLeft = centered
+          ? (lineRect.left + lineRect.right - textWidth) / 2
+          : lineRect.left;
+        const int underlineY = std::min(
+          static_cast<int>(lineRect.bottom) - 1,
+          top + lineHeight - 2);
+        HPEN pen = CreatePen(PS_SOLID, 1, color);
+        HGDIOBJ previousPen = SelectObject(dc, pen);
+        MoveToEx(dc, lineLeft, underlineY, nullptr);
+        LineTo(dc, lineLeft + textWidth, underlineY);
+        SelectObject(dc, previousPen);
+        DeleteObject(pen);
+      }
     }
     top += lineHeight;
   }
@@ -44011,8 +44207,8 @@ static void nativeTelepromptDrawPreview(
     1, static_cast<int>(client.right - client.left));
   const int height = std::max(
     1, static_cast<int>(client.bottom - client.top));
-  const int edgeX = std::max(10, width / 20);
-  const int edgeY = std::max(8, height / 18);
+  const int edgeX = std::max(6, width / 100);
+  const int edgeY = std::max(6, height / 100);
   RECT area{
     client.left + edgeX,
     client.top + std::max(edgeY, topReserve),
@@ -44078,14 +44274,9 @@ static void nativeTelepromptDrawPreview(
     return;
   }
 
-  const int columns = 4;
-  // Até quatro blocos usam uma única linha e crescem até o limite inferior
-  // disponível. Com cinco a oito blocos, divide em duas linhas. Assim não
-  // sobra uma segunda linha vazia enquanto nomes de músicas são cortados.
-  const int rows = std::max(
-    1, std::min(2,
-      (static_cast<int>(state.preview.blocks.size()) +
-       columns - 1) / columns));
+  const int blockCount = std::min(
+    8, static_cast<int>(state.preview.blocks.size()));
+  const int columns = std::max(1, std::min(4, blockCount));
   const int gap = std::max(
     4, std::min(16, width / 80));
   const int areaW = std::max(
@@ -44094,8 +44285,6 @@ static void nativeTelepromptDrawPreview(
     1, static_cast<int>(area.bottom - area.top));
   const int cardW = std::max(
     1, (areaW - gap * (columns - 1)) / columns);
-  const int cardH = std::max(
-    1, (areaH - gap * (rows - 1)) / rows);
   const int titleFontSize = std::max(
     12, std::min(34, width / 50));
   const int songFontSize = std::max(
@@ -44112,6 +44301,8 @@ static void nativeTelepromptDrawPreview(
     songFontSize + 3,
     static_cast<int>(std::lround(
       songFontSize * 1.18)));
+  std::vector<int> columnTops(
+    static_cast<size_t>(columns), area.top);
 
   for (size_t index = 0;
        index < state.preview.blocks.size() &&
@@ -44119,33 +44310,66 @@ static void nativeTelepromptDrawPreview(
     const NativeTelepromptPreviewBlock& block =
       state.preview.blocks[index];
     const int column = static_cast<int>(index) % columns;
-    const int row = static_cast<int>(index) / columns;
     const int left = area.left +
       column * (cardW + gap);
-    const int top = area.top +
-      row * (cardH + gap);
-    RECT card{
-      left, top,
-      column == columns - 1 ? area.right : left + cardW,
-      row == rows - 1 ? area.bottom : top + cardH
-    };
+    const int top = columnTops[static_cast<size_t>(column)];
+    if (top >= area.bottom) continue;
+    const int right = column == columns - 1
+      ? area.right : left + cardW;
     const COLORREF blockColor = nativeTelepromptColor(
       block.colorHex, fallbackColor);
-    nativeAppActiveFillOutlinedRect(
-      dc, card, RGB(0, 0, 0), blockColor);
-
     const int padX = std::max(5, cardW / 28);
-    const int padY = std::max(4, cardH / 42);
+    const int padY = std::max(4, std::min(12, areaH / 84));
     const int textWidth = std::max(
-      1, static_cast<int>(
-        card.right - card.left) - padX * 2);
+      1, right - left - padX * 2);
+    // Preview respeita a mesma caixa configurada para a letra do TP.
+    std::string titleLabel = nativeTelepromptDisplayText(
+      block.name, settings.textCase);
+    if (settings.previewBlockDurationEnabled && block.durationSec > 0.0) {
+      titleLabel += "  •  " +
+        nativeAppActiveFormatDuration(block.durationSec);
+    }
     const std::vector<std::string> titleLines =
       nativeTelepromptPreviewWrapLines(
-        dc, block.name, textWidth, titleFont, 3);
+        dc, titleLabel, textWidth, titleFont, 3);
     const int titleHeight = std::max(
       titleLineHeight,
       static_cast<int>(titleLines.size()) *
         titleLineHeight);
+    const int songGap = std::max(1, padY / 3);
+    std::vector<std::vector<std::string>> wrappedSongs;
+    wrappedSongs.reserve(block.songs.size());
+    int songsHeight = 0;
+    for (const auto& song : block.songs) {
+      std::string label = nativeTelepromptDisplayText(
+        song.name, settings.textCase);
+      if (settings.previewSongDurationEnabled && song.durationSec > 0.0) {
+        label += "  •  " +
+          nativeAppActiveFormatDuration(song.durationSec);
+      }
+      if (song.playing || song.queued) label = "[ " + label + " ]";
+      wrappedSongs.push_back(nativeTelepromptPreviewWrapLines(
+        dc, label, textWidth, songFont, 2));
+      songsHeight += std::max(
+        songLineHeight,
+        static_cast<int>(wrappedSongs.back().size()) * songLineHeight);
+      if (wrappedSongs.size() < block.songs.size()) songsHeight += songGap;
+    }
+    const int titleToSongsGap = block.songs.empty()
+      ? 0 : std::max(2, padY / 2);
+    const int desiredHeight = std::max(
+      titleLineHeight + padY * 2,
+      padY + titleHeight + titleToSongsGap + songsHeight + padY);
+    const bool lastBlockInColumn =
+      static_cast<int>(index) + columns >= blockCount;
+    RECT card{
+      left, top, right,
+      lastBlockInColumn
+        ? area.bottom
+        : std::min(static_cast<int>(area.bottom), top + desiredHeight)
+    };
+    nativeAppActiveFillOutlinedRect(
+      dc, card, RGB(0, 0, 0), blockColor);
     RECT titleRect{
       card.left + padX,
       card.top + padY,
@@ -44156,11 +44380,11 @@ static void nativeTelepromptDrawPreview(
     nativeTelepromptDrawPreviewLines(
       dc, titleLines, titleRect,
       titleLineHeight, true,
-      blockColor, titleFont);
+      blockColor, titleFont,
+      settings.previewUnderlineEnabled);
 
     int songTop = titleRect.bottom +
-      std::max(2, padY / 2);
-    const int songGap = std::max(1, padY / 3);
+      titleToSongsGap;
     const bool hasPlayingSong = std::any_of(
       block.songs.begin(), block.songs.end(),
       [](const NativeTelepromptPreviewSong& song) {
@@ -44176,14 +44400,10 @@ static void nativeTelepromptDrawPreview(
     const bool whitenOtherSongs =
       (blockColorKey == "green" && hasPlayingSong) ||
       (blockColorKey == "yellow" && hasQueuedSong);
-    for (const auto& song : block.songs) {
-      std::string label = song.name;
-      if (song.playing || song.queued) {
-        label = "[ " + label + " ]";
-      }
-      const std::vector<std::string> songLines =
-        nativeTelepromptPreviewWrapLines(
-          dc, label, textWidth, songFont, 2);
+    for (size_t songIndex = 0;
+         songIndex < block.songs.size(); ++songIndex) {
+      const auto& song = block.songs[songIndex];
+      const auto& songLines = wrappedSongs[songIndex];
       const int songHeight = std::max(
         songLineHeight,
         static_cast<int>(songLines.size()) *
@@ -44208,10 +44428,12 @@ static void nativeTelepromptDrawPreview(
             card.right - padX,
           songTop + songHeight},
           songLineHeight, false,
-          songColor, songFont);
+          songColor, songFont,
+          settings.previewUnderlineEnabled);
       }
       songTop += songHeight + songGap;
     }
+    columnTops[static_cast<size_t>(column)] = card.bottom + gap;
   }
 }
 
@@ -45655,12 +45877,12 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   }
 
   RECT textRect{
-    client.left + std::max(22, width / 20),
+    client.left + std::max(8, width / 100),
     std::max(topCursor,
-      static_cast<int>(client.top) + height / 12),
-    client.right - std::max(22, width / 20),
+      static_cast<int>(client.top) + std::max(8, height / 100)),
+    client.right - std::max(8, width / 100),
     std::min(bottomCursor,
-      static_cast<int>(client.bottom) - height / 12)
+      static_cast<int>(client.bottom) - std::max(8, height / 100))
   };
   const bool textAreaAvailable =
     textRect.right > textRect.left + 4 &&
@@ -45684,10 +45906,10 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       1, static_cast<int>(
         textRect.bottom - textRect.top));
     const int paddingX = std::min(
-      std::max(16, width / 28),
+      std::max(8, textRectWidth / 80),
       std::max(0, textRectWidth / 4));
     const int paddingY = std::min(
-      std::max(12, height / 38),
+      std::max(8, textRectHeight / 80),
       std::max(0, textRectHeight / 4));
     available.left += paddingX;
     available.right -= paddingX;
@@ -49162,6 +49384,24 @@ static void nativeRebuildState(bool forceSnapshot)
       previewOpenFamilyDrawers);
   const std::string telepromptPreviewJson =
     nativeTelepromptPreviewStateJson(telepromptPreview);
+  nativeTelepromptLoadSettings();
+  bool tpPreviewSongDurationEnabled[2]{true, true};
+  bool tpPreviewBlockDurationEnabled[2]{true, true};
+  bool tpPreviewUnderlineEnabled[2]{true, true};
+  std::string tpPreviewTextCase[2]{"uppercase", "uppercase"};
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    for (int index = 0; index < 2; ++index) {
+      tpPreviewSongDurationEnabled[index] =
+        g_nativeTelepromptSettings[index].previewSongDurationEnabled;
+      tpPreviewBlockDurationEnabled[index] =
+        g_nativeTelepromptSettings[index].previewBlockDurationEnabled;
+      tpPreviewUnderlineEnabled[index] =
+        g_nativeTelepromptSettings[index].previewUnderlineEnabled;
+      tpPreviewTextCase[index] =
+        g_nativeTelepromptSettings[index].textCase;
+    }
+  }
   const bool loopActive = nativeIsRepeatEnabled(activeProject);
   double loopStartPos = 0.0;
   double loopEndPos = 0.0;
@@ -49488,6 +49728,23 @@ static void nativeRebuildState(bool forceSnapshot)
        << (telepromptPreview.active ? "true" : "false") << ",";
   json << "\"telepromptPreview\":"
        << telepromptPreviewJson << ",";
+  json << "\"telepromptPreviewSettings\":{";
+  json << "\"tp1\":{\"songDurationEnabled\":"
+       << (tpPreviewSongDurationEnabled[0] ? "true" : "false")
+       << ",\"blockDurationEnabled\":"
+       << (tpPreviewBlockDurationEnabled[0] ? "true" : "false")
+       << ",\"underlineEnabled\":"
+       << (tpPreviewUnderlineEnabled[0] ? "true" : "false")
+       << ",\"textCase\":"
+       << nativeJsonString(tpPreviewTextCase[0]) << "},";
+  json << "\"tp2\":{\"songDurationEnabled\":"
+       << (tpPreviewSongDurationEnabled[1] ? "true" : "false")
+       << ",\"blockDurationEnabled\":"
+       << (tpPreviewBlockDurationEnabled[1] ? "true" : "false")
+       << ",\"underlineEnabled\":"
+       << (tpPreviewUnderlineEnabled[1] ? "true" : "false")
+       << ",\"textCase\":"
+       << nativeJsonString(tpPreviewTextCase[1]) << "}},";
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     json << "\"liveModeEnabled\":" << (g_nativeLiveMarkEnabled ? "true" : "false") << ",";
