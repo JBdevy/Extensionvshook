@@ -2961,7 +2961,8 @@ static std::string getTimecodeMode()
   if (!GetExtState_ptr) return std::string();
   const char* raw = GetExtState_ptr(kExtStateSection, kTimecodeModeKey);
   const std::string mode = raw ? raw : "";
-  return mode == "receive" || mode == "transmitter"
+  return mode == "receive" || mode == "transmitter" ||
+      mode == "project_sync"
     ? mode
     : std::string();
 }
@@ -3482,13 +3483,74 @@ static void addTimecodeForEveryRegion()
 
 static bool getProjectSyncEnabled()
 {
-  // Recurso reservado para uma atualizacao futura.
-  return false;
+  return getTimecodeMode() == "project_sync";
 }
 
 static void toggleProjectSync()
 {
-  showComingSoonFeatureMessage();
+  if (!SetExtState_ptr || !GetExtState_ptr) {
+    showDiagnostic("Nao foi possivel configurar o Project Sync.");
+    return;
+  }
+
+  if (getProjectSyncEnabled()) {
+    const int answer = ShowMessageBox_ptr
+      ? ShowMessageBox_ptr(
+          "Project Sync esta ativo. Deseja desativar a sincronizacao?",
+          "VS Hook - Project Sync", 4)
+      : 6;
+    if (answer == 6) {
+      SetExtState_ptr(kExtStateSection, kTimecodeModeKey, "", true);
+      SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey, "", true);
+    }
+    return;
+  }
+
+  char input[64] = "";
+  if (!GetUserInputs_ptr ||
+      !GetUserInputs_ptr(
+        "VS Hook - Project Sync", 1,
+        "Codigo do outro PC (vazio para criar):,extrawidth=180",
+        input, static_cast<int>(sizeof(input)))) {
+    return;
+  }
+
+  std::string code;
+  for (char value : std::string(input)) {
+    if (value >= '0' && value <= '9') code.push_back(value);
+  }
+  const bool generatedCode = code.empty();
+  if (generatedCode) {
+    const uint64_t seed =
+      static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now()
+          .time_since_epoch().count()) ^
+      static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(
+        &g_projectSyncAction));
+    std::mt19937_64 generator(seed);
+    code = std::to_string(100000ULL + (generator() % 900000ULL));
+  } else if (code.size() != 6) {
+    showDiagnostic(
+      "Digite o codigo de 6 numeros do outro computador ou deixe vazio para criar um codigo.");
+    return;
+  }
+
+  SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
+    code.c_str(), true);
+  SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
+    "project_sync", true);
+
+  if (ShowMessageBox_ptr) {
+    const std::string message = generatedCode
+      ? "Codigo do Project Sync: " + code +
+        "\n\nNo outro computador, abra Project Sync > Sync to project e digite este codigo.\n"
+        "Depois de conectados, os dois computadores poderao controlar o projeto."
+      : "Project Sync ativado com o codigo " + code +
+        ".\n\nA Hook Center esta procurando o outro computador na rede local.\n"
+        "Nenhum dos computadores sera mestre ou escravo.";
+    ShowMessageBox_ptr(
+      message.c_str(), "VS Hook - Project Sync", 0);
+  }
 }
 
 static std::string getCurrentProjectSignature()
@@ -4236,6 +4298,9 @@ static uint64_t g_nativeTimecodeLanEventSequence = 0;
 static NativeTimecodeLanTransport g_nativeTimecodeLanTransport;
 static bool g_nativeTimecodeLanPeerConnected = false;
 static std::string g_nativeTimecodeLanPeerName;
+// Comandos recebidos do outro computador nao podem voltar para a outbox e
+// circular indefinidamente no Project Sync bidirecional.
+static bool g_nativeApplyingTimecodeLanRemoteCommand = false;
 static std::string g_nativePremixSelectedSongId;
 static double g_nativePremixSelectedSongStart = 0.0;
 static double g_nativePremixSelectedSongEnd = 0.0;
@@ -5087,7 +5152,7 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   g_nativeTimecodeLanPeerConnected = false;
   g_nativeTimecodeLanPeerName.clear();
   g_nativeTimecodeLanOutbox.clear();
-  if (mode != "transmitter") {
+  if (mode != "transmitter" && mode != "project_sync") {
     g_nativeTimecodeLanEventSequence = 0;
   }
 }
@@ -5097,7 +5162,9 @@ static void nativeTimecodeLanRecordCommand(
 {
   if (commandBody.empty() || commandBody.size() > 512 * 1024) return;
   std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
-  if (g_nativeTimecodeLanMode != "transmitter") return;
+  if (g_nativeApplyingTimecodeLanRemoteCommand ||
+      (g_nativeTimecodeLanMode != "transmitter" &&
+       g_nativeTimecodeLanMode != "project_sync")) return;
 
   // O mesmo comando pode passar pelo despachante HTTP e pela função nativa
   // específica no mesmo ciclo. Não publica a cópia idêntica duas vezes.
@@ -6479,6 +6546,7 @@ static bool nativeIsRuntimeControlActive()
          nativeTelepromptWindowIsOpen(2) ||
          getTimecodeMode() == "receive" ||
          getTimecodeMode() == "transmitter" ||
+         getTimecodeMode() == "project_sync" ||
          nativeIsLuaControlActive() ||
          nativeIsDirectorControlActive();
 }
@@ -52768,7 +52836,8 @@ static bool nativeApplyTimecodeLanCommand(
   {
     std::lock_guard<std::mutex> lock(
       g_nativeTimecodeLanMutex);
-    receiveMode = g_nativeTimecodeLanMode == "receive";
+    receiveMode = g_nativeTimecodeLanMode == "receive" ||
+      g_nativeTimecodeLanMode == "project_sync";
   }
   if (!receiveMode) return true;
 
@@ -52830,6 +52899,13 @@ static bool nativeApplyTimecodeLanCommand(
 static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
 {
   if (commandBody.empty()) return;
+
+  const bool previousRemoteCommandState =
+    g_nativeApplyingTimecodeLanRemoteCommand;
+  if (nativeJsonBoolValue(
+        commandBody, "__vshookLanRemote", false)) {
+    g_nativeApplyingTimecodeLanRemoteCommand = true;
+  }
 
   const std::string commandType = nativeJsonExtractString(commandBody, "type");
   const std::string commandRole = nativeLower(nativeJsonExtractString(commandBody, "role"));
@@ -52950,6 +53026,9 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     nativeSaveProjectFromCommand(commandBody) ||
     nativeSelectProjectFromCommand(commandBody);
 
+  g_nativeApplyingTimecodeLanRemoteCommand =
+    previousRemoteCommandState;
+
   if (handledByNative) nativeMirrorCommandToLuaIfNeeded(commandType, commandBody);
 
   if (!handledByNative && !lightweightDirectorHeartbeat) {
@@ -53061,7 +53140,8 @@ static void nativeHandleClient(native_socket_t client)
     {
       std::lock_guard<std::mutex> lock(
         g_nativeTimecodeLanMutex);
-      receiveMode = g_nativeTimecodeLanMode == "receive";
+      receiveMode = g_nativeTimecodeLanMode == "receive" ||
+        g_nativeTimecodeLanMode == "project_sync";
     }
     if (!receiveMode) {
       body = nativeHttpResponse(
