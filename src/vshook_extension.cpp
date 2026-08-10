@@ -99,6 +99,9 @@ class AudioAccessor;
 #ifndef HTBOTTOMRIGHT
 #define HTBOTTOMRIGHT 17
 #endif
+#ifndef FF_DONTCARE
+#define FF_DONTCARE 0
+#endif
 
 namespace vshook {
 
@@ -4435,7 +4438,8 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
     g_projectAutoOpenEntries[0].displayName,
     g_projectAutoOpenEntries[0].commandId,
     projectAutoMode == g_projectAutoOpenEntries[0].autoOpenMode);
-  AppendMenu(startupMenu, MF_SEPARATOR, 0, nullptr);
+  InsertMenu(startupMenu, GetMenuItemCount(startupMenu),
+    MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
   for (StartupWindowEntry& entry : g_startupWindowEntries) {
     appendMenuString(startupMenu, entry.displayName,
       entry.commandId, nativeStartupWindowEnabled(entry));
@@ -39321,7 +39325,8 @@ static void nativeBigClockAppendMenu(
   const std::wstring wide = utf8ToWide(text ? text : "");
   AppendMenuW(menu, flags, id, wide.c_str());
 #else
-  AppendMenu(menu, flags, id, text ? text : "");
+  InsertMenu(menu, GetMenuItemCount(menu),
+    MF_BYPOSITION | flags, id, text ? text : "");
 #endif
 }
 
@@ -39387,7 +39392,8 @@ static void nativeBigClockHandleMenu(HWND hwnd)
     AppendMenuW(menu, MF_POPUP,
       reinterpret_cast<UINT_PTR>(fontMenu), wideLabel.c_str());
 #else
-    AppendMenu(menu, MF_POPUP,
+    InsertMenu(menu, GetMenuItemCount(menu),
+      MF_BYPOSITION | MF_POPUP,
       reinterpret_cast<UINT_PTR>(fontMenu), label ? label : "");
 #endif
   };
@@ -39415,7 +39421,8 @@ static void nativeBigClockHandleMenu(HWND hwnd)
     kBigClockChooseProgressColor, "Cor da barra de progresso...");
   nativeBigClockAppendMenu(menu, MF_STRING,
     kBigClockChooseRegressColor, "Cor da barra de regresso...");
-  AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
+  InsertMenu(menu, GetMenuItemCount(menu),
+    MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
   nativeBigClockAppendMenu(menu, MF_STRING,
     kBigClockChoosePlayingTextColor, "Cor do texto - Tocando/Selecionada...");
   nativeBigClockAppendMenu(menu, MF_STRING,
@@ -42345,7 +42352,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       return 0;
     }
     case WM_MOUSEWHEEL: {
-      const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+      const int delta = static_cast<short>(HIWORD(wParam));
       if (g_nativeHookControllerMode ==
           NativeHookControllerMode::Tcp) {
         const int step = delta > 0 ? -1 : 1;
