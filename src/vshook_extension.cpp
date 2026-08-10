@@ -5,6 +5,7 @@
 #include "js_api_compat.h"
 #include "license_validator.h"
 #include "native_video_decoder.h"
+#include "wdlutf8.h"
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -107,6 +108,7 @@ using ShowMessageBox_t = int (*)(const char*, const char*, int);
 using GetMainHwnd_t = HWND (*)();
 using GetResourcePath_t = const char* (*)();
 using GetAppVersion_t = const char* (*)();
+using get_config_var_t = void* (*)(const char*, int*);
 using Main_OnCommand_t = void (*)(int, int);
 using GetToggleCommandState_t = int (*)(int);
 using GetToggleCommandStateEx_t = int (*)(int, int);
@@ -244,6 +246,10 @@ using TrackFX_CopyToTrack_t = void (*)(MediaTrack*, int, MediaTrack*, int, bool)
 using MIDI_GetRecentInputEvent_t =
   int (*)(int, char*, int*, int*, int*, double*, int*);
 using GetMIDIInputName_t = bool (*)(int, char*, int);
+using format_timestr_pos_t = void (*)(double, char*, int, int);
+using GR_SelectColor_t = int (*)(HWND, int*);
+using TimeMap_curFrameRate_t = double (*)(ReaProject*, bool*);
+using GetProjectTimeSignature2_t = void (*)(ReaProject*, double*, double*);
 
 static plugin_register_t plugin_register_ptr = nullptr;
 static plugin_getapi_t plugin_getapi_ptr = nullptr;
@@ -251,6 +257,7 @@ static ShowMessageBox_t ShowMessageBox_ptr = nullptr;
 static GetMainHwnd_t GetMainHwnd_ptr = nullptr;
 static GetResourcePath_t GetResourcePath_ptr = nullptr;
 static GetAppVersion_t GetAppVersion_ptr = nullptr;
+static get_config_var_t get_config_var_ptr = nullptr;
 static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
 static GetToggleCommandState_t GetToggleCommandState_ptr = nullptr;
 static GetToggleCommandStateEx_t GetToggleCommandStateEx_ptr = nullptr;
@@ -307,6 +314,10 @@ static DockWindowRefreshForHWND_t DockWindowRefreshForHWND_ptr = nullptr;
 static DockWindowRemove_t DockWindowRemove_ptr = nullptr;
 static RefreshToolbar2_t RefreshToolbar2_ptr = nullptr;
 static ValidatePtr2_t ValidatePtr2_ptr = nullptr;
+static format_timestr_pos_t format_timestr_pos_ptr = nullptr;
+static GR_SelectColor_t GR_SelectColor_ptr = nullptr;
+static TimeMap_curFrameRate_t TimeMap_curFrameRate_ptr = nullptr;
+static GetProjectTimeSignature2_t GetProjectTimeSignature2_ptr = nullptr;
 
 static CountTracks_t CountTracks_ptr = nullptr;
 static GetTrack_t GetTrack_ptr = nullptr;
@@ -387,6 +398,18 @@ static const char* kExtStateSection = "VS_HOOK_LOADER";
 static const char* kAutoOpenModeKey = "AUTO_OPEN_VSHOOK_MODE";
 static const char* kLegacyAutoOpenKey = "AUTO_OPEN_VSHOOK";
 static const char* kProjectAutoOpenModeKey = "PROJECT_AUTO_OPEN_VSHOOK_MODE";
+static const char* kAutoOpenBigClockOneKey =
+  "AUTO_OPEN_BIG_CLOCK_1_V1";
+static const char* kAutoOpenBigClockTwoKey =
+  "AUTO_OPEN_BIG_CLOCK_2_V1";
+static const char* kAutoOpenHookControllerKey =
+  "AUTO_OPEN_HOOK_CONTROLLER_V1";
+static const char* kProjectAutoOpenBigClockOneKey =
+  "PROJECT_AUTO_OPEN_BIG_CLOCK_1_V1";
+static const char* kProjectAutoOpenBigClockTwoKey =
+  "PROJECT_AUTO_OPEN_BIG_CLOCK_2_V1";
+static const char* kProjectAutoOpenHookControllerKey =
+  "PROJECT_AUTO_OPEN_HOOK_CONTROLLER_V1";
 static const char* kTimecodeModeKey = "TIMECODE_MODE_V1";
 static const char* kTimecodePairCodeKey = "TIMECODE_PAIR_CODE_V1";
 static const char* kProjectSyncEnabledKey = "PROJECT_SYNC_ENABLED_V1";
@@ -477,6 +500,28 @@ struct AutoOpenEntry {
   int commandId = 0;
 };
 
+enum class StartupWindowTarget {
+  BigClockOne,
+  BigClockTwo,
+  HookController
+};
+
+struct StartupWindowEntry {
+  custom_action_register_t action;
+  const char* displayName;
+  const char* extStateKey;
+  StartupWindowTarget target;
+  int commandId = 0;
+};
+
+struct ProjectStartupWindowEntry {
+  custom_action_register_t action;
+  const char* displayName;
+  const char* projectExtStateKey;
+  StartupWindowTarget target;
+  int commandId = 0;
+};
+
 static ScriptEntry g_scripts[] = {
   {
     { 0, "VSHOOKRUNBETA", "VS Hook Beta", nullptr },
@@ -524,6 +569,15 @@ static custom_action_register_t g_recadosAction = {
   0, "VSHOOKNEWRECADOS",
   "VS Hook: Recados", nullptr
 };
+static custom_action_register_t g_bigClockHookAction = {
+  0, "VSHOOKNEWBIGCLOCK", "VS Hook: Big Clock Hook 1", nullptr
+};
+static custom_action_register_t g_bigClockHookTwoAction = {
+  0, "VSHOOKNEWBIGCLOCK2", "VS Hook: Big Clock Hook 2", nullptr
+};
+static custom_action_register_t g_hookControllerAction = {
+  0, "VSHOOKNEWCONTROLLER", "VS Hook: Hook Controller", nullptr
+};
 static int g_timecodeReceiveCommandId = 0;
 static int g_timecodeTransmitterCommandId = 0;
 static int g_addTimecodeCommandId = 0;
@@ -532,6 +586,9 @@ static int g_telepromptOneCommandId = 0;
 static int g_telepromptTwoCommandId = 0;
 static int g_telepromptSettingsCommandId = 0;
 static int g_recadosCommandId = 0;
+static int g_bigClockHookCommandId = 0;
+static int g_bigClockHookTwoCommandId = 0;
+static int g_hookControllerCommandId = 0;
 
 struct State {
   bool initialized = false;
@@ -547,8 +604,10 @@ struct State {
   int startupTimerTicks = 0;
   int projectStableTicks = 0;
   bool didGlobalStartupAutoOpen = false;
+  bool didAuxiliaryStartupAutoOpen = false;
   std::string activeProjectSignature;
   std::string autoOpenedProjectSignature;
+  std::string auxiliaryAutoOpenedProjectSignature;
   std::string lastLaunchedMode;
   std::string modeBeforeDirectorApp;
   std::string pendingScriptMode;
@@ -795,6 +854,14 @@ static std::vector<NativeUiButtonLayoutZoneHit>
 static RECT g_nativeMainListRect{0, 0, 0, 0};
 static RECT g_nativeMainParts1Rect{0, 0, 0, 0};
 static RECT g_nativeMainParts2Rect{0, 0, 0, 0};
+static RECT g_nativeMainParts1ResizeRect{0, 0, 0, 0};
+static RECT g_nativeMainParts2ResizeRect{0, 0, 0, 0};
+static RECT g_nativeMainPartsResizeBodyRect{0, 0, 0, 0};
+static bool g_nativeMainPartsResizeDragging = false;
+static bool g_nativeMainPartsResizeTargetParts2 = false;
+static bool g_nativeMainPartsWidthRatiosLoaded = false;
+static double g_nativeMainParts1WidthRatio = 0.22;
+static double g_nativeMainParts2WidthRatio = 0.22;
 static RECT g_nativeMainParts1HeaderRect{0, 0, 0, 0};
 static RECT g_nativeMainParts2HeaderRect{0, 0, 0, 0};
 static RECT g_nativeMainParts1ListRect{0, 0, 0, 0};
@@ -1032,6 +1099,11 @@ static int g_nativeMainListViewportPixels = 0;
 static int g_nativeMainListMaxScrollPixels = 0;
 static std::map<std::string, bool> g_nativeUiSelectedRows;
 static std::vector<std::string> g_nativeUiSelectionOrder;
+// Clique simples e navegacao representam uma unica musica, mesmo quando a
+// mesma selecao aparece como playlist na interface principal e como regiao no
+// Hook Controller. As chaves por pagina continuam existindo para Ctrl/Shift,
+// mas esta identidade impede duas linhas azuis entre as duas janelas.
+static std::string g_nativeUiExclusiveSelectedSongIdentity;
 static int g_nativeUiSelectionAnchorVisibleIndex = -1;
 // A ancora pertence ao Shift; o foco e a ultima linha efetivamente escolhida.
 // O Lua mantem esses dois conceitos separados (last_*_clicked_index e
@@ -1049,11 +1121,13 @@ static bool g_nativeUiMusicSelectionVisualActive = false;
 struct NativeUiPendingMusicNavigation {
   bool pending = false;
   bool regionsPage = false;
+  bool hookControllerSource = false;
   std::string rowKey;
   std::string commitCommand;
   std::chrono::steady_clock::time_point dueAt;
 };
 static NativeUiPendingMusicNavigation g_nativeUiPendingMusicNavigation;
+static bool g_nativeHookControllerSongContextActive = false;
 static constexpr int kNativeUiMusicNavigationSettleMs = 110;
 struct NativeMainFamilyButtonHit {
   RECT rect{0, 0, 0, 0};
@@ -1549,6 +1623,15 @@ static void nativeCloseAllTelepromptWindows();
 static void nativeRestoreTelepromptWindowsIfRequested();
 static void nativeOpenTelepromptSettings();
 static void nativeOpenRecadosApp();
+static bool nativeBigClockWindowIsOpen(int slot = 0);
+static bool nativeOpenBigClockWindow(int slot = 0);
+static void nativeCloseBigClockWindow(int slot = 0);
+static void nativeToggleBigClockWindow(int slot = 0);
+static bool nativeHookControllerWindowIsOpen();
+static bool nativeOpenHookControllerWindow();
+static void nativeCloseHookControllerWindow();
+static void nativeToggleHookControllerWindow();
+static int nativeTranslateHookControllerKeyboardMessage(const MSG* msg);
 static void nativeOpenShortcutNotice();
 static void nativeCloseShortcutNotice();
 static std::vector<int> nativeUiReadPreviewBlocks(int slot);
@@ -1598,6 +1681,7 @@ static void nativeClosePartsRenameModal();
 static void nativeUiCancelMixerInlineRename();
 static void nativeUiShowTemporaryPopup(
   const std::string& text, double durationSeconds);
+static UINT nativeUiDesiredFrameInterval();
 static int nativeUiTextWidth(
   HDC dc, const std::string& text, HFONT font);
 static void nativeSetTunerColumnVisible(bool visible);
@@ -1614,17 +1698,67 @@ static std::string nativeFindLoopRegionLabel(ReaProject* project, double loopSta
 
 static AutoOpenEntry g_autoOpenEntries[] = {
   {
-    { 0, "VSHOOKAUTONEW", "VS Hook: Iniciar junto com o REAPER", nullptr },
-    "Iniciar junto com o REAPER",
+    { 0, "VSHOOKAUTONEW",
+      "VS Hook: Iniciar VS Hook junto com o REAPER", nullptr },
+    "Iniciar VS Hook junto com o REAPER",
     "native"
   }
 };
 
 static AutoOpenEntry g_projectAutoOpenEntries[] = {
   {
-    { 0, "VSHOOKPROJECTAUTONEW", "VS Hook: Iniciar junto com este projeto", nullptr },
-    "Iniciar junto com este projeto",
+    { 0, "VSHOOKPROJECTAUTONEW",
+      "VS Hook: Iniciar VS Hook junto com esse projeto", nullptr },
+    "Iniciar VS Hook junto com esse projeto",
     "native"
+  }
+};
+
+static StartupWindowEntry g_startupWindowEntries[] = {
+  {
+    { 0, "VSHOOKAUTOBIGCLOCK1",
+      "VS Hook: Iniciar Big Clock Hook 1 junto com o REAPER", nullptr },
+    "Iniciar Big Clock Hook 1 junto com o REAPER",
+    kAutoOpenBigClockOneKey,
+    StartupWindowTarget::BigClockOne
+  },
+  {
+    { 0, "VSHOOKAUTOBIGCLOCK2",
+      "VS Hook: Iniciar Big Clock Hook 2 junto com o REAPER", nullptr },
+    "Iniciar Big Clock Hook 2 junto com o REAPER",
+    kAutoOpenBigClockTwoKey,
+    StartupWindowTarget::BigClockTwo
+  },
+  {
+    { 0, "VSHOOKAUTOHOOKCONTROLLER",
+      "VS Hook: Iniciar Hook Controller junto com o REAPER", nullptr },
+    "Iniciar Hook Controller junto com o REAPER",
+    kAutoOpenHookControllerKey,
+    StartupWindowTarget::HookController
+  }
+};
+
+static ProjectStartupWindowEntry g_projectStartupWindowEntries[] = {
+  {
+    { 0, "VSHOOKPROJECTAUTOBIGCLOCK1",
+      "VS Hook: Iniciar Big Clock Hook 1 junto com esse projeto", nullptr },
+    "Iniciar Big Clock Hook 1 junto com esse projeto",
+    kProjectAutoOpenBigClockOneKey,
+    StartupWindowTarget::BigClockOne
+  },
+  {
+    { 0, "VSHOOKPROJECTAUTOBIGCLOCK2",
+      "VS Hook: Iniciar Big Clock Hook 2 junto com esse projeto", nullptr },
+    "Iniciar Big Clock Hook 2 junto com esse projeto",
+    kProjectAutoOpenBigClockTwoKey,
+    StartupWindowTarget::BigClockTwo
+  },
+  {
+    { 0, "VSHOOKPROJECTAUTOHOOKCONTROLLER",
+      "VS Hook: Iniciar Hook Controller junto com esse projeto", nullptr },
+    "Iniciar Hook Controller junto com esse projeto",
+    kProjectAutoOpenHookControllerKey,
+    StartupWindowTarget::HookController
   }
 };
 
@@ -2440,6 +2574,16 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
   const bool keyDown = msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN;
   const int vk = static_cast<int>(msg->wParam);
 
+  // A Hook Controller desenha a propria lupa em uma janela customizada (nao
+  // existe um controle EDIT filho). Entrega todo o teclado ao seu WndProc e
+  // impede que a Action List do REAPER roube letras, numeros, Backspace,
+  // setas ou Enter enquanto essa janela possui o foco.
+  const int hookControllerKeyboardResult =
+    nativeTranslateHookControllerKeyboardMessage(msg);
+  if (hookControllerKeyboardResult != 0) {
+    return hookControllerKeyboardResult;
+  }
+
   // Diferente do Beta/Estavel, a interface VSHooknew e o proprio runtime.
   // Ela deve receber todo o teclado mesmo sem heartbeat do Lua ou do Diretor.
   // -1 manda o evento para a janela focada e impede o accelerator principal do
@@ -2942,6 +3086,159 @@ static void setAutoOpenModeRaw(const char* mode, bool showError)
 static void setAutoOpenMode(const char* mode)
 {
   setAutoOpenModeRaw(mode, true);
+}
+
+static bool nativeStartupWindowEnabled(
+  const StartupWindowEntry& entry)
+{
+  if (!GetExtState_ptr || !entry.extStateKey) return false;
+  const char* value = GetExtState_ptr(
+    kExtStateSection, entry.extStateKey);
+  return value && std::strcmp(value, "1") == 0;
+}
+
+static bool nativeProjectStartupWindowEnabled(
+  const ProjectStartupWindowEntry& entry)
+{
+  if (!GetProjExtState_ptr || !entry.projectExtStateKey) return false;
+  char value[32] = "";
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  return project &&
+    GetProjExtState_ptr(project, kExtStateSection,
+      entry.projectExtStateKey, value,
+      static_cast<int>(sizeof(value))) > 0 &&
+    std::strcmp(value, "1") == 0;
+}
+
+static void nativeSetProjectStartupWindowRaw(
+  const ProjectStartupWindowEntry& entry,
+  bool enabled)
+{
+  if (!SetProjExtState_ptr || !entry.projectExtStateKey) return;
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project) return;
+  SetProjExtState_ptr(project, kExtStateSection,
+    entry.projectExtStateKey, enabled ? "1" : "");
+  if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+}
+
+static ProjectStartupWindowEntry*
+nativeProjectStartupEntryForTarget(StartupWindowTarget target)
+{
+  for (ProjectStartupWindowEntry& entry :
+       g_projectStartupWindowEntries) {
+    if (entry.target == target) return &entry;
+  }
+  return nullptr;
+}
+
+static StartupWindowEntry*
+nativeGlobalStartupEntryForTarget(StartupWindowTarget target)
+{
+  for (StartupWindowEntry& entry : g_startupWindowEntries) {
+    if (entry.target == target) return &entry;
+  }
+  return nullptr;
+}
+
+static void nativeToggleStartupWindow(
+  const StartupWindowEntry& entry)
+{
+  if (!SetExtState_ptr || !entry.extStateKey) {
+    showDiagnostic(
+      "REAPER nao entregou a API para salvar esta opcao de Startup.");
+    return;
+  }
+  const bool enable = !nativeStartupWindowEnabled(entry);
+  SetExtState_ptr(kExtStateSection, entry.extStateKey,
+    enable ? "1" : "0", true);
+  if (enable) {
+    if (ProjectStartupWindowEntry* projectEntry =
+          nativeProjectStartupEntryForTarget(entry.target)) {
+      nativeSetProjectStartupWindowRaw(*projectEntry, false);
+    }
+  }
+  showDiagnostic(std::string(entry.displayName) +
+    (enable ? " foi ativado." : " foi desativado."));
+}
+
+static void nativeToggleProjectStartupWindow(
+  const ProjectStartupWindowEntry& entry)
+{
+  if (!SetProjExtState_ptr || !entry.projectExtStateKey) {
+    showDiagnostic(
+      "REAPER nao entregou a API para salvar o Startup neste projeto.");
+    return;
+  }
+  const bool enable = !nativeProjectStartupWindowEnabled(entry);
+  nativeSetProjectStartupWindowRaw(entry, enable);
+  if (enable && SetExtState_ptr) {
+    if (StartupWindowEntry* globalEntry =
+          nativeGlobalStartupEntryForTarget(entry.target)) {
+      SetExtState_ptr(kExtStateSection, globalEntry->extStateKey,
+        "0", true);
+    }
+  }
+  // Assim como o Startup principal, a opcao passa a valer quando este
+  // projeto for aberto novamente, nunca no clique que apenas a configura.
+  g_state.auxiliaryAutoOpenedProjectSignature =
+    getCurrentProjectSignature();
+  showDiagnostic(std::string(entry.displayName) +
+    (enable
+      ? " foi ativado. Salve o projeto para gravar no RPP."
+      : " foi desativado. Salve o projeto para gravar no RPP."));
+}
+
+static void nativeOpenConfiguredStartupWindows()
+{
+  for (const StartupWindowEntry& entry : g_startupWindowEntries) {
+    if (!nativeStartupWindowEnabled(entry)) continue;
+    switch (entry.target) {
+      case StartupWindowTarget::BigClockOne:
+        nativeOpenBigClockWindow(0);
+        break;
+      case StartupWindowTarget::BigClockTwo:
+        nativeOpenBigClockWindow(1);
+        break;
+      case StartupWindowTarget::HookController:
+        nativeOpenHookControllerWindow();
+        break;
+    }
+  }
+}
+
+static void nativeOpenConfiguredProjectStartupWindows()
+{
+  for (const ProjectStartupWindowEntry& entry :
+       g_projectStartupWindowEntries) {
+    if (!nativeProjectStartupWindowEnabled(entry)) continue;
+    switch (entry.target) {
+      case StartupWindowTarget::BigClockOne:
+        nativeOpenBigClockWindow(0);
+        break;
+      case StartupWindowTarget::BigClockTwo:
+        nativeOpenBigClockWindow(1);
+        break;
+      case StartupWindowTarget::HookController:
+        nativeOpenHookControllerWindow();
+        break;
+    }
+  }
+}
+
+static void nativeNormalizeStartupWindowConflicts()
+{
+  if (!SetExtState_ptr) return;
+  for (const ProjectStartupWindowEntry& projectEntry :
+       g_projectStartupWindowEntries) {
+    if (!nativeProjectStartupWindowEnabled(projectEntry)) continue;
+    StartupWindowEntry* globalEntry =
+      nativeGlobalStartupEntryForTarget(projectEntry.target);
+    if (globalEntry && nativeStartupWindowEnabled(*globalEntry)) {
+      SetExtState_ptr(kExtStateSection, globalEntry->extStateKey,
+        "0", true);
+    }
+  }
 }
 
 static bool isAutoOpenModeValue(const std::string& mode)
@@ -3615,6 +3912,7 @@ static void normalizeAutoOpenConflict()
   if (!getAutoOpenMode().empty() && !getProjectAutoOpenMode().empty()) {
     setAutoOpenModeRaw("", false);
   }
+  nativeNormalizeStartupWindowConflicts();
 }
 
 static const char* displayNameForAutoOpenMode(const char* mode)
@@ -3758,6 +4056,21 @@ static bool hookCommand(int command, int flag)
     nativeOpenRecadosApp();
     return true;
   }
+  if (g_bigClockHookCommandId != 0 &&
+      command == g_bigClockHookCommandId) {
+    nativeToggleBigClockWindow(0);
+    return true;
+  }
+  if (g_bigClockHookTwoCommandId != 0 &&
+      command == g_bigClockHookTwoCommandId) {
+    nativeToggleBigClockWindow(1);
+    return true;
+  }
+  if (g_hookControllerCommandId != 0 &&
+      command == g_hookControllerCommandId) {
+    nativeToggleHookControllerWindow();
+    return true;
+  }
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && command == entry.commandId) {
       toggleAutoOpenMode(entry.autoOpenMode);
@@ -3768,6 +4081,20 @@ static bool hookCommand(int command, int flag)
   for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
     if (entry.commandId != 0 && command == entry.commandId) {
       toggleProjectAutoOpenMode(entry.autoOpenMode);
+      return true;
+    }
+  }
+
+  for (StartupWindowEntry& entry : g_startupWindowEntries) {
+    if (entry.commandId != 0 && command == entry.commandId) {
+      nativeToggleStartupWindow(entry);
+      return true;
+    }
+  }
+  for (ProjectStartupWindowEntry& entry :
+       g_projectStartupWindowEntries) {
+    if (entry.commandId != 0 && command == entry.commandId) {
+      nativeToggleProjectStartupWindow(entry);
       return true;
     }
   }
@@ -3835,6 +4162,21 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
     nativeOpenRecadosApp();
     return true;
   }
+  if (g_bigClockHookCommandId != 0 &&
+      command == g_bigClockHookCommandId) {
+    nativeToggleBigClockWindow(0);
+    return true;
+  }
+  if (g_bigClockHookTwoCommandId != 0 &&
+      command == g_bigClockHookTwoCommandId) {
+    nativeToggleBigClockWindow(1);
+    return true;
+  }
+  if (g_hookControllerCommandId != 0 &&
+      command == g_hookControllerCommandId) {
+    nativeToggleHookControllerWindow();
+    return true;
+  }
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && command == entry.commandId) {
       toggleAutoOpenMode(entry.autoOpenMode);
@@ -3845,6 +4187,20 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
     if (entry.commandId != 0 && command == entry.commandId) {
       toggleProjectAutoOpenMode(entry.autoOpenMode);
+      return true;
+    }
+  }
+
+  for (StartupWindowEntry& entry : g_startupWindowEntries) {
+    if (entry.commandId != 0 && command == entry.commandId) {
+      nativeToggleStartupWindow(entry);
+      return true;
+    }
+  }
+  for (ProjectStartupWindowEntry& entry :
+       g_projectStartupWindowEntries) {
+    if (entry.commandId != 0 && command == entry.commandId) {
+      nativeToggleProjectStartupWindow(entry);
       return true;
     }
   }
@@ -3882,6 +4238,18 @@ static int toggleActionState(int commandId)
       commandId == g_telepromptTwoCommandId) {
     return nativeTelepromptWindowIsOpen(2) ? 1 : 0;
   }
+  if (g_bigClockHookCommandId != 0 &&
+      commandId == g_bigClockHookCommandId) {
+    return nativeBigClockWindowIsOpen(0) ? 1 : 0;
+  }
+  if (g_bigClockHookTwoCommandId != 0 &&
+      commandId == g_bigClockHookTwoCommandId) {
+    return nativeBigClockWindowIsOpen(1) ? 1 : 0;
+  }
+  if (g_hookControllerCommandId != 0 &&
+      commandId == g_hookControllerCommandId) {
+    return nativeHookControllerWindowIsOpen() ? 1 : 0;
+  }
 
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && commandId == entry.commandId) {
@@ -3892,6 +4260,18 @@ static int toggleActionState(int commandId)
   for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
     if (entry.commandId != 0 && commandId == entry.commandId) {
       return getProjectAutoOpenMode() == entry.autoOpenMode ? 1 : 0;
+    }
+  }
+
+  for (StartupWindowEntry& entry : g_startupWindowEntries) {
+    if (entry.commandId != 0 && commandId == entry.commandId) {
+      return nativeStartupWindowEnabled(entry) ? 1 : 0;
+    }
+  }
+  for (ProjectStartupWindowEntry& entry :
+       g_projectStartupWindowEntries) {
+    if (entry.commandId != 0 && commandId == entry.commandId) {
+      return nativeProjectStartupWindowEnabled(entry) ? 1 : 0;
     }
   }
 
@@ -3986,6 +4366,15 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
     for (AutoOpenEntry& entry : g_projectAutoOpenEntries) {
       setMenuCommandChecked(hMenu, entry.commandId, projectAutoMode == entry.autoOpenMode);
     }
+    for (StartupWindowEntry& entry : g_startupWindowEntries) {
+      setMenuCommandChecked(hMenu, entry.commandId,
+        nativeStartupWindowEnabled(entry));
+    }
+    for (ProjectStartupWindowEntry& entry :
+         g_projectStartupWindowEntries) {
+      setMenuCommandChecked(hMenu, entry.commandId,
+        nativeProjectStartupWindowEnabled(entry));
+    }
     const std::string timecodeMode = getTimecodeMode();
     setMenuCommandChecked(hMenu, g_timecodeReceiveCommandId, timecodeMode == "receive");
     setMenuCommandChecked(hMenu, g_timecodeTransmitterCommandId, timecodeMode == "transmitter");
@@ -3994,6 +4383,12 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
       nativeTelepromptWindowIsOpen(1));
     setMenuCommandChecked(hMenu, g_telepromptTwoCommandId,
       nativeTelepromptWindowIsOpen(2));
+    setMenuCommandChecked(hMenu, g_bigClockHookCommandId,
+      nativeBigClockWindowIsOpen(0));
+    setMenuCommandChecked(hMenu, g_bigClockHookTwoCommandId,
+      nativeBigClockWindowIsOpen(1));
+    setMenuCommandChecked(hMenu, g_hookControllerCommandId,
+      nativeHookControllerWindowIsOpen());
     return;
   }
 
@@ -4006,10 +4401,13 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   HMENU startupMenu = CreatePopupMenu();
   HMENU timecodeMenu = CreatePopupMenu();
   HMENU projectSyncMenu = CreatePopupMenu();
+  HMENU bigClockMenu = CreatePopupMenu();
   if (!vsHookMenu || !telepromptMenu || !startupMenu ||
-      !timecodeMenu || !projectSyncMenu) return;
+      !timecodeMenu || !projectSyncMenu || !bigClockMenu) return;
 
   appendMenuString(vsHookMenu, "Executar", g_nativeInterfaceCommandId, nativeAppActivePanelIsOpen());
+  appendMenuString(vsHookMenu, "Hook Controller",
+    g_hookControllerCommandId, nativeHookControllerWindowIsOpen());
   appendMenuString(telepromptMenu, "Abrir Teleprompt 1",
     g_telepromptOneCommandId, nativeTelepromptWindowIsOpen(1));
   appendMenuString(telepromptMenu, "Abrir Teleprompt 2",
@@ -4019,6 +4417,13 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   insertMenuSubMenu(vsHookMenu, telepromptMenu, "Teleprompt", -1);
   appendMenuString(
     vsHookMenu, "Recados", g_recadosCommandId, false);
+  appendMenuString(
+    bigClockMenu, "Big Clock Hook 1", g_bigClockHookCommandId,
+    nativeBigClockWindowIsOpen(0));
+  appendMenuString(
+    bigClockMenu, "Big Clock Hook 2", g_bigClockHookTwoCommandId,
+    nativeBigClockWindowIsOpen(1));
+  insertMenuSubMenu(vsHookMenu, bigClockMenu, "Big Clock", -1);
 
   appendMenuString(
     startupMenu,
@@ -4030,6 +4435,17 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
     g_projectAutoOpenEntries[0].displayName,
     g_projectAutoOpenEntries[0].commandId,
     projectAutoMode == g_projectAutoOpenEntries[0].autoOpenMode);
+  AppendMenu(startupMenu, MF_SEPARATOR, 0, nullptr);
+  for (StartupWindowEntry& entry : g_startupWindowEntries) {
+    appendMenuString(startupMenu, entry.displayName,
+      entry.commandId, nativeStartupWindowEnabled(entry));
+    if (ProjectStartupWindowEntry* projectEntry =
+          nativeProjectStartupEntryForTarget(entry.target)) {
+      appendMenuString(startupMenu, projectEntry->displayName,
+        projectEntry->commandId,
+        nativeProjectStartupWindowEnabled(*projectEntry));
+    }
+  }
   insertMenuSubMenu(vsHookMenu, startupMenu, "Startup", -1);
 
   const std::string timecodeMode = getTimecodeMode();
@@ -6236,6 +6652,7 @@ static std::string g_nativeArmedMarkerLabel;
 static std::chrono::steady_clock::time_point g_nativeArmedMarkerSetAt;
 static double g_nativeSelectedMarkerPos = 0.0;
 static double g_nativeArmedMarkerStartPlayPos = 0.0;
+static double g_nativeArmedMarkerLastPlayPos = 0.0;
 
 static std::vector<NativeSongWindow> g_nativeActivePlaylistItems;
 static bool g_nativeAutoplayEnabled = false;
@@ -6991,15 +7408,9 @@ static void nativeUpdateLiveMarkTracker(bool advancing, bool paused, const std::
     }
   }
   g_nativeLiveTrackerClock = clockNow;
-  // Marca exatamente aos 10 segundos, sem esperar Stop ou troca de música.
-  if (g_nativeLiveTrackerElapsed >= kNativeLiveMarkThresholdSec &&
-      g_nativeLiveExecutedItems.find(playingId) ==
-        g_nativeLiveExecutedItems.end()) {
-    g_nativeLiveExecutedItems[playingId] = true;
-    nativePersistLiveMarksForCurrentProjectLocked();
-    g_nativeForceSnapshotBuild.store(true);
-    g_nativeForceStateBuild.store(true);
-  }
+  // Os 10 segundos apenas qualificam a execução. A marca visual é confirmada
+  // por nativeFinalizeLiveTrackerLocked quando houver Stop, fim da região ou
+  // quando outra música assumir a reprodução.
 }
 
 static void nativeApplyLiveExecutedFlags(std::vector<NativeSongWindow>& songs)
@@ -10529,6 +10940,27 @@ static std::string nativeUpperNamePtBrKeepParentheses(
   return out;
 }
 
+static std::string nativeUtf8Lower(std::string value)
+{
+  size_t offset = 0;
+  while (offset < value.size()) {
+    const unsigned char first =
+      static_cast<unsigned char>(value[offset]);
+    int charLength = 1;
+    if (first >= 0x80) {
+      charLength = wdl_utf8_parsechar(
+        value.c_str() + offset, nullptr);
+      if (charLength < 1 ||
+          offset + static_cast<size_t>(charLength) > value.size()) {
+        charLength = 1;
+      }
+    }
+    wdl_utf8_set_char_case(&value[offset], -1);
+    offset += static_cast<size_t>(charLength);
+  }
+  return value;
+}
+
 static std::vector<NativeUiPlaylistRecord> nativeUiReadPlaylistRecords(
   ReaProject* project)
 {
@@ -12777,6 +13209,19 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
   }
   if (nativeIsLuaControlActive()) return false;
 
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (!g_nativeArmedMarkerId.empty()) {
+      // Parts confirmado possui prioridade absoluta sobre a fila. O Smooth
+      // Seek do REAPER conserva apenas um destino pendente; portanto o seek de
+      // dois segundos da fila nao pode substituir o salto do Parts. A fila
+      // permanece visivel/intacta e volta a ser avaliada depois que o cursor de
+      // reproducao realmente chegar ao marker engatilhado.
+      g_nativeQueuedSeekSignature.clear();
+      return false;
+    }
+  }
+
   if (!playing || playingId.empty()) {
     std::string queuedId;
     std::string queuedKind;
@@ -12990,6 +13435,9 @@ static void nativePrepareQueuedTunerNearRegionEndOnMainThread()
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     nativeLoadAutomationSettingsOnceLocked();
+    // A fila esta em standby enquanto um Parts aguarda o Smooth Seek. Nao
+    // antecipa nem a preparacao de Tuner do destino nesse intervalo.
+    if (!g_nativeArmedMarkerId.empty()) return;
     // AT/2 apenas prepara a musica. O Tuner sera aplicado no Play real dela,
     // nunca no fim da musica anterior.
     if (g_nativeAutoplayEnabled && g_nativeAuto2Enabled) return;
@@ -13118,6 +13566,15 @@ static void nativeMaintainAutoStop(
   const std::vector<NativeSongWindow>& projectSongs)
 {
   if (!project || !Main_OnCommand_ptr || !playing || nativeIsLuaControlActive()) return;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (!g_nativeArmedMarkerId.empty()) {
+      // Nem Auto Stop nem a promocao da fila podem tomar a fronteira usada
+      // pelo Smooth Seek de um Parts que ainda nao chegou ao alvo.
+      g_nativeAutoStopLastStoppedSignature.clear();
+      return;
+    }
+  }
   // O Repeat real cobre tanto o Loop normal quanto o Multiloops. Enquanto
   // estiver armado, o AutoStop não pode interromper o ciclo no fim da música.
   if (nativeIsRepeatEnabled(project)) {
@@ -13331,6 +13788,13 @@ static int nativeAppActiveReadWindowInt(const char* key, int fallback)
   char* end = nullptr;
   const long value = std::strtol(raw, &end, 10);
   return end && end != raw ? static_cast<int>(value) : fallback;
+}
+
+static bool nativeAppActiveHasWindowValue(const char* key)
+{
+  if (!GetExtState_ptr || !key) return false;
+  const char* raw = GetExtState_ptr(kLuaWindowExtStateSection, key);
+  return raw && *raw;
 }
 
 static void nativeAppActiveWriteWindowInt(const char* key, int value)
@@ -14577,7 +15041,8 @@ static void nativeUiDrawWrappedText(
   int lineHeight,
   COLORREF color,
   HFONT font,
-  bool strikeThrough = false);
+  bool strikeThrough = false,
+  COLORREF strikeColor = static_cast<COLORREF>(0xffffffff));
 static COLORREF nativeUiNamedVisualColor(
   std::string mode,
   const std::string& fallback);
@@ -16468,7 +16933,7 @@ nativeUiVisualDefaults()
     {"number_bar_bg_mode", "black"},
     {"scrollbar_color_mode", "yellow"},
     {"timer_color_mode", "yellow"},
-    {"live_mark_color_mode", "gray"},
+    {"live_mark_color_mode", "red"},
     {"playlist_selection_arrow_color_mode", "yellow"},
     {"regions_selection_arrow_color_mode", "yellow"},
     {"parts_selection_arrow_color_mode", "yellow"},
@@ -16530,6 +16995,7 @@ nativeUiVisualFixedDefaultPreset()
     result["transport_panel_bg_mode"] = "gray";
     result["number_bar_bg_mode"] = "gray";
     result["scrollbar_color_mode"] = "orange";
+    result["live_mark_color_mode"] = "red";
     result["no_block_text_color_mode"] = "yellow";
     result["status_current_top"] = "0";
     result["status_current_bottom"] = "1";
@@ -16570,14 +17036,30 @@ static std::string nativeUiVisualRawValue(
 static std::string nativeUiLiveMarkColorMode(
   const std::map<std::string, std::string>& values)
 {
-  const auto preset = values.find("visual_preset_index");
-  const int presetIndex =
-    preset == values.end() ? 0 : std::atoi(preset->second.c_str());
-  // O preset Padrão é fixo e agora usa cinza, inclusive para instalações que
-  // ainda guardaram o antigo vermelho no VISUAL_PREFS_V2.
-  if (presetIndex <= 0) return "gray";
-  return nativeLower(nativeUiVisualPref(
-    values, "live_mark_color_mode", "gray"));
+  std::string mode = nativeLower(nativeUiVisualPref(
+    values, "live_mark_color_mode", "red"));
+  const int presetIndex = nativeUiVisualPresetIndex(values);
+  // Antes desta versão, o Padrão era gravado como cinza e não podia ser
+  // editado. Migra somente esse valor legado; depois que o usuário escolher
+  // uma cor, inclusive Cinza ou Nenhum, a escolha passa a prevalecer.
+  if (presetIndex == 0 && mode == "gray" && GetExtState_ptr) {
+    const char* chosen = GetExtState_ptr(
+      kLuaWindowExtStateSection,
+      "LIVE_MARK_DEFAULT_COLOR_CHOSEN_V1");
+    if (!chosen || std::string(chosen) != "1") mode = "red";
+  }
+  return mode;
+}
+
+static COLORREF nativeUiLiveMarkBackgroundColor(
+  const std::map<std::string, std::string>& values)
+{
+  const std::string mode = nativeUiLiveMarkColorMode(values);
+  const COLORREF panel = nativeUiListPanelBackgroundColor(values);
+  if (mode == "none") return panel;
+  if (mode == "red") return RGB(153, 27, 27);
+  return nativeUiBlendColor(
+    panel, nativeUiNamedVisualColor(mode, "gray"), 0.82);
 }
 
 static void nativeUiWriteVisualPrefs(
@@ -16738,10 +17220,18 @@ static bool nativeUiSetVisualValue(
 {
   auto values = nativeUiReadVisualPrefs();
   const int active = nativeUiVisualPresetIndex(values);
-  if (active == 0) return false;
+  // O preset Padrão permanece protegido, exceto pela opção explícita de
+  // remover o fundo da marcação Live pedida em Personalizar.
+  if (active == 0 && key != "live_mark_color_mode") return false;
+  if (active == 0 && key == "live_mark_color_mode" && SetExtState_ptr) {
+    SetExtState_ptr(kLuaWindowExtStateSection,
+      "LIVE_MARK_DEFAULT_COLOR_CHOSEN_V1", "1", true);
+  }
   values[key] = value;
-  values["preset" + std::to_string(active) +
-    "_" + key] = value;
+  if (active > 0) {
+    values["preset" + std::to_string(active) +
+      "_" + key] = value;
+  }
   nativeUiWriteVisualPrefs(std::move(values));
   return true;
 }
@@ -18138,7 +18628,8 @@ static void nativeUiDrawWrappedText(
   int lineHeight,
   COLORREF color,
   HFONT font,
-  bool strikeThrough)
+  bool strikeThrough,
+  COLORREF strikeColor)
 {
   const int maxLines = std::max(
     1, height / std::max(1, lineHeight));
@@ -18172,7 +18663,9 @@ static void nativeUiDrawWrappedText(
           std::max(static_cast<int>(lineRect.top), strikeTop) + 2)};
       if (strikeRect.right > strikeRect.left &&
           strikeRect.bottom > strikeRect.top) {
-        nativeAppActiveFillRect(dc, strikeRect, color);
+        nativeAppActiveFillRect(dc, strikeRect,
+          strikeColor == static_cast<COLORREF>(0xffffffff)
+            ? color : strikeColor);
       }
     }
   }
@@ -18322,13 +18815,20 @@ static std::string nativeUiMainRowKey(
   return key.str();
 }
 
+static std::string nativeUiMainRowStableIdentity(
+  const NativeAppActivePanelModel::Row& row);
+
 static bool nativeUiMainRowIsSelected(
   const NativeAppActivePanelModel::Row& row,
   bool regionsPage)
 {
   const auto found =
     g_nativeUiSelectedRows.find(nativeUiMainRowKey(row, regionsPage));
-  return found != g_nativeUiSelectedRows.end() && found->second;
+  if (found != g_nativeUiSelectedRows.end() && found->second) return true;
+  return !row.block &&
+    !g_nativeUiExclusiveSelectedSongIdentity.empty() &&
+    nativeUiMainRowStableIdentity(row) ==
+      g_nativeUiExclusiveSelectedSongIdentity;
 }
 
 static void nativeUiRemoveSelectionOrderKey(const std::string& key)
@@ -18361,6 +18861,7 @@ static void nativeUiClearMainRowSelection()
 {
   g_nativeUiSelectedRows.clear();
   g_nativeUiSelectionOrder.clear();
+  g_nativeUiExclusiveSelectedSongIdentity.clear();
   g_nativeUiSelectionAnchorVisibleIndex = -1;
   g_nativeUiSelectionFocusVisibleIndex = -1;
   g_nativeUiMainSelectionAuthoritative = false;
@@ -18387,8 +18888,21 @@ static void nativeUiClearMainRowSelectionForPage(bool regionsPage)
     g_nativeUiSelectionOrder.end());
   g_nativeUiSelectionAnchorVisibleIndex = -1;
   g_nativeUiSelectionFocusVisibleIndex = -1;
+  g_nativeUiExclusiveSelectedSongIdentity.clear();
   g_nativeUiMainSelectionAuthoritative = false;
   g_nativeUiMusicSelectionVisualActive = false;
+}
+
+static void nativeUiSelectOnlyMainRow(
+  const NativeAppActivePanelModel::Row& row,
+  bool regionsPage)
+{
+  nativeUiClearMainRowSelection();
+  nativeUiSetMainRowSelected(row, regionsPage, true);
+  if (!row.block) {
+    g_nativeUiExclusiveSelectedSongIdentity =
+      nativeUiMainRowStableIdentity(row);
+  }
 }
 
 static int nativeUiMainSelectionCount(bool regionsPage)
@@ -18666,6 +19180,10 @@ static void nativeUiRestoreSelectionAfterMainReorder(
   g_nativeUiSelectionAnchorVisibleIndex = firstVisible;
   g_nativeUiSelectionFocusVisibleIndex =
     lastVisible >= 0 ? lastVisible : firstVisible;
+  if (selectedIdentities.size() == 1) {
+    g_nativeUiExclusiveSelectedSongIdentity =
+      selectedIdentities.begin()->first;
+  }
 }
 
 static void nativeUiApplyPendingDropSelectionToCurrentModel()
@@ -23833,10 +24351,16 @@ struct NativeMixerPaintTrack {
   std::string id;
   std::string name;
   int index = 0;
+  int folderDepth = 0;
+  int folderDelta = 0;
   double volume = 1.0;
+  double peakLeft = 0.0;
+  double peakRight = 0.0;
   bool mute = false;
   bool solo = false;
+  bool selected = false;
   bool group = false;
+  bool insideGroup = false;
   bool hasButtonMapping = false;
   bool hasTint = false;
   COLORREF tint = RGB(44, 49, 54);
@@ -23850,9 +24374,26 @@ static COLORREF nativeUiTrackTint(
   COLORREF& knobTint)
 {
   if (master) {
+    COLORREF masterColor = RGB(126, 52, 52);
+    if (GetProjExtState_ptr) {
+      char pathBuf[2048] = "";
+      ReaProject* project = getCurrentProject(
+        pathBuf, static_cast<int>(sizeof(pathBuf)));
+      char stored[64] = "";
+      if (project && GetProjExtState_ptr(project,
+            kMixerBindingExtSection,
+            "HOOK_CONTROLLER_MASTER_COLOR_V1",
+            stored, static_cast<int>(sizeof(stored))) > 0) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(stored, &end, 10);
+        if (end && end != stored) {
+          masterColor = static_cast<COLORREF>(parsed & 0x00ffffff);
+        }
+      }
+    }
     hasTint = true;
-    knobTint = RGB(77, 36, 36);
-    return RGB(77, 36, 36);
+    knobTint = masterColor;
+    return nativeUiBlendColor(RGB(34, 38, 43), masterColor, 0.46);
   }
   const int raw = GetMediaTrackInfo_Value_ptr
     ? static_cast<int>(GetMediaTrackInfo_Value_ptr(
@@ -23880,7 +24421,8 @@ static COLORREF nativeUiTrackTint(
 static NativeMixerPaintTrack nativeUiMixerTrackItem(
   MediaTrack* track,
   int index,
-  bool master)
+  bool master,
+  bool readPeaks = true)
 {
   NativeMixerPaintTrack item;
   item.index = index;
@@ -23892,10 +24434,16 @@ static NativeMixerPaintTrack nativeUiMixerTrackItem(
     : nativeTrackName(track, std::max(0, index - 1));
   item.volume = GetMediaTrackInfo_Value_ptr
     ? GetMediaTrackInfo_Value_ptr(track, "D_VOL") : 1.0;
+  if (readPeaks) {
+    item.peakLeft = nativeSafeTrackPeak(track, 0);
+    item.peakRight = nativeSafeTrackPeak(track, 1);
+  }
   item.mute = GetMediaTrackInfo_Value_ptr &&
     GetMediaTrackInfo_Value_ptr(track, "B_MUTE") > 0.5;
   item.solo = GetMediaTrackInfo_Value_ptr &&
     GetMediaTrackInfo_Value_ptr(track, "I_SOLO") > 0.5;
+  item.selected = GetMediaTrackInfo_Value_ptr &&
+    GetMediaTrackInfo_Value_ptr(track, "I_SELECTED") > 0.5;
   item.group = !master && GetMediaTrackInfo_Value_ptr &&
     GetMediaTrackInfo_Value_ptr(track, "I_FOLDERDEPTH") > 0.5;
   item.hasButtonMapping =
@@ -24159,6 +24707,12 @@ static std::string nativeUiMixerDbText(double volume)
   return text;
 }
 
+static void nativeHookControllerPaintTcpTrack(HDC dc,
+  RECT row, const NativeMixerPaintTrack& item,
+  int displayIndex, HFONT labelFont, HFONT statusFont,
+  bool compactLayout = true,
+  const std::string& areaId = "mixer_main");
+
 static void nativeUiPaintMixerTrackRow(
   HDC dc,
   const RECT& row,
@@ -24168,6 +24722,13 @@ static void nativeUiPaintMixerTrackRow(
   HFONT labelFont,
   HFONT statusFont)
 {
+  // O Mixer principal usa o mesmo card visual aprovado no TCP do Hook
+  // Controller. Mantem, entretanto, os 54 px e as colunas Grupos/Tracks da
+  // interface principal; somente o Controller aplica a compactacao TCP.
+  nativeHookControllerPaintTcpTrack(dc, row, item,
+    displayIndex, labelFont, statusFont, false, areaId);
+  return;
+
   nativeAppActiveFillRect(dc, row, item.tint);
   const COLORREF rowEdge = item.hasButtonMapping
     ? RGB(255, 219, 26) : RGB(74, 82, 89);
@@ -24795,10 +25356,27 @@ static void nativePaintAppActivePanel(HWND hwnd)
     const int fieldsRight = stripRight;
     const int fieldsWidth = std::max(
       3, fieldsRight - fieldsLeft - fieldGap * 2);
-    const int playlistWidth = std::max(
-      1, fieldsWidth * 60 / 100);
-    const int totalWidth = std::max(
-      1, fieldsWidth * 20 / 100);
+    const std::string versionText =
+      std::string("Version ") + VSHOOK_EXTENSION_VERSION;
+    const int desiredTotalWidth = std::max(58,
+      nativeUiTextWidth(dc, totalText, labelFont) + 10);
+    const int desiredVersionWidth = std::max(58,
+      nativeUiTextWidth(dc, versionText, labelFont) + 10);
+    const int minimumPlaylistWidth = std::min(58,
+      std::max(1, fieldsWidth / 3));
+    int totalWidth = desiredTotalWidth;
+    int versionWidth = desiredVersionWidth;
+    int playlistWidth = fieldsWidth - totalWidth - versionWidth;
+    if (playlistWidth < minimumPlaylistWidth) {
+      playlistWidth = minimumPlaylistWidth;
+      const int remaining = std::max(2,
+        fieldsWidth - playlistWidth);
+      const int desiredStatusWidth = std::max(1,
+        desiredTotalWidth + desiredVersionWidth);
+      totalWidth = std::max(1,
+        remaining * desiredTotalWidth / desiredStatusWidth);
+      versionWidth = std::max(1, remaining - totalWidth);
+    }
     const int playlistRight =
       fieldsLeft + playlistWidth;
     const int totalLeft =
@@ -24963,8 +25541,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       totalTextRect, totalTextFlags,
       RGB(250, 224, 46), labelFont);
     nativeAppActiveDrawText(dc,
-      std::string("Version ") +
-        VSHOOK_EXTENSION_VERSION,
+      versionText,
       versionFieldRect,
       DT_CENTER | DT_VCENTER | DT_SINGLELINE |
         DT_END_ELLIPSIS | DT_NOPREFIX,
@@ -25312,7 +25889,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       if (zone == "top1") {
         zoneIds = {
           "nav_playlist", "nav_regions", "nav_mixer",
-          "nav_midi", "nav_tuner", "nav_bpm", "nav_help", "nav_config"
+          "nav_midi", "nav_help", "nav_config"
         };
       } else if (zone == "top2") {
         zoneIds = {
@@ -25673,7 +26250,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
   drawStatusStack(bottomStatusModes, bottomStatusY);
 
   RECT bodyRect{pad, listTop, width - pad, listBottom};
+  g_nativeMainPartsResizeBodyRect = bodyRect;
   if (g_nativeAppActivePanelModel.mixerPage) {
+    g_nativeMainParts1ResizeRect = RECT{0, 0, 0, 0};
+    g_nativeMainParts2ResizeRect = RECT{0, 0, 0, 0};
     g_nativeMainParts2Rect = RECT{0, 0, 0, 0};
     g_nativeMainParts2HeaderRect = RECT{0, 0, 0, 0};
     g_nativeMainParts2ListRect = RECT{0, 0, 0, 0};
@@ -25716,7 +26296,23 @@ static void nativePaintAppActivePanel(HWND hwnd)
     !g_nativeAppActivePanelModel.mixerPage;
   const int bodyGap = 4;
   const int bodyW = std::max(0, static_cast<int>(bodyRect.right - bodyRect.left));
-  int partsColumnW = std::max(120, static_cast<int>(std::floor(bodyW * 0.22)));
+  if (!g_nativeMainPartsWidthRatiosLoaded) {
+    g_nativeMainParts1WidthRatio = std::max(0.22, std::min(0.50,
+      nativeAppActiveReadWindowInt(
+        "PARTS1_WIDTH_RATIO_X10000_V1", 2200) / 10000.0));
+    g_nativeMainParts2WidthRatio = std::max(0.22, std::min(0.50,
+      nativeAppActiveReadWindowInt(
+        "PARTS2_WIDTH_RATIO_X10000_V1", 2200) / 10000.0));
+    g_nativeMainPartsWidthRatiosLoaded = true;
+  }
+  const int defaultPartsColumnW = std::max(120,
+    static_cast<int>(std::floor(bodyW * 0.22)));
+  int parts1ColumnW = std::max(defaultPartsColumnW,
+    static_cast<int>(std::floor(
+      bodyW * g_nativeMainParts1WidthRatio + 0.5)));
+  int parts2ColumnW = std::max(defaultPartsColumnW,
+    static_cast<int>(std::floor(
+      bodyW * g_nativeMainParts2WidthRatio + 0.5)));
   int tunerColumnW = std::max(76,
     static_cast<int>(std::floor(bodyW * 0.14)));
   // BPM mostra controles, diferença relativa e o valor real do marcador.
@@ -25726,13 +26322,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
   const int visiblePartColumns = (showParts1 ? 1 : 0) + (showParts2 ? 1 : 0);
   const int visibleSideColumns =
     visiblePartColumns + (showTuner ? 1 : 0) + (showBpm ? 1 : 0);
-  int mainAvailable = bodyW - visiblePartColumns * partsColumnW -
-    (showTuner ? tunerColumnW : 0) - (showBpm ? bpmColumnW : 0) -
-    std::max(0, visibleSideColumns) * bodyGap;
-  if (visiblePartColumns > 0 && mainAvailable < 140) {
-    partsColumnW = std::max(90, static_cast<int>(std::floor(bodyW * 0.18)));
-  }
-  mainAvailable = bodyW - visiblePartColumns * partsColumnW -
+  int mainAvailable = bodyW - (showParts1 ? parts1ColumnW : 0) -
+    (showParts2 ? parts2ColumnW : 0) -
     (showTuner ? tunerColumnW : 0) - (showBpm ? bpmColumnW : 0) -
     std::max(0, visibleSideColumns) * bodyGap;
   if (showTuner && mainAvailable < 140) {
@@ -25743,16 +26334,37 @@ static void nativePaintAppActivePanel(HWND hwnd)
     bpmColumnW = std::max(132,
       static_cast<int>(std::floor(bodyW * 0.17)));
   }
+  const int fixedColumnsW =
+    (showTuner ? tunerColumnW : 0) +
+    (showBpm ? bpmColumnW : 0) +
+    std::max(0, visibleSideColumns) * bodyGap;
+  const int flexibleW = std::max(0, bodyW - fixedColumnsW);
+  if (showParts1) {
+    const int other = showParts2 ? parts2ColumnW : 0;
+    const int cap = std::max(defaultPartsColumnW,
+      (flexibleW - other) / 2);
+    parts1ColumnW = std::min(parts1ColumnW, cap);
+  }
+  if (showParts2) {
+    const int other = showParts1 ? parts1ColumnW : 0;
+    const int cap = std::max(defaultPartsColumnW,
+      (flexibleW - other) / 2);
+    parts2ColumnW = std::min(parts2ColumnW, cap);
+  }
 
   int mainLeft = bodyRect.left;
   if (showParts2) {
     g_nativeMainParts2Rect = RECT{bodyRect.left, bodyRect.top,
-      std::min(bodyRect.right, bodyRect.left + partsColumnW), bodyRect.bottom};
+      std::min(bodyRect.right, bodyRect.left + parts2ColumnW), bodyRect.bottom};
     mainLeft = g_nativeMainParts2Rect.right + bodyGap;
+    g_nativeMainParts2ResizeRect = RECT{
+      g_nativeMainParts2Rect.right - 3, bodyRect.top,
+      g_nativeMainParts2Rect.right + bodyGap + 3, bodyRect.bottom};
     nativePaintPartsColumn(dc, g_nativeMainParts2Rect,
       g_nativeAppActivePanelModel.parts2, true, labelFont, statusFont,
       paintVisualPrefs);
   } else {
+    g_nativeMainParts2ResizeRect = RECT{0, 0, 0, 0};
     g_nativeMainParts2Rect = RECT{0, 0, 0, 0};
     g_nativeMainParts2HeaderRect = RECT{0, 0, 0, 0};
     g_nativeMainParts2ListRect = RECT{0, 0, 0, 0};
@@ -25763,13 +26375,18 @@ static void nativePaintAppActivePanel(HWND hwnd)
   }
   int mainRight = bodyRect.right;
   if (showParts1) {
-    g_nativeMainParts1Rect = RECT{std::max(bodyRect.left, bodyRect.right - partsColumnW),
+    g_nativeMainParts1Rect = RECT{std::max(bodyRect.left,
+        bodyRect.right - parts1ColumnW),
       bodyRect.top, bodyRect.right, bodyRect.bottom};
     mainRight = g_nativeMainParts1Rect.left - bodyGap;
+    g_nativeMainParts1ResizeRect = RECT{
+      g_nativeMainParts1Rect.left - bodyGap - 3, bodyRect.top,
+      g_nativeMainParts1Rect.left + 3, bodyRect.bottom};
     nativePaintPartsColumn(dc, g_nativeMainParts1Rect,
       g_nativeAppActivePanelModel.parts1, false, labelFont, statusFont,
       paintVisualPrefs);
   } else {
+    g_nativeMainParts1ResizeRect = RECT{0, 0, 0, 0};
     g_nativeMainParts1Rect = RECT{0, 0, 0, 0};
     g_nativeMainParts1HeaderRect = RECT{0, 0, 0, 0};
     g_nativeMainParts1ListRect = RECT{0, 0, 0, 0};
@@ -26340,8 +26957,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
               g_nativeAppActivePanelModel.selectedEnd));
       const bool isLiveMarked = row.liveExecuted && !row.block;
       const bool isLiveExecuted = isLiveMarked && !isPlaying;
+      const std::string liveMarkColorMode =
+        nativeUiLiveMarkColorMode(visualPrefs);
       const COLORREF liveExecutedTextColor =
-        RGB(248, 113, 113);
+        RGB(255, 255, 255);
       const NativeAppActivePanelModel::Row* nextVisibleRow =
         i + 1 < rowCount
           ? &g_nativeAppActivePanelModel.rows[
@@ -26416,29 +27035,18 @@ static void nativePaintAppActivePanel(HWND hwnd)
         textColor = parsedColor;
       }
 
-      // Modo Live vem antes do estado Tocando/Fila no Lua e nao pinta a musica
-      // que esta tocando. Vermelho escuro forte com texto vermelho-claro
-      // mantém o mesmo contraste visual dos estados M/S do Multiloops.
+      // "Nenhum" conserva o fundo normal; as demais opcoes continuam usando
+      // a cor escolhida. Em todos os casos, o nome fica branco e o risco preto.
       if (isLiveExecuted) {
-        const std::string liveColorMode =
-          nativeUiLiveMarkColorMode(visualPrefs);
-        if (liveColorMode == "red") {
-          rowFill = RGB(153, 27, 27);
-        } else {
-          rowFill = nativeUiBlendColor(
-            panelFill,
-            nativeUiNamedVisualColor(
-              liveColorMode, "gray"), 0.82);
+        if (liveMarkColorMode != "none") {
+          rowFill = nativeUiLiveMarkBackgroundColor(visualPrefs);
         }
-        // A marcação Live precisa aparecer também na letra, não somente no
-        // fundo. O vermelho permanece igual mesmo quando a cor do fundo Live
-        // foi personalizada.
         textColor = liveExecutedTextColor;
       }
 
       if (isDraggingSource) {
         rowFill = RGB(122, 51, 219);
-      } else if (isSelected && !isPlaying) {
+      } else if (isSelected && !isPlaying && !isLiveExecuted) {
         rowFill = row.block
           ? RGB(245, 51, 148)
           : (mainSelectionUsesInactiveVisual
@@ -26467,7 +27075,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           isPlaying &&
           nativeUiVisualPrefBool(visualPrefs,
             "list_current_bg", true)) {
-        rowFill = RGB(184, 61, 61);
+        rowFill = RGB(205, 20, 20);
         stateBackgroundApplied = true;
       } else if (!isDraggingSource && !row.block &&
                  !isLiveExecuted && !isSelected &&
@@ -26479,9 +27087,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
       }
       if (stateBackgroundApplied ||
           (isSelected && !isDraggingSource &&
+           !isLiveExecuted &&
            (!mainSelectionUsesInactiveVisual || row.block))) {
         textColor = RGB(13, 13, 13);
       } else if (isSelected && !isDraggingSource &&
+                 !isLiveExecuted &&
                  mainSelectionUsesInactiveVisual) {
         textColor = RGB(224, 240, 255);
       }
@@ -26713,13 +27323,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
               rowRect.top) -
             listLayout.paddingY * 2),
           listLayout.lineHeight, textColor,
-          rowFont, isLiveMarked);
+          rowFont, isLiveMarked, RGB(0, 0, 0));
       }
       if (!rowMetrics.timeText.empty()) {
         COLORREF timeColor = RGB(255, 224, 46);
-        if (isLiveExecuted) {
-          timeColor = liveExecutedTextColor;
-        }
         if (stateBackgroundApplied) {
           timeColor = RGB(13, 13, 13);
         }
@@ -30348,6 +30955,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
           {"cyan", "Ciano"}, {"white", "Branco"},
           {"gray", "Cinza escuro"}
         };
+      std::vector<std::pair<std::string, std::string>>
+        liveMarkColorOptions = colorOptions;
+      liveMarkColorOptions.insert(
+        liveMarkColorOptions.begin(), {"none", "Nenhum"});
       auto addChoiceGrid = [&] (
           const std::vector<std::pair<std::string, std::string>>& options,
           const std::string& selected,
@@ -30762,22 +31373,22 @@ static void nativePaintAppActivePanel(HWND hwnd)
             preview.right - 8, preview.bottom - 9};
           const std::string liveColorMode =
             nativeUiLiveMarkColorMode(visual);
-          const bool strongRed = liveColorMode == "red";
           nativeAppActiveFillRect(dc, markedRow,
-            strongRed
-              ? RGB(153, 27, 27)
-              : nativeUiBlendColor(
-                  nativeUiListPanelBackgroundColor(visual),
-                  nativeUiNamedVisualColor(
-                    liveColorMode, "gray"), 0.82));
+            nativeUiLiveMarkBackgroundColor(visual));
           nativeAppActiveDrawText(dc,
             "01  MUSICA TOCADA                         03:20",
             RECT{markedRow.left + 6, markedRow.top,
               markedRow.right - 6, markedRow.bottom},
             DT_LEFT | DT_VCENTER | DT_SINGLELINE |
               DT_END_ELLIPSIS | DT_NOPREFIX,
-            RGB(248, 113, 113),
+            RGB(255, 255, 255),
             statusFont);
+          nativeAppActiveFillRect(dc,
+            RECT{markedRow.left + 6,
+              (markedRow.top + markedRow.bottom) / 2,
+              markedRow.right - 6,
+              (markedRow.top + markedRow.bottom) / 2 + 1},
+            RGB(0, 0, 0));
         } else if (kind == "search_border") {
           drawPreviewFrame(preview,
             nativeUiListPanelBackgroundColor(visual),
@@ -30976,8 +31587,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
             presetValue(preset, "list_progress_color_mode"), "green"));
           swatches.push_back(nativeUiNamedVisualColor(
             presetValue(preset, "list_regress_color_mode"), "yellow"));
-          swatches.push_back(nativeUiNamedVisualColor(
-            presetValue(preset, "live_mark_color_mode"), "gray"));
+          const std::string liveMarkMode = nativeLower(nativeTrim(
+            presetValue(preset, "live_mark_color_mode")));
+          swatches.push_back(liveMarkMode == "none"
+            ? previewInterfaceColor(
+                presetValue(preset, "interface_bg_mode"))
+            : nativeUiNamedVisualColor(liveMarkMode, "gray"));
           const std::string noBlock = nativeLower(nativeTrim(
             presetValue(preset, "no_block_text_color_mode")));
           swatches.push_back(noBlock == "none"
@@ -31504,7 +32119,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           optionsTop += 86;
           const std::string key = timer
             ? "timer_color_mode" : "live_mark_color_mode";
-          addChoiceGrid(colorOptions,
+          addChoiceGrid(liveMark ? liveMarkColorOptions : colorOptions,
             nativeUiVisualRawValue(visual, key),
             "custom_set|" + key + "|", optionsTop,
             panelWidth >= 560 ? 3 : (panelWidth >= 340 ? 2 : 1),
@@ -34755,6 +35370,12 @@ static bool nativeTriggerPartsSourceStart(bool parts2)
       g_nativeArmedMarkerSetAt = std::chrono::steady_clock::now();
       g_nativeArmedMarkerStartPlayPos = GetPlayPositionEx_ptr
         ? GetPlayPositionEx_ptr(project) : column.sourceStart;
+      g_nativeArmedMarkerLastPlayPos =
+        g_nativeArmedMarkerStartPlayPos;
+      // Se a fila ja tinha solicitado um Smooth Seek, o Parts substitui esse
+      // destino agora. Libera a assinatura para a fila poder tentar novamente
+      // somente depois que o Parts for concluido.
+      g_nativeQueuedSeekSignature.clear();
     } else {
       g_nativeArmedMarkerId.clear();
       g_nativeArmedMarkerLabel.clear();
@@ -34996,6 +35617,8 @@ static void nativeUiScheduleMusicNavigation(
 
   g_nativeUiPendingMusicNavigation.pending = true;
   g_nativeUiPendingMusicNavigation.regionsPage = regionsPage;
+  g_nativeUiPendingMusicNavigation.hookControllerSource =
+    g_nativeHookControllerSongContextActive;
   g_nativeUiPendingMusicNavigation.rowKey =
     nativeUiMainRowKey(row, regionsPage);
   // Igual ao Lua: durante a reproducao as setas atualizam exclusivamente a
@@ -35024,15 +35647,22 @@ static bool nativeUiCommitPendingMusicNavigation(bool force)
     g_nativeUiPendingMusicNavigation;
   nativeUiCancelPendingMusicNavigation();
 
-  if (g_nativeAppActivePanelModel.mixerPage ||
-      g_nativeAppActivePanelModel.regionsPage !=
-        pending.regionsPage) {
-    return false;
-  }
-  const auto* selected = nativeUiCurrentMainSelectedSongRow();
-  if (!selected || nativeUiMainRowKey(
-        *selected, pending.regionsPage) != pending.rowKey) {
-    return false;
+  if (pending.hookControllerSource) {
+    const auto selected = g_nativeUiSelectedRows.find(pending.rowKey);
+    if (selected == g_nativeUiSelectedRows.end() || !selected->second) {
+      return false;
+    }
+  } else {
+    if (g_nativeAppActivePanelModel.mixerPage ||
+        g_nativeAppActivePanelModel.regionsPage !=
+          pending.regionsPage) {
+      return false;
+    }
+    const auto* selected = nativeUiCurrentMainSelectedSongRow();
+    if (!selected || nativeUiMainRowKey(
+          *selected, pending.regionsPage) != pending.rowKey) {
+      return false;
+    }
   }
   return nativeApplySelectionCommand(pending.commitCommand);
 }
@@ -35129,8 +35759,7 @@ static bool nativeNavigateMainRows(int step)
         g_nativeAppActivePanelModel.playingEnd);
     if (row->block || playingRow) continue;
 
-    nativeUiClearMainRowSelectionForPage(regionsPage);
-    nativeUiSetMainRowSelected(*row, regionsPage, true);
+    nativeUiSelectOnlyMainRow(*row, regionsPage);
     g_nativeUiMusicSelectionVisualActive = true;
     g_nativeUiSelectionAnchorVisibleIndex = candidate;
     g_nativeUiSelectionFocusVisibleIndex = candidate;
@@ -37045,8 +37674,7 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
           g_nativeUiSelectionAnchorVisibleIndex = rowIndex;
           g_nativeUiSelectionFocusVisibleIndex = rowIndex;
         } else {
-          nativeUiClearMainRowSelectionForPage(regionsPage);
-          nativeUiSetMainRowSelected(row, regionsPage, true);
+          nativeUiSelectOnlyMainRow(row, regionsPage);
           g_nativeUiSelectionAnchorVisibleIndex = rowIndex;
           g_nativeUiSelectionFocusVisibleIndex = rowIndex;
         }
@@ -37092,10 +37720,10 @@ static void nativeUiToggleDocker(bool forceRight)
 
   const bool dockAfterRecreate = forceRight || currentDocker < 0;
   const int dockerIndex = forceRight
-    ? 2
+    ? 3
     : std::max(0,
         nativeAppActiveReadWindowInt(
-          "LAST_DOCKSTATE_V1", 513) >> 8);
+          "LAST_DOCKSTATE_V1", 769) >> 8);
   if (dockAfterRecreate) {
     const int dockState = dockerIndex * 256 + 1;
     nativeAppActiveWriteWindowInt("DOCKSTATE_V1", dockState);
@@ -37113,6 +37741,4902 @@ static void nativeUiToggleDocker(bool forceRight)
   g_nativeAppActivePanelHwnd = nullptr;
   g_nativeAppActivePanelClosing = false;
   nativeOpenAppActivePanel();
+}
+
+// ==========================================================
+// Big Clock Hook
+// ==========================================================
+
+static constexpr UINT_PTR kNativeBigClockTimerId = 0x5642434B;
+static HWND g_nativeBigClockHwnd[2] = {nullptr, nullptr};
+static bool g_nativeBigClockClosing[2] = {false, false};
+static int g_nativeBigClockOpeningSlot = 0;
+static int g_nativeBigClockMode = -1;
+static COLORREF g_nativeBigClockForeground = RGB(255, 255, 0);
+static COLORREF g_nativeBigClockBackground = RGB(31, 31, 31);
+static bool g_nativeBigClockShowExtra = false;
+static bool g_nativeBigClockShowTimer = true;
+static bool g_nativeBigClockShowRegionCurrent = true;
+static bool g_nativeBigClockShowRegionPrevious = false;
+static bool g_nativeBigClockShowRegionNext = true;
+static bool g_nativeBigClockShowMarkerCurrent = false;
+static bool g_nativeBigClockShowMarkerPrevious = false;
+static bool g_nativeBigClockShowMarkerNext = false;
+static bool g_nativeBigClockShowQueue = false;
+static bool g_nativeBigClockShowMultiLoopAlerts = true;
+static bool g_nativeBigClockShowProgressBar = false;
+static bool g_nativeBigClockShowRegressBar = false;
+static COLORREF g_nativeBigClockProgressColor = RGB(0, 210, 90);
+static COLORREF g_nativeBigClockRegressColor = RGB(255, 214, 20);
+static bool g_nativeBigClockMarqueeEnabled = true;
+static int g_nativeBigClockPlayingFontSize = 14;
+static int g_nativeBigClockQueueFontSize = 14;
+static int g_nativeBigClockTimerFontSize = 14;
+static int g_nativeBigClockBypassFontSize = 14;
+static COLORREF g_nativeBigClockPlayingTextColor = RGB(0, 230, 96);
+static COLORREF g_nativeBigClockQueueTextColor = RGB(255, 234, 0);
+static COLORREF g_nativeBigClockBypassTextColor = RGB(255, 174, 0);
+
+struct NativeBigClockSlotSettings {
+  bool loaded = false;
+  int mode = -1;
+  COLORREF foreground = RGB(255, 255, 0);
+  COLORREF background = RGB(31, 31, 31);
+  bool showExtra = false;
+  bool showTimer = true;
+  bool showNowPlaying = true;
+  bool showRegionPrevious = false;
+  bool showRegionNext = true;
+  bool showMarkerCurrent = false;
+  bool showMarkerPrevious = false;
+  bool showMarkerNext = false;
+  bool showQueue = false;
+  bool showMultiLoopAlerts = true;
+  bool showProgressBar = false;
+  bool showRegressBar = false;
+  COLORREF progressColor = RGB(0, 210, 90);
+  COLORREF regressColor = RGB(255, 214, 20);
+  bool marqueeEnabled = true;
+  int playingFontSize = 14;
+  int queueFontSize = 14;
+  int timerFontSize = 14;
+  int bypassFontSize = 14;
+  COLORREF playingTextColor = RGB(0, 230, 96);
+  COLORREF queueTextColor = RGB(255, 234, 0);
+  COLORREF bypassTextColor = RGB(255, 174, 0);
+};
+
+// O primeiro uso parte exatamente do layout aprovado no REAPER de produção:
+// Clock 1 no docker superior mostrando Tocando/progresso e Clock 2 no inferior
+// mostrando cronometro/fila/multiloops/regresso. Cada usuário continua podendo
+// alterar tudo depois, e os valores persistidos prevalecem sobre estes padrões.
+static NativeBigClockSlotSettings nativeBigClockDefaultSettings(int slot)
+{
+  NativeBigClockSlotSettings defaults;
+  defaults.foreground = RGB(255, 255, 0);
+  defaults.background = RGB(36, 36, 36);
+  defaults.showExtra = true;
+  defaults.showRegionPrevious = false;
+  defaults.showRegionNext = false;
+  defaults.showMarkerCurrent = false;
+  defaults.showMarkerPrevious = false;
+  defaults.showMarkerNext = false;
+  defaults.marqueeEnabled = true;
+  defaults.playingFontSize = 14;
+  defaults.queueFontSize = 14;
+  defaults.timerFontSize = 14;
+  defaults.bypassFontSize = 14;
+  defaults.playingTextColor = RGB(0, 230, 96);
+  defaults.queueTextColor = RGB(255, 234, 0);
+  defaults.bypassTextColor = RGB(255, 174, 0);
+  if (slot != 1) {
+    defaults.showTimer = false;
+    defaults.showNowPlaying = true;
+    defaults.showQueue = false;
+    defaults.showMultiLoopAlerts = false;
+    defaults.showProgressBar = true;
+    defaults.showRegressBar = false;
+    defaults.progressColor = RGB(0, 210, 90);
+    defaults.regressColor = RGB(255, 214, 20);
+    defaults.playingFontSize = 24;
+  } else {
+    defaults.showTimer = true;
+    defaults.showNowPlaying = false;
+    defaults.showQueue = true;
+    defaults.showMultiLoopAlerts = true;
+    defaults.showProgressBar = false;
+    defaults.showRegressBar = true;
+    defaults.progressColor = RGB(0, 210, 90);
+    defaults.regressColor = RGB(255, 214, 20);
+    defaults.queueFontSize = 24;
+  }
+  return defaults;
+}
+// Cada Big Clock possui um conjunto independente por preset visual.
+// O indice zero continua sendo o Preset Padrao, cuja regra propria sera
+// definida depois; por enquanto ele preserva as chaves legadas.
+static NativeBigClockSlotSettings g_nativeBigClockSlotSettings[2][4];
+#ifndef __APPLE__
+static std::unique_ptr<WDL_WinMemBitmap> g_nativeBigClockBackBuffer[2];
+static int g_nativeBigClockBackBufferWidth[2] = {0, 0};
+static int g_nativeBigClockBackBufferHeight[2] = {0, 0};
+#endif
+
+enum NativeBigClockMenuCommand {
+  kBigClockModeProject = 61001,
+  kBigClockModeTime,
+  kBigClockModeMeasuresTime,
+  kBigClockModeMeasures,
+  kBigClockModeSeconds,
+  kBigClockModeSamples,
+  kBigClockModeTimecode,
+  kBigClockModeFrames,
+  kBigClockToggleExtra = 61020,
+  kBigClockChooseTextColor,
+  kBigClockChooseBackgroundColor,
+  kBigClockResetColors,
+  kBigClockToggleDock,
+  kBigClockToggleTimer = 61030,
+  kBigClockToggleRegionCurrent,
+  kBigClockToggleRegionPrevious,
+  kBigClockToggleRegionNext,
+  kBigClockToggleMarkerCurrent,
+  kBigClockToggleMarkerPrevious,
+  kBigClockToggleMarkerNext,
+  kBigClockToggleQueue,
+  kBigClockToggleMultiLoopAlerts,
+  kBigClockToggleProgressBar,
+  kBigClockToggleRegressBar,
+  kBigClockChooseProgressColor,
+  kBigClockChooseRegressColor,
+  kBigClockToggleMarquee,
+  kBigClockChoosePlayingTextColor,
+  kBigClockChooseQueueTextColor,
+  kBigClockChooseBypassTextColor,
+  kBigClockPlayingFontBase = 61100,
+  kBigClockQueueFontBase = 61110,
+  kBigClockTimerFontBase = 61120,
+  kBigClockBypassFontBase = 61130
+};
+
+static int nativeBigClockSafeSlot(int slot)
+{
+  return slot == 1 ? 1 : 0;
+}
+
+// "Tocando agora" e um modo de destaque, nao apenas mais uma linha do
+// relogio. Quando ativo, somente o nome central, o status e as barras podem
+// dividir a janela. Isso tambem normaliza presets antigos que tinham outros
+// textos marcados ao mesmo tempo.
+static void nativeBigClockActivateNowPlayingFocusMode(
+  bool activateStatus = true)
+{
+  g_nativeBigClockShowRegionCurrent = true;
+  if (activateStatus) g_nativeBigClockShowExtra = true;
+  g_nativeBigClockShowTimer = false;
+  g_nativeBigClockShowRegionPrevious = false;
+  g_nativeBigClockShowRegionNext = false;
+  g_nativeBigClockShowMarkerCurrent = false;
+  g_nativeBigClockShowMarkerPrevious = false;
+  g_nativeBigClockShowMarkerNext = false;
+  g_nativeBigClockShowQueue = false;
+  g_nativeBigClockShowMultiLoopAlerts = false;
+}
+
+static void nativeBigClockLeaveNowPlayingFocusMode()
+{
+  g_nativeBigClockShowRegionCurrent = false;
+}
+
+static int nativeBigClockActiveVisualPreset()
+{
+  return nativeUiVisualPresetIndex(nativeUiVisualPrefsForPaint());
+}
+
+static bool nativeBigClockIsWindowStateSuffix(const char* suffix)
+{
+  const std::string key = suffix ? suffix : "";
+  return key == "X_V1" || key == "Y_V1" ||
+    key == "W_V1" || key == "H_V1" ||
+    key == "DOCKSTATE_V1" || key == "LAST_DOCKSTATE_V1";
+}
+
+static std::string nativeBigClockKey(int slot, const char* suffix)
+{
+  std::string key = slot == 1 ? "BIG_CLOCK2_" : "BIG_CLOCK_";
+  const int preset = nativeBigClockActiveVisualPreset();
+  if (preset > 0 && !nativeBigClockIsWindowStateSuffix(suffix)) {
+    key += "PRESET" + std::to_string(preset) + "_";
+  }
+  return key + (suffix ? suffix : "");
+}
+
+static int nativeBigClockSlotFromWindow(HWND hwnd)
+{
+  if (hwnd && hwnd == g_nativeBigClockHwnd[1]) return 1;
+  if (hwnd && hwnd == g_nativeBigClockHwnd[0]) return 0;
+  return nativeBigClockSafeSlot(g_nativeBigClockOpeningSlot);
+}
+
+static int nativeBigClockCommandId(int slot)
+{
+  return nativeBigClockSafeSlot(slot) == 1
+    ? g_bigClockHookTwoCommandId : g_bigClockHookCommandId;
+}
+
+static const char* nativeBigClockTitle(int slot)
+{
+  static const char* titles[2] = {
+    "Big Clock Hook 1", "Big Clock Hook 2"};
+  return titles[nativeBigClockSafeSlot(slot)];
+}
+
+static const char* nativeBigClockDockId(int slot)
+{
+  static const char* ids[2] = {
+    "VSHOOKEXT_BIG_CLOCK_V1",
+    "VSHOOKEXT_BIG_CLOCK_2_V1"};
+  return ids[nativeBigClockSafeSlot(slot)];
+}
+
+static int nativeBigClockDefaultDockState(int slot)
+{
+  // Docker 4 = faixa superior; docker 5 = faixa inferior no layout aprovado.
+  return nativeBigClockSafeSlot(slot) == 0 ? 1025 : 1281;
+}
+
+static void nativeBigClockWriteReaperConfigInt(
+    const char* key, int value)
+{
+  if (!get_config_var_ptr || !key) return;
+  int size = 0;
+  void* address = get_config_var_ptr(key, &size);
+  if (!address || size < static_cast<int>(sizeof(int))) return;
+  *static_cast<int*>(address) = value;
+}
+
+static void nativeBigClockPrepareFirstOpenDock(int slot)
+{
+  slot = nativeBigClockSafeSlot(slot);
+  // O REAPER guarda o lado de cada docker separadamente do estado da janela.
+  // Configura apenas no primeiro uso: depois disso, qualquer posição escolhida
+  // pelo usuário é respeitada pela chave DOCKSTATE persistida.
+  if (slot == 0) {
+    nativeBigClockWriteReaperConfigInt("dockermode4", 2); // superior
+    nativeBigClockWriteReaperConfigInt("dockheight_t", 69);
+  } else {
+    nativeBigClockWriteReaperConfigInt("dockermode5", 0); // inferior
+    nativeBigClockWriteReaperConfigInt("dockheight", 69);
+  }
+}
+
+static bool nativeBigClockWindowIsOpen(int slot)
+{
+  slot = nativeBigClockSafeSlot(slot);
+  return g_nativeBigClockHwnd[slot] &&
+    IsWindow(g_nativeBigClockHwnd[slot]);
+}
+
+static void nativeBigClockReadSettings(int slot);
+
+static void nativeBigClockStoreRuntimeSettings(int slot)
+{
+  NativeBigClockSlotSettings& saved =
+    g_nativeBigClockSlotSettings[nativeBigClockSafeSlot(slot)]
+      [nativeBigClockActiveVisualPreset()];
+  saved.loaded = true;
+  saved.mode = g_nativeBigClockMode;
+  saved.foreground = g_nativeBigClockForeground;
+  saved.background = g_nativeBigClockBackground;
+  saved.showExtra = g_nativeBigClockShowExtra;
+  saved.showTimer = g_nativeBigClockShowTimer;
+  saved.showNowPlaying = g_nativeBigClockShowRegionCurrent;
+  saved.showRegionPrevious = g_nativeBigClockShowRegionPrevious;
+  saved.showRegionNext = g_nativeBigClockShowRegionNext;
+  saved.showMarkerCurrent = g_nativeBigClockShowMarkerCurrent;
+  saved.showMarkerPrevious = g_nativeBigClockShowMarkerPrevious;
+  saved.showMarkerNext = g_nativeBigClockShowMarkerNext;
+  saved.showQueue = g_nativeBigClockShowQueue;
+  saved.showMultiLoopAlerts = g_nativeBigClockShowMultiLoopAlerts;
+  saved.showProgressBar = g_nativeBigClockShowProgressBar;
+  saved.showRegressBar = g_nativeBigClockShowRegressBar;
+  saved.progressColor = g_nativeBigClockProgressColor;
+  saved.regressColor = g_nativeBigClockRegressColor;
+  saved.marqueeEnabled = g_nativeBigClockMarqueeEnabled;
+  saved.playingFontSize = g_nativeBigClockPlayingFontSize;
+  saved.queueFontSize = g_nativeBigClockQueueFontSize;
+  saved.timerFontSize = g_nativeBigClockTimerFontSize;
+  saved.bypassFontSize = g_nativeBigClockBypassFontSize;
+  saved.playingTextColor = g_nativeBigClockPlayingTextColor;
+  saved.queueTextColor = g_nativeBigClockQueueTextColor;
+  saved.bypassTextColor = g_nativeBigClockBypassTextColor;
+}
+
+static void nativeBigClockLoadRuntimeSettings(int slot)
+{
+  const int safeSlot = nativeBigClockSafeSlot(slot);
+  const int preset = nativeBigClockActiveVisualPreset();
+  if (!g_nativeBigClockSlotSettings[safeSlot][preset].loaded) {
+    nativeBigClockReadSettings(safeSlot);
+  }
+  const NativeBigClockSlotSettings& saved =
+    g_nativeBigClockSlotSettings[safeSlot][preset];
+  if (!saved.loaded) return;
+  g_nativeBigClockMode = saved.mode;
+  g_nativeBigClockForeground = saved.foreground;
+  g_nativeBigClockBackground = saved.background;
+  g_nativeBigClockShowExtra = saved.showExtra;
+  g_nativeBigClockShowTimer = saved.showTimer;
+  g_nativeBigClockShowRegionCurrent = saved.showNowPlaying;
+  g_nativeBigClockShowRegionPrevious = saved.showRegionPrevious;
+  g_nativeBigClockShowRegionNext = saved.showRegionNext;
+  // Marker Name e Marker Next não fazem mais parte do Big Clock. Ignora
+  // inclusive presets antigos que ainda tenham essas opções persistidas.
+  g_nativeBigClockShowMarkerCurrent = false;
+  g_nativeBigClockShowMarkerPrevious = saved.showMarkerPrevious;
+  g_nativeBigClockShowMarkerNext = false;
+  g_nativeBigClockShowQueue = saved.showQueue;
+  g_nativeBigClockShowMultiLoopAlerts = saved.showMultiLoopAlerts;
+  g_nativeBigClockShowProgressBar = saved.showProgressBar;
+  g_nativeBigClockShowRegressBar = saved.showRegressBar;
+  g_nativeBigClockProgressColor = saved.progressColor;
+  g_nativeBigClockRegressColor = saved.regressColor;
+  g_nativeBigClockMarqueeEnabled = saved.marqueeEnabled;
+  g_nativeBigClockPlayingFontSize = saved.playingFontSize;
+  g_nativeBigClockQueueFontSize = saved.queueFontSize;
+  g_nativeBigClockTimerFontSize = saved.timerFontSize;
+  g_nativeBigClockBypassFontSize = saved.bypassFontSize;
+  g_nativeBigClockPlayingTextColor = saved.playingTextColor;
+  g_nativeBigClockQueueTextColor = saved.queueTextColor;
+  g_nativeBigClockBypassTextColor = saved.bypassTextColor;
+  if (g_nativeBigClockShowRegionCurrent) {
+    nativeBigClockActivateNowPlayingFocusMode(false);
+  }
+}
+
+static void nativeBigClockReadSettings(int slot)
+{
+  const NativeBigClockSlotSettings defaults =
+    nativeBigClockDefaultSettings(nativeBigClockSafeSlot(slot));
+  // O Big Clock Hook segue sempre a unidade escolhida na régua do projeto.
+  // As opções duplicadas de formato não fazem mais parte do menu próprio.
+  g_nativeBigClockMode = -1;
+  g_nativeBigClockForeground = static_cast<COLORREF>(
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "FG_V1").c_str(),
+      static_cast<int>(defaults.foreground)));
+  g_nativeBigClockBackground = static_cast<COLORREF>(
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "BG_V1").c_str(),
+      static_cast<int>(defaults.background)));
+  g_nativeBigClockShowExtra =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "EXTRA_V1").c_str(),
+      defaults.showExtra ? 1 : 0) != 0;
+  g_nativeBigClockShowTimer =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "TIMER_V1").c_str(),
+      defaults.showTimer ? 1 : 0) != 0;
+  g_nativeBigClockShowRegionCurrent =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "REGION_CURRENT_V1").c_str(),
+      defaults.showNowPlaying ? 1 : 0) != 0;
+  g_nativeBigClockShowRegionPrevious =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "REGION_PREVIOUS_V1").c_str(),
+      defaults.showRegionPrevious ? 1 : 0) != 0;
+  g_nativeBigClockShowRegionNext =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "REGION_NEXT_V1").c_str(),
+      defaults.showRegionNext ? 1 : 0) != 0;
+  g_nativeBigClockShowMarkerCurrent =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "MARKER_CURRENT_V1").c_str(),
+      defaults.showMarkerCurrent ? 1 : 0) != 0;
+  g_nativeBigClockShowMarkerPrevious =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "MARKER_PREVIOUS_V1").c_str(),
+      defaults.showMarkerPrevious ? 1 : 0) != 0;
+  g_nativeBigClockShowMarkerNext =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "MARKER_NEXT_V1").c_str(),
+      defaults.showMarkerNext ? 1 : 0) != 0;
+  g_nativeBigClockShowQueue =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "QUEUE_V1").c_str(),
+      defaults.showQueue ? 1 : 0) != 0;
+  g_nativeBigClockShowMultiLoopAlerts =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "MULTILOOP_ALERTS_V1").c_str(),
+      defaults.showMultiLoopAlerts ? 1 : 0) != 0;
+  g_nativeBigClockShowProgressBar =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "PROGRESS_BAR_V1").c_str(),
+      defaults.showProgressBar ? 1 : 0) != 0;
+  g_nativeBigClockShowRegressBar =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "REGRESS_BAR_V1").c_str(),
+      defaults.showRegressBar ? 1 : 0) != 0;
+  g_nativeBigClockProgressColor = static_cast<COLORREF>(
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "PROGRESS_COLOR_V1").c_str(),
+      static_cast<int>(defaults.progressColor)));
+  g_nativeBigClockRegressColor = static_cast<COLORREF>(
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "REGRESS_COLOR_V1").c_str(),
+      static_cast<int>(defaults.regressColor)));
+  g_nativeBigClockMarqueeEnabled =
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "MARQUEE_V1").c_str(),
+      defaults.marqueeEnabled ? 1 : 0) != 0;
+  const auto readFontSize = [&](const char* key) {
+    int value = std::max(14, std::min(24,
+      nativeAppActiveReadWindowInt(
+        nativeBigClockKey(slot, key).c_str(), defaults.playingFontSize)));
+    if ((value % 2) != 0) --value;
+    return value;
+  };
+  g_nativeBigClockPlayingFontSize = readFontSize("PLAYING_FONT_SIZE_V1");
+  g_nativeBigClockQueueFontSize = readFontSize("QUEUE_FONT_SIZE_V1");
+  g_nativeBigClockTimerFontSize = readFontSize("TIMER_FONT_SIZE_V1");
+  g_nativeBigClockBypassFontSize = readFontSize("BYPASS_FONT_SIZE_V1");
+  g_nativeBigClockPlayingTextColor = static_cast<COLORREF>(
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "PLAYING_TEXT_COLOR_V1").c_str(),
+      static_cast<int>(defaults.playingTextColor)));
+  g_nativeBigClockQueueTextColor = static_cast<COLORREF>(
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "QUEUE_TEXT_COLOR_V1").c_str(),
+      static_cast<int>(defaults.queueTextColor)));
+  g_nativeBigClockBypassTextColor = static_cast<COLORREF>(
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "BYPASS_TEXT_COLOR_V1").c_str(),
+      static_cast<int>(defaults.bypassTextColor)));
+  // Estas duas opções foram removidas do Big Clock.
+  g_nativeBigClockShowRegionPrevious = false;
+  g_nativeBigClockShowMarkerPrevious = false;
+  if (g_nativeBigClockShowRegionCurrent) {
+    nativeBigClockActivateNowPlayingFocusMode(false);
+  }
+  nativeBigClockStoreRuntimeSettings(slot);
+}
+
+static void nativeBigClockSaveSettings(int slot)
+{
+  nativeBigClockStoreRuntimeSettings(slot);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "MODE_V1").c_str(), g_nativeBigClockMode);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "FG_V1").c_str(),
+    static_cast<int>(g_nativeBigClockForeground));
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "BG_V1").c_str(),
+    static_cast<int>(g_nativeBigClockBackground));
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "EXTRA_V1").c_str(),
+    g_nativeBigClockShowExtra ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "TIMER_V1").c_str(),
+    g_nativeBigClockShowTimer ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "REGION_CURRENT_V1").c_str(),
+    g_nativeBigClockShowRegionCurrent ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "REGION_PREVIOUS_V1").c_str(),
+    g_nativeBigClockShowRegionPrevious ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "REGION_NEXT_V1").c_str(),
+    g_nativeBigClockShowRegionNext ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "MARKER_CURRENT_V1").c_str(),
+    g_nativeBigClockShowMarkerCurrent ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "MARKER_PREVIOUS_V1").c_str(),
+    g_nativeBigClockShowMarkerPrevious ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "MARKER_NEXT_V1").c_str(),
+    g_nativeBigClockShowMarkerNext ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "QUEUE_V1").c_str(),
+    g_nativeBigClockShowQueue ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "MULTILOOP_ALERTS_V1").c_str(),
+    g_nativeBigClockShowMultiLoopAlerts ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "PROGRESS_BAR_V1").c_str(),
+    g_nativeBigClockShowProgressBar ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "REGRESS_BAR_V1").c_str(),
+    g_nativeBigClockShowRegressBar ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "PROGRESS_COLOR_V1").c_str(),
+    static_cast<int>(g_nativeBigClockProgressColor));
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "REGRESS_COLOR_V1").c_str(),
+    static_cast<int>(g_nativeBigClockRegressColor));
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "MARQUEE_V1").c_str(),
+    g_nativeBigClockMarqueeEnabled ? 1 : 0);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "PLAYING_FONT_SIZE_V1").c_str(),
+    g_nativeBigClockPlayingFontSize);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "QUEUE_FONT_SIZE_V1").c_str(),
+    g_nativeBigClockQueueFontSize);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "TIMER_FONT_SIZE_V1").c_str(),
+    g_nativeBigClockTimerFontSize);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "BYPASS_FONT_SIZE_V1").c_str(),
+    g_nativeBigClockBypassFontSize);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "PLAYING_TEXT_COLOR_V1").c_str(),
+    static_cast<int>(g_nativeBigClockPlayingTextColor));
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "QUEUE_TEXT_COLOR_V1").c_str(),
+    static_cast<int>(g_nativeBigClockQueueTextColor));
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "BYPASS_TEXT_COLOR_V1").c_str(),
+    static_cast<int>(g_nativeBigClockBypassTextColor));
+}
+
+static void nativeBigClockSaveWindowState(int slot)
+{
+  slot = nativeBigClockSafeSlot(slot);
+  if (!nativeBigClockWindowIsOpen(slot)) return;
+  bool floatingDocker = false;
+  const int dockerIndex = DockIsChildOfDock_ptr
+    ? DockIsChildOfDock_ptr(g_nativeBigClockHwnd[slot], &floatingDocker) : -1;
+  if (dockerIndex >= 0) {
+    const int dockState = dockerIndex * 256 + 1;
+    nativeAppActiveWriteWindowInt(
+      nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), dockState);
+    nativeAppActiveWriteWindowInt(
+      nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str(), dockState);
+    return;
+  }
+  RECT rect{0, 0, 0, 0};
+  if (!GetWindowRect(g_nativeBigClockHwnd[slot], &rect)) return;
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "X_V1").c_str(), rect.left);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "Y_V1").c_str(), rect.top);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "W_V1").c_str(),
+    std::max(320, static_cast<int>(rect.right - rect.left)));
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "H_V1").c_str(),
+    std::max(64, static_cast<int>(rect.bottom - rect.top)));
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), 0);
+}
+
+static std::string nativeBigClockPositionText()
+{
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(
+    path, static_cast<int>(sizeof(path)));
+  const int playState = project && GetPlayStateEx_ptr
+    ? GetPlayStateEx_ptr(project) : 0;
+  const double position = project && (playState & 1) && GetPlayPositionEx_ptr
+    ? GetPlayPositionEx_ptr(project)
+    : (project && GetCursorPositionEx_ptr
+        ? GetCursorPositionEx_ptr(project) : 0.0);
+
+  if (g_nativeBigClockMode == 6) {
+    bool dropFrame = false;
+    double frameRate = TimeMap_curFrameRate_ptr
+      ? TimeMap_curFrameRate_ptr(project, &dropFrame) : 30.0;
+    if (!std::isfinite(frameRate) || frameRate <= 0.0) frameRate = 30.0;
+    const long long frame = static_cast<long long>(
+      std::floor(std::max(0.0, position) * frameRate + 0.5));
+    std::ostringstream out;
+    out << std::setw(8) << std::setfill('0') << frame;
+    return out.str();
+  }
+
+  char formatted[256] = "";
+  if (format_timestr_pos_ptr) {
+    format_timestr_pos_ptr(
+      position, formatted, static_cast<int>(sizeof(formatted)),
+      g_nativeBigClockMode);
+  } else {
+    const int hours = static_cast<int>(position / 3600.0);
+    const int minutes = static_cast<int>(position / 60.0) % 60;
+    const double seconds = std::fmod(std::max(0.0, position), 60.0);
+    std::snprintf(formatted, sizeof(formatted),
+      "%02d:%02d:%06.3f", hours, minutes, seconds);
+  }
+  return formatted;
+}
+
+struct NativeBigClockTimelineNames {
+  std::string regionCurrent;
+  std::string regionPrevious;
+  std::string regionNext;
+  std::string markerCurrent;
+  std::string markerPrevious;
+  std::string markerNext;
+};
+
+static NativeBigClockTimelineNames nativeBigClockTimelineNames()
+{
+  NativeBigClockTimelineNames names;
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(
+    path, static_cast<int>(sizeof(path)));
+  if (!project || !CountProjectMarkers_ptr || !EnumProjectMarkers3_ptr) {
+    return names;
+  }
+  const int playState = GetPlayStateEx_ptr
+    ? GetPlayStateEx_ptr(project) : 0;
+  const double position = (playState & 1) && GetPlayPositionEx_ptr
+    ? GetPlayPositionEx_ptr(project)
+    : (GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(project) : 0.0);
+
+  struct PointName {
+    double start = 0.0;
+    double end = 0.0;
+    std::string name;
+  };
+  std::vector<PointName> regions;
+  std::vector<PointName> markers;
+  int markerCount = 0;
+  int regionCount = 0;
+  const int total = CountProjectMarkers_ptr(
+    project, &markerCount, &regionCount);
+  for (int index = 0; index < total; ++index) {
+    bool isRegion = false;
+    double start = 0.0;
+    double end = 0.0;
+    const char* rawName = nullptr;
+    int number = 0;
+    int color = 0;
+    if (EnumProjectMarkers3_ptr(project, index, &isRegion,
+          &start, &end, &rawName, &number, &color) <= 0) {
+      continue;
+    }
+    PointName entry{start, end,
+      rawName ? nativeTrim(rawName) : std::string()};
+    if (isRegion) regions.push_back(std::move(entry));
+    else markers.push_back(std::move(entry));
+  }
+  const auto byStart = [](const PointName& left, const PointName& right) {
+    if (std::fabs(left.start - right.start) > 0.000001) {
+      return left.start < right.start;
+    }
+    return left.end < right.end;
+  };
+  std::sort(regions.begin(), regions.end(), byStart);
+  std::sort(markers.begin(), markers.end(), byStart);
+
+  int currentRegionIndex = -1;
+  for (size_t index = 0; index < regions.size(); ++index) {
+    if (position + 0.000001 >= regions[index].start &&
+        position < regions[index].end - 0.000001) {
+      currentRegionIndex = static_cast<int>(index);
+    }
+  }
+  if (currentRegionIndex >= 0) {
+    names.regionCurrent = regions[static_cast<size_t>(currentRegionIndex)].name;
+    if (currentRegionIndex > 0) {
+      names.regionPrevious = regions[
+        static_cast<size_t>(currentRegionIndex - 1)].name;
+    }
+    if (currentRegionIndex + 1 < static_cast<int>(regions.size())) {
+      names.regionNext = regions[
+        static_cast<size_t>(currentRegionIndex + 1)].name;
+    }
+  } else {
+    int previous = -1;
+    int next = -1;
+    for (size_t index = 0; index < regions.size(); ++index) {
+      if (regions[index].start <= position) previous = static_cast<int>(index);
+      if (regions[index].start > position) {
+        next = static_cast<int>(index);
+        break;
+      }
+    }
+    if (previous >= 0) names.regionPrevious = regions[static_cast<size_t>(previous)].name;
+    if (next >= 0) names.regionNext = regions[static_cast<size_t>(next)].name;
+  }
+
+  int currentMarkerIndex = -1;
+  for (size_t index = 0; index < markers.size(); ++index) {
+    if (markers[index].start <= position + 0.000001) {
+      currentMarkerIndex = static_cast<int>(index);
+    } else {
+      break;
+    }
+  }
+  if (currentMarkerIndex >= 0) {
+    names.markerCurrent = markers[static_cast<size_t>(currentMarkerIndex)].name;
+    if (currentMarkerIndex > 0) {
+      names.markerPrevious = markers[
+        static_cast<size_t>(currentMarkerIndex - 1)].name;
+    }
+  }
+  const int nextMarkerIndex = currentMarkerIndex + 1;
+  if (nextMarkerIndex >= 0 &&
+      nextMarkerIndex < static_cast<int>(markers.size())) {
+    names.markerNext = markers[static_cast<size_t>(nextMarkerIndex)].name;
+  }
+  return names;
+}
+
+static std::string nativeBigClockTimerText()
+{
+  const double displaySeconds = nativeTimerDisplaySecLocked();
+  const bool expired = nativeTimerCountdownExpiredLocked();
+  return nativeFormatTimerTextFromSeconds(displaySeconds, expired);
+}
+
+static std::string nativeBigClockExtraText();
+
+static std::string nativeBigClockQueuedSongName()
+{
+  std::vector<NativeSongWindow> songs;
+  std::vector<NativeSongWindow> playlistItems;
+  std::string queuedId;
+  double queuedStart = 0.0;
+  double queuedEnd = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+    playlistItems = g_nativeActivePlaylistItems;
+    queuedId = !g_nativeQueuedPlaylistSongId.empty()
+      ? g_nativeQueuedPlaylistSongId
+      : g_nativeQueuedSongId;
+    queuedStart = g_nativeQueuedStart;
+    queuedEnd = g_nativeQueuedEnd;
+  }
+  if (queuedId.empty() || queuedEnd <= queuedStart + 0.0005) return {};
+  return nativeUpperNamePtBrKeepParentheses(
+    nativeAppActiveSongNameForState(
+      playlistItems, songs, queuedId, queuedStart, queuedEnd));
+}
+
+static std::string nativeBigClockPrimarySongName(bool& playingNow)
+{
+  std::vector<NativeSongWindow> songs;
+  std::vector<NativeSongWindow> playlistItems;
+  std::string playingId;
+  std::string selectedId;
+  double playingStart = 0.0;
+  double playingEnd = 0.0;
+  double selectedStart = 0.0;
+  double selectedEnd = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+    playlistItems = g_nativeActivePlaylistItems;
+    playingId = g_nativeCurrentPlayingId;
+    playingStart = g_nativeCurrentSongStart;
+    playingEnd = g_nativeCurrentSongEnd;
+    playingNow = g_nativeCurrentTransportPlaying &&
+      !playingId.empty() &&
+      playingEnd > playingStart + 0.0005;
+    selectedId = g_nativeSelectedId;
+    selectedStart = g_nativeSelectedStart;
+    selectedEnd = g_nativeSelectedEnd;
+  }
+  const std::string& id = playingNow ? playingId : selectedId;
+  const double start = playingNow ? playingStart : selectedStart;
+  const double end = playingNow ? playingEnd : selectedEnd;
+  if (id.empty() || end <= start + 0.0005) return {};
+  return nativeUpperNamePtBrKeepParentheses(
+    nativeAppActiveSongNameForState(
+      playlistItems, songs, id, start, end));
+}
+
+static double nativeBigClockSongProgressRatio()
+{
+  double start = 0.0;
+  double end = 0.0;
+  double position = 0.0;
+  bool playing = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    start = g_nativeCurrentSongStart;
+    end = g_nativeCurrentSongEnd;
+    position = g_nativeCurrentPlayPosition;
+    playing = g_nativeCurrentTransportPlaying;
+  }
+  if (!playing || end <= start + 0.0005) return -1.0;
+  return std::max(0.0, std::min(1.0,
+    (position - start) / (end - start)));
+}
+
+static bool nativeBigClockQueueIsActive()
+{
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  return (!g_nativeQueuedPlaylistSongId.empty() ||
+          !g_nativeQueuedSongId.empty()) &&
+    g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005;
+}
+
+static std::string nativeBigClockActiveMultiLoopText()
+{
+  if (!g_nativeMultiLoopActivePair.valid) return {};
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(
+    path, static_cast<int>(sizeof(path)));
+  if (!project || !nativeIsRepeatEnabled(project)) return {};
+  const NativeMultiLoopPair pair = g_nativeMultiLoopActivePair;
+  std::string partName = nativeFindLoopBoundaryLabel(project, pair.start);
+  if (partName.empty()) {
+    partName = nativeFindLoopRegionLabel(project, pair.start, pair.end);
+  }
+  if (partName.empty()) {
+    partName = nativeFindLoopBoundaryLabel(project, pair.end);
+  }
+  if (partName.empty()) {
+    partName = "PARTE " + std::to_string(pair.slot + 1);
+  }
+  return nativeUpperNamePtBrKeepParentheses(partName) + " - EM LOOP";
+}
+
+struct NativeBigClockArmedPartState {
+  bool active = false;
+  std::string name;
+  double regressRatio = 1.0;
+};
+
+static NativeBigClockArmedPartState nativeBigClockArmedPartState()
+{
+  NativeBigClockArmedPartState state;
+  std::string armedMarkerId;
+  std::string armedMarkerLabel;
+  double armedTargetPos = 0.0;
+  double armedOriginPos = 0.0;
+  double playPosition = 0.0;
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    armedMarkerId = g_nativeArmedMarkerId;
+    armedMarkerLabel = g_nativeArmedMarkerLabel;
+    armedTargetPos = g_nativeSelectedMarkerPos;
+    armedOriginPos = g_nativeArmedMarkerStartPlayPos;
+    playPosition = g_nativeCurrentPlayPosition;
+    songs = g_nativeSongWindows;
+  }
+  if (armedMarkerId.empty()) return state;
+
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(
+    path, static_cast<int>(sizeof(path)));
+  if (!project) return state;
+
+  state.active = true;
+  state.name = nativeAppActiveArmedPartName(project, armedMarkerId);
+  if (state.name.empty()) state.name = armedMarkerLabel;
+  if (state.name.empty()) state.name = "PARTE";
+  state.name = nativeUpperNamePtBrKeepParentheses(state.name);
+
+  double contextStart = 0.0;
+  double contextEnd = 0.0;
+  std::string contextName;
+  nativeFindPlayingId(songs, armedOriginPos + 0.0005,
+    contextName, contextStart, contextEnd);
+  const double regressEnd = nativeResolvePartsRegressTrigger(
+    project, armedOriginPos, contextStart, contextEnd);
+  const double total = regressEnd - armedOriginPos;
+  if (total > 0.001) {
+    double livePosition = playPosition;
+    const int playState = GetPlayStateEx_ptr
+      ? GetPlayStateEx_ptr(project) : 0;
+    if (playState != 0 && GetPlayPositionEx_ptr) {
+      livePosition = GetPlayPositionEx_ptr(project);
+    }
+    const double remaining = std::max(0.0, regressEnd - livePosition);
+    state.regressRatio = std::max(0.0, std::min(1.0,
+      remaining / total));
+  } else if (std::fabs(armedTargetPos - armedOriginPos) > 0.001) {
+    const double totalToTarget = std::fabs(armedTargetPos - armedOriginPos);
+    const double remaining = std::fabs(armedTargetPos - playPosition);
+    state.regressRatio = std::max(0.0, std::min(1.0,
+      remaining / totalToTarget));
+  }
+  return state;
+}
+
+static std::string nativeBigClockSelectedTimelineText(
+  const NativeBigClockTimelineNames& names)
+{
+  std::vector<std::string> values;
+  const auto add = [&](bool enabled, const char* label,
+                       const std::string& value) {
+    if (!enabled || value.empty()) return;
+    values.push_back(std::string(label) + ": " + value);
+  };
+  add(g_nativeBigClockShowRegionPrevious, "REGIÃO ANTERIOR", names.regionPrevious);
+  add(g_nativeBigClockShowRegionNext, "PRÓXIMA REGIÃO", names.regionNext);
+  add(g_nativeBigClockShowMarkerPrevious, "MARCADOR ANTERIOR", names.markerPrevious);
+  if (g_nativeBigClockShowExtra) {
+    const std::string statusText = nativeBigClockExtraText();
+    if (!statusText.empty()) values.push_back(statusText);
+  }
+  std::ostringstream out;
+  for (size_t index = 0; index < values.size(); ++index) {
+    if (index != 0) out << "   |   ";
+    out << values[index];
+  }
+  return out.str();
+}
+
+static std::string nativeBigClockExtraText()
+{
+  std::vector<NativeSongWindow> songs;
+  std::vector<NativeSongWindow> playlistItems;
+  std::string playingId;
+  std::string selectedId;
+  std::string queuedId;
+  double playingStart = 0.0;
+  double playingEnd = 0.0;
+  double selectedStart = 0.0;
+  double selectedEnd = 0.0;
+  double queuedStart = 0.0;
+  double queuedEnd = 0.0;
+  bool transportPlaying = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+    playlistItems = g_nativeActivePlaylistItems;
+    playingId = g_nativeCurrentPlayingId;
+    playingStart = g_nativeCurrentSongStart;
+    playingEnd = g_nativeCurrentSongEnd;
+    transportPlaying = g_nativeCurrentTransportPlaying;
+    selectedId = g_nativeSelectedId;
+    selectedStart = g_nativeSelectedStart;
+    selectedEnd = g_nativeSelectedEnd;
+    queuedId = !g_nativeQueuedPlaylistSongId.empty()
+      ? g_nativeQueuedPlaylistSongId : g_nativeQueuedSongId;
+    queuedStart = g_nativeQueuedStart;
+    queuedEnd = g_nativeQueuedEnd;
+  }
+
+  std::string contextId;
+  double contextStart = 0.0;
+  double contextEnd = 0.0;
+  const auto useContext = [&](const std::string& id,
+      double start, double end) {
+    if (id.empty() || end <= start + 0.0005) return false;
+    contextId = id;
+    contextStart = start;
+    contextEnd = end;
+    return true;
+  };
+  // Cada Big Clock mostra o status do conteudo escolhido nele. Fila tem
+  // prioridade quando essa opcao esta marcada; Tocando agora usa a musica em
+  // execucao e, parado, a selecionada. Com apenas Status ativo, segue essa
+  // mesma prioridade e usa a fila como ultimo recurso.
+  if (g_nativeBigClockShowQueue) {
+    useContext(queuedId, queuedStart, queuedEnd);
+  } else if (g_nativeBigClockShowRegionCurrent) {
+    if (!(transportPlaying &&
+          useContext(playingId, playingStart, playingEnd))) {
+      useContext(selectedId, selectedStart, selectedEnd);
+    }
+  } else if (!(transportPlaying &&
+               useContext(playingId, playingStart, playingEnd)) &&
+             !useContext(selectedId, selectedStart, selectedEnd)) {
+    useContext(queuedId, queuedStart, queuedEnd);
+  }
+  if (contextId.empty()) return {};
+
+  char path[2048] = "";
+  ReaProject* project = getCurrentProject(
+    path, static_cast<int>(sizeof(path)));
+  const int playState = project && GetPlayStateEx_ptr
+    ? GetPlayStateEx_ptr(project) : 0;
+  const char* status = g_nativeBigClockShowQueue
+    ? "FILA"
+    : ((playState & 4) != 0
+        ? "GRAVANDO" : ((playState & 1) != 0 ? "TOCANDO" :
+          ((playState & 2) != 0 ? "PAUSADO" : "PARADO")));
+  double bpm = 0.0;
+  bool bpmAvailable = project &&
+    nativeTempoMarkerBpmAtOrBeforePosition(
+      project, contextStart, bpm);
+  if (!bpmAvailable) {
+    const auto findSong = [&](const std::vector<NativeSongWindow>& items)
+        -> const NativeSongWindow* {
+      const NativeSongWindow* rangeMatch = nullptr;
+      for (const auto& song : items) {
+        if (!nativeSongIsPlayable(song)) continue;
+        if (nativeSongIdMatches(song, contextId)) return &song;
+        if (!rangeMatch &&
+            std::fabs(song.start - contextStart) <= 0.003 &&
+            std::fabs(song.end - contextEnd) <= 0.003) {
+          rangeMatch = &song;
+        }
+      }
+      return rangeMatch;
+    };
+    const NativeSongWindow* song = findSong(playlistItems);
+    if (!song) song = findSong(songs);
+    if (song && song->bpmAvailable && song->bpmValue > 0.0) {
+      bpm = song->bpmValue;
+      bpmAvailable = true;
+    }
+  }
+  std::ostringstream out;
+  out << status;
+  if (bpmAvailable) {
+    out << "   |   " << std::fixed << std::setprecision(
+      std::fabs(bpm - std::round(bpm)) < 0.01 ? 0 : 2)
+        << bpm << " BPM";
+  } else {
+    out << "   |   -- BPM";
+  }
+  out << "   |   " << nativeFormatTotalTextFromSeconds(
+    std::max(0.0, contextEnd - contextStart));
+  return out.str();
+}
+
+static HFONT nativeBigClockFitFont(
+  HDC dc, const std::string& text, const RECT& bounds,
+  int weight = FW_BOLD,
+  int maximumFontSize = 420)
+{
+  const int width = std::max(1, static_cast<int>(bounds.right - bounds.left));
+  const int height = std::max(1, static_cast<int>(bounds.bottom - bounds.top));
+  int fontSize = std::max(12, std::min(height,
+    static_cast<int>(width / std::max<size_t>(1, text.size()) * 1.72)));
+  fontSize = std::min(fontSize, std::max(12, maximumFontSize));
+  for (; fontSize > 11; fontSize -= 2) {
+    HFONT font = CreateFont(-fontSize, 0, 0, 0, weight,
+      FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+      DEFAULT_QUALITY, FF_DONTCARE,
+      "Arial");
+    if (!font) continue;
+    HFONT old = static_cast<HFONT>(SelectObject(dc, font));
+    RECT measured{0, 0, 0, 0};
+    DrawText(dc, text.c_str(), -1, &measured,
+      DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, old);
+    if (measured.right <= width && measured.bottom <= height) return font;
+    DeleteObject(font);
+  }
+  return CreateFont(-12, 0, 0, 0, weight,
+    FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+    DEFAULT_QUALITY, FF_DONTCARE, "Arial");
+}
+
+static HFONT nativeBigClockInfoFont(int size, int weight = FW_BOLD)
+{
+  return CreateFont(-std::max(2, std::min(24, size)),
+    0, 0, 0, weight, FALSE, FALSE, FALSE,
+    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+    CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+    FF_DONTCARE, "Arial");
+}
+
+static HFONT nativeBigClockInfoFontForRect(
+  int size, const RECT& rect, int weight = FW_BOLD)
+{
+  // CreateFont(-14) pode ocupar 16/17 pixels reais dependendo do DPI e da
+  // plataforma. Quando o Big Clock esta muito baixo, usar os 14 pixels num
+  // retangulo menor faz o DrawText recortar justamente o topo das letras.
+  const int availableHeight = std::max(2,
+    static_cast<int>(rect.bottom - rect.top) - 2);
+  return nativeBigClockInfoFont(
+    std::min(size, availableHeight), weight);
+}
+
+static void nativeBigClockDrawMarquee(
+  HDC dc,
+  const std::string& text,
+  const RECT& rect,
+  COLORREF color,
+  HFONT font,
+  long long nowMs,
+  bool marqueeEnabled)
+{
+  if (text.empty() || rect.right <= rect.left ||
+      rect.bottom <= rect.top) return;
+  const int available = std::max(1,
+    static_cast<int>(rect.right - rect.left));
+  const int textWidth = nativeUiTextWidth(dc, text, font);
+  if (textWidth <= available || !marqueeEnabled) {
+    nativeAppActiveDrawText(dc, text, rect,
+      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
+        (marqueeEnabled ? 0 : DT_END_ELLIPSIS),
+      color, font);
+    return;
+  }
+  const int gap = std::max(36,
+    nativeUiTextWidth(dc, "      ", font));
+  const int cycle = std::max(1, textWidth + gap);
+  const int offset = static_cast<int>(std::fmod(
+    std::max<long long>(0, nowMs) * 0.040,
+    static_cast<double>(cycle)));
+  const NativeUiClipState clip = nativeUiBeginClipRect(dc, rect);
+  const auto drawCopy = [&](int x) {
+    RECT draw{x, rect.top, x + textWidth + 2, rect.bottom};
+    nativeAppActiveDrawText(dc, text, draw,
+      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      color, font);
+  };
+  const int first = rect.left - offset;
+  drawCopy(first);
+  drawCopy(first + cycle);
+  nativeUiEndClipRect(dc, clip);
+}
+
+static void nativeBigClockPaint(HWND hwnd)
+{
+  const int slot = nativeBigClockSlotFromWindow(hwnd);
+  nativeBigClockLoadRuntimeSettings(slot);
+  PAINTSTRUCT ps{};
+  HDC paintDc = BeginPaint(hwnd, &ps);
+  if (!paintDc) return;
+  RECT client{0, 0, 0, 0};
+  GetClientRect(hwnd, &client);
+  const int width = std::max(0,
+    static_cast<int>(client.right - client.left));
+  const int height = std::max(0,
+    static_cast<int>(client.bottom - client.top));
+#ifdef __APPLE__
+  HDC dc = paintDc;
+#else
+  if (!g_nativeBigClockBackBuffer[slot] ||
+      g_nativeBigClockBackBufferWidth[slot] != width ||
+      g_nativeBigClockBackBufferHeight[slot] != height) {
+    g_nativeBigClockBackBuffer[slot].reset();
+    g_nativeBigClockBackBufferWidth[slot] = 0;
+    g_nativeBigClockBackBufferHeight[slot] = 0;
+    if (width > 0 && height > 0) {
+      g_nativeBigClockBackBuffer[slot] =
+        std::make_unique<WDL_WinMemBitmap>();
+      g_nativeBigClockBackBuffer[slot]->DoSize(paintDc, width, height);
+      if (g_nativeBigClockBackBuffer[slot]->GetDC()) {
+        g_nativeBigClockBackBufferWidth[slot] = width;
+        g_nativeBigClockBackBufferHeight[slot] = height;
+      } else {
+        g_nativeBigClockBackBuffer[slot].reset();
+      }
+    }
+  }
+  HDC dc = g_nativeBigClockBackBuffer[slot]
+    ? g_nativeBigClockBackBuffer[slot]->GetDC() : paintDc;
+#endif
+  const auto finishPaint = [&]() {
+#ifndef __APPLE__
+    if (dc && dc != paintDc && width > 0 && height > 0) {
+      BitBlt(paintDc, 0, 0, width, height,
+        dc, 0, 0, SRCCOPY);
+    }
+#endif
+    EndPaint(hwnd, &ps);
+  };
+  if (width <= 0 || height <= 0) {
+    finishPaint();
+    return;
+  }
+  HBRUSH background = CreateSolidBrush(g_nativeBigClockBackground);
+  FillRect(dc, &client, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, g_nativeBigClockForeground);
+
+  // Em altura compacta, oito pixels em cima e embaixo consumiam quase toda a
+  // area util e deixavam somente a base do nome visivel no docker.
+  const bool compactHeight = height < 96;
+  const int padding = compactHeight
+    ? 2 : std::max(8, height / 24);
+  const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+  const bool blinkVisible = ((nowMs / 500) % 2) == 0;
+  const NativeBigClockArmedPartState armedPart =
+    nativeBigClockArmedPartState();
+  if (armedPart.active) {
+    const std::string armedText =
+      "PARTE ENGATILHADA: " + armedPart.name;
+    RECT armedRect{
+      client.left + padding,
+      client.top + padding,
+      client.right - padding,
+      client.bottom - padding - std::max(14, height / 18)};
+    HFONT armedFont = nativeBigClockFitFont(
+      dc, armedText, armedRect, FW_BOLD);
+    nativeAppActiveDrawText(dc, armedText, armedRect,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+        DT_END_ELLIPSIS | DT_NOPREFIX,
+      blinkVisible ? RGB(255, 234, 0) : RGB(145, 123, 0),
+      armedFont);
+    if (armedFont) DeleteObject(armedFont);
+
+    const int barHeight = std::max(10, std::min(22, height / 20));
+    RECT bar{
+      client.left + padding,
+      client.bottom - padding - barHeight,
+      client.right - padding,
+      client.bottom - padding};
+    nativeAppActiveFillRect(dc, bar, RGB(48, 52, 58));
+    RECT fill = bar;
+    fill.right = fill.left + std::max(0,
+      static_cast<int>(std::floor(
+        (fill.right - fill.left) * armedPart.regressRatio + 0.5)));
+    if (fill.right > fill.left) {
+      // O alerta de Parts e um estado global compartilhado pelos dois clocks;
+      // nao herda a cor individual da barra de fila de cada janela.
+      nativeAppActiveFillRect(dc, fill, RGB(255, 0, 0));
+    }
+    finishPaint();
+    return;
+  }
+
+  const std::string activeMultiLoopText =
+    g_nativeBigClockShowMultiLoopAlerts
+      ? nativeBigClockActiveMultiLoopText() : std::string();
+  const bool multiLoopTakesOver = !activeMultiLoopText.empty();
+
+  if (multiLoopTakesOver) {
+    if (blinkVisible) {
+      RECT loopRect{
+        client.left + padding, client.top + padding,
+        client.right - padding, client.bottom - padding};
+      HFONT loopFont = nativeBigClockFitFont(
+        dc, activeMultiLoopText, loopRect, FW_BOLD);
+      nativeAppActiveDrawText(dc, activeMultiLoopText, loopRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+          DT_END_ELLIPSIS | DT_NOPREFIX,
+        RGB(255, 234, 0), loopFont);
+      if (loopFont) DeleteObject(loopFont);
+    }
+    finishPaint();
+    return;
+  }
+
+  const NativeBigClockTimelineNames timelineNames =
+    nativeBigClockTimelineNames();
+  bool playingNow = false;
+  const std::string playingName = g_nativeBigClockShowRegionCurrent
+    ? nativeBigClockPrimarySongName(playingNow) : std::string();
+  const bool hasNowPlaying = !playingName.empty();
+  const std::string statusText = g_nativeBigClockShowExtra
+    ? nativeBigClockExtraText() : std::string();
+  if (g_nativeBigClockShowRegionCurrent) {
+    RECT focusRect{
+      client.left + padding,
+      client.top + padding,
+      client.right - padding,
+      client.bottom - padding};
+    const int focusBarHeight = compactHeight
+      ? 7 : std::max(8, std::min(14, height / 24));
+    const int focusBarGap = compactHeight ? 2 : 4;
+    const int focusBarCount =
+      (g_nativeBigClockShowProgressBar ? 1 : 0) +
+      (g_nativeBigClockShowRegressBar ? 1 : 0);
+    const int focusBarsSpace = focusBarCount > 0
+      ? focusBarCount * focusBarHeight +
+        (focusBarCount - 1) * focusBarGap
+      : 0;
+    RECT focusBarsRect = focusRect;
+    if (focusBarsSpace > 0) {
+      focusBarsRect.top = focusBarsRect.bottom - focusBarsSpace;
+      focusRect.bottom = std::max(focusRect.top,
+        focusBarsRect.top - (compactHeight ? 1 : 4));
+    }
+    const int statusHeight = !statusText.empty()
+      ? std::max(14, std::min(26, height / 5)) : 0;
+    const int statusGap = statusHeight > 0 ? (compactHeight ? 1 : 4) : 0;
+    RECT nameRect = focusRect;
+    if (statusHeight > 0) {
+      nameRect.bottom = std::max(nameRect.top + 1,
+        focusRect.bottom - statusHeight - statusGap);
+    }
+    const std::string focusedName =
+      std::string(playingNow ? "TOCANDO: " : "SELECIONADA: ") +
+      (playingName.empty() ? "-" : playingName);
+    const int nameHeight = std::max(2,
+      static_cast<int>(nameRect.bottom - nameRect.top) - 2);
+    const int focusedFontSize = std::max(2,
+      std::min(nameHeight,
+        std::max(14, std::min(24,
+          g_nativeBigClockPlayingFontSize)) * 2));
+    HFONT focusedFont = CreateFont(-focusedFontSize,
+      0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+      CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+      FF_DONTCARE, "Arial");
+    const int focusedWidth = nativeUiTextWidth(
+      dc, focusedName, focusedFont);
+    if (focusedWidth <= nameRect.right - nameRect.left) {
+      nativeAppActiveDrawText(dc, focusedName, nameRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        g_nativeBigClockPlayingTextColor, focusedFont);
+    } else if (g_nativeBigClockMarqueeEnabled) {
+      nativeBigClockDrawMarquee(dc, focusedName, nameRect,
+        g_nativeBigClockPlayingTextColor, focusedFont, nowMs,
+        true);
+    } else {
+      nativeAppActiveDrawText(dc, focusedName, nameRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+          DT_END_ELLIPSIS | DT_NOPREFIX,
+        g_nativeBigClockPlayingTextColor, focusedFont);
+    }
+    if (focusedFont) DeleteObject(focusedFont);
+
+    if (statusHeight > 0) {
+      RECT statusRect{focusRect.left,
+        focusRect.bottom - statusHeight,
+        focusRect.right, focusRect.bottom};
+      HFONT statusFont = nativeBigClockInfoFontForRect(
+        14, statusRect, FW_BOLD);
+      nativeAppActiveDrawText(dc, statusText, statusRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+          DT_END_ELLIPSIS | DT_NOPREFIX,
+        g_nativeBigClockForeground, statusFont);
+      if (statusFont) DeleteObject(statusFont);
+    }
+    if (focusBarsSpace > 0) {
+      const double progressRatio = nativeBigClockSongProgressRatio();
+      const bool hasSongProgress = progressRatio >= 0.0;
+      const bool queueActive = nativeBigClockQueueIsActive();
+      int barTop = focusBarsRect.top;
+      const auto paintFocusBar = [&](double ratio, COLORREF color) {
+        RECT bar{focusBarsRect.left, barTop,
+          focusBarsRect.right, barTop + focusBarHeight};
+        nativeAppActiveFillOutlinedRect(dc, bar,
+          g_nativeBigClockBackground, RGB(74, 82, 89));
+        RECT fill{bar.left + 1, bar.top + 1,
+          bar.right - 1, bar.bottom - 1};
+        fill.right = fill.left + std::max(0,
+          static_cast<int>(std::floor(
+            (fill.right - fill.left) *
+            std::max(0.0, std::min(1.0, ratio)) + 0.5)));
+        if (fill.right > fill.left) {
+          nativeAppActiveFillRect(dc, fill, color);
+        }
+        barTop += focusBarHeight + focusBarGap;
+      };
+      if (g_nativeBigClockShowProgressBar) {
+        paintFocusBar(hasSongProgress ? progressRatio : 0.0,
+          g_nativeBigClockProgressColor);
+      }
+      if (g_nativeBigClockShowRegressBar) {
+        paintFocusBar(hasSongProgress && queueActive
+            ? 1.0 - progressRatio : 0.0,
+          g_nativeBigClockRegressColor);
+      }
+    }
+    finishPaint();
+    return;
+  }
+  const bool hasTimelineDetail =
+    !statusText.empty() ||
+    g_nativeBigClockShowRegionPrevious ||
+    g_nativeBigClockShowRegionNext ||
+    g_nativeBigClockShowMarkerPrevious;
+  const bool hasLeftOption =
+    hasTimelineDetail || g_nativeBigClockShowQueue;
+  const bool hasOtherOption = hasLeftOption || hasNowPlaying;
+  RECT contentRect{
+    client.left + padding,
+    client.top + padding,
+    client.right - padding,
+    client.bottom - padding};
+  // Com 3 px o contorno consumia dois pixels e a cor útil virava uma linha
+  // de apenas 1 px. Mantém as duas barras legíveis até na altura compacta.
+  const int normalBarHeight = compactHeight
+    ? 7 : std::max(8, std::min(14, height / 24));
+  const int normalBarGap = compactHeight ? 2 : 4;
+  const int normalBarCount =
+    (g_nativeBigClockShowProgressBar ? 1 : 0) +
+    (g_nativeBigClockShowRegressBar ? 1 : 0);
+  const int normalBarsSpace = normalBarCount > 0
+    ? normalBarCount * normalBarHeight +
+      (normalBarCount - 1) * normalBarGap
+    : 0;
+  RECT normalBarsRect = contentRect;
+  if (normalBarsSpace > 0) {
+    normalBarsRect.top = normalBarsRect.bottom - normalBarsSpace;
+    contentRect.bottom = std::max(contentRect.top,
+      normalBarsRect.top - (compactHeight ? 1 : std::max(4, padding / 2)));
+  }
+
+  if (g_nativeBigClockShowMultiLoopAlerts &&
+      g_nativeMultiLoopBypassActive) {
+    const std::string bypassText =
+      "BYPASS ATIVO - MULTILOOPS TEMPORARIAMENTE DESATIVADOS";
+    RECT bypassRect{
+      client.left + width / 2,
+      client.top + std::max(4, padding / 2),
+      client.right - padding,
+      client.top + std::max(24, height / 14)};
+    HFONT bypassFont = nativeBigClockInfoFont(
+      g_nativeBigClockBypassFontSize, FW_BOLD);
+    nativeAppActiveDrawText(dc, bypassText, bypassRect,
+      DT_RIGHT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+      g_nativeBigClockBypassTextColor, bypassFont);
+    if (bypassFont) DeleteObject(bypassFont);
+  }
+
+  if (hasOtherOption || g_nativeBigClockShowTimer) {
+    const int contentWidth = std::max(1,
+      static_cast<int>(contentRect.right - contentRect.left));
+    const bool needsRightColumn =
+      g_nativeBigClockShowTimer ||
+      (g_nativeBigClockShowMultiLoopAlerts &&
+       g_nativeMultiLoopBypassActive);
+    const int rightColumnWidth = needsRightColumn
+      ? std::min(contentWidth / 2,
+          std::max(180, contentWidth * 30 / 100))
+      : 0;
+    RECT leftRect = contentRect;
+    leftRect.right = needsRightColumn
+      ? std::max(leftRect.left + 100,
+          contentRect.right - rightColumnWidth - padding)
+      : contentRect.right;
+
+    const int availableInfoHeight = std::max(1,
+      static_cast<int>(contentRect.bottom - contentRect.top));
+    int infoGap = compactHeight ? 1 : std::max(10, height / 18);
+    int infoRowHeight = std::max(18,
+      std::min(38, height / 7));
+    if (infoRowHeight * 2 + infoGap > availableInfoHeight) {
+      infoGap = compactHeight ? 1 : 2;
+      infoRowHeight = std::max(1,
+        (availableInfoHeight - infoGap) / 2);
+    }
+    // Quando Status/BPM/compasso estiver ativo, reserva uma linha real abaixo
+    // da fila. O conjunto sobe só o necessário e o status não encosta nas
+    // barras de progresso/regresso.
+    const int detailReserve = hasTimelineDetail
+      ? std::max(16, std::min(26, infoRowHeight)) : 0;
+    const int infoStackHeight =
+      infoRowHeight * 2 + infoGap + detailReserve;
+    const int infoStackTop = contentRect.top + std::max(0,
+      (availableInfoHeight - infoStackHeight) / 2);
+    RECT regionRect{
+      leftRect.left,
+      infoStackTop,
+      leftRect.right,
+      std::min(static_cast<int>(leftRect.bottom),
+        infoStackTop + infoRowHeight)};
+    RECT queueRect{
+      leftRect.left,
+      std::min(leftRect.bottom,
+        regionRect.bottom + infoGap),
+      leftRect.right,
+      std::min(leftRect.bottom,
+        regionRect.bottom + infoGap + infoRowHeight)};
+    RECT detailRect{
+      leftRect.left,
+      queueRect.bottom,
+      leftRect.right,
+      leftRect.bottom};
+
+    if (hasNowPlaying) {
+      const std::string regionText =
+        std::string(playingNow ? "TOCANDO: " : "SELECIONADA: ") +
+        playingName;
+      HFONT regionFont = nativeBigClockInfoFontForRect(
+        g_nativeBigClockPlayingFontSize, regionRect, FW_BOLD);
+      nativeBigClockDrawMarquee(dc, regionText, regionRect,
+        g_nativeBigClockPlayingTextColor, regionFont, nowMs,
+        g_nativeBigClockMarqueeEnabled);
+      if (regionFont) DeleteObject(regionFont);
+    }
+
+    if (g_nativeBigClockShowQueue) {
+      const std::string queuedName = nativeBigClockQueuedSongName();
+      if (!queuedName.empty()) {
+        const std::string queueText = "FILA: " + queuedName;
+        const RECT queueStatusRect =
+          !hasNowPlaying && !hasTimelineDetail
+            ? regionRect : queueRect;
+        HFONT queueFont = nativeBigClockInfoFontForRect(
+          g_nativeBigClockQueueFontSize, queueStatusRect, FW_BOLD);
+        nativeBigClockDrawMarquee(dc, queueText, queueStatusRect,
+          g_nativeBigClockQueueTextColor, queueFont, nowMs,
+          g_nativeBigClockMarqueeEnabled);
+        if (queueFont) DeleteObject(queueFont);
+      }
+    }
+
+    if (hasTimelineDetail) {
+      const std::string details =
+        nativeBigClockSelectedTimelineText(timelineNames);
+      if (!details.empty()) {
+        HFONT detailFont = nativeBigClockFitFont(
+          dc, details, detailRect, FW_NORMAL, 24);
+        nativeAppActiveDrawText(dc, details, detailRect,
+          DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+            DT_END_ELLIPSIS | DT_NOPREFIX,
+          g_nativeBigClockForeground, detailFont);
+        if (detailFont) DeleteObject(detailFont);
+      }
+    }
+
+    if (g_nativeBigClockShowTimer) {
+      const std::string timerText =
+        std::string("CRONÔMETRO  ") + nativeBigClockTimerText();
+      const auto visualPrefs = nativeUiReadVisualPrefs();
+      const COLORREF timerColor = nativeUiNamedVisualColor(
+        nativeUiVisualPref(visualPrefs,
+          "timer_color_mode", "yellow"), "yellow");
+      const bool showExpiredTimer =
+        !nativeTimerCountdownExpiredLocked() || blinkVisible;
+      if (showExpiredTimer) {
+        RECT alignedTimerRect = queueRect;
+        alignedTimerRect.left = hasOtherOption
+          ? contentRect.right - rightColumnWidth
+          : contentRect.left;
+        alignedTimerRect.right = contentRect.right;
+        HFONT timerFont = nativeBigClockInfoFontForRect(
+          g_nativeBigClockTimerFontSize, alignedTimerRect, FW_BOLD);
+        nativeAppActiveDrawText(dc, timerText, alignedTimerRect,
+          DT_RIGHT | DT_VCENTER | DT_SINGLELINE |
+            DT_END_ELLIPSIS | DT_NOPREFIX,
+          timerColor, timerFont);
+        if (timerFont) DeleteObject(timerFont);
+      }
+    }
+  }
+
+  if (normalBarsSpace > 0) {
+    const double progressRatio = nativeBigClockSongProgressRatio();
+    const bool hasSongProgress = progressRatio >= 0.0;
+    const bool queueActive = nativeBigClockQueueIsActive();
+    int barTop = normalBarsRect.top;
+    const auto paintBar = [&](double ratio, COLORREF color) {
+      RECT bar{
+        normalBarsRect.left, barTop,
+        normalBarsRect.right, barTop + normalBarHeight};
+      nativeAppActiveFillOutlinedRect(dc, bar,
+        g_nativeBigClockBackground, RGB(74, 82, 89));
+      RECT fill{bar.left + 1, bar.top + 1,
+        bar.right - 1, bar.bottom - 1};
+      fill.right = fill.left + std::max(0,
+        static_cast<int>(std::floor(
+          (fill.right - fill.left) *
+          std::max(0.0, std::min(1.0, ratio)) + 0.5)));
+      if (fill.right > fill.left) {
+        nativeAppActiveFillRect(dc, fill, color);
+      }
+      barTop += normalBarHeight + normalBarGap;
+    };
+    if (g_nativeBigClockShowProgressBar) {
+      paintBar(hasSongProgress ? progressRatio : 0.0,
+        g_nativeBigClockProgressColor);
+    }
+    if (g_nativeBigClockShowRegressBar) {
+      paintBar(hasSongProgress && queueActive
+          ? 1.0 - progressRatio : 0.0,
+        g_nativeBigClockRegressColor);
+    }
+  }
+  finishPaint();
+}
+
+static void nativeBigClockAppendMenu(
+  HMENU menu, UINT flags, UINT_PTR id, const char* text)
+{
+#ifdef _WIN32
+  const std::wstring wide = utf8ToWide(text ? text : "");
+  AppendMenuW(menu, flags, id, wide.c_str());
+#else
+  AppendMenu(menu, flags, id, text ? text : "");
+#endif
+}
+
+static void nativeBigClockRecreateForDock(int slot, bool dock)
+{
+  slot = nativeBigClockSafeSlot(slot);
+  nativeBigClockLoadRuntimeSettings(slot);
+  if (!nativeBigClockWindowIsOpen(slot)) return;
+  nativeBigClockSaveWindowState(slot);
+  if (dock) {
+    const int saved = nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str(),
+      nativeBigClockDefaultDockState(slot));
+    nativeAppActiveWriteWindowInt(
+      nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(),
+      saved != 0 ? saved : nativeBigClockDefaultDockState(slot));
+  } else {
+    nativeAppActiveWriteWindowInt(
+      nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), 0);
+  }
+  HWND old = g_nativeBigClockHwnd[slot];
+  g_nativeBigClockClosing[slot] = true;
+  if (DockWindowRemove_ptr) DockWindowRemove_ptr(old);
+  if (IsWindow(old)) DestroyWindow(old);
+  g_nativeBigClockHwnd[slot] = nullptr;
+  g_nativeBigClockClosing[slot] = false;
+  nativeOpenBigClockWindow(slot);
+}
+
+static void nativeBigClockHandleMenu(HWND hwnd)
+{
+  const int slot = nativeBigClockSlotFromWindow(hwnd);
+  nativeBigClockLoadRuntimeSettings(slot);
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return;
+  const auto checked = [](bool value) -> UINT {
+    return MF_STRING | (value ? MF_CHECKED : MF_UNCHECKED);
+  };
+  nativeBigClockAppendMenu(menu, checked(g_nativeBigClockShowTimer),
+    kBigClockToggleTimer, "Cronômetro");
+  nativeBigClockAppendMenu(menu, checked(g_nativeBigClockShowQueue),
+    kBigClockToggleQueue, "Fila de espera");
+  nativeBigClockAppendMenu(menu,
+    checked(g_nativeBigClockShowMultiLoopAlerts),
+    kBigClockToggleMultiLoopAlerts, "Avisos de multiloops");
+  nativeBigClockAppendMenu(menu,
+    checked(g_nativeBigClockMarqueeEnabled),
+    kBigClockToggleMarquee, "Letreiro para nomes longos");
+  const auto appendFontSizeMenu = [&](const char* label,
+      int commandBase, int selectedSize) {
+    HMENU fontMenu = CreatePopupMenu();
+    if (!fontMenu) return;
+    for (int index = 0; index < 6; ++index) {
+      const int value = 14 + index * 2;
+      const std::string text = std::to_string(value);
+      nativeBigClockAppendMenu(fontMenu,
+        checked(selectedSize == value),
+        static_cast<UINT_PTR>(commandBase + index),
+        text.c_str());
+    }
+#ifdef _WIN32
+    const std::wstring wideLabel = utf8ToWide(label ? label : "");
+    AppendMenuW(menu, MF_POPUP,
+      reinterpret_cast<UINT_PTR>(fontMenu), wideLabel.c_str());
+#else
+    AppendMenu(menu, MF_POPUP,
+      reinterpret_cast<UINT_PTR>(fontMenu), label ? label : "");
+#endif
+  };
+  appendFontSizeMenu("Fonte - Tocando/Selecionada",
+    kBigClockPlayingFontBase, g_nativeBigClockPlayingFontSize);
+  appendFontSizeMenu("Fonte - Fila",
+    kBigClockQueueFontBase, g_nativeBigClockQueueFontSize);
+  appendFontSizeMenu("Fonte - Cronômetro",
+    kBigClockTimerFontBase, g_nativeBigClockTimerFontSize);
+  appendFontSizeMenu("Fonte - Bypass",
+    kBigClockBypassFontBase, g_nativeBigClockBypassFontSize);
+  nativeBigClockAppendMenu(menu, checked(g_nativeBigClockShowRegionCurrent),
+    kBigClockToggleRegionCurrent, "Tocando agora");
+  nativeBigClockAppendMenu(menu, checked(g_nativeBigClockShowRegionNext),
+    kBigClockToggleRegionNext, "Region next (próxima região)");
+  nativeBigClockAppendMenu(menu, checked(g_nativeBigClockShowExtra),
+    kBigClockToggleExtra, "Exibir status, BPM e tempo");
+  nativeBigClockAppendMenu(menu,
+    checked(g_nativeBigClockShowProgressBar),
+    kBigClockToggleProgressBar, "Barra de progresso");
+  nativeBigClockAppendMenu(menu,
+    checked(g_nativeBigClockShowRegressBar),
+    kBigClockToggleRegressBar, "Barra de regresso");
+  nativeBigClockAppendMenu(menu, MF_STRING,
+    kBigClockChooseProgressColor, "Cor da barra de progresso...");
+  nativeBigClockAppendMenu(menu, MF_STRING,
+    kBigClockChooseRegressColor, "Cor da barra de regresso...");
+  AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
+  nativeBigClockAppendMenu(menu, MF_STRING,
+    kBigClockChoosePlayingTextColor, "Cor do texto - Tocando/Selecionada...");
+  nativeBigClockAppendMenu(menu, MF_STRING,
+    kBigClockChooseQueueTextColor, "Cor do texto - Fila...");
+  nativeBigClockAppendMenu(menu, MF_STRING,
+    kBigClockChooseBypassTextColor, "Cor do texto - Bypass...");
+  nativeBigClockAppendMenu(menu, MF_STRING,
+    kBigClockChooseBackgroundColor, "Cor do fundo...");
+  nativeBigClockAppendMenu(menu, MF_STRING,
+    kBigClockResetColors, "Restaurar cores");
+  bool floatingDocker = false;
+  const bool docked = DockIsChildOfDock_ptr &&
+    DockIsChildOfDock_ptr(hwnd, &floatingDocker) >= 0;
+  nativeBigClockAppendMenu(menu, checked(docked),
+    kBigClockToggleDock, "Dock Big Clock Hook");
+
+  POINT cursor{0, 0};
+  GetCursorPos(&cursor);
+  const int command = TrackPopupMenu(menu,
+    TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+    cursor.x, cursor.y, 0, hwnd, nullptr);
+  DestroyMenu(menu);
+
+  // TrackPopupMenu executa um loop modal. Enquanto o menu desta instância
+  // está aberto, o outro Big Clock pode receber WM_PAINT e carregar as suas
+  // preferências no estado temporário compartilhado. Restaura sempre o slot
+  // dono do menu antes de aplicar qualquer alteração.
+  nativeBigClockLoadRuntimeSettings(slot);
+
+  const auto fontSizeFromCommand = [&](int base) {
+    return command >= base && command < base + 6
+      ? 14 + (command - base) * 2 : 0;
+  };
+  const int playingFontSize =
+    fontSizeFromCommand(kBigClockPlayingFontBase);
+  const int queueFontSize =
+    fontSizeFromCommand(kBigClockQueueFontBase);
+  const int timerFontSize =
+    fontSizeFromCommand(kBigClockTimerFontBase);
+  const int bypassFontSize =
+    fontSizeFromCommand(kBigClockBypassFontBase);
+
+  if (playingFontSize != 0) {
+    g_nativeBigClockPlayingFontSize = playingFontSize;
+  } else if (queueFontSize != 0) {
+    g_nativeBigClockQueueFontSize = queueFontSize;
+  } else if (timerFontSize != 0) {
+    g_nativeBigClockTimerFontSize = timerFontSize;
+  } else if (bypassFontSize != 0) {
+    g_nativeBigClockBypassFontSize = bypassFontSize;
+  } else if (command == kBigClockToggleExtra) {
+    g_nativeBigClockShowExtra = !g_nativeBigClockShowExtra;
+  } else if (command == kBigClockToggleTimer) {
+    g_nativeBigClockShowTimer = !g_nativeBigClockShowTimer;
+    if (g_nativeBigClockShowTimer) nativeBigClockLeaveNowPlayingFocusMode();
+  } else if (command == kBigClockToggleQueue) {
+    g_nativeBigClockShowQueue = !g_nativeBigClockShowQueue;
+    if (g_nativeBigClockShowQueue) nativeBigClockLeaveNowPlayingFocusMode();
+  } else if (command == kBigClockToggleMultiLoopAlerts) {
+    g_nativeBigClockShowMultiLoopAlerts =
+      !g_nativeBigClockShowMultiLoopAlerts;
+    if (g_nativeBigClockShowMultiLoopAlerts) {
+      nativeBigClockLeaveNowPlayingFocusMode();
+    }
+  } else if (command == kBigClockToggleMarquee) {
+    g_nativeBigClockMarqueeEnabled =
+      !g_nativeBigClockMarqueeEnabled;
+  } else if (command == kBigClockToggleProgressBar) {
+    g_nativeBigClockShowProgressBar =
+      !g_nativeBigClockShowProgressBar;
+  } else if (command == kBigClockToggleRegressBar) {
+    g_nativeBigClockShowRegressBar =
+      !g_nativeBigClockShowRegressBar;
+  } else if (command == kBigClockToggleRegionCurrent) {
+    if (g_nativeBigClockShowRegionCurrent) {
+      nativeBigClockLeaveNowPlayingFocusMode();
+    } else {
+      nativeBigClockActivateNowPlayingFocusMode();
+    }
+  } else if (command == kBigClockToggleRegionPrevious) {
+    g_nativeBigClockShowRegionPrevious =
+      !g_nativeBigClockShowRegionPrevious;
+    if (g_nativeBigClockShowRegionPrevious) {
+      nativeBigClockLeaveNowPlayingFocusMode();
+    }
+  } else if (command == kBigClockToggleRegionNext) {
+    g_nativeBigClockShowRegionNext =
+      !g_nativeBigClockShowRegionNext;
+    if (g_nativeBigClockShowRegionNext) {
+      nativeBigClockLeaveNowPlayingFocusMode();
+    }
+  } else if (command == kBigClockToggleMarkerCurrent) {
+    g_nativeBigClockShowMarkerCurrent =
+      !g_nativeBigClockShowMarkerCurrent;
+    if (g_nativeBigClockShowMarkerCurrent) {
+      nativeBigClockLeaveNowPlayingFocusMode();
+    }
+  } else if (command == kBigClockToggleMarkerPrevious) {
+    g_nativeBigClockShowMarkerPrevious =
+      !g_nativeBigClockShowMarkerPrevious;
+    if (g_nativeBigClockShowMarkerPrevious) {
+      nativeBigClockLeaveNowPlayingFocusMode();
+    }
+  } else if (command == kBigClockToggleMarkerNext) {
+    g_nativeBigClockShowMarkerNext =
+      !g_nativeBigClockShowMarkerNext;
+    if (g_nativeBigClockShowMarkerNext) {
+      nativeBigClockLeaveNowPlayingFocusMode();
+    }
+  } else if (command == kBigClockChooseTextColor && GR_SelectColor_ptr) {
+    int color = static_cast<int>(g_nativeBigClockForeground);
+    const bool selected = GR_SelectColor_ptr(hwnd, &color) != 0;
+    nativeBigClockLoadRuntimeSettings(slot);
+    if (selected) {
+      g_nativeBigClockForeground = static_cast<COLORREF>(color);
+    }
+  } else if (command == kBigClockChooseBackgroundColor && GR_SelectColor_ptr) {
+    int color = static_cast<int>(g_nativeBigClockBackground);
+    const bool selected = GR_SelectColor_ptr(hwnd, &color) != 0;
+    nativeBigClockLoadRuntimeSettings(slot);
+    if (selected) {
+      g_nativeBigClockBackground = static_cast<COLORREF>(color);
+    }
+  } else if (command == kBigClockChooseProgressColor && GR_SelectColor_ptr) {
+    int color = static_cast<int>(g_nativeBigClockProgressColor);
+    const bool selected = GR_SelectColor_ptr(hwnd, &color) != 0;
+    nativeBigClockLoadRuntimeSettings(slot);
+    if (selected) {
+      g_nativeBigClockProgressColor = static_cast<COLORREF>(color);
+    }
+  } else if (command == kBigClockChooseRegressColor && GR_SelectColor_ptr) {
+    int color = static_cast<int>(g_nativeBigClockRegressColor);
+    const bool selected = GR_SelectColor_ptr(hwnd, &color) != 0;
+    nativeBigClockLoadRuntimeSettings(slot);
+    if (selected) {
+      g_nativeBigClockRegressColor = static_cast<COLORREF>(color);
+    }
+  } else if (command == kBigClockChoosePlayingTextColor && GR_SelectColor_ptr) {
+    int color = static_cast<int>(g_nativeBigClockPlayingTextColor);
+    const bool selected = GR_SelectColor_ptr(hwnd, &color) != 0;
+    nativeBigClockLoadRuntimeSettings(slot);
+    if (selected) {
+      g_nativeBigClockPlayingTextColor = static_cast<COLORREF>(color);
+    }
+  } else if (command == kBigClockChooseQueueTextColor && GR_SelectColor_ptr) {
+    int color = static_cast<int>(g_nativeBigClockQueueTextColor);
+    const bool selected = GR_SelectColor_ptr(hwnd, &color) != 0;
+    nativeBigClockLoadRuntimeSettings(slot);
+    if (selected) {
+      g_nativeBigClockQueueTextColor = static_cast<COLORREF>(color);
+    }
+  } else if (command == kBigClockChooseBypassTextColor && GR_SelectColor_ptr) {
+    int color = static_cast<int>(g_nativeBigClockBypassTextColor);
+    const bool selected = GR_SelectColor_ptr(hwnd, &color) != 0;
+    nativeBigClockLoadRuntimeSettings(slot);
+    if (selected) {
+      g_nativeBigClockBypassTextColor = static_cast<COLORREF>(color);
+    }
+  } else if (command == kBigClockResetColors) {
+    const NativeBigClockSlotSettings defaults =
+      nativeBigClockDefaultSettings(slot);
+    g_nativeBigClockForeground = defaults.foreground;
+    g_nativeBigClockBackground = defaults.background;
+    g_nativeBigClockProgressColor = defaults.progressColor;
+    g_nativeBigClockRegressColor = defaults.regressColor;
+    g_nativeBigClockPlayingTextColor = defaults.playingTextColor;
+    g_nativeBigClockQueueTextColor = defaults.queueTextColor;
+    g_nativeBigClockBypassTextColor = defaults.bypassTextColor;
+  } else if (command == kBigClockToggleDock) {
+    nativeBigClockStoreRuntimeSettings(slot);
+    nativeBigClockRecreateForDock(slot, !docked);
+    return;
+  }
+  nativeBigClockSaveSettings(slot);
+  InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK nativeBigClockWndProc(
+  HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+  (void)lParam;
+  const int slot = nativeBigClockSlotFromWindow(hwnd);
+  switch (message) {
+    case WM_CREATE:
+    case WM_INITDIALOG:
+      SetTimer(hwnd, kNativeBigClockTimerId, 30, nullptr);
+      return message == WM_INITDIALOG ? TRUE : 0;
+    case WM_TIMER:
+      if (wParam == kNativeBigClockTimerId) {
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      break;
+    case WM_ERASEBKGND:
+      return 1;
+#ifdef _WIN32
+    case WM_GETDLGCODE:
+      return DLGC_WANTALLKEYS | DLGC_WANTCHARS |
+        DLGC_WANTARROWS | DLGC_WANTTAB;
+#endif
+    case WM_PAINT:
+      nativeBigClockPaint(hwnd);
+      return 0;
+    case WM_SIZE:
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    case WM_GETMINMAXINFO: {
+      MINMAXINFO* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+      if (limits) {
+        limits->ptMinTrackSize.x = std::max<LONG>(
+          limits->ptMinTrackSize.x, 380);
+        limits->ptMinTrackSize.y = std::max<LONG>(
+          limits->ptMinTrackSize.y, 64);
+      }
+      return 0;
+    }
+    case WM_CONTEXTMENU:
+    case WM_RBUTTONUP:
+      nativeBigClockHandleMenu(hwnd);
+      return 0;
+    case WM_COMMAND:
+      if (LOWORD(wParam) == IDCANCEL) {
+        if (!g_nativeBigClockClosing[slot]) {
+          nativeCloseBigClockWindow(slot);
+        }
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+      if (!g_nativeBigClockClosing[slot]) {
+        nativeCloseBigClockWindow(slot);
+        return 0;
+      }
+      DestroyWindow(hwnd);
+      return 0;
+    case WM_DESTROY:
+    case WM_NCDESTROY:
+      KillTimer(hwnd, kNativeBigClockTimerId);
+#ifndef __APPLE__
+      g_nativeBigClockBackBuffer[slot].reset();
+      g_nativeBigClockBackBufferWidth[slot] = 0;
+      g_nativeBigClockBackBufferHeight[slot] = 0;
+#endif
+      if (message == WM_DESTROY && DockWindowRemove_ptr &&
+          !g_nativeBigClockClosing[slot]) {
+        DockWindowRemove_ptr(hwnd);
+      }
+      if (g_nativeBigClockHwnd[slot] == hwnd) {
+        g_nativeBigClockHwnd[slot] = nullptr;
+      }
+      const int commandId = nativeBigClockCommandId(slot);
+      if (RefreshToolbar2_ptr && commandId != 0) {
+        RefreshToolbar2_ptr(0, commandId);
+      }
+      return 0;
+  }
+#ifdef _WIN32
+  return DefWindowProcW(hwnd, message, wParam, lParam);
+#else
+  return 0;
+#endif
+}
+
+static bool nativeOpenBigClockWindow(int slot)
+{
+  slot = nativeBigClockSafeSlot(slot);
+  if (nativeBigClockWindowIsOpen(slot)) {
+    if (DockWindowActivate_ptr) {
+      DockWindowActivate_ptr(g_nativeBigClockHwnd[slot]);
+    }
+    ShowWindow(g_nativeBigClockHwnd[slot], SW_SHOW);
+    SetFocus(g_nativeBigClockHwnd[slot]);
+    return true;
+  }
+  nativeBigClockReadSettings(slot);
+  const std::string dockStateKey =
+    nativeBigClockKey(slot, "DOCKSTATE_V1");
+  const bool firstOpen =
+    !nativeAppActiveHasWindowValue(dockStateKey.c_str());
+  if (firstOpen) nativeBigClockPrepareFirstOpenDock(slot);
+  const int x = nativeAppActiveReadWindowInt(
+    nativeBigClockKey(slot, "X_V1").c_str(), 180 + slot * 40);
+  const int y = nativeAppActiveReadWindowInt(
+    nativeBigClockKey(slot, "Y_V1").c_str(), 180 + slot * 40);
+  const int width = std::max(320,
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "W_V1").c_str(), 720));
+  const int height = std::max(64,
+    nativeAppActiveReadWindowInt(
+      nativeBigClockKey(slot, "H_V1").c_str(), 64));
+  const int dockState = nativeAppActiveReadWindowInt(
+    dockStateKey.c_str(), nativeBigClockDefaultDockState(slot));
+  const char* title = nativeBigClockTitle(slot);
+  const char* dockId = nativeBigClockDockId(slot);
+  HWND hwnd = nullptr;
+  g_nativeBigClockOpeningSlot = slot;
+#ifdef _WIN32
+  static const wchar_t* className = L"VS_HOOK_BIG_CLOCK_WINDOW";
+  WNDCLASSEXW wc{};
+  wc.cbSize = sizeof(wc);
+  if (!GetClassInfoExW(g_pluginInstance, className, &wc)) {
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc = nativeBigClockWndProc;
+    wc.hInstance = g_pluginInstance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = className;
+    if (!RegisterClassExW(&wc)) return false;
+  }
+  RECT outer{0, 0, width, height};
+  AdjustWindowRectEx(&outer, WS_OVERLAPPEDWINDOW, FALSE, 0);
+  hwnd = CreateWindowExW(WS_EX_TOOLWINDOW,
+    className, utf8ToWide(title).c_str(), WS_OVERLAPPEDWINDOW,
+    x, y, outer.right - outer.left, outer.bottom - outer.top,
+    GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
+    nullptr, g_pluginInstance, nullptr);
+#else
+  const char* resizableWindow = reinterpret_cast<const char*>(
+    static_cast<INT_PTR>(0x400001));
+  hwnd = CreateDialogParam(g_pluginInstance, resizableWindow,
+    GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
+    reinterpret_cast<DLGPROC>(nativeBigClockWndProc), slot + 1);
+  if (hwnd) {
+    SetWindowText(hwnd, title);
+    SetWindowPos(hwnd, nullptr, x, y, width, height,
+      SWP_NOZORDER | SWP_NOACTIVATE);
+  }
+#endif
+  if (!hwnd) return false;
+  g_nativeBigClockHwnd[slot] = hwnd;
+  if (dockState != 0 && Dock_UpdateDockID_ptr && DockWindowAddEx_ptr) {
+    const int dockerIndex = std::max(0, dockState >> 8);
+    Dock_UpdateDockID_ptr(dockId, dockerIndex);
+    DockWindowAddEx_ptr(hwnd, title, dockId, true);
+    if (DockWindowActivate_ptr) DockWindowActivate_ptr(hwnd);
+    if (DockWindowRefreshForHWND_ptr) DockWindowRefreshForHWND_ptr(hwnd);
+  } else {
+    ShowWindow(hwnd, SW_SHOW);
+  }
+  SetFocus(hwnd);
+  InvalidateRect(hwnd, nullptr, FALSE);
+  const int commandId = nativeBigClockCommandId(slot);
+  if (RefreshToolbar2_ptr && commandId != 0) {
+    RefreshToolbar2_ptr(0, commandId);
+  }
+  return true;
+}
+
+static void nativeCloseBigClockWindow(int slot)
+{
+  slot = nativeBigClockSafeSlot(slot);
+  if (!nativeBigClockWindowIsOpen(slot)) {
+    g_nativeBigClockHwnd[slot] = nullptr;
+    return;
+  }
+  nativeBigClockLoadRuntimeSettings(slot);
+  nativeBigClockSaveSettings(slot);
+  nativeBigClockSaveWindowState(slot);
+  HWND hwnd = g_nativeBigClockHwnd[slot];
+  g_nativeBigClockClosing[slot] = true;
+  if (DockWindowRemove_ptr) DockWindowRemove_ptr(hwnd);
+  if (IsWindow(hwnd)) DestroyWindow(hwnd);
+  g_nativeBigClockHwnd[slot] = nullptr;
+  g_nativeBigClockClosing[slot] = false;
+  const int commandId = nativeBigClockCommandId(slot);
+  if (RefreshToolbar2_ptr && commandId != 0) {
+    RefreshToolbar2_ptr(0, commandId);
+  }
+}
+
+static void nativeToggleBigClockWindow(int slot)
+{
+  slot = nativeBigClockSafeSlot(slot);
+  if (nativeBigClockWindowIsOpen(slot)) nativeCloseBigClockWindow(slot);
+  else nativeOpenBigClockWindow(slot);
+}
+
+// ==========================================================
+// Hook Controller
+// ==========================================================
+
+enum class NativeHookControllerMode {
+  Songs = 0,
+  Tcp,
+  Parts2
+};
+
+struct NativeHookControllerAdjustHit {
+  RECT rect{0, 0, 0, 0};
+  std::string id;
+  int sourceNumber = 0;
+  int delta = 0;
+  bool bpm = false;
+};
+
+struct NativeHookControllerSongHit {
+  RECT rect{0, 0, 0, 0};
+  NativeAppActivePanelModel::Row row;
+  int visibleIndex = -1;
+};
+
+struct NativeHookControllerActionHit {
+  RECT rect{0, 0, 0, 0};
+  std::string action;
+};
+
+struct NativeHookControllerPartsState {
+  RECT panel{0, 0, 0, 0};
+  RECT header{0, 0, 0, 0};
+  RECT list{0, 0, 0, 0};
+  std::vector<NativePartsRowHit> rowHits;
+  std::vector<int> rowOffsets;
+  std::vector<int> rowHeights;
+  int scrollPixels = 0;
+  int maxScrollPixels = 0;
+  NativeUiSmoothScrollState smoothScroll;
+};
+
+static HWND g_nativeHookControllerHwnd = nullptr;
+static bool g_nativeHookControllerClosing = false;
+static NativeHookControllerMode g_nativeHookControllerMode =
+  NativeHookControllerMode::Songs;
+static RECT g_nativeHookControllerTabs[3]{};
+static RECT g_nativeHookControllerDockRect{0, 0, 0, 0};
+static std::vector<NativeHookControllerAdjustHit>
+  g_nativeHookControllerAdjustHits;
+static int g_nativeHookControllerScroll = 0;
+static int g_nativeHookControllerMaxScroll = 0;
+static int g_nativeHookControllerMixerGroupsScroll = 0;
+static int g_nativeHookControllerMixerTracksScroll = 0;
+static std::string g_nativeHookControllerLastFaderClickTrackId;
+static std::chrono::steady_clock::time_point
+  g_nativeHookControllerLastFaderClickAt{};
+static bool g_nativeHookControllerSuppressNextMouseUp = false;
+static std::string g_nativeHookControllerSearchText;
+static size_t g_nativeHookControllerSearchCursor = 0;
+static bool g_nativeHookControllerSearchFocused = false;
+static RECT g_nativeHookControllerSearchRect{0, 0, 0, 0};
+static RECT g_nativeHookControllerScrollbarTrackRect{0, 0, 0, 0};
+static RECT g_nativeHookControllerScrollbarThumbRect{0, 0, 0, 0};
+static bool g_nativeHookControllerScrollbarDragging = false;
+static int g_nativeHookControllerScrollbarGrabOffset = 0;
+static std::vector<NativeHookControllerSongHit>
+  g_nativeHookControllerSongHits;
+static std::vector<NativeAppActivePanelModel::Row>
+  g_nativeHookControllerSongRows;
+static std::vector<size_t>
+  g_nativeHookControllerSongVisibleRowIndices;
+static std::vector<NativeMainRowHit>
+  g_nativeHookControllerSongRowHits;
+static std::vector<int> g_nativeHookControllerSongRowOffsets;
+static std::vector<int> g_nativeHookControllerSongRowHeights;
+static RECT g_nativeHookControllerSongListRect{0, 0, 0, 0};
+static RECT g_nativeHookControllerSongListContentRect{0, 0, 0, 0};
+static int g_nativeHookControllerSongViewportPixels = 0;
+static NativeUiSmoothScrollState
+  g_nativeHookControllerSongSmoothScroll;
+static int g_nativeHookControllerSelectionAnchorVisibleIndex = -1;
+static int g_nativeHookControllerSelectionFocusVisibleIndex = -1;
+static std::vector<NativeHookControllerActionHit>
+  g_nativeHookControllerActionHits;
+static std::vector<NativeMainFamilyButtonHit>
+  g_nativeHookControllerFamilyButtonHits;
+static std::vector<NativeMixerHit> g_nativeHookControllerMixerHits;
+static std::vector<NativeMixerRowHit> g_nativeHookControllerMixerRowHits;
+static std::map<std::string, std::pair<double, double>>
+  g_nativeHookControllerMeterPeaks;
+static std::chrono::steady_clock::time_point
+  g_nativeHookControllerMeterSampleAt{};
+static NativeMixerAreaLayout g_nativeHookControllerMixerGroupsLayout;
+static NativeMixerAreaLayout g_nativeHookControllerMixerTracksLayout;
+static RECT g_nativeHookControllerMixerGroupsRect{0, 0, 0, 0};
+static RECT g_nativeHookControllerMixerTracksRect{0, 0, 0, 0};
+static NativeHookControllerPartsState
+  g_nativeHookControllerPartsState[2];
+static constexpr UINT_PTR kNativeHookControllerTimerId = 0x56484354;
+static constexpr const char* kNativeHookControllerTitle =
+  "Hook Controller";
+static constexpr const char* kNativeHookControllerDockId =
+  "VSHOOKEXT_HOOK_CONTROLLER_V1";
+static void nativeHookControllerRecreateForDock(bool dock);
+static bool nativeUiBeginMainListPress(HWND hwnd, const POINT& point);
+static void nativeUiUpdateMainListDrag(const POINT& point);
+static bool nativeUiAdvanceMainListDragAutoscroll();
+static bool nativeUiFinishMainListPress(HWND hwnd, const POINT& point);
+static void nativeUiResetMainListDrag();
+static bool nativeUiPrepareNavigationKeyDown(HWND hwnd, WPARAM key);
+static bool nativeUiAdvanceNavigationRepeat(HWND hwnd);
+static void nativeUiResetNavigationRepeat(int releasedKey = 0);
+#ifndef __APPLE__
+static std::unique_ptr<WDL_WinMemBitmap> g_nativeHookControllerBackBuffer;
+static int g_nativeHookControllerBackBufferWidth = 0;
+static int g_nativeHookControllerBackBufferHeight = 0;
+#endif
+
+static bool nativeHookControllerWindowIsOpen()
+{
+  return g_nativeHookControllerHwnd &&
+    IsWindow(g_nativeHookControllerHwnd);
+}
+
+static int nativeTranslateHookControllerKeyboardMessage(const MSG* msg)
+{
+  if (!msg || !nativeHookControllerWindowIsOpen()) return 0;
+
+  const auto belongsToController = [](HWND target) {
+    if (!target || !g_nativeHookControllerHwnd) return false;
+    for (HWND current = target; current; current = GetParent(current)) {
+      if (current == g_nativeHookControllerHwnd) return true;
+    }
+    return false;
+  };
+
+  // O foco real ganha do HWND informado pelo accelerator. Dentro do Docker o
+  // REAPER frequentemente informa o container, embora o painel seja quem foi
+  // clicado e deve receber as setas/caracteres.
+  HWND focused = GetFocus();
+  const bool focusedController = belongsToController(focused);
+  const bool messageController = belongsToController(msg->hwnd);
+  if (!focusedController && !messageController) return 0;
+
+  if (msg->hwnd == g_nativeHookControllerHwnd) return -1;
+  SendMessage(g_nativeHookControllerHwnd, msg->message,
+    msg->wParam, msg->lParam);
+  return 1;
+}
+
+// Instala temporariamente a geometria e as linhas do Controller nos mesmos
+// globals usados pela lista principal. Assim setas, repeticao, scroll e
+// drag/drop executam literalmente o mesmo codigo nas duas janelas.
+class NativeHookControllerSongContext {
+public:
+  NativeHookControllerSongContext()
+    : savedRegionsPage_(g_nativeAppActivePanelModel.regionsPage),
+      savedMixerPage_(g_nativeAppActivePanelModel.mixerPage),
+      savedListRect_(g_nativeMainListRect),
+      savedContentRect_(g_nativeMainListContentRect),
+      savedViewport_(g_nativeMainListViewportPixels),
+      savedMaximum_(g_nativeMainListMaxScrollPixels),
+      savedScroll_(g_nativeAppActiveListScrollPixels),
+      savedSmooth_(g_nativeMainSmoothScroll),
+      savedAnchor_(g_nativeUiSelectionAnchorVisibleIndex),
+      savedFocus_(g_nativeUiSelectionFocusVisibleIndex),
+      savedNavigationFocus_(g_nativeMainNavigationFocus)
+  {
+    std::swap(g_nativeAppActivePanelModel.rows,
+      g_nativeHookControllerSongRows);
+    std::swap(g_nativeMainVisibleRowIndices,
+      g_nativeHookControllerSongVisibleRowIndices);
+    std::swap(g_nativeMainRowHits,
+      g_nativeHookControllerSongRowHits);
+    std::swap(g_nativeMainRowOffsets,
+      g_nativeHookControllerSongRowOffsets);
+    std::swap(g_nativeMainRowHeights,
+      g_nativeHookControllerSongRowHeights);
+    g_nativeAppActivePanelModel.regionsPage = true;
+    g_nativeAppActivePanelModel.mixerPage = false;
+    g_nativeMainListRect = g_nativeHookControllerSongListRect;
+    g_nativeMainListContentRect =
+      g_nativeHookControllerSongListContentRect;
+    g_nativeMainListViewportPixels =
+      g_nativeHookControllerSongViewportPixels;
+    g_nativeMainListMaxScrollPixels =
+      g_nativeHookControllerMaxScroll;
+    g_nativeAppActiveListScrollPixels =
+      g_nativeHookControllerScroll;
+    g_nativeMainSmoothScroll =
+      g_nativeHookControllerSongSmoothScroll;
+    g_nativeUiSelectionAnchorVisibleIndex =
+      g_nativeHookControllerSelectionAnchorVisibleIndex;
+    g_nativeUiSelectionFocusVisibleIndex =
+      g_nativeHookControllerSelectionFocusVisibleIndex;
+    g_nativeMainNavigationFocus = "regions";
+    g_nativeHookControllerSongContextActive = true;
+  }
+
+  ~NativeHookControllerSongContext()
+  {
+    g_nativeHookControllerScroll =
+      g_nativeAppActiveListScrollPixels;
+    g_nativeHookControllerMaxScroll =
+      g_nativeMainListMaxScrollPixels;
+    g_nativeHookControllerSongSmoothScroll =
+      g_nativeMainSmoothScroll;
+    g_nativeHookControllerSelectionAnchorVisibleIndex =
+      g_nativeUiSelectionAnchorVisibleIndex;
+    g_nativeHookControllerSelectionFocusVisibleIndex =
+      g_nativeUiSelectionFocusVisibleIndex;
+    std::swap(g_nativeAppActivePanelModel.rows,
+      g_nativeHookControllerSongRows);
+    std::swap(g_nativeMainVisibleRowIndices,
+      g_nativeHookControllerSongVisibleRowIndices);
+    std::swap(g_nativeMainRowHits,
+      g_nativeHookControllerSongRowHits);
+    std::swap(g_nativeMainRowOffsets,
+      g_nativeHookControllerSongRowOffsets);
+    std::swap(g_nativeMainRowHeights,
+      g_nativeHookControllerSongRowHeights);
+    g_nativeAppActivePanelModel.regionsPage = savedRegionsPage_;
+    g_nativeAppActivePanelModel.mixerPage = savedMixerPage_;
+    g_nativeMainListRect = savedListRect_;
+    g_nativeMainListContentRect = savedContentRect_;
+    g_nativeMainListViewportPixels = savedViewport_;
+    g_nativeMainListMaxScrollPixels = savedMaximum_;
+    g_nativeAppActiveListScrollPixels = savedScroll_;
+    g_nativeMainSmoothScroll = savedSmooth_;
+    g_nativeUiSelectionAnchorVisibleIndex = savedAnchor_;
+    g_nativeUiSelectionFocusVisibleIndex = savedFocus_;
+    g_nativeMainNavigationFocus = savedNavigationFocus_;
+    g_nativeHookControllerSongContextActive = false;
+  }
+
+  NativeHookControllerSongContext(
+    const NativeHookControllerSongContext&) = delete;
+  NativeHookControllerSongContext& operator=(
+    const NativeHookControllerSongContext&) = delete;
+
+private:
+  bool savedRegionsPage_ = false;
+  bool savedMixerPage_ = false;
+  RECT savedListRect_{0, 0, 0, 0};
+  RECT savedContentRect_{0, 0, 0, 0};
+  int savedViewport_ = 0;
+  int savedMaximum_ = 0;
+  int savedScroll_ = 0;
+  NativeUiSmoothScrollState savedSmooth_;
+  int savedAnchor_ = -1;
+  int savedFocus_ = -1;
+  std::string savedNavigationFocus_;
+};
+
+static bool nativeHookControllerNavigateSong(int step)
+{
+  NativeHookControllerSongContext context;
+  return nativeNavigateMainRows(step);
+}
+
+static bool nativeHookControllerNavigateParts(bool parts2, int step)
+{
+  NativeHookControllerPartsState& controller =
+    g_nativeHookControllerPartsState[parts2 ? 1 : 0];
+  auto& hits = parts2 ? g_nativeParts2RowHits : g_nativeParts1RowHits;
+  auto& offsets = parts2
+    ? g_nativeParts2RowOffsets : g_nativeParts1RowOffsets;
+  auto& heights = parts2
+    ? g_nativeParts2RowHeights : g_nativeParts1RowHeights;
+  int& scroll = parts2
+    ? g_nativeParts2ScrollPixels : g_nativeParts1ScrollPixels;
+  int& maximum = parts2
+    ? g_nativeParts2MaxScrollPixels : g_nativeParts1MaxScrollPixels;
+  NativeUiSmoothScrollState& smooth = parts2
+    ? g_nativeParts2SmoothScroll : g_nativeParts1SmoothScroll;
+  const auto savedHits = hits;
+  const auto savedOffsets = offsets;
+  const auto savedHeights = heights;
+  const int savedScroll = scroll;
+  const int savedMaximum = maximum;
+  const NativeUiSmoothScrollState savedSmooth = smooth;
+  hits = controller.rowHits;
+  offsets = controller.rowOffsets;
+  heights = controller.rowHeights;
+  scroll = controller.scrollPixels;
+  maximum = controller.maxScrollPixels;
+  smooth = controller.smoothScroll;
+  const bool handled = step == 0
+    ? nativeUiAdvanceSmoothScrolls()
+    : nativeNavigateParts(parts2, step);
+  controller.scrollPixels = scroll;
+  controller.maxScrollPixels = maximum;
+  controller.smoothScroll = smooth;
+  hits = savedHits;
+  offsets = savedOffsets;
+  heights = savedHeights;
+  scroll = savedScroll;
+  maximum = savedMaximum;
+  smooth = savedSmooth;
+  return handled;
+}
+
+static const char* nativeHookControllerModeName(
+  NativeHookControllerMode mode)
+{
+  switch (mode) {
+    case NativeHookControllerMode::Songs: return "Músicas";
+    case NativeHookControllerMode::Tcp: return "TCP";
+    case NativeHookControllerMode::Parts2: return "Parts 2";
+  }
+  return "Músicas";
+}
+
+static void nativeHookControllerSaveWindowState()
+{
+  nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_MODE_V1",
+    static_cast<int>(g_nativeHookControllerMode));
+  if (!nativeHookControllerWindowIsOpen()) return;
+  bool floatingDocker = false;
+  const int dockerIndex = DockIsChildOfDock_ptr
+    ? DockIsChildOfDock_ptr(
+        g_nativeHookControllerHwnd, &floatingDocker)
+    : -1;
+  if (dockerIndex >= 0) {
+    const int dockState = dockerIndex * 256 + 1;
+    nativeAppActiveWriteWindowInt(
+      "HOOK_CONTROLLER_DOCKSTATE_V1", dockState);
+    nativeAppActiveWriteWindowInt(
+      "HOOK_CONTROLLER_LAST_DOCKSTATE_V1", dockState);
+    return;
+  }
+  RECT windowRect{0, 0, 0, 0};
+  RECT clientRect{0, 0, 0, 0};
+  if (!GetWindowRect(g_nativeHookControllerHwnd, &windowRect)) return;
+#ifdef _WIN32
+  if (!GetClientRect(g_nativeHookControllerHwnd, &clientRect)) return;
+#else
+  GetClientRect(g_nativeHookControllerHwnd, &clientRect);
+#endif
+  nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_X_V1", windowRect.left);
+  nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_Y_V1", windowRect.top);
+  nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_W_V1",
+    std::max(1,
+      static_cast<int>(clientRect.right - clientRect.left)));
+  nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_H_V1",
+    std::max(1,
+      static_cast<int>(clientRect.bottom - clientRect.top)));
+  nativeAppActiveWriteWindowInt(
+    "HOOK_CONTROLLER_DOCKSTATE_V1", 0);
+}
+
+static HFONT nativeHookControllerFont(int size, int weight = FW_NORMAL)
+{
+  return CreateFont(-std::max(11, size), 0, 0, 0, weight,
+    FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+    DEFAULT_QUALITY, FF_DONTCARE, "Arial");
+}
+
+static void nativeHookControllerDrawText(HDC dc,
+  const std::string& text, const RECT& rect, COLORREF color,
+  HFONT font, UINT align = DT_LEFT)
+{
+  nativeAppActiveDrawText(dc, text, rect,
+    align | DT_VCENTER | DT_SINGLELINE |
+      DT_END_ELLIPSIS | DT_NOPREFIX,
+      color, font);
+}
+
+static bool nativeUiFamilyChildVisible(bool child,
+  bool drawerOpen, bool revealSearchChildren)
+{
+  return !child || drawerOpen || revealSearchChildren;
+}
+
+static void nativeHookControllerPaintScrollbar(HDC dc,
+  const RECT& lane, int value, int maximum, double visibleRatio)
+{
+  g_nativeHookControllerScrollbarTrackRect = RECT{0, 0, 0, 0};
+  g_nativeHookControllerScrollbarThumbRect = RECT{0, 0, 0, 0};
+  if (lane.right <= lane.left || lane.bottom <= lane.top) return;
+
+  const COLORREF panel = nativeUiListPanelBackgroundColor(
+    nativeUiVisualPrefsForPaint());
+  nativeAppActiveFillRect(dc, lane, panel);
+  nativeAppActiveFillRect(dc,
+    RECT{lane.left, lane.top, lane.left + 1, lane.bottom},
+    nativeUiBlendColor(panel, RGB(74, 82, 89), 0.55));
+  if (maximum <= 0) return;
+
+  const RECT hitTrack{lane.left, lane.top + 2,
+    lane.right, lane.bottom - 2};
+  if (hitTrack.bottom <= hitTrack.top) return;
+  g_nativeHookControllerScrollbarTrackRect = hitTrack;
+  const int visualW = std::min(6,
+    std::max(3, static_cast<int>(hitTrack.right - hitTrack.left)));
+  const int visualLeft = hitTrack.left + std::max(0,
+    (static_cast<int>(hitTrack.right - hitTrack.left) - visualW) / 2);
+  const RECT visualTrack{visualLeft, hitTrack.top,
+    visualLeft + visualW, hitTrack.bottom};
+  const COLORREF edge = RGB(74, 82, 89);
+  nativeAppActiveFillOutlinedRect(dc, visualTrack,
+    RGB(87, 69, 10), edge);
+
+  const int trackH = std::max(1,
+    static_cast<int>(hitTrack.bottom - hitTrack.top));
+  visibleRatio = std::max(0.0, std::min(1.0, visibleRatio));
+  const int thumbH = std::min(trackH, std::max(14,
+    static_cast<int>(std::floor(trackH * visibleRatio * 0.60 + 0.5))));
+  const int travel = std::max(0, trackH - thumbH);
+  const int thumbY = hitTrack.top + static_cast<int>(std::floor(
+    travel * (static_cast<double>(std::max(0, std::min(maximum, value))) /
+      maximum) + 0.5));
+  g_nativeHookControllerScrollbarThumbRect = RECT{
+    hitTrack.left, thumbY, hitTrack.right, thumbY + thumbH};
+  nativeAppActiveFillOutlinedRect(dc,
+    RECT{visualTrack.left, thumbY, visualTrack.right, thumbY + thumbH},
+    nativeUiNamedVisualColor(nativeUiVisualPref(
+      nativeUiVisualPrefsForPaint(), "scrollbar_color_mode", "yellow"),
+      "yellow"), edge);
+}
+
+static void nativeHookControllerSetScrollbarFromPoint(int mouseY)
+{
+  if (g_nativeHookControllerScrollbarTrackRect.bottom <=
+        g_nativeHookControllerScrollbarTrackRect.top ||
+      g_nativeHookControllerScrollbarThumbRect.bottom <=
+        g_nativeHookControllerScrollbarThumbRect.top) {
+    return;
+  }
+  int maximum = 0;
+  int* value = nullptr;
+  NativeUiSmoothScrollState* smooth = nullptr;
+  if (g_nativeHookControllerMode == NativeHookControllerMode::Songs) {
+    maximum = g_nativeHookControllerMaxScroll;
+    value = &g_nativeHookControllerScroll;
+    smooth = &g_nativeHookControllerSongSmoothScroll;
+  } else if (g_nativeHookControllerMode ==
+               NativeHookControllerMode::Parts2) {
+    auto& parts = g_nativeHookControllerPartsState[1];
+    maximum = parts.maxScrollPixels;
+    value = &parts.scrollPixels;
+    smooth = &parts.smoothScroll;
+  } else if (g_nativeHookControllerMode == NativeHookControllerMode::Tcp) {
+    maximum = g_nativeHookControllerMaxScroll;
+    value = &g_nativeHookControllerMixerTracksScroll;
+  }
+  if (!value || maximum <= 0) return;
+
+  const int thumbH =
+    g_nativeHookControllerScrollbarThumbRect.bottom -
+    g_nativeHookControllerScrollbarThumbRect.top;
+  const int travel = std::max(1,
+    static_cast<int>(g_nativeHookControllerScrollbarTrackRect.bottom -
+      g_nativeHookControllerScrollbarTrackRect.top) - thumbH);
+  const int thumbTop = std::max(
+    static_cast<int>(g_nativeHookControllerScrollbarTrackRect.top),
+    std::min(
+      static_cast<int>(g_nativeHookControllerScrollbarTrackRect.bottom) -
+        thumbH,
+      mouseY - g_nativeHookControllerScrollbarGrabOffset));
+  const double ratio = static_cast<double>(
+    thumbTop - g_nativeHookControllerScrollbarTrackRect.top) / travel;
+  *value = std::max(0, std::min(maximum,
+    static_cast<int>(std::floor(ratio * maximum + 0.5))));
+  if (smooth) smooth->target = -1;
+  if (g_nativeHookControllerMode == NativeHookControllerMode::Parts2) {
+    g_nativeHookControllerScroll = *value;
+  }
+}
+
+static bool nativeHookControllerBeginScrollbarDrag(
+  HWND hwnd, const POINT& point)
+{
+  if (!PtInRect(&g_nativeHookControllerScrollbarTrackRect, point)) {
+    return false;
+  }
+  if (PtInRect(&g_nativeHookControllerScrollbarThumbRect, point)) {
+    g_nativeHookControllerScrollbarGrabOffset =
+      point.y - g_nativeHookControllerScrollbarThumbRect.top;
+  } else {
+    g_nativeHookControllerScrollbarGrabOffset = std::max(1,
+      static_cast<int>(g_nativeHookControllerScrollbarThumbRect.bottom -
+        g_nativeHookControllerScrollbarThumbRect.top) / 2);
+  }
+  g_nativeHookControllerScrollbarDragging = true;
+  SetCapture(hwnd);
+  nativeHookControllerSetScrollbarFromPoint(point.y);
+  return true;
+}
+
+static std::vector<NativeAppActivePanelModel::Row>
+nativeHookControllerBuildSongRows()
+{
+  std::vector<NativeSongWindow> songs;
+  std::map<std::string, bool> openFamilyDrawers;
+  std::map<std::string, bool> liveExecutedItems;
+  bool liveEnabled = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+    openFamilyDrawers = g_nativeDirectorOpenFamilyDrawers;
+    liveExecutedItems = g_nativeLiveExecutedItems;
+    liveEnabled = g_nativeLiveMarkEnabled;
+  }
+  songs = nativeUiNormalizeFamilyOrder(
+    songs, nativeUiSongFamilyInfo);
+  const std::string query = nativeLower(nativeTrim(
+    g_nativeHookControllerSearchText));
+  const bool revealSearchChildren =
+    g_nativeHookControllerSearchFocused && !query.empty();
+  const auto drawerIsOpen = [&](const std::string& parentId) {
+    const auto found = openFamilyDrawers.find(parentId);
+    return found != openFamilyDrawers.end() && found->second;
+  };
+  const auto songMatches = [&](const NativeSongWindow& song) {
+    if (query.empty()) return true;
+    const std::string name = nativeLower(
+      nativeUpperNamePtBrKeepParentheses(
+        nativeCleanSongName(song.name)));
+    if (name.find(query) != std::string::npos) return true;
+    const int number = g_nativeAppActivePanelModel.numberRegionMode
+      ? std::abs(song.sourceNumber) : 0;
+    return number > 0 &&
+      std::to_string(number).find(query) != std::string::npos;
+  };
+
+  std::vector<NativeAppActivePanelModel::Row> rows;
+  int displayNumber = 0;
+  int order = 0;
+  for (const auto& song : songs) {
+    if (song.isBlock) continue;
+    const bool child = song.isHashChild || song.isRegionChild;
+    const bool drawerOpen = child && drawerIsOpen(song.parentId);
+    const bool searchMatch = songMatches(song);
+    // Mesma regra da aba Musicas: gaveta fechada sempre oculta os filhos.
+    // A unica excecao e uma pesquisa ativa, que os revela temporariamente.
+    if (!nativeUiFamilyChildVisible(
+          child, drawerOpen, revealSearchChildren)) continue;
+    if (!searchMatch) continue;
+    NativeAppActivePanelModel::Row row;
+    row.id = song.id;
+    row.name = nativeUpperNamePtBrKeepParentheses(
+      nativeCleanSongName(song.name));
+    if (row.name.empty()) row.name = "SEM NOME";
+    row.parentId = song.parentId;
+    row.inheritedColorHex = song.inheritedBlockColorHex;
+    row.start = song.start;
+    row.end = song.end;
+    row.order = ++order;
+    row.displayNumber = ++displayNumber;
+    row.sourceNumber = song.sourceNumber;
+    row.enumIndex = song.enumIndex;
+    row.tunerValue = song.tunerValue;
+    row.child = child;
+    row.markerChild = song.isHashChild && !song.isRegionChild;
+    row.familyParent = song.isHashParent;
+    row.childrenHidden = song.isHashParent && !drawerIsOpen(song.id);
+    row.searchRevealedChild = child && !drawerOpen;
+    row.liveExecuted = liveEnabled &&
+      (song.liveExecuted || liveExecutedItems.count(song.id) != 0);
+    rows.push_back(std::move(row));
+  }
+
+  if (g_nativeRegionsSortMode != 0) {
+    const int mode = g_nativeRegionsSortMode;
+    std::map<std::string,
+      const NativeAppActivePanelModel::Row*> parents;
+    for (auto& row : rows) {
+      if (row.familyParent && !row.id.empty()) parents[row.id] = &row;
+    }
+    const auto anchor = [&](const NativeAppActivePanelModel::Row& row)
+        -> const NativeAppActivePanelModel::Row* {
+      if (row.child && !row.parentId.empty()) {
+        const auto found = parents.find(row.parentId);
+        if (found != parents.end()) return found->second;
+      }
+      return &row;
+    };
+    std::stable_sort(rows.begin(), rows.end(),
+      [&](const auto& left, const auto& right) {
+        const auto* leftAnchor = anchor(left);
+        const auto* rightAnchor = anchor(right);
+        if (leftAnchor == rightAnchor) return left.order < right.order;
+        if (mode == 1 || mode == 2) {
+          const std::string leftName = nativeLower(leftAnchor->name);
+          const std::string rightName = nativeLower(rightAnchor->name);
+          if (leftName == rightName) {
+            return leftAnchor->order < rightAnchor->order;
+          }
+          return mode == 2 ? leftName > rightName : leftName < rightName;
+        }
+        const int leftNumber = std::abs(leftAnchor->sourceNumber);
+        const int rightNumber = std::abs(rightAnchor->sourceNumber);
+        if (leftNumber == rightNumber) {
+          return leftAnchor->order < rightAnchor->order;
+        }
+        return mode == 4
+          ? leftNumber > rightNumber : leftNumber < rightNumber;
+      });
+  }
+  return rows;
+}
+
+static void nativeHookControllerPaintSongs(
+  HDC dc, const RECT& body, HFONT normalFont, HFONT boldFont)
+{
+  const auto& visualPrefs = nativeUiVisualPrefsForPaint();
+  const NativeUiListLayout listLayout =
+    nativeUiCurrentListLayout(visualPrefs);
+  const int rowH = std::max(16, listLayout.baseHeight);
+  const int gap = 3;
+  g_nativeHookControllerSongHits.clear();
+  g_nativeHookControllerActionHits.clear();
+  g_nativeHookControllerFamilyButtonHits.clear();
+
+  std::vector<NativeSongWindow> sourceSongs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    sourceSongs = g_nativeSongWindows;
+  }
+  const std::string totalText = nativeFormatTotalTextFromSeconds(
+    nativeComputeRegionsTotalSec(sourceSongs));
+  const int infoTop = body.top;
+  RECT info{body.left, infoTop, body.right, infoTop + rowH};
+  const int fieldGap = 2;
+  const int fieldsW = std::max(3,
+    static_cast<int>(info.right - info.left) - fieldGap * 2);
+  const std::string controllerTotalText = "Total: " + totalText;
+  const std::string controllerVersionText =
+    std::string("Version ") + VSHOOK_EXTENSION_VERSION;
+  const int desiredTotalW = std::max(58,
+    nativeUiTextWidth(dc, controllerTotalText, normalFont) + 10);
+  const int desiredVersionW = std::max(58,
+    nativeUiTextWidth(dc, controllerVersionText, normalFont) + 10);
+  const int minimumListW = std::min(58,
+    std::max(1, fieldsW / 3));
+  int totalW = desiredTotalW;
+  int versionW = desiredVersionW;
+  int playlistW = fieldsW - totalW - versionW;
+  if (playlistW < minimumListW) {
+    playlistW = minimumListW;
+    const int remaining = std::max(2, fieldsW - playlistW);
+    const int desiredStatusW = std::max(1,
+      desiredTotalW + desiredVersionW);
+    totalW = std::max(1,
+      remaining * desiredTotalW / desiredStatusW);
+    versionW = std::max(1, remaining - totalW);
+  }
+  RECT listNameField{info.left, info.top,
+    info.left + playlistW, info.bottom};
+  RECT totalField{listNameField.right + fieldGap, info.top,
+    listNameField.right + fieldGap + totalW, info.bottom};
+  RECT versionField{totalField.right + fieldGap, info.top,
+    info.right, info.bottom};
+  for (const RECT& field :
+       {listNameField, totalField, versionField}) {
+    nativeAppActiveFillOutlinedRect(dc, field,
+      RGB(36, 38, 43), RGB(77, 84, 92));
+  }
+  RECT listNameText = listNameField;
+  listNameText.left += 6;
+  listNameText.right -= 4;
+  RECT totalTextRect = totalField;
+  totalTextRect.left += 2;
+  totalTextRect.right -= 2;
+  RECT versionTextRect = versionField;
+  versionTextRect.left += 2;
+  versionTextRect.right -= 2;
+  nativeHookControllerDrawText(dc, "Lista Geral", listNameText,
+    RGB(250, 224, 46), boldFont);
+  nativeHookControllerDrawText(dc, controllerTotalText, totalTextRect,
+    RGB(250, 224, 46), normalFont, DT_CENTER);
+  nativeHookControllerDrawText(dc,
+    controllerVersionText,
+    versionTextRect, RGB(250, 224, 46), normalFont, DT_CENTER);
+
+  struct ControllerButtonSpec {
+    std::string id;
+    std::string label;
+    std::string style;
+    bool active = false;
+  };
+  const auto buttonSpec = [&](const std::string& id) {
+    ControllerButtonSpec spec{id, id, "page", false};
+    if (id == "action_all") spec.label = "All";
+    else if (id == "action_create") {
+      spec.label = "Criar"; spec.style = "add_list";
+    } else if (id == "action_add") {
+      spec.label = "Adicionar"; spec.style = "add_existing";
+    } else if (id == "header_live") {
+      spec.label = "Live";
+      spec.style = g_nativeAppActivePanelModel.liveEnabled
+        ? "live_active" : "stop";
+      spec.active = g_nativeAppActivePanelModel.liveEnabled;
+    } else if (id == "header_retry") {
+      spec.label = "Retry"; spec.style = "play";
+    } else if (id == "header_number") {
+      spec.label = "Number";
+      spec.style = g_nativeAppActivePanelModel.numberRegionMode
+        ? "play" : "stop";
+      spec.active = g_nativeAppActivePanelModel.numberRegionMode;
+    } else if (id == "header_sort09") {
+      spec.label = g_nativeRegionsSortMode == 3 ? "9-0" : "0-9";
+    } else if (id == "header_update") {
+      spec.label = "Atualizar"; spec.style = "play";
+    } else if (id == "header_view") {
+      spec.label = "View";
+      spec.style = g_nativeMainViewEnabled ? "play" : "page";
+      spec.active = g_nativeMainViewEnabled;
+    } else if (id == "header_alpha") {
+      spec.label = g_nativeRegionsSortMode == 1 ? "Z-A" : "A-Z";
+    } else if (id == "header_reset") {
+      spec.label = "R"; spec.style = "yellow_reset";
+    }
+    return spec;
+  };
+  // A Hook Controller usa um cabeçalho limpo. Os controles de organização
+  // continuam apenas na interface principal.
+  const std::set<std::string> controllerMusicButtons;
+  const auto configuredLayout = nativeUiReadButtonLayout("regions");
+  const auto controlsForZone = [&](const std::string& zone) {
+    std::vector<ControllerButtonSpec> result;
+    const auto found = configuredLayout.find(zone);
+    if (found == configuredLayout.end()) return result;
+    for (const auto& id : found->second) {
+      if (!controllerMusicButtons.count(id) ||
+          !nativeUiPageButtonVisible(
+            visualPrefs, "regions", id)) {
+        continue;
+      }
+      result.push_back(buttonSpec(id));
+    }
+    return result;
+  };
+  const auto drawConfiguredRow = [&](
+      const std::vector<ControllerButtonSpec>& specs,
+      int top, int left, int right) {
+    if (specs.empty() || right <= left) return;
+    std::vector<int> widths;
+    std::vector<int> minimums;
+    for (const auto& spec : specs) {
+      widths.push_back(std::max(30,
+        nativeUiTextWidth(dc, spec.label, boldFont) + 12));
+      minimums.push_back(std::max(22,
+        nativeUiTextWidth(dc,
+          nativeUiFirstUtf8(spec.label), boldFont) + 8));
+    }
+    nativeUiDistributeWidths(widths, minimums,
+      std::max(1, right - left -
+        gap * (static_cast<int>(specs.size()) - 1)), true);
+    int x = left;
+    for (size_t index = 0; index < specs.size(); ++index) {
+      const int itemRight = index + 1 == specs.size()
+        ? right : std::min(right, x + widths[index]);
+      RECT rect{x, top, itemRight, top + rowH};
+      nativeUiDrawButton(dc, rect, specs[index].label,
+        specs[index].style, specs[index].active, true,
+        boldFont, 3);
+      g_nativeHookControllerActionHits.push_back(
+        {rect, specs[index].id});
+      x = itemRight + gap;
+    }
+  };
+
+  int controlsTop = info.bottom + gap;
+  for (const char* zone : {"top1", "top2", "top3"}) {
+    const auto controls = controlsForZone(zone);
+    if (controls.empty()) continue;
+    drawConfiguredRow(controls, controlsTop, body.left, body.right);
+    controlsTop += rowH + gap;
+  }
+  const auto footerControls = controlsForZone("footer");
+  const int footerSpace = footerControls.empty() ? 0 : rowH + gap;
+  RECT listRect{body.left, controlsTop, body.right,
+    std::max<LONG>(controlsTop, body.bottom - footerSpace)};
+  nativeAppActiveFillOutlinedRect(dc, listRect,
+    nativeUiListPanelBackgroundColor(visualPrefs), RGB(74, 82, 89));
+  RECT header{listRect.left, listRect.top, listRect.right,
+    std::min(listRect.bottom, listRect.top + rowH)};
+  nativeAppActiveFillOutlinedRect(dc, header,
+    RGB(28, 32, 36), RGB(74, 82, 89));
+  RECT title{header.left + 8, header.top,
+    header.left + std::min(72,
+      static_cast<int>(header.right - header.left) / 5),
+    header.bottom};
+  nativeHookControllerDrawText(dc, "Músicas", title,
+    RGB(255, 255, 255), boldFont);
+  const auto headerSpecs = controlsForZone("header");
+  const int headerLeft = title.right + 2;
+  if (!headerSpecs.empty()) {
+    drawConfiguredRow(headerSpecs, header.top,
+      headerLeft, header.right - 2);
+  }
+  if (!footerControls.empty()) {
+    drawConfiguredRow(footerControls,
+      listRect.bottom + gap, body.left, body.right);
+  }
+
+  const auto rows = nativeHookControllerBuildSongRows();
+  constexpr int scrollbarLaneW = 14;
+  const RECT rowsBody{listRect.left + 1, header.bottom,
+    std::max<LONG>(listRect.left + 2,
+      listRect.right - scrollbarLaneW), listRect.bottom - 1};
+  std::vector<NativeUiMainRowMetrics> rowMetrics;
+  rowMetrics.reserve(rows.size());
+  int contentHeight = 0;
+  for (const auto& row : rows) {
+    const bool familyControlVisible = g_nativeMainViewEnabled &&
+      row.familyParent && !row.id.empty();
+    NativeUiMainRowMetrics metrics = nativeUiMeasureMainRow(
+      dc, row,
+      std::max(1, static_cast<int>(rowsBody.right - rowsBody.left)),
+      false, familyControlVisible, false, false,
+      row.familyParent ? boldFont : normalFont, listLayout);
+    metrics.height = std::max(rowH, metrics.height);
+    contentHeight += metrics.height;
+    rowMetrics.push_back(std::move(metrics));
+  }
+  g_nativeHookControllerMaxScroll = std::max(0,
+    contentHeight - static_cast<int>(rowsBody.bottom - rowsBody.top));
+  g_nativeHookControllerScroll = std::max(0,
+    std::min(g_nativeHookControllerMaxScroll,
+      g_nativeHookControllerScroll));
+  g_nativeHookControllerSongRows = rows;
+  g_nativeHookControllerSongVisibleRowIndices.resize(rows.size());
+  g_nativeHookControllerSongRowOffsets.resize(rows.size() + 1);
+  g_nativeHookControllerSongRowHeights.resize(rows.size());
+  g_nativeHookControllerSongRowHits.clear();
+  int measuredOffset = 0;
+  for (size_t index = 0; index < rows.size(); ++index) {
+    g_nativeHookControllerSongVisibleRowIndices[index] = index;
+    g_nativeHookControllerSongRowOffsets[index] =
+      measuredOffset;
+    g_nativeHookControllerSongRowHeights[index] =
+      rowMetrics[index].height;
+    measuredOffset += rowMetrics[index].height;
+  }
+  g_nativeHookControllerSongRowOffsets[rows.size()] = contentHeight;
+  g_nativeHookControllerSongListRect = listRect;
+  g_nativeHookControllerSongListContentRect = rowsBody;
+  g_nativeHookControllerSongViewportPixels = std::max(0,
+    static_cast<int>(rowsBody.bottom - rowsBody.top));
+  int y = rowsBody.top - g_nativeHookControllerScroll;
+  int visibleIndex = 0;
+  const NativeUiClipState rowsClip =
+    nativeUiBeginClipRect(dc, rowsBody);
+  for (size_t rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
+    const auto& row = rows[rowIndex];
+    const NativeAppActivePanelModel::Row* nextRow =
+      rowIndex + 1 < rows.size() ? &rows[rowIndex + 1] : nullptr;
+    const bool drawerFamilyTop = !row.child && nextRow &&
+      nextRow->child && nextRow->parentId == row.id;
+    const bool drawerFamilyChild = row.child && !row.parentId.empty();
+    const bool drawerFamilyBottom = drawerFamilyChild &&
+      (!nextRow || !nextRow->child ||
+       nextRow->parentId != row.parentId);
+    const bool drawerFamilyMember =
+      drawerFamilyTop || drawerFamilyChild;
+    const bool drawerOutlineEnabled = nativeUiVisualPrefBool(
+      visualPrefs, "drawer_outline_enabled",
+      g_nativeAppActivePanelModel.drawerOutlineEnabled);
+    const bool drawerSymbolEnabled = nativeUiVisualPrefBool(
+      visualPrefs, "drawer_symbol_enabled",
+      g_nativeAppActivePanelModel.drawerSymbolEnabled);
+    const COLORREF drawerOutlineColor = nativeDrawerColor(
+      nativeUiVisualPref(visualPrefs, "drawer_outline_color_mode",
+        g_nativeAppActivePanelModel.drawerOutlineColor));
+    const COLORREF drawerSymbolColor = nativeDrawerColor(
+      nativeUiVisualPref(visualPrefs, "drawer_symbol_color_mode",
+        g_nativeAppActivePanelModel.drawerSymbolColor));
+    const bool familyControlVisible = g_nativeMainViewEnabled &&
+      row.familyParent && !row.id.empty();
+    const NativeUiMainRowMetrics& metrics = rowMetrics[rowIndex];
+    RECT rowRect{rowsBody.left, y, rowsBody.right,
+      y + metrics.height - 1};
+    y += metrics.height;
+    if (rowRect.bottom <= rowsBody.top ||
+        rowRect.top >= rowsBody.bottom) {
+      ++visibleIndex;
+      continue;
+    }
+    const COLORREF listFill =
+      nativeUiListPanelBackgroundColor(visualPrefs);
+    const bool playing = nativeAppActiveRowMatches(row,
+      g_nativeAppActivePanelModel.playingId,
+      g_nativeAppActivePanelModel.playingStart,
+      g_nativeAppActivePanelModel.playingEnd);
+    const bool liveMarked = row.liveExecuted;
+    const bool liveExecuted = liveMarked && !playing;
+    const std::string liveMarkColorMode =
+      nativeUiLiveMarkColorMode(visualPrefs);
+    const bool queued = nativeAppActiveRowMatches(row,
+      g_nativeAppActivePanelModel.queuedId,
+      g_nativeAppActivePanelModel.queuedStart,
+      g_nativeAppActivePanelModel.queuedEnd);
+    const bool selectionVisualAllowed =
+      !g_nativeAppActivePanelModel.playing ||
+      g_nativeUiMusicSelectionVisualActive ||
+      g_nativeHookControllerSearchFocused;
+    // A mesma regra da interface principal: depois de um clique/drop local,
+    // o mapa local e a unica fonte visual. Nao mistura a musica nova com o
+    // selectedId atrasado do snapshot do bridge.
+    const bool selected = selectionVisualAllowed && !playing &&
+      (g_nativeUiMainSelectionAuthoritative
+        ? nativeUiMainRowIsSelected(row, true)
+        : nativeAppActiveRowMatches(row,
+            g_nativeAppActivePanelModel.selectedId,
+            g_nativeAppActivePanelModel.selectedStart,
+            g_nativeAppActivePanelModel.selectedEnd));
+    COLORREF rowFill = listFill;
+    if (playing) rowFill = RGB(205, 20, 20);
+    else if (liveExecuted && liveMarkColorMode != "none") {
+      rowFill = nativeUiLiveMarkBackgroundColor(visualPrefs);
+    }
+    else if (!liveExecuted && queued) rowFill =
+      g_nativeAppActivePanelModel.autoplay2Enabled
+        ? RGB(38, 176, 92) : RGB(230, 122, 41);
+    else if (!liveExecuted && selected) rowFill = RGB(26, 128, 242);
+    const bool draggingSource = g_nativeMainListDrag.active &&
+      g_nativeMainListDrag.regionsPage &&
+      ((!g_nativeMainListDrag.sourceIdentity.empty() &&
+        g_nativeMainListDrag.sourceIdentity ==
+          nativeUiMainRowStableIdentity(row)) ||
+       (g_nativeMainListDrag.sourceIdentity.empty() &&
+        g_nativeMainListDrag.sourceIndex == rowIndex));
+    if (draggingSource) rowFill = RGB(122, 51, 219);
+    nativeAppActiveFillRect(dc, rowRect, rowFill);
+    constexpr int indexW = 28;
+    nativeAppActiveFillRect(dc,
+      RECT{rowRect.left, rowRect.top,
+        rowRect.left + indexW, rowRect.bottom},
+      nativeUiNumberBarColor(visualPrefs));
+    if (playing || queued) {
+      const double ratio = std::max(0.0, std::min(1.0,
+        playing ? g_nativeAppActivePanelModel.progress
+                : 1.0 - g_nativeAppActivePanelModel.progress));
+      const COLORREF barColor = playing
+        ? nativeUiNamedVisualColor(
+            nativeUiVisualPref(visualPrefs,
+              "list_progress_color_mode", "green"), "green")
+        : nativeUiNamedVisualColor(
+            nativeUiVisualPref(visualPrefs,
+              "list_regress_color_mode", "yellow"), "yellow");
+      const bool showTop = nativeUiVisualPrefBool(visualPrefs,
+        playing ? "list_current_top" : "list_queue_top", false);
+      const bool showBottom = nativeUiVisualPrefBool(visualPrefs,
+        playing ? "list_current_bottom" : "list_queue_bottom", true);
+      const int barWidth = std::max(0,
+        static_cast<int>(std::floor(
+          std::max(0, static_cast<int>(rowRect.right - rowRect.left) -
+            indexW) * ratio + (queued ? 0.5 : 0.0))));
+      if (barWidth > 0) {
+        const int barLeft = rowRect.left + indexW;
+        const int barRight = std::min(
+          static_cast<int>(rowRect.right), barLeft + barWidth);
+        if (showTop) {
+          nativeAppActiveFillRect(dc,
+            RECT{barLeft, rowRect.top + 1,
+              barRight, rowRect.top + 3}, barColor);
+        }
+        if (showBottom) {
+          nativeAppActiveFillRect(dc,
+            RECT{barLeft, rowRect.bottom - 3,
+              barRight, rowRect.bottom - 1}, barColor);
+        }
+      }
+    }
+    RECT line{rowRect.left, rowRect.bottom,
+      rowRect.right, rowRect.bottom + 1};
+    nativeAppActiveFillRect(dc, line, RGB(48, 53, 60));
+    const int number = g_nativeAppActivePanelModel.numberRegionMode
+      ? std::abs(row.sourceNumber) : std::max(1, row.displayNumber);
+    RECT numberRect{rowRect.left, rowRect.top,
+      rowRect.left + indexW, rowRect.bottom};
+    nativeHookControllerDrawText(dc,
+      row.searchRevealedChild ? "" :
+        (number < 10 ? "0" : "") + std::to_string(number),
+      numberRect, RGB(255, 224, 46), normalFont, DT_CENTER);
+    const std::string duration = nativeAppActiveFormatDuration(
+      std::max(0.0, row.end - row.start));
+    const int durationW = std::max(44,
+      nativeUiTextWidth(dc, duration, normalFont) + 8);
+    RECT durationRect{rowRect.right - durationW, rowRect.top,
+      rowRect.right - 4, rowRect.bottom};
+    int textRight = durationRect.left - 3;
+    if (familyControlVisible &&
+        rowRect.top >= rowsBody.top && rowRect.bottom <= rowsBody.bottom) {
+      const int familyButtonW = 64;
+      const int familyButtonH = std::max(12,
+        std::min(15, static_cast<int>(rowRect.bottom - rowRect.top) - 5));
+      const int familyButtonY = rowRect.top +
+        (static_cast<int>(rowRect.bottom - rowRect.top) - familyButtonH) / 2;
+      RECT familyButtonRect{
+        std::max(static_cast<int>(rowRect.left + indexW + 34),
+          static_cast<int>(durationRect.left) - 4 - familyButtonW),
+        familyButtonY,
+        durationRect.left - 4,
+        familyButtonY + familyButtonH};
+      if (familyButtonRect.right > familyButtonRect.left + 18) {
+        nativeUiDrawButton(dc, familyButtonRect,
+          row.childrenHidden ? "Mostrar" : "Ocultar",
+          row.childrenHidden ? "danger" : "play",
+          true, true, normalFont, 4);
+        g_nativeHookControllerFamilyButtonHits.push_back(
+          {familyButtonRect, row.id, row.childrenHidden});
+        textRight = familyButtonRect.left - 4;
+      }
+    }
+    RECT textRect{rowRect.left + indexW + 7 +
+        (row.child ? 12 : 0), rowRect.top,
+      textRight, rowRect.bottom};
+    if (row.child && drawerSymbolEnabled) {
+      nativeAppActiveFillRect(dc,
+        RECT{rowRect.left + indexW + 10, rowRect.top + 4,
+          rowRect.left + indexW + 12, rowRect.bottom - 4},
+        drawerSymbolColor);
+    }
+    if (selected && !playing) {
+      nativeUiDrawSelectionArrow(dc, textRect.left - 7,
+        (rowRect.top + rowRect.bottom) / 2,
+        nativeUiNamedVisualColor(
+          nativeUiVisualPref(visualPrefs,
+            "regions_selection_arrow_color_mode", "yellow"),
+          "yellow"));
+    }
+    COLORREF textColor = liveExecuted
+      ? RGB(255, 255, 255)
+      : ((playing || queued || selected)
+          ? RGB(13, 13, 13) : RGB(235, 238, 242));
+    COLORREF inherited{};
+    if (!playing && !queued && !selected && !liveExecuted &&
+        nativeAppActiveColorFromHex(
+          row.inheritedColorHex, inherited)) {
+      textColor = inherited;
+    }
+    nativeUiDrawWrappedText(dc, metrics.lines,
+      textRect.left, rowRect.top + listLayout.paddingY,
+      std::max(1, static_cast<int>(textRect.right - textRect.left)),
+      std::max(1, static_cast<int>(rowRect.bottom - rowRect.top) -
+        listLayout.paddingY * 2),
+      listLayout.lineHeight, textColor,
+      row.familyParent ? boldFont : normalFont,
+      liveMarked, RGB(0, 0, 0));
+    nativeHookControllerDrawText(dc, duration, durationRect,
+      liveExecuted ? RGB(255, 224, 46) : textColor,
+      normalFont, DT_RIGHT);
+    RECT hitRect{rowRect.left,
+      std::max(rowRect.top, rowsBody.top), rowRect.right,
+      std::min(rowRect.bottom, rowsBody.bottom)};
+    g_nativeHookControllerSongHits.push_back(
+      {hitRect, row, visibleIndex});
+    g_nativeHookControllerSongRowHits.push_back(
+      {hitRect, visibleIndex,
+        static_cast<size_t>(visibleIndex), rowFill});
+    if (drawerFamilyMember && drawerOutlineEnabled) {
+      const int lineW = 2;
+      const int capW = std::min(28, std::max(8,
+        static_cast<int>(rowRect.right - rowRect.left) / 3));
+      nativeAppActiveFillRect(dc,
+        RECT{rowRect.left, rowRect.top,
+          rowRect.left + lineW, rowRect.bottom}, drawerOutlineColor);
+      nativeAppActiveFillRect(dc,
+        RECT{rowRect.right - lineW, rowRect.top,
+          rowRect.right, rowRect.bottom}, drawerOutlineColor);
+      if (drawerFamilyTop) {
+        nativeAppActiveFillRect(dc,
+          RECT{rowRect.left, rowRect.top,
+            rowRect.left + capW, rowRect.top + lineW}, drawerOutlineColor);
+        nativeAppActiveFillRect(dc,
+          RECT{rowRect.right - capW, rowRect.top,
+            rowRect.right, rowRect.top + lineW}, drawerOutlineColor);
+      }
+      if (drawerFamilyBottom) {
+        nativeAppActiveFillRect(dc,
+          RECT{rowRect.left, rowRect.bottom - lineW,
+            rowRect.left + capW, rowRect.bottom}, drawerOutlineColor);
+        nativeAppActiveFillRect(dc,
+          RECT{rowRect.right - capW, rowRect.bottom - lineW,
+            rowRect.right, rowRect.bottom}, drawerOutlineColor);
+      }
+    }
+    ++visibleIndex;
+  }
+  nativeUiEndClipRect(dc, rowsClip);
+  if (g_nativeMainListDrag.active &&
+      g_nativeMainListDrag.regionsPage) {
+    int lineY = g_nativeHookControllerSongRowHits.empty()
+      ? rowsBody.top
+      : g_nativeHookControllerSongRowHits.back().rect.bottom;
+    for (const auto& hit : g_nativeHookControllerSongRowHits) {
+      if (g_nativeMainListDrag.targetVisibleIndex <=
+          hit.visibleIndex) {
+        lineY = hit.rect.top;
+        break;
+      }
+    }
+    lineY = std::max(static_cast<int>(rowsBody.top),
+      std::min(static_cast<int>(rowsBody.bottom), lineY));
+    const int lineLeft = rowsBody.left + 7;
+    const int lineRight = rowsBody.right - 3;
+    const COLORREF outer = RGB(255, 204, 26);
+    const COLORREF inner = RGB(255, 235, 89);
+    nativeAppActiveFillRect(dc,
+      RECT{lineLeft, lineY - 1, lineRight, lineY + 1}, outer);
+    nativeAppActiveFillRect(dc,
+      RECT{lineLeft + 1, lineY, lineRight - 1, lineY + 1}, inner);
+    nativeAppActiveFillRect(dc,
+      RECT{lineLeft, lineY - 4, lineLeft + 1, lineY + 5}, outer);
+    nativeAppActiveFillRect(dc,
+      RECT{lineRight - 1, lineY - 4, lineRight, lineY + 5}, outer);
+  }
+  const int viewport = std::max(1,
+    static_cast<int>(rowsBody.bottom - rowsBody.top));
+  nativeHookControllerPaintScrollbar(dc,
+    RECT{rowsBody.right, rowsBody.top,
+      listRect.right - 1, rowsBody.bottom},
+    g_nativeHookControllerScroll, g_nativeHookControllerMaxScroll,
+    static_cast<double>(viewport) /
+      std::max(1, viewport + g_nativeHookControllerMaxScroll));
+}
+
+static void nativeHookControllerPaintParts(HDC dc,
+  const RECT& body,
+  const NativeAppActivePanelModel::PartColumn& column,
+  bool parts2,
+  HFONT normalFont, HFONT boldFont)
+{
+  (void)normalFont;
+  NativeHookControllerPartsState& controller =
+    g_nativeHookControllerPartsState[parts2 ? 1 : 0];
+
+  RECT& panel = parts2 ? g_nativeMainParts2Rect : g_nativeMainParts1Rect;
+  RECT& header = parts2
+    ? g_nativeMainParts2HeaderRect : g_nativeMainParts1HeaderRect;
+  RECT& list = parts2
+    ? g_nativeMainParts2ListRect : g_nativeMainParts1ListRect;
+  auto& hits = parts2 ? g_nativeParts2RowHits : g_nativeParts1RowHits;
+  auto& offsets = parts2
+    ? g_nativeParts2RowOffsets : g_nativeParts1RowOffsets;
+  auto& heights = parts2
+    ? g_nativeParts2RowHeights : g_nativeParts1RowHeights;
+  int& scroll = parts2
+    ? g_nativeParts2ScrollPixels : g_nativeParts1ScrollPixels;
+  int& maximum = parts2
+    ? g_nativeParts2MaxScrollPixels : g_nativeParts1MaxScrollPixels;
+  NativeUiSmoothScrollState& smooth = parts2
+    ? g_nativeParts2SmoothScroll : g_nativeParts1SmoothScroll;
+
+  const RECT savedPanel = panel;
+  const RECT savedHeader = header;
+  const RECT savedList = list;
+  const auto savedHits = hits;
+  const auto savedOffsets = offsets;
+  const auto savedHeights = heights;
+  const int savedScroll = scroll;
+  const int savedMaximum = maximum;
+  const NativeUiSmoothScrollState savedSmooth = smooth;
+
+  scroll = controller.scrollPixels;
+  smooth = controller.smoothScroll;
+  nativePaintPartsColumn(dc, body, column, parts2,
+    boldFont, boldFont, nativeUiVisualPrefsForPaint());
+  controller.panel = panel;
+  controller.header = header;
+  controller.list = list;
+  controller.rowHits = hits;
+  controller.rowOffsets = offsets;
+  controller.rowHeights = heights;
+  controller.scrollPixels = scroll;
+  controller.maxScrollPixels = maximum;
+  controller.smoothScroll = smooth;
+  g_nativeHookControllerMaxScroll = maximum;
+  g_nativeHookControllerScroll = scroll;
+  const int viewport = std::max(1,
+    static_cast<int>(controller.list.bottom - controller.list.top));
+  nativeHookControllerPaintScrollbar(dc,
+    RECT{std::max<LONG>(controller.list.left,
+        controller.list.right - 14),
+      controller.list.top, controller.list.right,
+      controller.list.bottom},
+    controller.scrollPixels, controller.maxScrollPixels,
+    static_cast<double>(viewport) /
+      std::max(1, viewport + controller.maxScrollPixels));
+
+  panel = savedPanel;
+  header = savedHeader;
+  list = savedList;
+  hits = savedHits;
+  offsets = savedOffsets;
+  heights = savedHeights;
+  scroll = savedScroll;
+  maximum = savedMaximum;
+  smooth = savedSmooth;
+}
+
+static const NativeSongWindow* nativeHookControllerFindSong(
+  const NativeAppActivePanelModel::Row& row,
+  const std::vector<NativeSongWindow>& songs)
+{
+  for (const auto& song : songs) {
+    if (nativeSongIdMatches(song, row.id)) return &song;
+    if (std::fabs(song.start - row.start) <= 0.003 &&
+        std::fabs(song.end - row.end) <= 0.003) return &song;
+  }
+  return nullptr;
+}
+
+static void nativeHookControllerPaintValues(HDC dc,
+  const RECT& body, bool bpm, HFONT normalFont, HFONT boldFont)
+{
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+  }
+  std::vector<const NativeAppActivePanelModel::Row*> rows;
+  for (const auto& row : g_nativeAppActivePanelModel.rows) {
+    if (!row.block && !row.familyParent) rows.push_back(&row);
+  }
+  const NativeUiListLayout listLayout =
+    nativeUiCurrentListLayout(nativeUiVisualPrefsForPaint());
+  const int rowH = std::max(18, listLayout.baseHeight);
+  g_nativeHookControllerMaxScroll = std::max(0,
+    static_cast<int>(rows.size()) * rowH -
+      static_cast<int>(body.bottom - body.top));
+  g_nativeHookControllerScroll = std::max(0,
+    std::min(g_nativeHookControllerMaxScroll,
+      g_nativeHookControllerScroll));
+  int y = body.top - g_nativeHookControllerScroll;
+  for (const auto* row : rows) {
+    RECT line{body.left, y, body.right, y + rowH - 1};
+    y += rowH;
+    if (line.bottom <= body.top || line.top >= body.bottom) continue;
+    nativeAppActiveFillRect(dc, line, RGB(25, 29, 34));
+    RECT nameRect{line.left + 10, line.top,
+      line.right - 190, line.bottom};
+    nativeHookControllerDrawText(dc,
+      nativeUpperNamePtBrKeepParentheses(row->name),
+      nameRect, RGB(235, 238, 242), normalFont);
+    const int controlPad = std::max(1, rowH / 8);
+    RECT minusRect{line.right - 176, line.top + controlPad,
+      line.right - 136, line.bottom - controlPad};
+    RECT valueRect{line.right - 132, line.top + controlPad,
+      line.right - 52, line.bottom - controlPad};
+    RECT plusRect{line.right - 48, line.top + controlPad,
+      line.right - 8, line.bottom - controlPad};
+    nativeUiDrawButton(dc, minusRect, "−", "danger",
+      false, true, boldFont, 4);
+    nativeAppActiveFillRect(dc, valueRect, RGB(8, 11, 16));
+    nativeUiDrawButton(dc, plusRect, "+", "play",
+      false, true, boldFont, 4);
+    std::string value = "--";
+    const NativeSongWindow* song =
+      nativeHookControllerFindSong(*row, songs);
+    if (bpm) {
+      if (song && song->bpmAvailable) {
+        value = nativeNumber(song->bpmValue, 0);
+      }
+    } else {
+      value = std::to_string(row->tunerValue);
+      if (row->tunerValue > 0) value.insert(value.begin(), '+');
+    }
+    nativeHookControllerDrawText(dc, value, valueRect,
+      bpm ? RGB(87, 166, 255) : RGB(255, 224, 46),
+      boldFont, DT_CENTER);
+    g_nativeHookControllerAdjustHits.push_back(
+      {minusRect, row->id, row->sourceNumber, -1, bpm});
+    g_nativeHookControllerAdjustHits.push_back(
+      {plusRect, row->id, row->sourceNumber, 1, bpm});
+  }
+}
+
+static void nativeHookControllerPaintTcpTrack(HDC dc,
+  RECT row, const NativeMixerPaintTrack& item,
+  int displayIndex, HFONT labelFont, HFONT statusFont,
+  bool compactLayout,
+  const std::string& areaId)
+{
+  const bool master = item.index == 0;
+  const bool compact = compactLayout && !master;
+  const bool nested = compactLayout && !master && item.insideGroup;
+  const COLORREF accent = item.hasTint
+    ? item.knobTint
+    : (master ? RGB(239, 68, 68) : RGB(34, 211, 238));
+  if (nested) {
+    const int baseLeft = row.left;
+    const int depth = std::max(1, std::min(4, item.folderDepth));
+    const int indent = 9 + depth * 8;
+    const COLORREF treeColor = item.selected
+      ? nativeUiBlendColor(RGB(73, 84, 99), accent, 0.55)
+      : RGB(67, 77, 91);
+    for (int level = 0; level < depth; ++level) {
+      const int x = baseLeft + 5 + level * 8;
+      nativeAppActiveFillRect(dc,
+        RECT{x, row.top - 1, x + 1, row.bottom + 1},
+        treeColor);
+    }
+    const int elbowX = baseLeft + 5 + (depth - 1) * 8;
+    const int midY = (row.top + row.bottom) / 2;
+    nativeAppActiveFillRect(dc,
+      RECT{elbowX, midY, baseLeft + indent + 1, midY + 1},
+      treeColor);
+    row.left += indent;
+  }
+  const COLORREF cardFill = item.selected
+    ? nativeUiBlendColor(RGB(21, 25, 31), accent, 0.22)
+    : (item.group
+        ? nativeUiBlendColor(RGB(22, 26, 32), accent, 0.10)
+        : (nested ? RGB(19, 23, 28) : RGB(24, 28, 34)));
+  const COLORREF cardEdge = item.selected
+    ? accent
+    : (item.hasButtonMapping
+        ? RGB(255, 219, 26)
+        : (item.group
+            ? nativeUiBlendColor(RGB(61, 70, 82), accent, 0.32)
+            : (nested ? RGB(48, 57, 68) : RGB(61, 70, 82))));
+  nativeAppActiveFillRoundRect(dc, row,
+    cardFill, cardEdge, nested ? 4 : 7);
+  nativeAppActiveFillRoundRect(dc,
+    RECT{row.left + 2, row.top + (nested ? 1 : (compact ? 2 : 3)),
+      row.left + (nested ? 5 : (compact ? 7 : 8)),
+      row.bottom - (nested ? 1 : (compact ? 2 : 3))},
+    accent, accent, 3);
+
+  const int pad = nested ? 4 : (compact ? 6 : 8);
+  const int railRight = row.left + (nested ? 6 : (compact ? 9 : 11));
+  RECT numberBadge{railRight + 4,
+    row.top + (compact ? 3 : 8),
+    railRight + (nested ? 27 : (compact ? 31 : 36)),
+    row.bottom - (compact ? 3 : 8)};
+  nativeAppActiveFillRoundRect(dc, numberBadge,
+    RGB(12, 15, 19),
+    item.selected ? accent : RGB(53, 61, 72), nested ? 3 : 5);
+  const std::string numberText = item.index == 0
+    ? "M" : (item.index < 10 ? "0" : "") +
+        std::to_string(item.index);
+  nativeAppActiveDrawText(dc, numberText, numberBadge,
+    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    accent, labelFont);
+
+  const int controlGap = nested ? 2 : (compact ? 3 : 4);
+  const int controlW = nested ? 19 : (compact ? 23 : 28);
+  const int ioW = nested ? 25 : (compact ? 29 : 34);
+  const int controlTop = row.top + (compact ? 2 : 7);
+  const int controlH = nested ? 15 : (compact ? 16 : 24);
+  const int soloLeft = row.right - pad - controlW;
+  const int muteLeft = soloLeft - controlGap - controlW;
+  const int ioLeft = muteLeft - controlGap - ioW;
+  RECT ioRect{ioLeft, controlTop,
+    ioLeft + ioW, controlTop + controlH};
+  RECT muteRect{muteLeft, controlTop,
+    muteLeft + controlW, controlTop + controlH};
+  RECT soloRect{soloLeft, controlTop,
+    soloLeft + controlW, controlTop + controlH};
+  const auto paintControl = [&](const RECT& rect,
+      const char* text, COLORREF activeColor, bool active) {
+    const COLORREF fill = active
+      ? activeColor : RGB(13, 16, 21);
+    const COLORREF edge = active
+      ? activeColor : RGB(65, 75, 88);
+    nativeAppActiveFillRoundRect(dc, rect, fill, edge,
+      nested ? 3 : (compact ? 4 : 5));
+    nativeAppActiveDrawText(dc, text, rect,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      active ? RGB(10, 12, 15) : RGB(203, 213, 225),
+      statusFont);
+  };
+  paintControl(ioRect, "I/O", RGB(34, 211, 238), false);
+  paintControl(muteRect, "M", RGB(239, 68, 68), item.mute);
+  paintControl(soloRect, "S", RGB(250, 204, 21), item.solo);
+  g_nativeMixerHits.push_back(
+    {ioRect, NativeMixerHitKind::Route, item.id});
+  g_nativeMixerHits.push_back(
+    {muteRect, NativeMixerHitKind::Mute, item.id});
+  g_nativeMixerHits.push_back(
+    {soloRect, NativeMixerHitKind::Solo, item.id});
+
+  RECT nameRect{numberBadge.right + (nested ? 4 : (compact ? 6 : 8)),
+    row.top + (compact ? 1 : 5),
+    std::max(numberBadge.right + 7, ioRect.left - 6),
+    controlTop + controlH + (compact ? 1 : 3)};
+  const bool renameActive = g_nativeMixerRenameOpen &&
+    g_nativeMixerRenameTrackId == item.id;
+  const std::string displayName = renameActive
+    ? g_nativeMixerRenameInput
+    : (item.group
+        ? std::string("GRUPO  •  ") + item.name
+        : item.name);
+  if (renameActive) {
+    g_nativeMixerRenameInputRect = nameRect;
+    nativeUiDrawEditableText(dc, nameRect,
+      nativeUpperNamePtBr(displayName),
+      NativeUiTextInputKind::MixerRename,
+      true, nativePartsBlinkBright(),
+      RGB(255, 255, 255), labelFont,
+      DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+        DT_END_ELLIPSIS | DT_NOPREFIX);
+  } else {
+    nativeAppActiveDrawText(dc,
+      nativeUpperNamePtBr(displayName), nameRect,
+      DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+        DT_END_ELLIPSIS | DT_NOPREFIX,
+      item.selected ? RGB(255, 255, 255) : RGB(226, 232, 240),
+      labelFont);
+  }
+  g_nativeMixerHits.push_back(
+    {nameRect, NativeMixerHitKind::Name, item.id, item.group});
+
+  const int bottomTop = row.bottom - (nested ? 12 : (compact ? 13 : 21));
+  RECT dbRect{numberBadge.right + (nested ? 4 : (compact ? 6 : 8)), bottomTop,
+    numberBadge.right + (nested ? 42 : (compact ? 50 : 61)),
+    row.bottom - (compact ? 2 : 6)};
+  nativeAppActiveFillRoundRect(dc, dbRect,
+    RGB(10, 13, 17), RGB(53, 61, 72), 4);
+  nativeAppActiveDrawText(dc,
+    nativeUiMixerDbText(item.volume) + (nested ? "" : " dB"), dbRect,
+    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    RGB(250, 204, 21), statusFont);
+  g_nativeMixerHits.push_back(
+    {dbRect, NativeMixerHitKind::ResetVolume, item.id});
+
+  const int meterW = nested ? 44 : (compact ? 50 : 72);
+  const int meterLeft = row.right - pad - meterW;
+  RECT faderRect{dbRect.right + (nested ? 4 : (compact ? 6 : 8)),
+    bottomTop + (compact ? 2 : 4),
+    meterLeft - (nested ? 5 : 7),
+    row.bottom - (compact ? 4 : 9)};
+  if (faderRect.right > faderRect.left + 8) {
+    nativeAppActiveFillRoundRect(dc, faderRect,
+      RGB(8, 11, 15), RGB(55, 65, 77), 4);
+    const double ratio = nativeVolumeToRatio(item.volume);
+    RECT levelRect{faderRect.left + 2, faderRect.top + 2,
+      faderRect.left + 2 + std::max(0,
+        static_cast<int>((faderRect.right - faderRect.left - 4) * ratio)),
+      faderRect.bottom - 2};
+    if (levelRect.right > levelRect.left) {
+      nativeAppActiveFillRoundRect(dc, levelRect,
+        nativeUiBlendColor(accent, RGB(255, 255, 255), 0.10),
+        accent, 3);
+    }
+    const int zeroX = faderRect.left +
+      static_cast<int>((faderRect.right - faderRect.left) * 0.76);
+    nativeAppActiveFillRect(dc,
+      RECT{zeroX, faderRect.top - 2,
+        zeroX + 1, faderRect.bottom + 2},
+      RGB(148, 163, 184));
+    const int knobX = faderRect.left +
+      static_cast<int>((faderRect.right - faderRect.left - 5) * ratio);
+    nativeAppActiveFillRoundRect(dc,
+      RECT{knobX, faderRect.top - 4,
+        knobX + 5, faderRect.bottom + 4},
+      RGB(248, 250, 252), accent, 2);
+    RECT faderHit{faderRect.left,
+      faderRect.top - (compact ? 3 : 7),
+      faderRect.right,
+      faderRect.bottom + (compact ? 3 : 7)};
+    g_nativeMixerHits.push_back(
+      {faderHit, NativeMixerHitKind::Volume, item.id});
+  }
+  const auto meterRatio = [](double peak) {
+    if (!std::isfinite(peak) || peak <= 0.000001) return 0.0;
+    const double db = 20.0 * std::log10(peak);
+    return std::max(0.0, std::min(1.0,
+      (db + 60.0) / 60.0));
+  };
+  const int meterHeight = compact ? 4 : 5;
+  const auto paintMeter = [&](int top, double peak) {
+    RECT meter{meterLeft, top, row.right - pad,
+      top + meterHeight};
+    nativeAppActiveFillRoundRect(dc, meter,
+      RGB(7, 10, 13), RGB(45, 55, 65), 2);
+    const double ratio = meterRatio(peak);
+    RECT fill{meter.left + 1, meter.top + 1,
+      meter.left + 1 + std::max(0,
+        static_cast<int>((meter.right - meter.left - 2) * ratio)),
+      meter.bottom - 1};
+    if (fill.right > fill.left) {
+      const COLORREF meterColor = peak >= 1.0
+        ? RGB(239, 68, 68)
+        : (ratio >= 0.82 ? RGB(250, 204, 21)
+                         : RGB(34, 197, 94));
+      nativeAppActiveFillRoundRect(dc, fill,
+        meterColor, meterColor, 1);
+    }
+  };
+  const int meterTop = bottomTop + (compact ? 1 : 2);
+  paintMeter(meterTop, item.peakLeft);
+  paintMeter(meterTop + (compact ? 5 : 7), item.peakRight);
+  g_nativeMixerRowHits.push_back(
+    {row, areaId, item.id, displayIndex});
+}
+
+static void nativeHookControllerPaintTcp(HDC dc,
+  const RECT& body, HFONT normalFont, HFONT boldFont)
+{
+  const auto savedHits = g_nativeMixerHits;
+  const auto savedRowHits = g_nativeMixerRowHits;
+  const NativeMixerAreaLayout savedGroupsLayout =
+    g_nativeMixerGroupsLayout;
+  const NativeMixerAreaLayout savedTracksLayout =
+    g_nativeMixerTracksLayout;
+  const RECT savedGroupsRect = g_nativeMixerGroupsRect;
+  const RECT savedTracksRect = g_nativeMixerTracksRect;
+  const RECT savedRenameRect = g_nativeMixerRenameInputRect;
+  g_nativeMixerHits.clear();
+  g_nativeMixerRowHits.clear();
+  g_nativeMixerGroupsLayout = NativeMixerAreaLayout{};
+  g_nativeMixerTracksLayout = NativeMixerAreaLayout{};
+  g_nativeMixerGroupsRect = RECT{0, 0, 0, 0};
+  g_nativeMixerTracksRect = body;
+
+  char projectPath[2048] = "";
+  ReaProject* project = getCurrentProject(
+    projectPath, static_cast<int>(sizeof(projectPath)));
+  const auto meterNow = std::chrono::steady_clock::now();
+  const UINT meterIntervalMs = nativeUiDesiredFrameInterval();
+  const bool refreshMeterSamples =
+    g_nativeHookControllerMeterSampleAt.time_since_epoch().count() == 0 ||
+    std::chrono::duration_cast<std::chrono::milliseconds>(
+      meterNow - g_nativeHookControllerMeterSampleAt).count() >=
+        static_cast<long long>(meterIntervalMs);
+  if (refreshMeterSamples) {
+    // Usa literalmente a mesma cadencia adaptativa da aba Mixer: rapida
+    // durante playback/manipulacao e economica quando a interface esta ociosa.
+    g_nativeHookControllerMeterSampleAt = meterNow;
+  }
+  const auto applyMeterSample = [&](NativeMixerPaintTrack& item,
+      MediaTrack* track) {
+    if (refreshMeterSamples) {
+      item.peakLeft = nativeSafeTrackPeak(track, 0);
+      item.peakRight = nativeSafeTrackPeak(track, 1);
+      g_nativeHookControllerMeterPeaks[item.id] =
+        {item.peakLeft, item.peakRight};
+      return;
+    }
+    const auto cached =
+      g_nativeHookControllerMeterPeaks.find(item.id);
+    if (cached != g_nativeHookControllerMeterPeaks.end()) {
+      item.peakLeft = cached->second.first;
+      item.peakRight = cached->second.second;
+    }
+  };
+  std::vector<NativeMixerPaintTrack> tracks;
+  if (project && GetMasterTrack_ptr) {
+    if (MediaTrack* master = GetMasterTrack_ptr(project)) {
+      NativeMixerPaintTrack item =
+        nativeUiMixerTrackItem(master, 0, true, false);
+      applyMeterSample(item, master);
+      tracks.push_back(std::move(item));
+    }
+  }
+  if (project && CountTracks_ptr && GetTrack_ptr) {
+    const int count = CountTracks_ptr(project);
+    tracks.reserve(tracks.size() +
+      static_cast<size_t>(std::max(0, count)));
+    int folderDepth = 0;
+    for (int index = 0; index < count; ++index) {
+      MediaTrack* track = GetTrack_ptr(project, index);
+      if (!track) continue;
+      NativeMixerPaintTrack item = nativeUiMixerTrackItem(
+        track, index + 1, false, false);
+      item.folderDepth = std::max(0, folderDepth);
+      item.insideGroup = item.folderDepth > 0;
+      item.folderDelta = GetMediaTrackInfo_Value_ptr
+        ? static_cast<int>(std::lround(
+            GetMediaTrackInfo_Value_ptr(track, "I_FOLDERDEPTH")))
+        : 0;
+      item.group = item.folderDelta > 0;
+      applyMeterSample(item, track);
+      tracks.push_back(std::move(item));
+      folderDepth = std::max(0, folderDepth +
+        tracks.back().folderDelta);
+    }
+  }
+
+  nativeAppActiveFillRoundRect(dc, body,
+    RGB(18, 21, 25), RGB(74, 82, 89), 0);
+  const int headerH = std::max(22,
+    std::min(30, static_cast<int>(body.bottom - body.top) / 8));
+  RECT header{body.left, body.top, body.right,
+    std::min(static_cast<int>(body.bottom),
+      static_cast<int>(body.top) + headerH)};
+  nativeAppActiveFillOutlinedRect(dc, header,
+    RGB(13, 16, 20), RGB(74, 82, 89));
+  RECT headerTitle{header.left + 9, header.top + 1,
+    header.right - 90, header.bottom - 1};
+  nativeAppActiveDrawText(dc, "TRACK CONTROL PANEL", headerTitle,
+    DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+      DT_END_ELLIPSIS | DT_NOPREFIX,
+    RGB(255, 224, 46), boldFont);
+  RECT countRect{std::max(header.left, header.right - 86),
+    header.top + 1, header.right - 8, header.bottom - 1};
+  nativeAppActiveDrawText(dc,
+    std::to_string(tracks.size()) +
+      (tracks.size() == 1 ? " PISTA" : " PISTAS"),
+    countRect,
+    DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    RGB(148, 163, 184), normalFont);
+
+  constexpr int scrollbarLaneW = 14;
+  RECT content{body.left + 4, header.bottom + 4,
+    std::max<LONG>(body.left + 10,
+      body.right - 4 - scrollbarLaneW), body.bottom - 4};
+  const auto rowHeightFor = [](const NativeMixerPaintTrack& track) {
+    if (track.index == 0) return 54;
+    if (track.group) return 40;
+    if (track.insideGroup) return 30;
+    return 36;
+  };
+  const auto rowGapFor = [](const NativeMixerPaintTrack& track) {
+    if (track.index == 0) return 5;
+    if (track.group) return 3;
+    return track.insideGroup ? 1 : 2;
+  };
+  const int contentHeight = std::max(1,
+    static_cast<int>(content.bottom - content.top));
+  int maxScroll = 0;
+  if (!tracks.empty()) {
+    int usedFromBottom = 0;
+    maxScroll = static_cast<int>(tracks.size()) - 1;
+    for (int index = static_cast<int>(tracks.size()) - 1;
+         index >= 0; --index) {
+      const int pitch = rowHeightFor(
+        tracks[static_cast<size_t>(index)]) +
+        rowGapFor(tracks[static_cast<size_t>(index)]);
+      if (usedFromBottom > 0 &&
+          usedFromBottom + pitch > contentHeight) {
+        break;
+      }
+      usedFromBottom += pitch;
+      maxScroll = index;
+    }
+  }
+  g_nativeHookControllerMixerTracksScroll = std::max(0,
+    std::min(maxScroll,
+      g_nativeHookControllerMixerTracksScroll));
+  g_nativeMixerTracksLayout.contentRect = content;
+  g_nativeMixerTracksLayout.rowPitch = 36;
+  g_nativeMixerTracksLayout.visibleRows = 1;
+  g_nativeMixerTracksLayout.scroll =
+    g_nativeHookControllerMixerTracksScroll;
+  g_nativeMixerTracksLayout.itemCount =
+    static_cast<int>(tracks.size());
+  if (tracks.empty()) {
+    nativeAppActiveDrawText(dc, "Nenhuma pista no projeto", content,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      RGB(100, 116, 139), normalFont);
+  } else {
+    int y = content.top;
+    const int first = g_nativeHookControllerMixerTracksScroll;
+    int paintedRows = 0;
+    const NativeUiClipState clip =
+      nativeUiBeginClipRect(dc, content);
+    for (int index = first;
+         index < static_cast<int>(tracks.size()) &&
+           y < content.bottom;
+         ++index) {
+      const int rowHeight = rowHeightFor(
+        tracks[static_cast<size_t>(index)]);
+      const int rowGap = rowGapFor(
+        tracks[static_cast<size_t>(index)]);
+      RECT shadow{content.left + 2, y + 2,
+        content.right, y + rowHeight + 2};
+      nativeAppActiveFillRect(dc, shadow, RGB(7, 9, 12));
+      RECT row{content.left, y,
+        content.right - 2, y + rowHeight};
+      nativeHookControllerPaintTcpTrack(dc, row,
+        tracks[static_cast<size_t>(index)],
+        index + 1,
+        boldFont, normalFont);
+      y += rowHeight + rowGap;
+      ++paintedRows;
+    }
+    nativeUiEndClipRect(dc, clip);
+    g_nativeMixerTracksLayout.visibleRows =
+      std::max(1, paintedRows);
+  }
+  g_nativeHookControllerMixerHits = g_nativeMixerHits;
+  g_nativeHookControllerMixerRowHits = g_nativeMixerRowHits;
+  g_nativeHookControllerMixerGroupsLayout =
+    g_nativeMixerGroupsLayout;
+  g_nativeHookControllerMixerTracksLayout =
+    g_nativeMixerTracksLayout;
+  g_nativeHookControllerMixerGroupsRect = g_nativeMixerGroupsRect;
+  g_nativeHookControllerMixerTracksRect = g_nativeMixerTracksRect;
+
+  nativeHookControllerPaintScrollbar(dc,
+    RECT{content.right, content.top,
+      body.right - 4, content.bottom},
+    g_nativeHookControllerMixerTracksScroll, maxScroll,
+    tracks.empty() ? 1.0 :
+      static_cast<double>(
+        std::max(1, g_nativeMixerTracksLayout.visibleRows)) /
+        std::max(1, static_cast<int>(tracks.size())));
+
+  g_nativeMixerHits = savedHits;
+  g_nativeMixerRowHits = savedRowHits;
+  g_nativeMixerGroupsLayout = savedGroupsLayout;
+  g_nativeMixerTracksLayout = savedTracksLayout;
+  g_nativeMixerGroupsRect = savedGroupsRect;
+  g_nativeMixerTracksRect = savedTracksRect;
+  g_nativeMixerRenameInputRect = savedRenameRect;
+  g_nativeHookControllerMaxScroll = maxScroll;
+}
+
+static void nativeHookControllerPaint(HWND hwnd)
+{
+  PAINTSTRUCT ps{};
+  HDC paintDc = BeginPaint(hwnd, &ps);
+  if (!paintDc) return;
+  g_nativeHookControllerScrollbarTrackRect = RECT{0, 0, 0, 0};
+  g_nativeHookControllerScrollbarThumbRect = RECT{0, 0, 0, 0};
+  RECT client{0, 0, 0, 0};
+  GetClientRect(hwnd, &client);
+  const int width = std::max(0,
+    static_cast<int>(client.right - client.left));
+  const int height = std::max(0,
+    static_cast<int>(client.bottom - client.top));
+#ifdef __APPLE__
+  HDC dc = paintDc;
+#else
+  if (!g_nativeHookControllerBackBuffer ||
+      g_nativeHookControllerBackBufferWidth != width ||
+      g_nativeHookControllerBackBufferHeight != height) {
+    g_nativeHookControllerBackBuffer.reset();
+    g_nativeHookControllerBackBuffer =
+      std::make_unique<WDL_WinMemBitmap>();
+    g_nativeHookControllerBackBuffer->DoSize(paintDc, width, height);
+    g_nativeHookControllerBackBufferWidth = width;
+    g_nativeHookControllerBackBufferHeight = height;
+  }
+  HDC dc = g_nativeHookControllerBackBuffer &&
+      g_nativeHookControllerBackBuffer->GetDC()
+    ? g_nativeHookControllerBackBuffer->GetDC() : paintDc;
+#endif
+  const auto& visualPrefs = nativeUiVisualPrefsForPaint();
+  g_nativeUiModernButtonDesign = nativeLower(
+    nativeUiVisualPref(visualPrefs,
+      "button_design_mode", "square")) == "round";
+  g_nativeUiButtonPaintFont = nativeUiConfiguredFont(
+    nativeUiVisualPref(visualPrefs,
+      "button_font_mode", "default"));
+  const COLORREF interfaceBackground =
+    nativeUiInterfaceBackgroundColor(visualPrefs);
+  nativeAppActiveFillRect(dc, client, RGB(5, 5, 6));
+  nativeAppActiveFillRoundRect(dc, client,
+    interfaceBackground, interfaceBackground, 10);
+  g_nativeHookControllerAdjustHits.clear();
+  const int padding = 5;
+#ifdef __APPLE__
+  const int titleH = 22;
+  const int tabH = 22;
+#else
+  const int titleH = 20;
+  const int tabH = 18;
+#endif
+  const int tabGap = 4;
+  const int tabColumns = 3;
+  const int tabW = std::max(24,
+    (width - padding * 2 - tabGap * (tabColumns - 1)) /
+      tabColumns);
+  HFONT normalFont = nativeUiConfiguredFont(
+    nativeUiVisualPref(visualPrefs,
+      "playlist_font_mode", "default"));
+  HFONT boldFont = nativeUiSharedFont();
+  RECT titleStrip{padding, padding,
+    client.right - padding, padding + titleH};
+  nativeAppActiveFillRect(dc, titleStrip,
+    nativeUiBlendColor(interfaceBackground,
+      RGB(22, 27, 34), 0.78));
+  const int dockWidth = std::max(36, std::min(62,
+    std::max(36, width / 5)));
+  g_nativeHookControllerDockRect = RECT{
+    std::max(titleStrip.left, titleStrip.right - dockWidth),
+    titleStrip.top + 2,
+    titleStrip.right - 2,
+    titleStrip.bottom - 2};
+  RECT titleText{titleStrip.left + 7, titleStrip.top,
+    g_nativeHookControllerDockRect.left - 5,
+    titleStrip.bottom};
+  g_nativeHookControllerSearchRect = titleText;
+  nativeAppActiveFillOutlinedRect(dc,
+    g_nativeHookControllerSearchRect,
+    g_nativeHookControllerSearchFocused
+      ? RGB(54, 54, 45) : RGB(36, 38, 43),
+    g_nativeHookControllerSearchFocused
+      ? RGB(255, 224, 46)
+      : nativeUiNamedVisualColor(
+          nativeUiVisualPref(visualPrefs,
+            "search_border_color_mode", "green"), "green"));
+  RECT controllerSearchText = g_nativeHookControllerSearchRect;
+  controllerSearchText.left += 7;
+  controllerSearchText.right -= 5;
+  nativeHookControllerDrawText(dc,
+    g_nativeHookControllerSearchText.empty()
+      ? "Buscar música..." : g_nativeHookControllerSearchText,
+    controllerSearchText,
+    g_nativeHookControllerSearchText.empty()
+      ? RGB(148, 163, 184) : RGB(248, 250, 252),
+    boldFont);
+  if (g_nativeHookControllerSearchFocused &&
+      ((std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()
+        / 500) % 2) == 0) {
+    const std::string before =
+      g_nativeHookControllerSearchText.substr(0,
+        std::min(g_nativeHookControllerSearchCursor,
+          g_nativeHookControllerSearchText.size()));
+    const int caretX = controllerSearchText.left +
+      nativeUiTextWidth(dc, before, boldFont);
+    nativeAppActiveFillRect(dc,
+      RECT{caretX, controllerSearchText.top + 3,
+        caretX + 1, controllerSearchText.bottom - 3},
+      RGB(255, 224, 46));
+  }
+  bool floatingDocker = false;
+  const bool docked = DockIsChildOfDock_ptr &&
+    DockIsChildOfDock_ptr(
+      g_nativeHookControllerHwnd, &floatingDocker) >= 0;
+  nativeUiDrawButton(dc, g_nativeHookControllerDockRect,
+    docked ? "Undock" : "Dock",
+    docked ? "stop" : "play", docked, true,
+    boldFont, 4);
+  const int tabsTop = titleStrip.bottom + 4;
+  for (int index = 0; index < 3; ++index) {
+    const int column = index % tabColumns;
+    const int row = 0;
+    const int left = padding + column * (tabW + tabGap);
+    const int top = tabsTop + row * (tabH + tabGap);
+    RECT tab{left, top,
+      column == tabColumns - 1
+        ? client.right - padding : left + tabW,
+      top + tabH};
+    g_nativeHookControllerTabs[index] = tab;
+    const bool selected =
+      static_cast<int>(g_nativeHookControllerMode) == index;
+    nativeUiDrawButton(dc, tab,
+      nativeHookControllerModeName(
+        static_cast<NativeHookControllerMode>(index)),
+      selected ? "play" : "yellow_reset",
+      selected, true, boldFont, 4);
+  }
+  const int tabsBottom = tabsTop + tabH;
+  RECT body{padding, tabsBottom + 5,
+    client.right - padding, client.bottom - padding};
+  const COLORREF listPanelFill =
+    nativeUiListPanelBackgroundColor(visualPrefs);
+  nativeAppActiveFillRoundRect(dc, body,
+    listPanelFill, RGB(74, 82, 89), 0);
+  RECT contentBody{body.left + 1, body.top + 1,
+    body.right - 1, body.bottom - 1};
+  if (g_nativeHookControllerMode !=
+        NativeHookControllerMode::Songs &&
+      g_nativeHookControllerMode !=
+        NativeHookControllerMode::Parts2 &&
+      g_nativeHookControllerMode !=
+        NativeHookControllerMode::Tcp) {
+    const NativeUiListLayout listLayout =
+      nativeUiCurrentListLayout(visualPrefs);
+    const int headerH = std::max(17, listLayout.baseHeight);
+    RECT header{body.left, body.top, body.right,
+      std::min(body.bottom, body.top + headerH)};
+    nativeAppActiveFillOutlinedRect(dc, header,
+      RGB(28, 32, 36), RGB(74, 82, 89));
+    RECT headerText{header.left + 8, header.top + 1,
+      header.right - 8, header.bottom - 1};
+    nativeHookControllerDrawText(dc,
+      nativeHookControllerModeName(g_nativeHookControllerMode),
+      headerText, RGB(255, 255, 255), boldFont);
+    contentBody.top = header.bottom;
+  }
+  switch (g_nativeHookControllerMode) {
+    case NativeHookControllerMode::Songs:
+      nativeHookControllerPaintSongs(
+        dc, contentBody, normalFont, boldFont);
+      break;
+    case NativeHookControllerMode::Tcp:
+      nativeHookControllerPaintTcp(
+        dc, contentBody, normalFont, boldFont);
+      break;
+    case NativeHookControllerMode::Parts2:
+      nativeHookControllerPaintParts(dc, contentBody,
+        g_nativeAppActivePanelModel.parts2, true,
+        normalFont, boldFont);
+      break;
+  }
+#ifndef __APPLE__
+  if (dc != paintDc && width > 0 && height > 0) {
+    BitBlt(paintDc, 0, 0, width, height,
+      dc, 0, 0, SRCCOPY);
+  }
+#endif
+  EndPaint(hwnd, &ps);
+}
+
+static bool nativeHookControllerHandlePartsClick(
+  const POINT& point, bool rightClick, bool parts2)
+{
+  NativeHookControllerPartsState& controller =
+    g_nativeHookControllerPartsState[parts2 ? 1 : 0];
+  RECT& panel = parts2 ? g_nativeMainParts2Rect : g_nativeMainParts1Rect;
+  RECT& header = parts2
+    ? g_nativeMainParts2HeaderRect : g_nativeMainParts1HeaderRect;
+  RECT& list = parts2
+    ? g_nativeMainParts2ListRect : g_nativeMainParts1ListRect;
+  auto& hits = parts2 ? g_nativeParts2RowHits : g_nativeParts1RowHits;
+  auto& offsets = parts2
+    ? g_nativeParts2RowOffsets : g_nativeParts1RowOffsets;
+  auto& heights = parts2
+    ? g_nativeParts2RowHeights : g_nativeParts1RowHeights;
+  int& scroll = parts2
+    ? g_nativeParts2ScrollPixels : g_nativeParts1ScrollPixels;
+  int& maximum = parts2
+    ? g_nativeParts2MaxScrollPixels : g_nativeParts1MaxScrollPixels;
+  NativeUiSmoothScrollState& smooth = parts2
+    ? g_nativeParts2SmoothScroll : g_nativeParts1SmoothScroll;
+
+  const RECT savedPanel = panel;
+  const RECT savedHeader = header;
+  const RECT savedList = list;
+  const auto savedHits = hits;
+  const auto savedOffsets = offsets;
+  const auto savedHeights = heights;
+  const int savedScroll = scroll;
+  const int savedMaximum = maximum;
+  const NativeUiSmoothScrollState savedSmooth = smooth;
+
+  panel = controller.panel;
+  header = controller.header;
+  list = controller.list;
+  hits = controller.rowHits;
+  offsets = controller.rowOffsets;
+  heights = controller.rowHeights;
+  scroll = controller.scrollPixels;
+  maximum = controller.maxScrollPixels;
+  smooth = controller.smoothScroll;
+  const bool handled =
+    nativeHandlePartsColumnClick(point, rightClick, parts2);
+  controller.scrollPixels = scroll;
+  controller.smoothScroll = smooth;
+
+  panel = savedPanel;
+  header = savedHeader;
+  list = savedList;
+  hits = savedHits;
+  offsets = savedOffsets;
+  heights = savedHeights;
+  scroll = savedScroll;
+  maximum = savedMaximum;
+  smooth = savedSmooth;
+  return handled;
+}
+
+static bool nativeHookControllerConfirm(
+  const char* message, const char* title)
+{
+  return !ShowMessageBox_ptr ||
+    ShowMessageBox_ptr(message, title, 4) == 6;
+}
+
+static bool nativeHookControllerChooseTrackColor(
+  HWND owner, const std::string& trackId)
+{
+  if (trackId.empty() || !GR_SelectColor_ptr ||
+      !GetMediaTrackInfo_Value_ptr ||
+      !SetMediaTrackInfo_Value_ptr) {
+    return false;
+  }
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project) return false;
+  MediaTrack* target = nullptr;
+  if (trackId == "MASTER_TRACK" && GetMasterTrack_ptr) {
+    target = GetMasterTrack_ptr(project);
+  } else if (CountTracks_ptr && GetTrack_ptr) {
+    const int count = CountTracks_ptr(project);
+    for (int index = 0; index < count; ++index) {
+      MediaTrack* track = GetTrack_ptr(project, index);
+      if (track && nativeTrackGuid(track, index) == trackId) {
+        target = track;
+        break;
+      }
+    }
+  }
+  if (!target) return false;
+  if (trackId == "MASTER_TRACK") {
+    int color = RGB(126, 52, 52);
+    if (GetProjExtState_ptr) {
+      char stored[64] = "";
+      if (GetProjExtState_ptr(project, kMixerBindingExtSection,
+            "HOOK_CONTROLLER_MASTER_COLOR_V1",
+            stored, static_cast<int>(sizeof(stored))) > 0) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(stored, &end, 10);
+        if (end && end != stored) {
+          color = static_cast<int>(parsed & 0x00ffffff);
+        }
+      }
+    }
+    if (!GR_SelectColor_ptr(owner, &color)) return true;
+    if (SetProjExtState_ptr) {
+      const std::string stored = std::to_string(
+        static_cast<unsigned long>(color & 0x00ffffff));
+      SetProjExtState_ptr(project, kMixerBindingExtSection,
+        "HOOK_CONTROLLER_MASTER_COLOR_V1", stored.c_str());
+      if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+    }
+    g_nativeForceSnapshotBuild.store(true);
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
+  const int raw = static_cast<int>(
+    GetMediaTrackInfo_Value_ptr(target, "I_CUSTOMCOLOR"));
+  int color = raw & 0x00ffffff;
+  // Abre o seletor RGB padrão disponibilizado pelo REAPER/sistema, não uma
+  // paleta fixa da extensão.
+  if (!GR_SelectColor_ptr(owner, &color)) return true;
+  SetMediaTrackInfo_Value_ptr(target, "I_CUSTOMCOLOR",
+    static_cast<double>((color & 0x00ffffff) | 0x01000000));
+  if (TrackList_AdjustWindows_ptr) {
+    TrackList_AdjustWindows_ptr(false);
+  }
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+  g_nativeForceSnapshotBuild.store(true);
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
+static void nativeHookControllerHandleClick(
+  HWND hwnd, POINT point, bool rightClick = false)
+{
+  // A busca da Hook Controller e um campo de edicao temporario. Qualquer
+  // clique fora dela encerra o foco antes de tratar botoes, abas ou linhas,
+  // para que as teclas voltem imediatamente ao comportamento da interface.
+  if (g_nativeHookControllerSearchFocused &&
+      !PtInRect(&g_nativeHookControllerSearchRect, point)) {
+    g_nativeHookControllerSearchFocused = false;
+    InvalidateRect(hwnd, &g_nativeHookControllerSearchRect, FALSE);
+  }
+  if (PtInRect(&g_nativeHookControllerDockRect, point)) {
+    if (rightClick) return;
+    bool floatingDocker = false;
+    const bool docked = DockIsChildOfDock_ptr &&
+      DockIsChildOfDock_ptr(hwnd, &floatingDocker) >= 0;
+    nativeHookControllerRecreateForDock(!docked);
+    return;
+  }
+  for (int index = 0; index < 3; ++index) {
+    if (!PtInRect(&g_nativeHookControllerTabs[index], point)) continue;
+    if (rightClick) return;
+    g_nativeHookControllerMode =
+      static_cast<NativeHookControllerMode>(index);
+    if (g_nativeHookControllerMode !=
+        NativeHookControllerMode::Songs) {
+      g_nativeHookControllerSearchFocused = false;
+    }
+    g_nativeHookControllerScroll = 0;
+    nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_MODE_V1", index);
+    InvalidateRect(hwnd, nullptr, FALSE);
+    return;
+  }
+  if (PtInRect(&g_nativeHookControllerSearchRect, point)) {
+    if (!rightClick) {
+      g_nativeHookControllerMode = NativeHookControllerMode::Songs;
+      nativeAppActiveWriteWindowInt(
+        "HOOK_CONTROLLER_MODE_V1", 0);
+      g_nativeHookControllerSearchFocused = true;
+      g_nativeHookControllerSearchCursor =
+        nativeUiTextCursorFromPoint(hwnd,
+          g_nativeHookControllerSearchRect,
+          g_nativeHookControllerSearchText,
+          point.x, 7);
+      SetFocus(hwnd);
+      InvalidateRect(hwnd, nullptr, FALSE);
+    }
+    return;
+  }
+  if (g_nativeHookControllerMode == NativeHookControllerMode::Songs) {
+    if (!rightClick && g_nativeHookControllerSearchFocused) {
+      g_nativeHookControllerSearchFocused = false;
+    }
+    if (!rightClick) {
+      for (const auto& familyButton :
+           g_nativeHookControllerFamilyButtonHits) {
+        if (!PtInRect(&familyButton.rect, point)) continue;
+        {
+          std::lock_guard<std::mutex> lock(g_nativeMutex);
+          const auto found = g_nativeDirectorOpenFamilyDrawers.find(
+            familyButton.familyId);
+          if (found == g_nativeDirectorOpenFamilyDrawers.end()) {
+            g_nativeDirectorOpenFamilyDrawers[familyButton.familyId] = true;
+          } else {
+            g_nativeDirectorOpenFamilyDrawers.erase(found);
+          }
+          g_nativeFamilyDrawersOwner = "pc";
+          ++g_nativeFamilyDrawersRevision;
+          nativeBumpSharedRevisionLocked("pc");
+          nativePersistFamilyDrawersForCurrentProjectLocked();
+        }
+        g_nativeForceStateBuild.store(true);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+      }
+    }
+    for (const auto& hit : g_nativeHookControllerActionHits) {
+      if (!PtInRect(&hit.rect, point)) continue;
+      if (rightClick) return;
+      const std::string& action = hit.action;
+      if (action == "action_all") {
+        nativeUiClearMainRowSelectionForPage(true);
+        const auto rows = nativeHookControllerBuildSongRows();
+        for (const auto& row : rows) {
+          nativeUiSetMainRowSelected(row, true, true);
+        }
+      } else if (action == "action_create") {
+        nativeUiOpenCreatePlaylist();
+        if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
+      } else if (action == "action_add") {
+        if (nativeUiMainSelectionCount(true) > 0) {
+          nativeUiOpenSelectPlaylist();
+          if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
+        }
+      } else if (action == "header_live") {
+        if (nativeHookControllerConfirm(
+              g_nativeAppActivePanelModel.liveEnabled
+                ? "Desativar o modo Live e limpar as marcações?"
+                : "Ativar o modo Live?",
+              "VS Hook - Live")) {
+          const bool enabling =
+            !g_nativeAppActivePanelModel.liveEnabled;
+          const std::string command = std::string(
+            "{\"type\":\"live_set\",\"enabled\":") +
+            (enabling ? "true}" : "false}");
+          nativeApplyLiveMarkCommand(command);
+        }
+      } else if (action == "header_retry") {
+        if (nativeHookControllerConfirm(
+              "Voltar à última organização feita por Number ou 0-9?",
+              "VS Hook - Retry")) {
+          nativeUiApplyRetry();
+        }
+      } else if (action == "header_number") {
+        if (nativeHookControllerConfirm(
+              "Alternar a numeração entre ordem da lista e ID da região?",
+              "VS Hook - Number")) {
+          nativeUiSetNumberMode(
+            !g_nativeAppActivePanelModel.numberRegionMode);
+        }
+      } else if (action == "header_sort09") {
+        if (!g_nativeAppActivePanelModel.numberRegionMode) {
+          nativeUiOpenMessage(
+            "0-9 só funciona com Number em ID da região.");
+        } else if (nativeHookControllerConfirm(
+                     "Organizar as músicas pela numeração das regiões?",
+                     "VS Hook - 0-9")) {
+          nativeUiApply09Sort();
+        }
+      } else if (action == "header_update") {
+        nativeUiUpdateProjectFromConfig();
+      } else if (action == "header_view") {
+        g_nativeMainViewEnabled = !g_nativeMainViewEnabled;
+        if (SetExtState_ptr) {
+          SetExtState_ptr(kLuaWindowExtStateSection,
+            "HASH_CHILDREN_CONTROLS_VIEW_V1",
+            g_nativeMainViewEnabled ? "1" : "0", true);
+        }
+      } else if (action == "header_alpha") {
+        g_nativeRegionsRetrySortMode = g_nativeRegionsSortMode;
+        g_nativeRegionsSortMode =
+          g_nativeRegionsSortMode == 1 ? 2 : 1;
+        g_nativeHookControllerScroll = 0;
+      } else if (action == "header_reset") {
+        if (nativeHookControllerConfirm(
+              "Restaurar a ordem original das músicas?",
+              "VS Hook - Restaurar")) {
+          g_nativeRegionsRetrySortMode = g_nativeRegionsSortMode;
+          g_nativeRegionsSortMode = 0;
+          g_nativeHookControllerScroll = 0;
+        }
+      }
+      g_nativeForceStateBuild.store(true);
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return;
+    }
+    for (const auto& hit : g_nativeHookControllerSongHits) {
+      if (!PtInRect(&hit.rect, point)) continue;
+      if (rightClick) {
+        nativeUiOpenRowRename(hit.row, true);
+        if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
+        return;
+      }
+      const bool transportPlaying = nativeUiTransportActive();
+      if (transportPlaying) {
+        nativeUiClearMainRowSelection();
+        nativeApplySelectionCommand("{\"type\":\"clear_selection\"}");
+        nativeApplyQueueCommand(nativeMainSongCommandJson(
+          "queue_region_song", hit.row, true));
+      } else {
+        nativeUiSelectOnlyMainRow(hit.row, true);
+        nativeApplySelectionCommand(nativeMainSongCommandJson(
+          "select_region", hit.row, true));
+      }
+      {
+        std::lock_guard<std::mutex> lock(g_nativeMutex);
+        nativeBumpSharedRevisionLocked("pc");
+      }
+      g_nativeForceStateBuild.store(true);
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return;
+    }
+  }
+  if (g_nativeHookControllerMode == NativeHookControllerMode::Parts2) {
+    const bool parts2 = true;
+    if (nativeHookControllerHandlePartsClick(
+          point, rightClick, parts2)) {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      nativeBumpSharedRevisionLocked("pc");
+      g_nativeForceStateBuild.store(true);
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return;
+    }
+  }
+  if (g_nativeHookControllerMode == NativeHookControllerMode::Tcp) {
+    if (rightClick) {
+      // Mute, Solo e fader reutilizam exatamente os mesmos modais de
+      // mapeamento da aba Mixer. O restante do cartao abre o RGB nativo.
+      for (auto it = g_nativeHookControllerMixerHits.rbegin();
+           it != g_nativeHookControllerMixerHits.rend(); ++it) {
+        if (!PtInRect(&it->rect, point) || it->trackId.empty()) continue;
+        if (it->kind != NativeMixerHitKind::Mute &&
+            it->kind != NativeMixerHitKind::Solo &&
+            it->kind != NativeMixerHitKind::Volume) {
+          continue;
+        }
+        const std::string action =
+          it->kind == NativeMixerHitKind::Solo ? "solo"
+            : (it->kind == NativeMixerHitKind::Volume
+                ? "volume" : "mute");
+        nativeUiOpenMixerBinding(it->trackId, action);
+        if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
+        if (g_nativeAppActivePanelHwnd) {
+          InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+      }
+      for (auto it = g_nativeHookControllerMixerRowHits.rbegin();
+           it != g_nativeHookControllerMixerRowHits.rend(); ++it) {
+        if (!PtInRect(&it->rect, point) || it->trackId.empty()) continue;
+        nativeHookControllerChooseTrackColor(hwnd, it->trackId);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+      }
+    }
+    bool selectedTrack = false;
+    if (!rightClick) {
+      for (auto it = g_nativeHookControllerMixerRowHits.rbegin();
+           it != g_nativeHookControllerMixerRowHits.rend(); ++it) {
+        if (!PtInRect(&it->rect, point) || it->trackId.empty()) continue;
+        std::ostringstream command;
+        command << "{\"type\":\"mixer_select_track\",\"targetId\":"
+                << nativeJsonString(it->trackId) << "}";
+        selectedTrack = nativeApplyMixerCommand(command.str());
+        break;
+      }
+    }
+    const auto savedHits = g_nativeMixerHits;
+    const auto savedRowHits = g_nativeMixerRowHits;
+    const auto savedGroupsLayout = g_nativeMixerGroupsLayout;
+    const auto savedTracksLayout = g_nativeMixerTracksLayout;
+    const RECT savedGroupsRect = g_nativeMixerGroupsRect;
+    const RECT savedTracksRect = g_nativeMixerTracksRect;
+    g_nativeMixerHits = g_nativeHookControllerMixerHits;
+    g_nativeMixerRowHits = g_nativeHookControllerMixerRowHits;
+    g_nativeMixerGroupsLayout = g_nativeHookControllerMixerGroupsLayout;
+    g_nativeMixerTracksLayout = g_nativeHookControllerMixerTracksLayout;
+    g_nativeMixerGroupsRect = g_nativeHookControllerMixerGroupsRect;
+    g_nativeMixerTracksRect = g_nativeHookControllerMixerTracksRect;
+    const bool handled = nativeUiHandleMixerHit(
+      point, rightClick, false) || selectedTrack;
+    g_nativeMixerHits = savedHits;
+    g_nativeMixerRowHits = savedRowHits;
+    g_nativeMixerGroupsLayout = savedGroupsLayout;
+    g_nativeMixerTracksLayout = savedTracksLayout;
+    g_nativeMixerGroupsRect = savedGroupsRect;
+    g_nativeMixerTracksRect = savedTracksRect;
+    if (handled) {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      nativeBumpSharedRevisionLocked("pc");
+      g_nativeForceStateBuild.store(true);
+      InvalidateRect(hwnd, nullptr, FALSE);
+    }
+    if (handled) return;
+  }
+  for (const auto& hit : g_nativeHookControllerAdjustHits) {
+    if (!PtInRect(&hit.rect, point)) continue;
+    if (rightClick) return;
+    std::ostringstream command;
+    if (hit.bpm) {
+      command << "{\"type\":\"bpm_adjust\",\"songId\":"
+              << nativeJsonString(hit.id)
+              << ",\"regionNumber\":" << hit.sourceNumber
+              << ",\"delta\":" << hit.delta << "}";
+      nativeApplyBpmCommand(command.str());
+    } else {
+      command << "{\"type\":\"tuner_adjust\",\"songId\":"
+              << nativeJsonString(hit.id)
+              << ",\"regionNumber\":" << hit.sourceNumber
+              << ",\"delta\":" << hit.delta << "}";
+      nativeApplyTunerCommand(command.str());
+    }
+    g_nativeForceStateBuild.store(true);
+    InvalidateRect(hwnd, nullptr, FALSE);
+    return;
+  }
+}
+
+static LRESULT CALLBACK nativeHookControllerWndProc(
+  HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+  const auto forwardKeyboardToMain = [&]() {
+    if (!nativeAppActivePanelIsOpen() ||
+        !g_nativeAppActivePanelHwnd ||
+        g_nativeAppActivePanelHwnd == hwnd) {
+      return false;
+    }
+    SendMessage(g_nativeAppActivePanelHwnd,
+      message, wParam, lParam);
+    return true;
+  };
+  switch (message) {
+    case WM_CREATE:
+    case WM_INITDIALOG:
+      SetTimer(hwnd, kNativeHookControllerTimerId,
+        kNativeUiFrameFastIntervalMs, nullptr);
+      return message == WM_INITDIALOG ? TRUE : 0;
+    case WM_TIMER:
+      if (wParam == kNativeHookControllerTimerId) {
+        const bool navigationChanged =
+          nativeUiAdvanceNavigationRepeat(hwnd);
+        bool scrollChanged = false;
+        if (g_nativeHookControllerMode ==
+            NativeHookControllerMode::Songs) {
+          NativeHookControllerSongContext context;
+          scrollChanged = nativeUiAdvanceSmoothScrolls() || scrollChanged;
+          scrollChanged = nativeUiAdvanceMainListDragAutoscroll() ||
+            scrollChanged;
+        } else if (g_nativeHookControllerMode ==
+                     NativeHookControllerMode::Parts2) {
+          const bool parts2 = g_nativeHookControllerMode ==
+            NativeHookControllerMode::Parts2;
+          scrollChanged = nativeHookControllerNavigateParts(parts2, 0) ||
+            scrollChanged;
+        }
+        nativeUiCommitPendingMusicNavigation(false);
+        nativeRefreshAppActivePanelModel();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        if (navigationChanged || scrollChanged) UpdateWindow(hwnd);
+        return 0;
+      }
+      break;
+    case WM_NCHITTEST: {
+      bool floatingDocker = false;
+      const bool docked = DockIsChildOfDock_ptr &&
+        DockIsChildOfDock_ptr(hwnd, &floatingDocker) >= 0;
+      if (docked) return HTCLIENT;
+      break;
+    }
+    case WM_ERASEBKGND:
+      return 1;
+#ifdef _WIN32
+    case WM_GETDLGCODE:
+      return DLGC_WANTALLKEYS | DLGC_WANTCHARS |
+        DLGC_WANTARROWS | DLGC_WANTTAB;
+#endif
+    case WM_PAINT:
+      nativeHookControllerPaint(hwnd);
+      return 0;
+    case WM_LBUTTONDOWN: {
+      SetFocus(hwnd);
+      POINT point{
+        static_cast<short>(LOWORD(lParam)),
+        static_cast<short>(HIWORD(lParam))};
+      if (nativeHookControllerBeginScrollbarDrag(hwnd, point)) {
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      if (g_nativeHookControllerMode ==
+          NativeHookControllerMode::Tcp) {
+        for (const auto& hit : g_nativeHookControllerMixerHits) {
+          if (hit.kind != NativeMixerHitKind::Volume ||
+              !PtInRect(&hit.rect, point)) {
+            continue;
+          }
+          nativeApplyMixerCommand(
+            std::string("{\"type\":\"mixer_select_track\",\"targetId\":") +
+            nativeJsonString(hit.trackId) + "}");
+          const auto now = std::chrono::steady_clock::now();
+          const bool doubleClick =
+            hit.trackId ==
+              g_nativeHookControllerLastFaderClickTrackId &&
+            g_nativeHookControllerLastFaderClickAt.
+              time_since_epoch().count() != 0 &&
+            now - g_nativeHookControllerLastFaderClickAt <=
+              std::chrono::milliseconds(350);
+          g_nativeHookControllerLastFaderClickAt = now;
+          g_nativeHookControllerLastFaderClickTrackId = hit.trackId;
+          if (doubleClick) {
+            std::ostringstream command;
+            command << "{\"type\":\"mixer_reset_volume\",\"targetId\":"
+                    << nativeJsonString(hit.trackId) << "}";
+            nativeApplyMixerCommand(command.str());
+            g_nativeHookControllerLastFaderClickTrackId.clear();
+            g_nativeHookControllerLastFaderClickAt = {};
+            g_nativeHookControllerSuppressNextMouseUp = true;
+            g_nativeForceStateBuild.store(true);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+          }
+          g_nativeMixerVolumeDragging = true;
+          g_nativeMixerVolumeDragRect = hit.rect;
+          g_nativeMixerVolumeDragTrackId = hit.trackId;
+          SetCapture(hwnd);
+          nativeUiSetMixerVolumeAtPoint(
+            hit.trackId, hit.rect, point.x);
+          InvalidateRect(hwnd, nullptr, FALSE);
+          return 0;
+        }
+      }
+      if (g_nativeHookControllerMode ==
+          NativeHookControllerMode::Songs) {
+        for (const auto& familyButton :
+             g_nativeHookControllerFamilyButtonHits) {
+          if (PtInRect(&familyButton.rect, point)) return 0;
+        }
+        NativeHookControllerSongContext context;
+        if (nativeUiBeginMainListPress(hwnd, point)) {
+          InvalidateRect(hwnd, nullptr, FALSE);
+          return 0;
+        }
+      }
+      return 0;
+    }
+    case WM_LBUTTONUP: {
+      POINT point{
+        static_cast<short>(LOWORD(lParam)),
+        static_cast<short>(HIWORD(lParam))};
+      if (g_nativeHookControllerScrollbarDragging) {
+        nativeHookControllerSetScrollbarFromPoint(point.y);
+        g_nativeHookControllerScrollbarDragging = false;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      if (g_nativeHookControllerSuppressNextMouseUp) {
+        g_nativeHookControllerSuppressNextMouseUp = false;
+        return 0;
+      }
+      if (g_nativeMixerVolumeDragging &&
+          g_nativeHookControllerMode ==
+            NativeHookControllerMode::Tcp) {
+        nativeUiSetMixerVolumeAtPoint(
+          g_nativeMixerVolumeDragTrackId,
+          g_nativeMixerVolumeDragRect, point.x);
+        g_nativeMixerVolumeDragging = false;
+        g_nativeMixerVolumeDragTrackId.clear();
+        if (GetCapture() == hwnd) ReleaseCapture();
+        g_nativeForceStateBuild.store(true);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      if (g_nativeMainListDrag.pressed &&
+          g_nativeHookControllerMode ==
+            NativeHookControllerMode::Songs) {
+        const bool wasDrag = g_nativeMainListDrag.active;
+        {
+          NativeHookControllerSongContext context;
+          nativeUiFinishMainListPress(hwnd, point);
+        }
+        // Clique simples pertence exclusivamente aos hits existentes na Hook
+        // Controller. Nunca encaminha coordenadas para botoes/retangulos da
+        // interface principal que estejam salvos por baixo.
+        if (!wasDrag) {
+          nativeHookControllerHandleClick(hwnd, point);
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      nativeHookControllerHandleClick(hwnd, point);
+      return 0;
+    }
+    case WM_MOUSEMOVE: {
+      if (g_nativeHookControllerScrollbarDragging) {
+        POINT point{
+          static_cast<short>(LOWORD(lParam)),
+          static_cast<short>(HIWORD(lParam))};
+        nativeHookControllerSetScrollbarFromPoint(point.y);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        UpdateWindow(hwnd);
+        return 0;
+      }
+      if (g_nativeMixerVolumeDragging &&
+          g_nativeHookControllerMode ==
+            NativeHookControllerMode::Tcp) {
+        POINT point{
+          static_cast<short>(LOWORD(lParam)),
+          static_cast<short>(HIWORD(lParam))};
+        nativeUiSetMixerVolumeAtPoint(
+          g_nativeMixerVolumeDragTrackId,
+          g_nativeMixerVolumeDragRect, point.x);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      if (g_nativeMainListDrag.pressed &&
+          g_nativeHookControllerMode ==
+            NativeHookControllerMode::Songs) {
+        POINT point{
+          static_cast<short>(LOWORD(lParam)),
+          static_cast<short>(HIWORD(lParam))};
+        NativeHookControllerSongContext context;
+        nativeUiUpdateMainListDrag(point);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      break;
+    }
+    case WM_CAPTURECHANGED:
+      if (g_nativeHookControllerScrollbarDragging) {
+        g_nativeHookControllerScrollbarDragging = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+      }
+      if (g_nativeMixerVolumeDragging) {
+        g_nativeMixerVolumeDragging = false;
+        g_nativeMixerVolumeDragTrackId.clear();
+        InvalidateRect(hwnd, nullptr, FALSE);
+      }
+      if (g_nativeMainListDrag.pressed) {
+        nativeUiResetMainListDrag();
+        InvalidateRect(hwnd, nullptr, FALSE);
+      }
+      break;
+    case WM_RBUTTONUP: {
+      SetFocus(hwnd);
+      POINT point{
+        static_cast<short>(LOWORD(lParam)),
+        static_cast<short>(HIWORD(lParam))};
+      nativeHookControllerHandleClick(hwnd, point, true);
+      return 0;
+    }
+    case WM_MOUSEWHEEL: {
+      const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+      if (g_nativeHookControllerMode ==
+          NativeHookControllerMode::Tcp) {
+        const int step = delta > 0 ? -1 : 1;
+        g_nativeHookControllerMixerTracksScroll = std::max(0,
+          g_nativeHookControllerMixerTracksScroll + step);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      if (g_nativeHookControllerMode ==
+            NativeHookControllerMode::Parts2) {
+        auto& parts = g_nativeHookControllerPartsState[
+          g_nativeHookControllerMode ==
+            NativeHookControllerMode::Parts2 ? 1 : 0];
+        parts.scrollPixels = std::max(0,
+          std::min(parts.maxScrollPixels,
+            parts.scrollPixels -
+              (delta > 0 ? 72 : -72)));
+        g_nativeHookControllerScroll = parts.scrollPixels;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      g_nativeHookControllerScroll = std::max(0,
+        std::min(g_nativeHookControllerMaxScroll,
+          g_nativeHookControllerScroll -
+            (delta > 0 ? 72 : -72)));
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    }
+    case WM_KILLFOCUS:
+      nativeUiResetNavigationRepeat();
+      return 0;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+      nativeUiResetNavigationRepeat(static_cast<int>(wParam));
+      forwardKeyboardToMain();
+      return 0;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+      if ((wParam == VK_UP || wParam == VK_DOWN) &&
+          g_nativeHookControllerMode !=
+            NativeHookControllerMode::Tcp) {
+        if (nativeUiPrepareNavigationKeyDown(hwnd, wParam)) return 0;
+        const int step = wParam == VK_UP ? -1 : 1;
+        bool handled = false;
+        if (g_nativeHookControllerMode ==
+            NativeHookControllerMode::Songs) {
+          handled = nativeHookControllerNavigateSong(step);
+        } else if (g_nativeHookControllerMode ==
+                     NativeHookControllerMode::Parts2) {
+          handled = nativeHookControllerNavigateParts(
+            g_nativeHookControllerMode ==
+              NativeHookControllerMode::Parts2, step);
+        }
+        if (handled) {
+          nativeUiRefreshNavigationNow(hwnd);
+          return 0;
+        }
+      }
+      if (g_nativeHookControllerMode ==
+            NativeHookControllerMode::Songs &&
+          g_nativeHookControllerSearchFocused) {
+        if (wParam == VK_ESCAPE) {
+          if (!g_nativeHookControllerSearchText.empty()) {
+            g_nativeHookControllerSearchText.clear();
+            g_nativeHookControllerSearchCursor = 0;
+            g_nativeHookControllerScroll = 0;
+          } else {
+            g_nativeHookControllerSearchFocused = false;
+          }
+          nativeUiRefreshTextInputNow(hwnd);
+          return 0;
+        }
+        if (wParam == VK_RETURN) {
+          if (!g_nativeHookControllerSongHits.empty()) {
+            const RECT centerRect =
+              g_nativeHookControllerSongHits.front().rect;
+            nativeHookControllerHandleClick(hwnd,
+              POINT{centerRect.left + 2, centerRect.top + 2});
+          }
+          return 0;
+        }
+        if (nativeUiHandleTextEditKey(
+              g_nativeHookControllerSearchText,
+              g_nativeHookControllerSearchCursor,
+              static_cast<int>(wParam))) {
+          g_nativeHookControllerScroll = 0;
+          nativeUiRefreshTextInputNow(hwnd);
+          return 0;
+        }
+      }
+      if (forwardKeyboardToMain()) return 0;
+      break;
+    case WM_CHAR:
+    case WM_SYSCHAR:
+      if (g_nativeHookControllerMode ==
+            NativeHookControllerMode::Songs &&
+          g_nativeHookControllerSearchFocused) {
+        if (!nativeUiTextCommandModifierDown() &&
+            wParam >= 0x20 && wParam != 0x7f) {
+          nativeUiInsertTextAtCursor(
+            g_nativeHookControllerSearchText,
+            g_nativeHookControllerSearchCursor,
+            static_cast<uint32_t>(wParam), 240);
+          g_nativeHookControllerScroll = 0;
+          nativeUiRefreshTextInputNow(hwnd);
+        }
+        return 0;
+      }
+      if (forwardKeyboardToMain()) return 0;
+      break;
+    case WM_COMMAND:
+      if (LOWORD(wParam) == IDCANCEL &&
+          !g_nativeHookControllerClosing) {
+        nativeCloseHookControllerWindow();
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+      if (!g_nativeHookControllerClosing) {
+        nativeCloseHookControllerWindow();
+        return 0;
+      }
+      DestroyWindow(hwnd);
+      return 0;
+    case WM_DESTROY:
+    case WM_NCDESTROY:
+      nativeUiResetNavigationRepeat();
+      g_nativeHookControllerScrollbarDragging = false;
+      KillTimer(hwnd, kNativeHookControllerTimerId);
+#ifndef __APPLE__
+      g_nativeHookControllerBackBuffer.reset();
+      g_nativeHookControllerBackBufferWidth = 0;
+      g_nativeHookControllerBackBufferHeight = 0;
+#endif
+      if (message == WM_DESTROY && DockWindowRemove_ptr &&
+          !g_nativeHookControllerClosing) {
+        DockWindowRemove_ptr(hwnd);
+      }
+      if (g_nativeHookControllerHwnd == hwnd) {
+        g_nativeHookControllerHwnd = nullptr;
+      }
+      if (RefreshToolbar2_ptr && g_hookControllerCommandId != 0) {
+        RefreshToolbar2_ptr(0, g_hookControllerCommandId);
+      }
+      return 0;
+  }
+#ifdef _WIN32
+  // A classe foi registrada com RegisterClassExW. Usar DefWindowProcA aqui
+  // fazia o texto UTF-16 "Hook Controller" ser interpretado como "H\0".
+  return DefWindowProcW(hwnd, message, wParam, lParam);
+#else
+  return DefWindowProc(hwnd, message, wParam, lParam);
+#endif
+}
+
+static bool nativeOpenHookControllerWindow()
+{
+  if (nativeHookControllerWindowIsOpen()) {
+    ShowWindow(g_nativeHookControllerHwnd, SW_SHOW);
+    SetFocus(g_nativeHookControllerHwnd);
+    return true;
+  }
+  const bool firstOpen = !nativeAppActiveHasWindowValue(
+    "HOOK_CONTROLLER_DOCKSTATE_V1");
+  if (firstOpen) {
+    nativeBigClockWriteReaperConfigInt("dockermode1", 1); // esquerda
+    nativeBigClockWriteReaperConfigInt("dockheight_l", 362);
+  }
+  const int savedMode = nativeAppActiveReadWindowInt(
+    "HOOK_CONTROLLER_MODE_V1", 0);
+  g_nativeHookControllerMode = static_cast<NativeHookControllerMode>(
+    std::max(0, std::min(2, savedMode)));
+  const int x = nativeAppActiveReadWindowInt(
+    "HOOK_CONTROLLER_X_V1", 240);
+  const int y = nativeAppActiveReadWindowInt(
+    "HOOK_CONTROLLER_Y_V1", 220);
+  const int savedWidth = nativeAppActiveReadWindowInt(
+    "HOOK_CONTROLLER_W_V1", 860);
+  const int savedHeight = nativeAppActiveReadWindowInt(
+    "HOOK_CONTROLLER_H_V1", 560);
+  const int width = savedWidth > 0 ? savedWidth : 860;
+  const int height = savedHeight > 0 ? savedHeight : 560;
+  const int dockState = nativeAppActiveReadWindowInt(
+    "HOOK_CONTROLLER_DOCKSTATE_V1", 257);
+  HWND hwnd = nullptr;
+#ifdef _WIN32
+  static const wchar_t* className = L"VS_HOOK_CONTROLLER_WINDOW";
+  WNDCLASSEXW wc{};
+  wc.cbSize = sizeof(wc);
+  if (!GetClassInfoExW(g_pluginInstance, className, &wc)) {
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc = nativeHookControllerWndProc;
+    wc.hInstance = g_pluginInstance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = className;
+    if (!RegisterClassExW(&wc)) return false;
+  }
+  RECT outer{0, 0, width, height};
+  AdjustWindowRectEx(&outer, WS_OVERLAPPEDWINDOW, FALSE, 0);
+  hwnd = CreateWindowExW(WS_EX_TOOLWINDOW,
+    className, L"Hook Controller", WS_OVERLAPPEDWINDOW,
+    x, y, outer.right - outer.left, outer.bottom - outer.top,
+    GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
+    nullptr, g_pluginInstance, nullptr);
+#else
+  const char* resizableWindow = reinterpret_cast<const char*>(
+    static_cast<INT_PTR>(0x400001));
+  hwnd = CreateDialogParam(g_pluginInstance, resizableWindow,
+    GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
+    reinterpret_cast<DLGPROC>(nativeHookControllerWndProc), 0);
+  if (hwnd) {
+    SetWindowText(hwnd, "Hook Controller");
+    SetWindowPos(hwnd, nullptr, x, y, width, height,
+      SWP_NOZORDER | SWP_NOACTIVATE);
+  }
+#endif
+  if (!hwnd) return false;
+#ifdef _WIN32
+  SetWindowTextW(hwnd, L"Hook Controller");
+#endif
+  g_nativeHookControllerHwnd = hwnd;
+  if (dockState != 0 && Dock_UpdateDockID_ptr &&
+      DockWindowAddEx_ptr) {
+    const int dockerIndex = std::max(0, dockState >> 8);
+    Dock_UpdateDockID_ptr(kNativeHookControllerDockId, dockerIndex);
+    DockWindowAddEx_ptr(hwnd, kNativeHookControllerTitle,
+      kNativeHookControllerDockId, true);
+    if (DockWindowActivate_ptr) DockWindowActivate_ptr(hwnd);
+    if (DockWindowRefreshForHWND_ptr) {
+      DockWindowRefreshForHWND_ptr(hwnd);
+    }
+  } else {
+    ShowWindow(hwnd, SW_SHOW);
+  }
+  SetFocus(hwnd);
+  InvalidateRect(hwnd, nullptr, FALSE);
+  if (RefreshToolbar2_ptr && g_hookControllerCommandId != 0) {
+    RefreshToolbar2_ptr(0, g_hookControllerCommandId);
+  }
+  return true;
+}
+
+static void nativeCloseHookControllerWindow()
+{
+  if (!nativeHookControllerWindowIsOpen()) {
+    g_nativeHookControllerHwnd = nullptr;
+    return;
+  }
+  nativeHookControllerSaveWindowState();
+  HWND hwnd = g_nativeHookControllerHwnd;
+  g_nativeHookControllerClosing = true;
+  if (DockWindowRemove_ptr) DockWindowRemove_ptr(hwnd);
+  if (IsWindow(hwnd)) DestroyWindow(hwnd);
+  g_nativeHookControllerHwnd = nullptr;
+  g_nativeHookControllerClosing = false;
+  if (RefreshToolbar2_ptr && g_hookControllerCommandId != 0) {
+    RefreshToolbar2_ptr(0, g_hookControllerCommandId);
+  }
+}
+
+static void nativeHookControllerRecreateForDock(bool dock)
+{
+  if (!nativeHookControllerWindowIsOpen()) return;
+  nativeHookControllerSaveWindowState();
+  if (dock) {
+    const int saved = nativeAppActiveReadWindowInt(
+      "HOOK_CONTROLLER_LAST_DOCKSTATE_V1", 257);
+    nativeAppActiveWriteWindowInt(
+      "HOOK_CONTROLLER_DOCKSTATE_V1",
+      saved != 0 ? saved : 257);
+  } else {
+    nativeAppActiveWriteWindowInt(
+      "HOOK_CONTROLLER_DOCKSTATE_V1", 0);
+  }
+  HWND old = g_nativeHookControllerHwnd;
+  g_nativeHookControllerClosing = true;
+  if (DockWindowRemove_ptr) DockWindowRemove_ptr(old);
+  if (IsWindow(old)) DestroyWindow(old);
+  g_nativeHookControllerHwnd = nullptr;
+  g_nativeHookControllerClosing = false;
+  nativeOpenHookControllerWindow();
+}
+
+static void nativeToggleHookControllerWindow()
+{
+  if (nativeHookControllerWindowIsOpen()) {
+    nativeCloseHookControllerWindow();
+  } else {
+    nativeOpenHookControllerWindow();
+  }
 }
 
 static bool nativeMainHandleModalClick(
@@ -39567,7 +45091,7 @@ static bool nativeUiAdvanceSmoothScrolls()
   return changed;
 }
 
-static void nativeUiResetNavigationRepeat(int releasedKey = 0)
+static void nativeUiResetNavigationRepeat(int releasedKey)
 {
   if (releasedKey != 0 &&
       releasedKey != g_nativeUiHeldNavigationKey) {
@@ -39716,6 +45240,89 @@ static bool nativeUiBeginMainScrollbarDrag(
   return true;
 }
 
+static bool nativeUiMainPartsResizeHitAt(
+  const POINT& point, bool& parts2)
+{
+  if (g_nativeAppActivePanelModel.mixerPage ||
+      g_nativeMainModalKind != NativeMainModalKind::None) {
+    return false;
+  }
+  if (PtInRect(&g_nativeMainParts2ResizeRect, point)) {
+    parts2 = true;
+    return true;
+  }
+  if (PtInRect(&g_nativeMainParts1ResizeRect, point)) {
+    parts2 = false;
+    return true;
+  }
+  return false;
+}
+
+static void nativeUiUpdateMainPartsResize(const POINT& point)
+{
+  if (!g_nativeMainPartsResizeDragging) return;
+  const RECT& body = g_nativeMainPartsResizeBodyRect;
+  const int bodyW = std::max(1,
+    static_cast<int>(body.right - body.left));
+  const RECT& partRect = g_nativeMainPartsResizeTargetParts2
+    ? g_nativeMainParts2Rect : g_nativeMainParts1Rect;
+  const RECT& otherPartRect = g_nativeMainPartsResizeTargetParts2
+    ? g_nativeMainParts1Rect : g_nativeMainParts2Rect;
+  const int currentPartW = std::max(0,
+    static_cast<int>(partRect.right - partRect.left));
+  const int otherPartW = std::max(0,
+    static_cast<int>(otherPartRect.right - otherPartRect.left));
+  const int currentListW = std::max(0,
+    static_cast<int>(g_nativeMainListRect.right -
+      g_nativeMainListRect.left));
+  const int minimum = std::max(120,
+    static_cast<int>(std::floor(bodyW * 0.22)));
+  // Ao mover uma divisoria, somente a lista e aquela coluna trocam espaco.
+  // A igualdade entre as duas define o maximo permitido para Parts.
+  int maximum = (currentPartW + currentListW) / 2;
+  if (otherPartW > 0) {
+    maximum = std::min(maximum,
+      currentPartW + currentListW - otherPartW);
+  }
+  maximum = std::max(minimum, maximum);
+  const int requested = g_nativeMainPartsResizeTargetParts2
+    ? point.x - body.left : body.right - point.x;
+  const int nextWidth = std::max(minimum,
+    std::min(maximum, requested));
+  const double ratio = std::max(0.22, std::min(0.50,
+    static_cast<double>(nextWidth) / bodyW));
+  if (g_nativeMainPartsResizeTargetParts2) {
+    g_nativeMainParts2WidthRatio = ratio;
+  } else {
+    g_nativeMainParts1WidthRatio = ratio;
+  }
+}
+
+static bool nativeUiBeginMainPartsResize(HWND hwnd, const POINT& point)
+{
+  bool parts2 = false;
+  if (!nativeUiMainPartsResizeHitAt(point, parts2)) return false;
+  g_nativeMainPartsResizeDragging = true;
+  g_nativeMainPartsResizeTargetParts2 = parts2;
+  SetCapture(hwnd);
+  nativeUiUpdateMainPartsResize(point);
+  return true;
+}
+
+static void nativeUiFinishMainPartsResize(const POINT& point)
+{
+  if (!g_nativeMainPartsResizeDragging) return;
+  nativeUiUpdateMainPartsResize(point);
+  const char* key = g_nativeMainPartsResizeTargetParts2
+    ? "PARTS2_WIDTH_RATIO_X10000_V1"
+    : "PARTS1_WIDTH_RATIO_X10000_V1";
+  const double ratio = g_nativeMainPartsResizeTargetParts2
+    ? g_nativeMainParts2WidthRatio : g_nativeMainParts1WidthRatio;
+  nativeAppActiveWriteWindowInt(key,
+    static_cast<int>(std::floor(ratio * 10000.0 + 0.5)));
+  g_nativeMainPartsResizeDragging = false;
+}
+
 static bool nativeUiBeginMainListPress(
   HWND hwnd,
   const POINT& point)
@@ -39855,6 +45462,15 @@ static bool nativeUiFinishMainListPress(
   nativeUiResetMainListDrag();
   if (GetCapture() == hwnd) ReleaseCapture();
   if (drag.active) {
+    if (g_nativeHookControllerSongContextActive &&
+        drag.regionsPage &&
+        g_nativeAppActivePanelModel.numberRegionMode) {
+      // Number continua exibindo o ID real da regiao, mas um drag manual na
+      // aba Musicas da Hook Controller passa a definir a ordem da lista. Sem
+      // isso, o sort 0-9 reaplicava imediatamente e fazia o drop parecer voltar
+      // ou cair em outra linha.
+      g_nativeRegionsSortMode = 0;
+    }
     int sourceModelIndex = static_cast<int>(drag.sourceIndex);
     if (!drag.sourceIdentity.empty()) {
       for (size_t index = 0;
@@ -39872,7 +45488,13 @@ static bool nativeUiFinishMainListPress(
       drag.targetVisibleIndex,
       drag.regionsPage);
   } else {
-    nativeMainHandleControlClick(point, false);
+    // Na Hook Controller, os controles da interface principal nao existem.
+    // O WndProc da propria Controller executa seu hit-test depois de restaurar
+    // este contexto; chamar o handler principal aqui criava botoes invisiveis
+    // e selecoes empilhadas.
+    if (!g_nativeHookControllerSongContextActive) {
+      nativeMainHandleControlClick(point, false);
+    }
   }
   return true;
 }
@@ -39952,6 +45574,7 @@ static UINT nativeUiDesiredFrameInterval()
     g_nativeMixerReorderDrag.pressed ||
     g_nativeMainListDrag.pressed ||
     g_nativeMainScrollbarDragging ||
+    g_nativeMainPartsResizeDragging ||
     g_nativeUiPlaylistMarqueeActive;
   if (directManipulation) {
     return kNativeUiFrameFastIntervalMs;
@@ -40095,6 +45718,18 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         }
       }
       return 0;
+    case WM_SETCURSOR: {
+      POINT cursor{};
+      GetCursorPos(&cursor);
+      ScreenToClient(hwnd, &cursor);
+      bool parts2 = false;
+      if (g_nativeMainPartsResizeDragging ||
+          nativeUiMainPartsResizeHitAt(cursor, parts2)) {
+        SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+        return 1;
+      }
+      break;
+    }
     case WM_RBUTTONDOWN: {
       if (GetFocus() != hwnd) SetFocus(hwnd);
 #ifndef _WIN32
@@ -40116,6 +45751,22 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       }
       if (mouseDown) nativeUiCancelPendingMusicNavigation();
       const POINT point = nativeAppActiveClickPoint(hwnd, lParam);
+      if (mouseDown && !g_state.directorInterfaceBlocked &&
+          nativeUiBeginMainPartsResize(hwnd, point)) {
+        nativeUiSetFrameTimerInterval(
+          hwnd, kNativeUiFrameFastIntervalMs);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      if (!mouseDown && g_nativeMainPartsResizeDragging) {
+        nativeUiFinishMainPartsResize(point);
+        if (GetCapture() == hwnd) ReleaseCapture();
+#ifndef _WIN32
+        g_nativeAppActiveMouseDownHandled = false;
+#endif
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
 #ifndef _WIN32
       if (std::chrono::steady_clock::now() <
             g_nativeAppActiveSuppressLeftMouseUntil &&
@@ -40395,6 +46046,12 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_MOUSEMOVE: {
       const POINT point =
         nativeAppActiveClickPoint(hwnd, lParam);
+      if (g_nativeMainPartsResizeDragging) {
+        nativeUiUpdateMainPartsResize(point);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        UpdateWindow(hwnd);
+        return 0;
+      }
       if (g_nativeUiTextMouseSelecting) {
         nativeUiUpdateTextMouseSelection(hwnd, point);
         return 0;
@@ -40454,6 +46111,10 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       return 0;
     }
     case WM_CAPTURECHANGED:
+      if (g_nativeMainPartsResizeDragging) {
+        g_nativeMainPartsResizeDragging = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+      }
       if (g_nativeUiTextMouseSelecting) {
         g_nativeUiTextMouseSelecting = false;
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -41653,14 +47314,25 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           return 0;
         }
         if (wParam == VK_ESCAPE) {
-          if (g_nativeAppActivePanelModel.queueActive) {
+          bool partsArmed = false;
+          {
+            // Usa o estado vivo, pois o modelo visual pode estar um frame
+            // atrasado logo depois de confirmar o engatilhamento.
+            std::lock_guard<std::mutex> lock(g_nativeMutex);
+            partsArmed = !g_nativeArmedMarkerId.empty();
+          }
+          if (partsArmed) {
+            nativeUiShowShortcutPopup(
+              "Esc", "Parts cancelado");
+            g_nativePartsPreparedSelectionId.clear();
+            nativeApplyMarkerCommand("{\"type\":\"marker_cancel\"}");
+          } else if (g_nativeAppActivePanelModel.queueActive) {
             nativeUiShowShortcutPopup(
               "Esc", "Fila de espera cancelada");
             nativeApplyQueueCommand("{\"type\":\"clear_queue\"}");
             nativeApplyAutoCommand(
               "{\"type\":\"autoplay_set\",\"desiredState\":false}");
-          } else if (!g_nativeAppActivePanelModel.armedMarkerId.empty() ||
-                     !g_nativeAppActivePanelModel.selectedMarkerId.empty()) {
+          } else if (!g_nativeAppActivePanelModel.selectedMarkerId.empty()) {
             nativeUiShowShortcutPopup(
               "Esc", "Parts cancelado");
             g_nativePartsPreparedSelectionId.clear();
@@ -42220,8 +47892,24 @@ static bool nativeOpenAppActivePanel()
     return true;
   }
 
-  // Primeira abertura: Docker direito. Depois segue o estado salvo pelo VS Hook.
-  const int savedDockState = nativeAppActiveReadWindowInt("DOCKSTATE_V1", 513);
+  // Primeira abertura: prepara e usa exatamente o Docker direito aprovado.
+  // Depois disso, o estado salvo pelo usuário sempre prevalece.
+  const bool firstOpen = !nativeAppActiveHasWindowValue("DOCKSTATE_V1");
+  if (firstOpen) {
+    // Reproduz inclusive a prioridade dos quatro cantos: a direita atravessa
+    // toda a altura; em cima/baixo atravessam a esquerda e enquadram o
+    // Hook Controller no meio.
+    nativeBigClockWriteReaperConfigInt("dockposflags", 5);
+    nativeBigClockWriteReaperConfigInt("dockermode3", 3); // direita
+    nativeBigClockWriteReaperConfigInt("dockheight_r", 409);
+    nativeBigClockWriteReaperConfigInt("dockermode4", 2); // superior
+    nativeBigClockWriteReaperConfigInt("dockheight_t", 69);
+    nativeBigClockWriteReaperConfigInt("dockermode5", 0); // inferior
+    nativeBigClockWriteReaperConfigInt("dockheight", 69);
+    nativeBigClockWriteReaperConfigInt("dockermode1", 1); // esquerda
+    nativeBigClockWriteReaperConfigInt("dockheight_l", 362);
+  }
+  const int savedDockState = nativeAppActiveReadWindowInt("DOCKSTATE_V1", 769);
   const int savedX = nativeAppActiveReadWindowInt("WINDOW_X_V1", 100);
   const int savedY = nativeAppActiveReadWindowInt("WINDOW_Y_V1", 100);
 #ifdef __APPLE__
@@ -42327,6 +48015,13 @@ static bool nativeOpenAppActivePanel()
     if (DockWindowRefreshForHWND_ptr) DockWindowRefreshForHWND_ptr(hwnd);
   } else {
     ShowWindow(hwnd, SW_SHOW);
+  }
+  if (firstOpen) {
+    // A primeira abertura entrega o conjunto completo já no layout padrão.
+    // Cada janela passa a persistir sua própria posição a partir daqui.
+    nativeOpenBigClockWindow(0);
+    nativeOpenBigClockWindow(1);
+    nativeOpenHookControllerWindow();
   }
   SetFocus(hwnd);
   InvalidateRect(hwnd, nullptr, FALSE);
@@ -43862,12 +49557,7 @@ static std::string nativeTelepromptDisplayText(
     return nativeUpperNamePtBrKeepParentheses(raw);
   }
   if (nativeLower(textCase) == "lowercase") {
-    std::string value = raw;
-    std::transform(value.begin(), value.end(), value.begin(),
-      [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-      });
-    return value;
+    return nativeUtf8Lower(raw);
   }
   return raw;
 }
@@ -46888,7 +52578,8 @@ static void nativeOpenRecadosApp()
 
 static void nativeRefreshAppActivePanelModel()
 {
-  if (!nativeAppActivePanelIsOpen()) return;
+  if (!nativeAppActivePanelIsOpen() &&
+      !nativeHookControllerWindowIsOpen()) return;
 
   const auto modelNow = std::chrono::steady_clock::now();
   const bool recentlyInteracted =
@@ -47158,8 +52849,8 @@ static void nativeRefreshAppActivePanelModel()
           item.isHashChild || item.isRegionChild;
         const bool drawerOpen =
           child && drawerIsOpen(item.parentId);
-        if (child && !drawerOpen &&
-            !revealSearchChildren) {
+        if (!nativeUiFamilyChildVisible(
+              child, drawerOpen, revealSearchChildren)) {
           continue;
         }
         appendRow(item, std::string(),
@@ -47363,10 +53054,15 @@ static void nativeRefreshAppActivePanelModel()
   }
   g_nativeAppActivePanelModel = std::move(next);
   nativeUiApplyPendingDropSelectionToCurrentModel();
-  nativeUiSetFrameTimerInterval(
-    g_nativeAppActivePanelHwnd,
-    nativeUiDesiredFrameInterval());
-  InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  if (nativeAppActivePanelIsOpen()) {
+    nativeUiSetFrameTimerInterval(
+      g_nativeAppActivePanelHwnd,
+      nativeUiDesiredFrameInterval());
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
+  if (nativeHookControllerWindowIsOpen()) {
+    InvalidateRect(g_nativeHookControllerHwnd, nullptr, FALSE);
+  }
 }
 
 static void nativeSetRepeatEnabled(ReaProject* project, bool enabled)
@@ -49339,10 +55035,25 @@ static void nativeRebuildState(bool forceSnapshot)
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_nativeArmedMarkerSetAt).count() >= 150;
       const double target = g_nativeSelectedMarkerPos;
       const double origin = g_nativeArmedMarkerStartPlayPos;
+      const double previousPlayPos =
+        g_nativeArmedMarkerLastPlayPos;
       const bool nearTarget = playing && std::fabs(playPos - target) <= 0.120;
       const bool forwardCrossed = playing && origin <= target && playPos >= target - 0.080;
-      const bool backwardCrossed = playing && origin > target && playPos <= target + 0.080;
-      const bool playReached = nearTarget || forwardCrossed || backwardCrossed;
+      const bool backwardCrossed = playing && origin > target &&
+        playPos < origin - 0.020 &&
+        playPos >= target - 0.250 &&
+        playPos <= target + 1.000;
+      // Quando o Smooth Seek dispara exatamente no fim da regiao, o ciclo de
+      // snapshot pode enxergar o transporte somente alguns decimos depois do
+      // marker. Detectar a queda da posicao confirma esse salto mesmo que a
+      // janela curta de nearTarget ja tenha passado.
+      const bool backwardJumpReached = playing && origin > target &&
+        previousPlayPos > target + 0.020 &&
+        playPos + 0.020 < previousPlayPos &&
+        playPos >= target - 0.250 &&
+        playPos <= target + 1.000;
+      const bool playReached = nearTarget || forwardCrossed ||
+        backwardCrossed || backwardJumpReached;
       if (playReached && hasGraceElapsed) {
         // FIX73: ao chegar no alvo, limpa tambem a selecao amarela do marker.
         g_nativeArmedMarkerId.clear();
@@ -49351,6 +55062,9 @@ static void nativeRebuildState(bool forceSnapshot)
         g_nativeSelectedMarkerPos = 0.0;
         g_nativeArmedMarkerSetAt = std::chrono::steady_clock::time_point();
         g_nativeArmedMarkerStartPlayPos = 0.0;
+        g_nativeArmedMarkerLastPlayPos = 0.0;
+      } else if (playing) {
+        g_nativeArmedMarkerLastPlayPos = playPos;
       }
     }
     luaLiveRaw = g_nativeLuaLiveFragment;
@@ -49541,13 +55255,11 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string liveMarkColorMode =
     nativeUiLiveMarkColorMode(bridgeVisualPrefs);
   const COLORREF liveMarkBorderColor =
-    nativeUiNamedVisualColor(liveMarkColorMode, "gray");
+    liveMarkColorMode == "none"
+      ? nativeUiListPanelBackgroundColor(bridgeVisualPrefs)
+      : nativeUiNamedVisualColor(liveMarkColorMode, "gray");
   const COLORREF liveMarkBackgroundColor =
-    liveMarkColorMode == "red"
-      ? RGB(153, 27, 27)
-      : nativeUiBlendColor(
-          nativeUiListPanelBackgroundColor(bridgeVisualPrefs),
-          liveMarkBorderColor, 0.82);
+    nativeUiLiveMarkBackgroundColor(bridgeVisualPrefs);
 
   std::ostringstream json;
   json << "{";
@@ -50423,6 +56135,7 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
       type != "mixer_reset_volume" &&
       type != "mixer_toggle_mute" &&
       type != "mixer_toggle_solo" &&
+      type != "mixer_select_track" &&
       type != "mixer_route" &&
       type != "mixer_bulk_unmute" &&
       type != "mixer_bulk_unsolo") {
@@ -50487,6 +56200,17 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
   if (id.empty()) id = nativeJsonExtractString(commandBody, "id");
   MediaTrack* tr = nativeFindTrackById(project, id);
   if (!tr) return false;
+  if (type == "mixer_select_track") {
+    if (!SetOnlyTrackSelected_ptr) return false;
+    SetOnlyTrackSelected_ptr(tr);
+    if (TrackList_AdjustWindows_ptr) {
+      TrackList_AdjustWindows_ptr(false);
+    }
+    if (UpdateArrange_ptr) UpdateArrange_ptr();
+    g_nativeForceSnapshotBuild.store(true);
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
   if (type == "mixer_route") {
     MediaTrack* master =
       GetMasterTrack_ptr ? GetMasterTrack_ptr(project) : nullptr;
@@ -52430,6 +58154,11 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
         g_nativeArmedMarkerLabel = markerLabel;
         g_nativeArmedMarkerSetAt = std::chrono::steady_clock::now();
         g_nativeArmedMarkerStartPlayPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : 0.0;
+        g_nativeArmedMarkerLastPlayPos =
+          g_nativeArmedMarkerStartPlayPos;
+        // Parts ganha do Smooth Seek da fila. A fila continua armazenada em
+        // standby e recupera seu proprio seek depois da chegada ao marker.
+        g_nativeQueuedSeekSignature.clear();
       } else {
         g_nativeArmedMarkerId.clear();
         g_nativeArmedMarkerLabel.clear();
@@ -53465,17 +59194,34 @@ static void nativeReleaseRuntimeControlOnMainThread()
 }
 
 static bool g_nativePanelWasOpenBeforeProjectLoad = false;
+static bool g_nativeHookControllerWasOpenBeforeProjectLoad = false;
+static bool g_nativeBigClockWasOpenBeforeProjectLoad[2] = {false, false};
 static bool g_nativeProjectLoadAwaitingPanelRestore = false;
 static std::chrono::steady_clock::time_point
   g_nativeProjectLoadPanelClosedAt{};
 
 static void nativePreparePanelForProjectTransition()
 {
+  for (int slot = 0; slot < 2; ++slot) {
+    if (nativeBigClockWindowIsOpen(slot)) {
+      g_nativeBigClockWasOpenBeforeProjectLoad[slot] = true;
+      nativeCloseBigClockWindow(slot);
+    }
+  }
+  if (nativeHookControllerWindowIsOpen()) {
+    g_nativeHookControllerWasOpenBeforeProjectLoad = true;
+    nativeCloseHookControllerWindow();
+  }
   if (nativeAppActivePanelIsOpen()) {
     g_nativePanelWasOpenBeforeProjectLoad = true;
     nativeCloseAppActivePanel();
   }
-  if (g_nativePanelWasOpenBeforeProjectLoad &&
+  const bool anyWindowWasOpen =
+    g_nativePanelWasOpenBeforeProjectLoad ||
+    g_nativeHookControllerWasOpenBeforeProjectLoad ||
+    g_nativeBigClockWasOpenBeforeProjectLoad[0] ||
+    g_nativeBigClockWasOpenBeforeProjectLoad[1];
+  if (anyWindowWasOpen &&
       !g_nativeProjectLoadAwaitingPanelRestore) {
     g_nativeProjectLoadAwaitingPanelRestore = true;
     g_nativeProjectLoadPanelClosedAt =
@@ -53526,8 +59272,7 @@ static project_config_extension_t g_nativeProjectConfigExtension = {
 
 static void nativeRestorePanelAfterProjectLoadIfReady()
 {
-  if (!g_nativeProjectLoadAwaitingPanelRestore ||
-      !g_nativePanelWasOpenBeforeProjectLoad) {
+  if (!g_nativeProjectLoadAwaitingPanelRestore) {
     return;
   }
   if (g_state.projectStableTicks < 2 ||
@@ -53542,8 +59287,23 @@ static void nativeRestorePanelAfterProjectLoadIfReady()
       !IsWindowVisible(mainWindow) || !IsWindowEnabled(mainWindow)) {
     return;
   }
-  if (nativeOpenAppActivePanel()) {
+  bool restored = true;
+  if (g_nativePanelWasOpenBeforeProjectLoad) {
+    restored = nativeOpenAppActivePanel() && restored;
+  }
+  if (g_nativeHookControllerWasOpenBeforeProjectLoad) {
+    restored = nativeOpenHookControllerWindow() && restored;
+  }
+  for (int slot = 0; slot < 2; ++slot) {
+    if (g_nativeBigClockWasOpenBeforeProjectLoad[slot]) {
+      restored = nativeOpenBigClockWindow(slot) && restored;
+    }
+  }
+  if (restored) {
     g_nativePanelWasOpenBeforeProjectLoad = false;
+    g_nativeHookControllerWasOpenBeforeProjectLoad = false;
+    g_nativeBigClockWasOpenBeforeProjectLoad[0] = false;
+    g_nativeBigClockWasOpenBeforeProjectLoad[1] = false;
     g_nativeProjectLoadAwaitingPanelRestore = false;
     g_nativeProjectLoadPanelClosedAt =
       std::chrono::steady_clock::time_point{};
@@ -53560,6 +59320,9 @@ static constexpr UINT_PTR kNativeReaperMainSubclassId =
   static_cast<UINT_PTR>(0x5653484D);
 static HWND g_nativeReaperMainSubclassHwnd = nullptr;
 static bool g_nativePanelClosedForHostClose = false;
+static bool g_nativeMainPanelClosedForHostClose = false;
+static bool g_nativeHookControllerClosedForHostClose = false;
+static bool g_nativeBigClockClosedForHostClose[2] = {false, false};
 static std::chrono::steady_clock::time_point
   g_nativePanelClosedForHostCloseAt{};
 
@@ -53629,11 +59392,27 @@ static LRESULT CALLBACK nativeReaperMainSubclassProc(
         hwnd, LOWORD(wParam))) {
     nativePreparePanelForProjectTransition();
   } else if (message == WM_CLOSE) {
+    bool closedWindow = false;
+    for (int slot = 0; slot < 2; ++slot) {
+      if (!nativeBigClockWindowIsOpen(slot)) continue;
+      g_nativeBigClockClosedForHostClose[slot] = true;
+      nativeCloseBigClockWindow(slot);
+      closedWindow = true;
+    }
+    if (nativeHookControllerWindowIsOpen()) {
+      g_nativeHookControllerClosedForHostClose = true;
+      nativeCloseHookControllerWindow();
+      closedWindow = true;
+    }
     if (nativeAppActivePanelIsOpen()) {
+      g_nativeMainPanelClosedForHostClose = true;
+      nativeCloseAppActivePanel();
+      closedWindow = true;
+    }
+    if (closedWindow) {
       g_nativePanelClosedForHostClose = true;
       g_nativePanelClosedForHostCloseAt =
         std::chrono::steady_clock::now();
-      nativeCloseAppActivePanel();
     }
   } else if (message == WM_NCDESTROY) {
     RemoveWindowSubclass(
@@ -53665,6 +59444,10 @@ static void nativeRemoveReaperMainWindowSubclass()
   HWND mainWindow = g_nativeReaperMainSubclassHwnd;
   g_nativeReaperMainSubclassHwnd = nullptr;
   g_nativePanelClosedForHostClose = false;
+  g_nativeMainPanelClosedForHostClose = false;
+  g_nativeHookControllerClosedForHostClose = false;
+  g_nativeBigClockClosedForHostClose[0] = false;
+  g_nativeBigClockClosedForHostClose[1] = false;
   g_nativePanelClosedForHostCloseAt =
     std::chrono::steady_clock::time_point{};
   if (mainWindow && IsWindow(mainWindow)) {
@@ -53694,7 +59477,21 @@ static void nativeRestorePanelAfterCancelledHostClose()
   g_nativePanelClosedForHostClose = false;
   g_nativePanelClosedForHostCloseAt =
     std::chrono::steady_clock::time_point{};
-  nativeOpenAppActivePanel();
+  if (g_nativeMainPanelClosedForHostClose) {
+    nativeOpenAppActivePanel();
+  }
+  if (g_nativeHookControllerClosedForHostClose) {
+    nativeOpenHookControllerWindow();
+  }
+  for (int slot = 0; slot < 2; ++slot) {
+    if (g_nativeBigClockClosedForHostClose[slot]) {
+      nativeOpenBigClockWindow(slot);
+    }
+  }
+  g_nativeMainPanelClosedForHostClose = false;
+  g_nativeHookControllerClosedForHostClose = false;
+  g_nativeBigClockClosedForHostClose[0] = false;
+  g_nativeBigClockClosedForHostClose[1] = false;
 }
 #else
 static void nativeInstallReaperMainWindowSubclass() {}
@@ -53920,6 +59717,18 @@ static void startupTimer()
 
   normalizeAutoOpenConflict();
 
+  if (!g_state.didAuxiliaryStartupAutoOpen) {
+    g_state.didAuxiliaryStartupAutoOpen = true;
+    nativeOpenConfiguredStartupWindows();
+  }
+
+  if (g_state.projectStableTicks >= 6 &&
+      g_state.auxiliaryAutoOpenedProjectSignature !=
+        projectSignature) {
+    g_state.auxiliaryAutoOpenedProjectSignature = projectSignature;
+    nativeOpenConfiguredProjectStartupWindows();
+  }
+
   const std::string projectMode = getProjectAutoOpenMode();
 
   if (!projectMode.empty() && g_state.projectStableTicks >= 6) {
@@ -53960,6 +59769,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetMainHwnd_ptr = reinterpret_cast<GetMainHwnd_t>(rec->GetFunc("GetMainHwnd"));
   GetResourcePath_ptr = reinterpret_cast<GetResourcePath_t>(rec->GetFunc("GetResourcePath"));
   GetAppVersion_ptr = reinterpret_cast<GetAppVersion_t>(rec->GetFunc("GetAppVersion"));
+  get_config_var_ptr = reinterpret_cast<get_config_var_t>(
+    rec->GetFunc("get_config_var"));
   Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
   GetToggleCommandState_ptr = reinterpret_cast<GetToggleCommandState_t>(rec->GetFunc("GetToggleCommandState"));
   GetToggleCommandStateEx_ptr = reinterpret_cast<GetToggleCommandStateEx_t>(rec->GetFunc("GetToggleCommandStateEx"));
@@ -54052,6 +59863,15 @@ static bool loadApi(reaper_plugin_info_t* rec)
   ValidatePtr2_ptr =
     reinterpret_cast<ValidatePtr2_t>(
       rec->GetFunc("ValidatePtr2"));
+  format_timestr_pos_ptr = reinterpret_cast<format_timestr_pos_t>(
+    rec->GetFunc("format_timestr_pos"));
+  GR_SelectColor_ptr = reinterpret_cast<GR_SelectColor_t>(
+    rec->GetFunc("GR_SelectColor"));
+  TimeMap_curFrameRate_ptr = reinterpret_cast<TimeMap_curFrameRate_t>(
+    rec->GetFunc("TimeMap_curFrameRate"));
+  GetProjectTimeSignature2_ptr =
+    reinterpret_cast<GetProjectTimeSignature2_t>(
+      rec->GetFunc("GetProjectTimeSignature2"));
   CountTracks_ptr = reinterpret_cast<CountTracks_t>(rec->GetFunc("CountTracks"));
   GetTrack_ptr = reinterpret_cast<GetTrack_t>(rec->GetFunc("GetTrack"));
   GetMasterTrack_ptr = reinterpret_cast<GetMasterTrack_t>(rec->GetFunc("GetMasterTrack"));
@@ -54209,6 +60029,22 @@ static bool initialize()
     }
   }
 
+  for (StartupWindowEntry& entry : g_startupWindowEntries) {
+    entry.commandId = plugin_register_ptr(
+      "custom_action", (void*)&entry.action);
+    if (entry.commandId != 0) {
+      hasRegisteredAction = true;
+    }
+  }
+  for (ProjectStartupWindowEntry& entry :
+       g_projectStartupWindowEntries) {
+    entry.commandId = plugin_register_ptr(
+      "custom_action", (void*)&entry.action);
+    if (entry.commandId != 0) {
+      hasRegisteredAction = true;
+    }
+  }
+
   g_timecodeReceiveCommandId = plugin_register_ptr("custom_action", (void*)&g_timecodeReceiveAction);
   if (g_timecodeReceiveCommandId != 0) {
     hasRegisteredAction = true;
@@ -54240,6 +60076,18 @@ static bool initialize()
     plugin_register_ptr(
       "custom_action", (void*)&g_recadosAction);
   if (g_recadosCommandId != 0) hasRegisteredAction = true;
+  g_bigClockHookCommandId =
+    plugin_register_ptr(
+      "custom_action", (void*)&g_bigClockHookAction);
+  if (g_bigClockHookCommandId != 0) hasRegisteredAction = true;
+  g_bigClockHookTwoCommandId =
+    plugin_register_ptr(
+      "custom_action", (void*)&g_bigClockHookTwoAction);
+  if (g_bigClockHookTwoCommandId != 0) hasRegisteredAction = true;
+  g_hookControllerCommandId =
+    plugin_register_ptr(
+      "custom_action", (void*)&g_hookControllerAction);
+  if (g_hookControllerCommandId != 0) hasRegisteredAction = true;
 
   for (ScriptEntry& script : g_scripts) {
     script.commandId = plugin_register_ptr("custom_action", (void*)&script.action);
@@ -54309,13 +60157,19 @@ static bool initialize()
   g_state.startupTimerTicks = 0;
   g_state.projectStableTicks = 0;
   g_state.didGlobalStartupAutoOpen = false;
+  g_state.didAuxiliaryStartupAutoOpen = false;
   g_state.activeProjectSignature.clear();
   g_state.autoOpenedProjectSignature.clear();
+  g_state.auxiliaryAutoOpenedProjectSignature.clear();
   rememberActiveScriptMode("");
   if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
     g_state.timerRegistered = true;
-  } else if (!getAutoOpenMode().empty()) {
-    runScriptByAutoOpenMode(getAutoOpenMode());
+  } else {
+    if (!getAutoOpenMode().empty()) {
+      runScriptByAutoOpenMode(getAutoOpenMode());
+    }
+    nativeOpenConfiguredStartupWindows();
+    g_state.didAuxiliaryStartupAutoOpen = true;
   }
 
   g_state.initialized = true;
@@ -54337,6 +60191,9 @@ static void shutdown()
     g_state.projectConfigRegistered = false;
   }
   g_nativePanelWasOpenBeforeProjectLoad = false;
+  g_nativeHookControllerWasOpenBeforeProjectLoad = false;
+  g_nativeBigClockWasOpenBeforeProjectLoad[0] = false;
+  g_nativeBigClockWasOpenBeforeProjectLoad[1] = false;
   g_nativeProjectLoadAwaitingPanelRestore = false;
   g_nativeProjectLoadPanelClosedAt =
     std::chrono::steady_clock::time_point{};
@@ -54355,6 +60212,9 @@ static void shutdown()
 
   nativeCloseAppActivePanel();
   nativeCloseAllTelepromptWindows();
+  nativeCloseBigClockWindow(0);
+  nativeCloseBigClockWindow(1);
+  nativeCloseHookControllerWindow();
   nativeTechnicalNoticeFlushPersistenceOnMainThread();
 
   unregisterNativeBridgeApi();
@@ -54423,6 +60283,21 @@ static void shutdown()
       "-custom_action", (void*)&g_recadosAction);
     g_recadosCommandId = 0;
   }
+  if (g_bigClockHookCommandId != 0) {
+    plugin_register_ptr(
+      "-custom_action", (void*)&g_bigClockHookAction);
+    g_bigClockHookCommandId = 0;
+  }
+  if (g_bigClockHookTwoCommandId != 0) {
+    plugin_register_ptr(
+      "-custom_action", (void*)&g_bigClockHookTwoAction);
+    g_bigClockHookTwoCommandId = 0;
+  }
+  if (g_hookControllerCommandId != 0) {
+    plugin_register_ptr(
+      "-custom_action", (void*)&g_hookControllerAction);
+    g_hookControllerCommandId = 0;
+  }
 
   for (ScriptEntry& script : g_scripts) {
     if (script.commandId != 0) {
@@ -54444,8 +60319,23 @@ static void shutdown()
       entry.commandId = 0;
     }
   }
+  for (StartupWindowEntry& entry : g_startupWindowEntries) {
+    if (entry.commandId != 0) {
+      plugin_register_ptr("-custom_action", (void*)&entry.action);
+      entry.commandId = 0;
+    }
+  }
+  for (ProjectStartupWindowEntry& entry :
+       g_projectStartupWindowEntries) {
+    if (entry.commandId != 0) {
+      plugin_register_ptr("-custom_action", (void*)&entry.action);
+      entry.commandId = 0;
+    }
+  }
   g_state.activeProjectSignature.clear();
   g_state.autoOpenedProjectSignature.clear();
+  g_state.auxiliaryAutoOpenedProjectSignature.clear();
+  g_state.didAuxiliaryStartupAutoOpen = false;
   rememberActiveScriptMode("");
   g_state.modeBeforeDirectorApp.clear();
   g_appActiveOpenRequested.store(false);
