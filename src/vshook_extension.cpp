@@ -55750,17 +55750,24 @@ static bool nativeTelepromptDrawHeldImageFrame(
   if (!sourceDc) return false;
 #ifdef _WIN32
   const int oldStretchMode = SetStretchBltMode(dc, HALFTONE);
-#endif
   const bool rendered = StretchBlt(
     dc, drawX, drawY, drawWidth, drawHeight,
     sourceDc, 0, 0, sourceWidth, sourceHeight,
     SRCCOPY) != 0;
-#ifdef _WIN32
   if (oldStretchMode != 0) {
     SetStretchBltMode(dc, oldStretchMode);
   }
-#endif
   return rendered;
+#else
+  // SWELL declara StretchBlt como void no macOS, ao contrario do Win32.
+  // A source DC ja foi validada acima; depois da chamada nao existe valor de
+  // retorno portavel que possamos consultar.
+  StretchBlt(
+    dc, drawX, drawY, drawWidth, drawHeight,
+    sourceDc, 0, 0, sourceWidth, sourceHeight,
+    SRCCOPY);
+  return true;
+#endif
 }
 
 #if defined(_WIN32) || defined(__APPLE__)
