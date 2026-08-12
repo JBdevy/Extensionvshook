@@ -416,6 +416,8 @@ static const char* kProjectAutoOpenHookControllerKey =
 static const char* kTimecodeModeKey = "TIMECODE_MODE_V1";
 static const char* kTimecodePairCodeKey = "TIMECODE_PAIR_CODE_V1";
 static const char* kProjectSyncEnabledKey = "PROJECT_SYNC_ENABLED_V1";
+static const char* kExtensionBypassKey =
+  "EXTENSION_GLOBAL_BYPASS_V1";
 static const char* kScriptControlSection = "VS_HOOK_SCRIPT_CONTROL";
 static const char* kActiveScriptModeKey = "ACTIVE_MODE_V1";
 static const char* kMixerBindingExtSection =
@@ -435,6 +437,9 @@ static const char* kAccessLegacyPassKey =
 static const char* kAccessUserKey = "USER_V1";
 
 static bool g_transportCommandBypass = false;
+// Estado global e persistente: continua ativo entre projetos e reinicios do
+// REAPER ate o usuario desmarcar ou abrir Executar/Hook Controller.
+static std::atomic<bool> g_nativeExtensionBypassActive{false};
 static const int kReaperTransportPlayStopCommandId = 40044;
 static const int kReaperTransportStopCommandId = 1016;
 
@@ -442,6 +447,7 @@ static bool nativeIsLuaControlActive();
 static bool nativeIsDirectorControlActive();
 static bool nativeUiBlockInterfaceWhenDirectorConnectedEnabled();
 static bool nativeIsRuntimeControlActive();
+static void nativeSetExtensionBypass(bool enabled);
 static void nativeClearExplicitStopQueueState();
 static bool nativePrepareStopSelectionFromQueueOrCurrent(ReaProject* project, bool moveCursorAfterStop);
 static bool nativeStopTransportAndPrepareExplicitSelection(ReaProject* project, const std::string& explicitSelectionId, const std::string& explicitSelectionTab, double explicitStartPos, double explicitEndPos, bool moveCursorAfterStop, bool validatedNavigationSelection = false);
@@ -581,6 +587,9 @@ static custom_action_register_t g_bigClockHookTwoAction = {
 static custom_action_register_t g_hookControllerAction = {
   0, "VSHOOKNEWCONTROLLER", "VS Hook: Hook Controller", nullptr
 };
+static custom_action_register_t g_extensionBypassAction = {
+  0, "VSHOOKGLOBALBYPASS", "VS Hook: Bypass", nullptr
+};
 static int g_timecodeReceiveCommandId = 0;
 static int g_timecodeTransmitterCommandId = 0;
 static int g_addTimecodeCommandId = 0;
@@ -592,6 +601,7 @@ static int g_recadosCommandId = 0;
 static int g_bigClockHookCommandId = 0;
 static int g_bigClockHookTwoCommandId = 0;
 static int g_hookControllerCommandId = 0;
+static int g_extensionBypassCommandId = 0;
 
 struct State {
   bool initialized = false;
@@ -2573,6 +2583,7 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
 {
   (void)ctx;
   if (!msg) return 0;
+  if (g_nativeExtensionBypassActive.load()) return 0;
 
   const bool keyDown = msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN;
   const int vk = static_cast<int>(msg->wParam);
@@ -4014,15 +4025,42 @@ static bool hookCommand(int command, int flag)
 {
   (void)flag;
 
+  if (g_extensionBypassCommandId != 0 &&
+      command == g_extensionBypassCommandId) {
+    nativeSetExtensionBypass(
+      !g_nativeExtensionBypassActive.load());
+    return true;
+  }
+  if (g_nativeInterfaceCommandId != 0 &&
+      command == g_nativeInterfaceCommandId) {
+    if (g_nativeExtensionBypassActive.load()) {
+      nativeSetExtensionBypass(false);
+      nativeOpenAppActivePanel();
+    } else {
+      toggleNativeInterface();
+    }
+    return true;
+  }
+  if (g_hookControllerCommandId != 0 &&
+      command == g_hookControllerCommandId) {
+    if (g_nativeExtensionBypassActive.load()) {
+      nativeSetExtensionBypass(false);
+      nativeOpenHookControllerWindow();
+    } else {
+      nativeToggleHookControllerWindow();
+    }
+    return true;
+  }
+
+  // Em Bypass somente os dois comandos acima podem reativar a extensao.
+  // Comandos nativos do REAPER continuam livres para o proprio host.
+  if (g_nativeExtensionBypassActive.load()) return false;
+
   if (nativeCommandStartsProjectTransition(command)) {
     nativePreparePanelForProjectTransition();
   }
 
   if (handleTransportQueueStopCommand(command)) return true;
-  if (g_nativeInterfaceCommandId != 0 && command == g_nativeInterfaceCommandId) {
-    toggleNativeInterface();
-    return true;
-  }
   if (g_timecodeReceiveCommandId != 0 && command == g_timecodeReceiveCommandId) {
     toggleTimecodeMode("receive");
     return true;
@@ -4067,11 +4105,6 @@ static bool hookCommand(int command, int flag)
   if (g_bigClockHookTwoCommandId != 0 &&
       command == g_bigClockHookTwoCommandId) {
     nativeToggleBigClockWindow(1);
-    return true;
-  }
-  if (g_hookControllerCommandId != 0 &&
-      command == g_hookControllerCommandId) {
-    nativeToggleHookControllerWindow();
     return true;
   }
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
@@ -4120,15 +4153,40 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   (void)relmode;
   (void)hwnd;
 
+  if (g_extensionBypassCommandId != 0 &&
+      command == g_extensionBypassCommandId) {
+    nativeSetExtensionBypass(
+      !g_nativeExtensionBypassActive.load());
+    return true;
+  }
+  if (g_nativeInterfaceCommandId != 0 &&
+      command == g_nativeInterfaceCommandId) {
+    if (g_nativeExtensionBypassActive.load()) {
+      nativeSetExtensionBypass(false);
+      nativeOpenAppActivePanel();
+    } else {
+      toggleNativeInterface();
+    }
+    return true;
+  }
+  if (g_hookControllerCommandId != 0 &&
+      command == g_hookControllerCommandId) {
+    if (g_nativeExtensionBypassActive.load()) {
+      nativeSetExtensionBypass(false);
+      nativeOpenHookControllerWindow();
+    } else {
+      nativeToggleHookControllerWindow();
+    }
+    return true;
+  }
+
+  if (g_nativeExtensionBypassActive.load()) return false;
+
   if (nativeCommandStartsProjectTransition(command)) {
     nativePreparePanelForProjectTransition();
   }
 
   if (handleTransportQueueStopCommand(command)) return true;
-  if (g_nativeInterfaceCommandId != 0 && command == g_nativeInterfaceCommandId) {
-    toggleNativeInterface();
-    return true;
-  }
   if (g_timecodeReceiveCommandId != 0 && command == g_timecodeReceiveCommandId) {
     toggleTimecodeMode("receive");
     return true;
@@ -4175,11 +4233,6 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
     nativeToggleBigClockWindow(1);
     return true;
   }
-  if (g_hookControllerCommandId != 0 &&
-      command == g_hookControllerCommandId) {
-    nativeToggleHookControllerWindow();
-    return true;
-  }
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0 && command == entry.commandId) {
       toggleAutoOpenMode(entry.autoOpenMode);
@@ -4219,6 +4272,12 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
 
 static int toggleActionState(int commandId)
 {
+  if (g_extensionBypassCommandId != 0 &&
+      commandId == g_extensionBypassCommandId) {
+    return g_nativeExtensionBypassActive.load() ? 1 : 0;
+  }
+  if (g_nativeExtensionBypassActive.load()) return -1;
+
   normalizeAutoOpenConflict();
 
   if (g_nativeInterfaceCommandId != 0 && commandId == g_nativeInterfaceCommandId) {
@@ -4354,7 +4413,9 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   if (!menustr || !hMenu) return;
   if (std::strcmp(menustr, "Main extensions") != 0) return;
 
-  normalizeAutoOpenConflict();
+  if (!g_nativeExtensionBypassActive.load()) {
+    normalizeAutoOpenConflict();
+  }
 
   const std::string autoMode = getAutoOpenMode();
   const std::string projectAutoMode = getProjectAutoOpenMode();
@@ -4392,6 +4453,8 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
       nativeBigClockWindowIsOpen(1));
     setMenuCommandChecked(hMenu, g_hookControllerCommandId,
       nativeHookControllerWindowIsOpen());
+    setMenuCommandChecked(hMenu, g_extensionBypassCommandId,
+      g_nativeExtensionBypassActive.load());
     return;
   }
 
@@ -4461,8 +4524,14 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   appendMenuString(projectSyncMenu, "Sync to project", g_projectSyncCommandId, getProjectSyncEnabled());
   insertMenuSubMenu(vsHookMenu, projectSyncMenu, "Project Sync", -1);
 
+  InsertMenu(vsHookMenu, GetMenuItemCount(vsHookMenu),
+    MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+  appendMenuString(vsHookMenu, "Bypass",
+    g_extensionBypassCommandId,
+    g_nativeExtensionBypassActive.load());
+
   // VS Hook aparece como uma unica entrada no menu Extensions e abre tudo no
-  // submenu lateral: Executar, Teleprompt, Startup, Timecode e Project Sync.
+  // submenu lateral; Bypass permanece literalmente como a ultima opcao.
   insertMenuSubMenu(hMenu, vsHookMenu, "VS Hook", 0);
 }
 
@@ -4872,6 +4941,7 @@ struct NativePendingSelectionCommand {
 
 static NativePendingSelectionCommand g_nativePendingSelection;
 static bool g_nativeTimerRunning = false;
+static bool g_nativeTimerWasRunningBeforeExtensionBypass = false;
 static std::string g_nativeTimerMode = "progressive";
 static double g_nativeTimerBaseSec = 0.0;
 static double g_nativeTimerTargetSec = 0.0;
@@ -6959,10 +7029,12 @@ static bool nativeIsDirectorControlActive()
 
 static bool nativeIsRuntimeControlActive()
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   // As janelas nativas do teleprompt também dependem do snapshot completo do
   // projeto. Mantém o motor acordado enquanto qualquer uma delas estiver
   // aberta, mesmo sem a interface principal, Lua ou Diretor conectados.
   return nativeAppActivePanelIsOpen() ||
+         nativeHookControllerWindowIsOpen() ||
          nativeTelepromptWindowIsOpen(1) ||
          nativeTelepromptWindowIsOpen(2) ||
          getTimecodeMode() == "receive" ||
@@ -55859,6 +55931,7 @@ static bool VS_Hook_Native_PullCommand(char* buf, int bufSize)
 {
   if (!buf || bufSize <= 0) return false;
   buf[0] = '\0';
+  if (g_nativeExtensionBypassActive.load()) return false;
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   if (g_nativeCommandQueue.empty()) return false;
   std::string command = g_nativeCommandQueue.front();
@@ -55870,6 +55943,7 @@ static bool VS_Hook_Native_PullCommand(char* buf, int bufSize)
 
 static bool VS_Hook_Native_SetLuaState(const char* jsonFragment)
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   g_nativeLuaLiveFragment = jsonFragment ? jsonFragment : "";
   return true;
@@ -55877,6 +55951,7 @@ static bool VS_Hook_Native_SetLuaState(const char* jsonFragment)
 
 static bool VS_Hook_Native_ApplyTimerCommand(const char* commandJson)
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   if (!commandJson || !*commandJson) return false;
   // ReaScripts executam na thread principal do REAPER, a mesma em que os
   // comandos HTTP eram consumidos. Assim Windows e macOS seguem a mesma rota.
@@ -55885,6 +55960,7 @@ static bool VS_Hook_Native_ApplyTimerCommand(const char* commandJson)
 
 static bool VS_Hook_Native_SetActivePlaylist(const char* playlistName)
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
   if (!project || !SetProjExtState_ptr) return false;
@@ -55907,6 +55983,7 @@ static bool VS_Hook_Native_GetState(char* buf, int bufSize)
 {
   if (!buf || bufSize <= 0) return false;
   buf[0] = '\0';
+  if (g_nativeExtensionBypassActive.load()) return false;
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   const std::string state = g_nativeStateJson.empty() ? std::string("{\"ok\":false,\"connected\":false}") : g_nativeStateJson;
   std::strncpy(buf, state.c_str(), static_cast<size_t>(bufSize - 1));
@@ -55916,6 +55993,7 @@ static bool VS_Hook_Native_GetState(char* buf, int bufSize)
 
 static bool VS_Hook_Native_ResumePcAccess()
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     g_nativeLastDirectorHeartbeat = std::chrono::steady_clock::time_point();
@@ -55927,6 +56005,7 @@ static bool VS_Hook_Native_ResumePcAccess()
 
 static bool VS_Hook_Native_ClearQueue()
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   nativeClearAllQueueStateLocked();
   g_nativeForceStateBuild.store(true);
@@ -55935,6 +56014,7 @@ static bool VS_Hook_Native_ClearQueue()
 
 static bool VS_Hook_Native_StopTransportReadyFromQueue()
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
   if (!Main_OnCommand_ptr) return false;
@@ -55946,6 +56026,7 @@ static bool VS_Hook_Native_StopTransportReadyFromQueue()
 
 static bool VS_Hook_Native_SetManualQueueByPlaylistOrder(int playlistOrder)
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   const NativeSongWindow* song = nativeFindActivePlaylistSongByOrderLocked(playlistOrder);
   if (!song || !nativeSongIsPlayable(*song)) return false;
@@ -55956,6 +56037,7 @@ static bool VS_Hook_Native_SetManualQueueByPlaylistOrder(int playlistOrder)
 
 static bool VS_Hook_Native_ArmAutoQueueFromPlaylistOrder(int currentPlaylistOrder)
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   nativeLoadAutomationSettingsOnceLocked();
   if (!g_nativeAutoplayEnabled) {
@@ -55997,6 +56079,7 @@ static bool VS_Hook_Native_ArmAutoQueueFromPlaylistOrder(int currentPlaylistOrde
 
 static bool VS_Hook_Native_ToggleMultiLoopBypass()
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   g_nativeMultiLoopBypassRequest.store(2);
   g_nativeForceStateBuild.store(true);
   return true;
@@ -56004,6 +56087,7 @@ static bool VS_Hook_Native_ToggleMultiLoopBypass()
 
 static bool VS_Hook_Native_SetMultiLoopBypass(bool enabled)
 {
+  if (g_nativeExtensionBypassActive.load()) return false;
   g_nativeMultiLoopBypassRequest.store(enabled ? 1 : 0);
   g_nativeForceStateBuild.store(true);
   return true;
@@ -59169,6 +59253,7 @@ static bool nativeCanHostBridgeServer()
 
 static void startNativeBridgeServer()
 {
+  if (g_nativeExtensionBypassActive.load()) return;
   if (g_nativeRunning.load()) return;
   if (!nativeCanHostBridgeServer()) return;
   if (g_nativeThread.joinable()) g_nativeThread.join();
@@ -59372,7 +59457,7 @@ static void nativeProjectConfigBeginLoadProjectState(
   (void)registration;
   // Undo tambem passa pelo callback de projeto, mas nao troca o RPP ativo e
   // nunca deve fazer a janela piscar ou perder o foco.
-  if (isUndo) return;
+  if (isUndo || g_nativeExtensionBypassActive.load()) return;
   nativePreparePanelForProjectTransition();
 }
 
@@ -59612,6 +59697,145 @@ static void nativeRemoveReaperMainWindowSubclass() {}
 static void nativeRestorePanelAfterCancelledHostClose() {}
 #endif
 
+static void nativeSetExtensionBypass(bool enabled)
+{
+  const bool previous =
+    g_nativeExtensionBypassActive.exchange(enabled);
+  if (previous == enabled) return;
+
+  if (enabled) {
+    // Corta primeiro todas as entradas externas. A partir daqui o app perde a
+    // conexao e nenhum novo comando entra enquanto as janelas sao encerradas.
+    stopNativeBridgeServer();
+    g_appActiveOpenRequested.store(false);
+    g_pcResumeRequested.store(false);
+    g_nativeForceSnapshotBuild.store(false);
+    g_nativeForceStateBuild.store(false);
+    g_nativeMetersLastRequestMs.store(0);
+    g_state.appActiveScreenOpen = false;
+    g_state.directorInterfaceBlocked = false;
+    g_state.pcAccessOverride = false;
+
+    g_state.pendingScriptMode.clear();
+    g_state.pendingScriptWaitTicks = 0;
+    for (ScriptEntry& script : g_scripts) {
+      if (isScriptWindowOpen(script) ||
+          getScriptToggleState(script) > 0) {
+        terminateKnownScript(script);
+      }
+    }
+    rememberActiveScriptMode("");
+
+    nativeDestroyBpmScanAccessor();
+    nativeUiCancelPendingMusicNavigation();
+    g_nativeUiPendingBlockMidiNumber = 0;
+    g_nativeUiBulkSpacePendingActions.clear();
+    g_nativeUiConverterPending = false;
+    g_nativeUiMidiPendingBinding.clear();
+    g_nativeMainPendingDropSelectionIdentities.clear();
+    g_nativeMainPendingDropSelectionRegionsPage = false;
+    nativeReleaseRuntimeControlOnMainThread();
+    g_nativeRuntimeWasActive = false;
+    g_nativeMultiLoopBypassRequest.store(-1);
+
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      g_nativeTimerWasRunningBeforeExtensionBypass =
+        g_nativeTimerRunning;
+      if (g_nativeTimerRunning) nativeTimerStopLocked();
+      nativePublishTimerStateLocked();
+
+      g_nativeCommandQueue.clear();
+      g_nativeHttpCommandQueue.clear();
+      g_nativeTunerCommandQueue.clear();
+      g_nativeCommandHistory.clear();
+      g_nativePublishedCommandsSignature.clear();
+      g_nativeLuaLiveFragment.clear();
+      g_nativeLastDirectorHeartbeat = {};
+      g_nativeLastLuaControlHeartbeat = {};
+      g_nativeLastLuaControlHeartbeatToken.clear();
+      g_nativeLastLuaQueueSyncSeq.clear();
+      g_nativeLastLuaStateSyncSeq.clear();
+      g_nativeDirectorWasActive = false;
+      g_nativePendingSelection = NativePendingSelectionCommand{};
+      g_nativePendingPlayTarget = NativePendingPlayTarget{};
+      ++g_nativePendingPlayTargetRevision;
+      nativeClearAllQueueStateLocked();
+      g_nativeArmedMarkerId.clear();
+      g_nativeArmedMarkerLabel.clear();
+      g_nativeArmedMarkerSetAt = {};
+      g_nativeArmedMarkerStartPlayPos = 0.0;
+      g_nativeArmedMarkerLastPlayPos = 0.0;
+      g_nativeStateJson =
+        "{\"ok\":false,\"connected\":false,\"bypassed\":true}";
+    }
+    nativePublishCommandsToExtState();
+    if (SetExtState_ptr) {
+      SetExtState_ptr(kNativeExtStateSection,
+        "NATIVE_STATE_JSON_V1",
+        "{\"ok\":false,\"connected\":false,\"bypassed\":true}",
+        false);
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+      g_nativeTimecodeLanOutbox.clear();
+      g_nativeTimecodeLanTransport = NativeTimecodeLanTransport{};
+      g_nativeTimecodeLanPeerConnected = false;
+      g_nativeTimecodeLanPeerName.clear();
+      g_nativeApplyingTimecodeLanRemoteCommand = false;
+    }
+
+    // Bypass tambem significa nenhuma interface nativa ainda executando.
+    // Limpa a intencao de restaurar Teleprompts ao reabrir o painel.
+    nativeCloseTelepromptWindow(1, true);
+    nativeCloseTelepromptWindow(2, true);
+    nativeCloseAllTelepromptWindows();
+    nativeCloseBigClockWindow(0);
+    nativeCloseBigClockWindow(1);
+    nativeCloseHookControllerWindow();
+    nativeCloseAppActivePanel();
+
+    g_nativePanelWasOpenBeforeProjectLoad = false;
+    g_nativeHookControllerWasOpenBeforeProjectLoad = false;
+    g_nativeBigClockWasOpenBeforeProjectLoad[0] = false;
+    g_nativeBigClockWasOpenBeforeProjectLoad[1] = false;
+    g_nativeProjectLoadAwaitingPanelRestore = false;
+    g_nativeProjectLoadPanelClosedAt = {};
+    nativeRemoveReaperMainWindowSubclass();
+  } else {
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      if (g_nativeTimerWasRunningBeforeExtensionBypass &&
+          !g_nativeTimerRunning) {
+        nativeTimerStartLocked();
+      }
+      g_nativeTimerWasRunningBeforeExtensionBypass = false;
+      nativePublishTimerStateLocked();
+    }
+
+    // Sair do Bypass nao executa configuracoes de Startup atrasadas. Somente
+    // o clique em Executar/Hook Controller abre a janela pedida pelo usuario.
+    g_state.didGlobalStartupAutoOpen = true;
+    g_state.didAuxiliaryStartupAutoOpen = true;
+    g_nativeForceSnapshotBuild.store(true);
+    g_nativeForceStateBuild.store(true);
+    nativePublishStandbyDiscoveryState();
+    startNativeBridgeServer();
+  }
+
+  // Persiste somente depois de concluir a transicao. Assim uma falha externa
+  // ao parar/iniciar o bridge nao deixa o proximo REAPER preso num estado que
+  // esta sessao nao conseguiu terminar de aplicar.
+  if (SetExtState_ptr) {
+    SetExtState_ptr(kExtStateSection, kExtensionBypassKey,
+      enabled ? "1" : "0", true);
+  }
+  if (RefreshToolbar2_ptr && g_extensionBypassCommandId != 0) {
+    RefreshToolbar2_ptr(0, g_extensionBypassCommandId);
+  }
+}
+
 static void nativeUiResetForProjectTabChange()
 {
   // Se a aba anterior ainda existe, restaura nela qualquer estado temporário
@@ -59698,6 +59922,15 @@ static void startupTimer()
   static std::string standbyDiscoveryProjectSignature;
   static bool runtimeLicenseValid = true;
   static std::chrono::steady_clock::time_point nextLicenseCheck{};
+
+  if (g_nativeExtensionBypassActive.load()) {
+    if (g_nativeRunning.load()) stopNativeBridgeServer();
+    if (g_nativeRuntimeWasActive) {
+      g_nativeRuntimeWasActive = false;
+      nativeReleaseRuntimeControlOnMainThread();
+    }
+    return;
+  }
 
   nativeInstallReaperMainWindowSubclass();
   nativeRestorePanelAfterCancelledHostClose();
@@ -60114,6 +60347,15 @@ static bool initialize()
 {
   if (g_state.initialized) return true;
 
+  bool startsBypassed = false;
+  if (GetExtState_ptr) {
+    const char* raw =
+      GetExtState_ptr(kExtStateSection, kExtensionBypassKey);
+    startsBypassed = raw && std::strcmp(raw, "1") == 0;
+  }
+  g_nativeExtensionBypassActive.store(startsBypassed);
+  g_nativeTimerWasRunningBeforeExtensionBypass = false;
+
   bool hasRegisteredAction = false;
 
   // Esta action funciona como identidade única da extensão dentro do processo
@@ -60201,6 +60443,10 @@ static bool initialize()
     plugin_register_ptr(
       "custom_action", (void*)&g_hookControllerAction);
   if (g_hookControllerCommandId != 0) hasRegisteredAction = true;
+  g_extensionBypassCommandId =
+    plugin_register_ptr(
+      "custom_action", (void*)&g_extensionBypassAction);
+  if (g_extensionBypassCommandId != 0) hasRegisteredAction = true;
 
   for (ScriptEntry& script : g_scripts) {
     script.commandId = plugin_register_ptr("custom_action", (void*)&script.action);
@@ -60225,11 +60471,34 @@ static bool initialize()
   nativeTechnicalNoticeRefreshAuthCache(
     nativeDirectorPasswordHash(nativeReadDirectorPassword()),
     nativeDirectorPasswordHash(nativeReadRecadosPassword()));
+  if (startsBypassed) {
+    const char* bypassedState =
+      "{\"ok\":false,\"connected\":false,\"bypassed\":true}";
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      g_nativeCommandQueue.clear();
+      g_nativeHttpCommandQueue.clear();
+      g_nativeTunerCommandQueue.clear();
+      g_nativeStateJson = bypassedState;
+      g_nativePublishedCommandsSignature.clear();
+    }
+    if (SetExtState_ptr) {
+      SetExtState_ptr(kNativeExtStateSection,
+        "NATIVE_STATE_JSON_V1", bypassedState, false);
+      SetExtState_ptr(kNativeExtStateSection,
+        kNativeCommandsExtKey,
+        "{\"seq\":0,\"commands\":[]}", false);
+      SetExtState_ptr(kNativeExtStateSection,
+        kLuaControlHeartbeatKey, "", false);
+    }
+  }
   // Deixa a descoberta do projeto pronta antes da primeira consulta da Hook
   // Center. O timer continuará atualizando normalmente, mas Macs antigos não
   // dependem mais do primeiro ciclo do SWELL para aparecer no app.
-  nativePublishStandbyDiscoveryState();
-  startNativeBridgeServer();
+  if (!startsBypassed) {
+    nativePublishStandbyDiscoveryState();
+    startNativeBridgeServer();
+  }
 
   if (plugin_register_ptr("accelerator", reinterpret_cast<void*>(&g_vshookGlobalHotkeyAccelerator))) {
     g_state.acceleratorRegistered = true;
@@ -60269,15 +60538,15 @@ static bool initialize()
   // quando o usuario troca/abre projetos depois do REAPER ja estar rodando.
   g_state.startupTimerTicks = 0;
   g_state.projectStableTicks = 0;
-  g_state.didGlobalStartupAutoOpen = false;
-  g_state.didAuxiliaryStartupAutoOpen = false;
+  g_state.didGlobalStartupAutoOpen = startsBypassed;
+  g_state.didAuxiliaryStartupAutoOpen = startsBypassed;
   g_state.activeProjectSignature.clear();
   g_state.autoOpenedProjectSignature.clear();
   g_state.auxiliaryAutoOpenedProjectSignature.clear();
   rememberActiveScriptMode("");
   if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
     g_state.timerRegistered = true;
-  } else {
+  } else if (!startsBypassed) {
     if (!getAutoOpenMode().empty()) {
       runScriptByAutoOpenMode(getAutoOpenMode());
     }
@@ -60410,6 +60679,11 @@ static void shutdown()
     plugin_register_ptr(
       "-custom_action", (void*)&g_hookControllerAction);
     g_hookControllerCommandId = 0;
+  }
+  if (g_extensionBypassCommandId != 0) {
+    plugin_register_ptr(
+      "-custom_action", (void*)&g_extensionBypassAction);
+    g_extensionBypassCommandId = 0;
   }
 
   for (ScriptEntry& script : g_scripts) {
