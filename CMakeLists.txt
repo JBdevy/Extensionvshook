@@ -58,6 +58,7 @@ endif()
 add_library(reaper_vshook SHARED
   src/js_api_compat.cpp
   src/license_validator.cpp
+  src/native_static_image_decoder.cpp
   src/vshook_extension.cpp
 )
 
@@ -101,6 +102,7 @@ if(WIN32)
     mfreadwrite
     mfuuid
     propsys
+    windowscodecs
   )
 endif()
 
@@ -140,6 +142,7 @@ if(APPLE)
     "-framework AVFoundation"
     "-framework CoreGraphics"
     "-framework CoreFoundation"
+    "-framework ImageIO"
     "-framework CoreMedia"
     "-framework CoreVideo"
     "-framework Security"
