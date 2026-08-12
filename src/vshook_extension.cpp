@@ -37999,19 +37999,36 @@ static void nativeBigClockWriteReaperConfigInt(
   *static_cast<int*>(address) = value;
 }
 
+static void nativePrepareFirstUseDockerLayout()
+{
+  // Prepara o conjunto inteiro independentemente de qual janela o usuário
+  // abrir primeiro. Sem isso, abrir pelo Startup antes da interface principal
+  // deixava o REAPER criar os dockers novos todos na posição padrão inferior.
+  nativeBigClockWriteReaperConfigInt("dockposflags", 5);
+  nativeBigClockWriteReaperConfigInt("dockermode3", 3); // principal: direita
+  nativeBigClockWriteReaperConfigInt("dockheight_r", 409);
+  nativeBigClockWriteReaperConfigInt("dockermode1", 1); // controller: esquerda
+  nativeBigClockWriteReaperConfigInt("dockheight_l", 362);
+  nativeBigClockWriteReaperConfigInt("dockermode4", 2); // clock 1: em cima
+  nativeBigClockWriteReaperConfigInt("dockheight_t", 69);
+  nativeBigClockWriteReaperConfigInt("dockermode5", 0); // clock 2: em baixo
+  nativeBigClockWriteReaperConfigInt("dockheight", 69);
+}
+
 static void nativeBigClockPrepareFirstOpenDock(int slot)
 {
   slot = nativeBigClockSafeSlot(slot);
   // O REAPER guarda o lado de cada docker separadamente do estado da janela.
   // Configura apenas no primeiro uso: depois disso, qualquer posição escolhida
   // pelo usuário é respeitada pela chave DOCKSTATE persistida.
-  if (slot == 0) {
-    nativeBigClockWriteReaperConfigInt("dockermode4", 2); // superior
-    nativeBigClockWriteReaperConfigInt("dockheight_t", 69);
-  } else {
-    nativeBigClockWriteReaperConfigInt("dockermode5", 0); // inferior
-    nativeBigClockWriteReaperConfigInt("dockheight", 69);
-  }
+  nativePrepareFirstUseDockerLayout();
+  const int dockState = nativeBigClockDefaultDockState(slot);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), dockState);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str(), dockState);
+  nativeAppActiveWriteWindowInt(
+    nativeBigClockKey(slot, "H_V1").c_str(), 64);
 }
 
 static bool nativeBigClockWindowIsOpen(int slot)
@@ -42351,7 +42368,17 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       nativeHookControllerHandleClick(hwnd, point, true);
       return 0;
     }
+    case WM_MOUSEHWHEEL:
+      // O touchpad do macOS envia componentes vertical e horizontal no mesmo
+      // gesto. A Hook Controller não usa rolagem horizontal, mas precisa
+      // consumi-la para que ela não continue até o grid do REAPER.
+      if (GetFocus() != hwnd) SetFocus(hwnd);
+      return 0;
     case WM_MOUSEWHEEL: {
+      // Igual à interface principal: o gesto pertence à janela sob o cursor.
+      // Sem assumir o foco aqui, o SWELL pode manter o docker/timeline como
+      // destino do restante do gesto inercial do touchpad.
+      if (GetFocus() != hwnd) SetFocus(hwnd);
       const int delta = static_cast<short>(HIWORD(wParam));
       if (g_nativeHookControllerMode ==
           NativeHookControllerMode::Tcp) {
@@ -42518,8 +42545,10 @@ static bool nativeOpenHookControllerWindow()
   const bool firstOpen = !nativeAppActiveHasWindowValue(
     "HOOK_CONTROLLER_DOCKSTATE_V1");
   if (firstOpen) {
-    nativeBigClockWriteReaperConfigInt("dockermode1", 1); // esquerda
-    nativeBigClockWriteReaperConfigInt("dockheight_l", 362);
+    nativePrepareFirstUseDockerLayout();
+    nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_DOCKSTATE_V1", 257);
+    nativeAppActiveWriteWindowInt(
+      "HOOK_CONTROLLER_LAST_DOCKSTATE_V1", 257);
   }
   const int savedMode = nativeAppActiveReadWindowInt(
     "HOOK_CONTROLLER_MODE_V1", 0);
@@ -47906,15 +47935,9 @@ static bool nativeOpenAppActivePanel()
     // Reproduz inclusive a prioridade dos quatro cantos: a direita atravessa
     // toda a altura; em cima/baixo atravessam a esquerda e enquadram o
     // Hook Controller no meio.
-    nativeBigClockWriteReaperConfigInt("dockposflags", 5);
-    nativeBigClockWriteReaperConfigInt("dockermode3", 3); // direita
-    nativeBigClockWriteReaperConfigInt("dockheight_r", 409);
-    nativeBigClockWriteReaperConfigInt("dockermode4", 2); // superior
-    nativeBigClockWriteReaperConfigInt("dockheight_t", 69);
-    nativeBigClockWriteReaperConfigInt("dockermode5", 0); // inferior
-    nativeBigClockWriteReaperConfigInt("dockheight", 69);
-    nativeBigClockWriteReaperConfigInt("dockermode1", 1); // esquerda
-    nativeBigClockWriteReaperConfigInt("dockheight_l", 362);
+    nativePrepareFirstUseDockerLayout();
+    nativeAppActiveWriteWindowInt("DOCKSTATE_V1", 769);
+    nativeAppActiveWriteWindowInt("LAST_DOCKSTATE_V1", 769);
   }
   const int savedDockState = nativeAppActiveReadWindowInt("DOCKSTATE_V1", 769);
   const int savedX = nativeAppActiveReadWindowInt("WINDOW_X_V1", 100);
@@ -48574,17 +48597,22 @@ static std::unique_ptr<vshook_video::Decoder>
   g_nativeTelepromptPlatformVideoDecoder[2];
 static PCM_source* g_nativeTelepromptVideoSource[2]{nullptr, nullptr};
 static std::string g_nativeTelepromptVideoSourcePath[2];
-// Imagens estáticas não precisam passar por GETIMAGE e ScaledBlit em cada
-// quadro de 16 ms. O source dedicado continua sendo o dono do bitmap; o cache
-// só permanece válido enquanto esse mesmo source e tamanho solicitado vivem.
-static LICE_IBitmap*
-  g_nativeTelepromptStillImage[2]{nullptr, nullptr};
-static std::string g_nativeTelepromptStillImagePath[2];
-static int g_nativeTelepromptStillImageRequestWidth[2]{0, 0};
-static int g_nativeTelepromptStillImageRequestHeight[2]{0, 0};
-static LICE_IBitmap*
-  g_nativeTelepromptMediaBufferSource[2]{nullptr, nullptr};
+// O bitmap devolvido por PCM_SOURCE_EXT_GETIMAGE pode existir antes de o
+// decoder do REAPER preencher seus pixels. Por isso o cache do raster final
+// usa uma amostra do conteúdo, e nunca apenas o endereço do LICE_IBitmap.
+// GETIMAGE continua sendo consultado para manter o preview acordado; o
+// ScaledBlit pesado só é repetido quando os pixels realmente mudam.
 static std::string g_nativeTelepromptMediaBufferPath[2];
+static LICE_IBitmap*
+  g_nativeTelepromptMediaBufferSourceIdentity[2]{nullptr, nullptr};
+static std::uint64_t
+  g_nativeTelepromptMediaBufferFingerprint[2]{0, 0};
+static int g_nativeTelepromptMediaBufferSourceWidth[2]{0, 0};
+static int g_nativeTelepromptMediaBufferSourceHeight[2]{0, 0};
+static bool
+  g_nativeTelepromptMediaBufferFingerprintValid[2]{false, false};
+static std::chrono::steady_clock::time_point
+  g_nativeTelepromptMediaBufferRefreshedAt[2]{};
 // Diagnóstico publicado no bridge: 0=sem mídia, 1=fonte pronta,
 // 2=quadro decodificado, 3=quadro desenhado; valores negativos identificam
 // em qual etapa o vídeo nativo falhou.
@@ -50208,6 +50236,60 @@ struct NativeTelepromptMediaFrame {
   bool keepPreviewAlive = false;
 };
 
+static bool nativeTelepromptBitmapFingerprint(
+  LICE_IBitmap* image,
+  std::uint64_t& fingerprint)
+{
+  if (!image ||
+      !LICE_GetBits_ptr ||
+      !LICE_GetWidth_ptr ||
+      !LICE_GetHeight_ptr ||
+      !LICE_GetRowSpan_ptr) {
+    return false;
+  }
+  const int width = LICE_GetWidth_ptr(image);
+  const int height = LICE_GetHeight_ptr(image);
+  const int rowSpan = LICE_GetRowSpan_ptr(image);
+  const auto* pixels = static_cast<const std::uint32_t*>(
+    LICE_GetBits_ptr(image));
+  if (!pixels || width <= 0 || height <= 0 || rowSpan < width) {
+    return false;
+  }
+
+  // Uma grade 64x64 detecta quando o decoder preenche tardiamente o mesmo
+  // LICE_IBitmap, sem varrer até 8 MB a cada repaint dos dois Teleprompts.
+  constexpr int maximumSamplesPerAxis = 64;
+  const int sampleRows = std::min(height, maximumSamplesPerAxis);
+  const int sampleColumns = std::min(width, maximumSamplesPerAxis);
+  std::uint64_t hash = 1469598103934665603ull;
+  const auto mix = [&](std::uint32_t value) {
+    hash ^= static_cast<std::uint64_t>(value);
+    hash *= 1099511628211ull;
+  };
+  mix(static_cast<std::uint32_t>(width));
+  mix(static_cast<std::uint32_t>(height));
+  for (int row = 0; row < sampleRows; ++row) {
+    const int y = sampleRows == 1
+      ? 0
+      : static_cast<int>(
+          (static_cast<std::int64_t>(row) * (height - 1)) /
+          (sampleRows - 1));
+    const auto* sourceRow = pixels +
+      static_cast<std::size_t>(y) *
+        static_cast<std::size_t>(rowSpan);
+    for (int column = 0; column < sampleColumns; ++column) {
+      const int x = sampleColumns == 1
+        ? 0
+        : static_cast<int>(
+            (static_cast<std::int64_t>(column) * (width - 1)) /
+            (sampleColumns - 1));
+      mix(sourceRow[x]);
+    }
+  }
+  fingerprint = hash;
+  return true;
+}
+
 static PCM_source* nativeTelepromptCachedVideoSource(
   int slot,
   const std::string& mediaPath)
@@ -50215,12 +50297,13 @@ static PCM_source* nativeTelepromptCachedVideoSource(
   const int index = nativeTelepromptIndex(slot);
   if (g_nativeTelepromptVideoSource[index] &&
       g_nativeTelepromptVideoSourcePath[index] != mediaPath) {
-    g_nativeTelepromptStillImage[index] = nullptr;
-    g_nativeTelepromptStillImagePath[index].clear();
-    g_nativeTelepromptStillImageRequestWidth[index] = 0;
-    g_nativeTelepromptStillImageRequestHeight[index] = 0;
-    g_nativeTelepromptMediaBufferSource[index] = nullptr;
     g_nativeTelepromptMediaBufferPath[index].clear();
+    g_nativeTelepromptMediaBufferSourceIdentity[index] = nullptr;
+    g_nativeTelepromptMediaBufferFingerprint[index] = 0;
+    g_nativeTelepromptMediaBufferSourceWidth[index] = 0;
+    g_nativeTelepromptMediaBufferSourceHeight[index] = 0;
+    g_nativeTelepromptMediaBufferFingerprintValid[index] = false;
+    g_nativeTelepromptMediaBufferRefreshedAt[index] = {};
     double clearPreviewPosition = -1.0;
     g_nativeTelepromptVideoSource[index]->Extended(
       PCM_SOURCE_EXT_SET_PREVIEW_POS_OVERRIDE,
@@ -50383,19 +50466,6 @@ static NativeTelepromptMediaFrame nativeTelepromptAcquireMediaFrame(
     g_nativeTelepromptMediaDiagParent[index].store(0);
     return nativeTelepromptAcquirePlatformVideoFrame(
       slot, state, wantW, wantH);
-  }
-
-  if (g_nativeTelepromptStillImage[index] &&
-      g_nativeTelepromptVideoSource[index] &&
-      g_nativeTelepromptStillImagePath[index] == state.mediaPath &&
-      g_nativeTelepromptVideoSourcePath[index] == state.mediaPath &&
-      g_nativeTelepromptStillImageRequestWidth[index] == wantW &&
-      g_nativeTelepromptStillImageRequestHeight[index] == wantH) {
-    frame.source = g_nativeTelepromptVideoSource[index];
-    frame.image = g_nativeTelepromptStillImage[index];
-    frame.keepPreviewAlive = true;
-    g_nativeTelepromptMediaStatus[index].store(2);
-    return frame;
   }
 
   ReaProject* project = EnumProjects_ptr
@@ -50577,10 +50647,6 @@ static NativeTelepromptMediaFrame nativeTelepromptAcquireMediaFrame(
   if (trySource(
         dedicatedSource, true,
         g_nativeTelepromptMediaDiagDedicated[index])) {
-    g_nativeTelepromptStillImage[index] = frame.image;
-    g_nativeTelepromptStillImagePath[index] = state.mediaPath;
-    g_nativeTelepromptStillImageRequestWidth[index] = wantW;
-    g_nativeTelepromptStillImageRequestHeight[index] = wantH;
     return frame;
   }
 
@@ -50945,8 +51011,13 @@ static bool nativeTelepromptDrawMedia(
       LICE_CreateBitmap_ptr(1, outputW, outputH);
     g_nativeTelepromptMediaBufferWidth[index] = outputW;
     g_nativeTelepromptMediaBufferHeight[index] = outputH;
-    g_nativeTelepromptMediaBufferSource[index] = nullptr;
     g_nativeTelepromptMediaBufferPath[index].clear();
+    g_nativeTelepromptMediaBufferSourceIdentity[index] = nullptr;
+    g_nativeTelepromptMediaBufferFingerprint[index] = 0;
+    g_nativeTelepromptMediaBufferSourceWidth[index] = 0;
+    g_nativeTelepromptMediaBufferSourceHeight[index] = 0;
+    g_nativeTelepromptMediaBufferFingerprintValid[index] = false;
+    g_nativeTelepromptMediaBufferRefreshedAt[index] = {};
   }
   LICE_IBitmap* output = g_nativeTelepromptMediaBuffer[index];
   if (!output) {
@@ -50954,10 +51025,33 @@ static bool nativeTelepromptDrawMedia(
     nativeTelepromptReleaseMediaFrame(frame);
     return false;
   }
+  const bool isStillImage =
+    nativeLower(state.mediaType) == "image";
+  std::uint64_t sourceFingerprint = 0;
+  const bool fingerprintAvailable =
+    isStillImage &&
+    nativeTelepromptBitmapFingerprint(
+      frame.image, sourceFingerprint);
+  const auto mediaNow = std::chrono::steady_clock::now();
+  // Mesmo que o fingerprint amostral coincida, refaz o raster a 10 fps.
+  // Isso cobre imagens muito esparsas e bitmaps que o decoder do REAPER
+  // preenche por dentro sem trocar o ponteiro retornado por GETIMAGE.
+  const bool safetyRefreshDue =
+    isStillImage &&
+    (g_nativeTelepromptMediaBufferRefreshedAt[index] ==
+       std::chrono::steady_clock::time_point{} ||
+     mediaNow - g_nativeTelepromptMediaBufferRefreshedAt[index] >=
+       std::chrono::milliseconds(100));
   const bool scaledImageAlreadyCached =
-    nativeLower(state.mediaType) == "image" &&
-    g_nativeTelepromptMediaBufferSource[index] == frame.image &&
-    g_nativeTelepromptMediaBufferPath[index] == state.mediaPath;
+    !safetyRefreshDue &&
+    fingerprintAvailable &&
+    g_nativeTelepromptMediaBufferFingerprintValid[index] &&
+    g_nativeTelepromptMediaBufferPath[index] == state.mediaPath &&
+    g_nativeTelepromptMediaBufferSourceIdentity[index] == frame.image &&
+    g_nativeTelepromptMediaBufferSourceWidth[index] == sourceW &&
+    g_nativeTelepromptMediaBufferSourceHeight[index] == sourceH &&
+    g_nativeTelepromptMediaBufferFingerprint[index] ==
+      sourceFingerprint;
   if (!scaledImageAlreadyCached) {
     LICE_Clear_ptr(output, 0xff000000);
     LICE_ScaledBlit_ptr(
@@ -50967,12 +51061,23 @@ static bool nativeTelepromptDrawMedia(
       static_cast<float>(sourceW),
       static_cast<float>(sourceH),
       1.0f, 0x100);
-    if (nativeLower(state.mediaType) == "image") {
-      g_nativeTelepromptMediaBufferSource[index] = frame.image;
+    if (fingerprintAvailable) {
       g_nativeTelepromptMediaBufferPath[index] = state.mediaPath;
+      g_nativeTelepromptMediaBufferSourceIdentity[index] = frame.image;
+      g_nativeTelepromptMediaBufferFingerprint[index] =
+        sourceFingerprint;
+      g_nativeTelepromptMediaBufferSourceWidth[index] = sourceW;
+      g_nativeTelepromptMediaBufferSourceHeight[index] = sourceH;
+      g_nativeTelepromptMediaBufferFingerprintValid[index] = true;
+      g_nativeTelepromptMediaBufferRefreshedAt[index] = mediaNow;
     } else {
-      g_nativeTelepromptMediaBufferSource[index] = nullptr;
       g_nativeTelepromptMediaBufferPath[index].clear();
+      g_nativeTelepromptMediaBufferSourceIdentity[index] = nullptr;
+      g_nativeTelepromptMediaBufferFingerprint[index] = 0;
+      g_nativeTelepromptMediaBufferSourceWidth[index] = 0;
+      g_nativeTelepromptMediaBufferSourceHeight[index] = 0;
+      g_nativeTelepromptMediaBufferFingerprintValid[index] = false;
+      g_nativeTelepromptMediaBufferRefreshedAt[index] = {};
     }
   }
 #ifdef __APPLE__
@@ -52393,8 +52498,13 @@ static void nativeCloseAllTelepromptWindows()
     g_nativeTelepromptMediaBuffer[index] = nullptr;
     g_nativeTelepromptMediaBufferWidth[index] = 0;
     g_nativeTelepromptMediaBufferHeight[index] = 0;
-    g_nativeTelepromptMediaBufferSource[index] = nullptr;
     g_nativeTelepromptMediaBufferPath[index].clear();
+    g_nativeTelepromptMediaBufferSourceIdentity[index] = nullptr;
+    g_nativeTelepromptMediaBufferFingerprint[index] = 0;
+    g_nativeTelepromptMediaBufferSourceWidth[index] = 0;
+    g_nativeTelepromptMediaBufferSourceHeight[index] = 0;
+    g_nativeTelepromptMediaBufferFingerprintValid[index] = false;
+    g_nativeTelepromptMediaBufferRefreshedAt[index] = {};
     if (g_nativeTelepromptDecodedVideoBitmap[index] &&
         LICE_Destroy_ptr) {
       LICE_Destroy_ptr(
@@ -52407,10 +52517,6 @@ static void nativeCloseAllTelepromptWindows()
     g_nativeTelepromptDecodedVideoPath[index].clear();
     g_nativeTelepromptPlatformVideoDecoder[index].reset();
     g_nativeTelepromptPlatformVideoStatus[index].store(0);
-    g_nativeTelepromptStillImage[index] = nullptr;
-    g_nativeTelepromptStillImagePath[index].clear();
-    g_nativeTelepromptStillImageRequestWidth[index] = 0;
-    g_nativeTelepromptStillImageRequestHeight[index] = 0;
     if (g_nativeTelepromptVideoSource[index]) {
       double clearPreviewPosition = -1.0;
       g_nativeTelepromptVideoSource[index]->Extended(
