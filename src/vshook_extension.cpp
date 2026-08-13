@@ -44091,12 +44091,16 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
           transportPlaying && (range || extend);
 
         if (!row.block && !range && !extend) {
-          finishPcCommand(nativeApplySelectionCommand(
+          const bool selected = nativeApplySelectionCommand(
             nativeMainSongCommandJson(
               regionsPage
                 ? "select_region"
                 : "select_playlist_song",
-              row, regionsPage)));
+              row, regionsPage));
+          if (selected) {
+            std::lock_guard<std::mutex> lock(g_nativeMutex);
+            nativeBumpSharedRevisionLocked("pc");
+          }
         }
       }
       return true;
@@ -48643,7 +48647,6 @@ static void nativeHookControllerHandleClick(
         std::lock_guard<std::mutex> lock(g_nativeMutex);
         nativeBumpSharedRevisionLocked("pc");
       }
-      g_nativeForceStateBuild.store(true);
       InvalidateRect(hwnd, nullptr, FALSE);
       return;
     }
@@ -66531,11 +66534,10 @@ static void nativeProcessPendingSelectionOnMainThread()
   // timeline a redesenhar imagens e videos dezenas de vezes por segundo. O
   // redesenho fica reservado ao commit final, quando o cursor realmente muda.
   if (editCursorChanged && UpdateArrange_ptr) UpdateArrange_ptr();
-  // selectionOnly e produzido continuamente pelas setas. A selecao externa
-  // continua sendo publicada pelo tick normal; o commit final força o estado.
-  if (!command.selectionOnly) {
-    g_nativeForceStateBuild.store(true);
-  }
+  // A selecao ja foi aplicada ao modelo compartilhado e ao cursor. Nao força
+  // aqui uma serializacao completa do projeto: em projetos grandes essa
+  // reconstrucao pode custar mais de 100 ms exatamente no clique. O tick vivo
+  // normal publica a nova selecao em ate kNativeBridgeLiveIntervalMs.
 }
 
 static bool nativeApplySelectionCommand(const std::string& commandBody)
@@ -66650,13 +66652,10 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
     // Uma unica solicitacao pendente. O ultimo toque substitui o anterior.
     g_nativePendingSelection = command;
   }
-  if (!command.selectionOnly) {
-    g_nativeForceStateBuild.store(true);
-  } else if (remoteMusicSelection) {
-    // O passo remoto precisa aparecer no mesmo ciclo; nao espera o refresh
-    // normal nem o commit de tecla do computador de origem.
-    g_nativeForceStateBuild.store(true);
-  }
+  // Nao força o snapshot antes de a solicitacao pendente ser consumida. Isso
+  // fazia um clique comum disputar a thread principal com a serializacao
+  // completa do estado. O estado vivo periódico cobre comandos locais e
+  // remotos sem atrasar o cursor nem a pintura das janelas nativas.
   return true;
 }
 
@@ -67937,6 +67936,10 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     commandAppRole == "director" || commandAppRole == "diretor";
   const bool lightweightDirectorHeartbeat = commandType == "director_active" || commandType == "director_heartbeat" ||
     ((commandType == "app_heartbeat" || commandType == "heartbeat") && commandIsDirectorRole);
+  const bool lightweightSelectionCommand =
+    commandType == "select_playlist_song" ||
+    commandType == "select_region" ||
+    commandType == "edit_cursor_move";
   bool handledAccessControlCommand = false;
 
   if (commandType == "director_enter" || commandType == "director_active" || commandType == "director_heartbeat" ||
@@ -68067,7 +68070,9 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     }
     ++g_nativeCommandSequence;
   }
-  if (!lightweightDirectorHeartbeat) g_nativeForceStateBuild.store(true);
+  if (!lightweightDirectorHeartbeat && !lightweightSelectionCommand) {
+    g_nativeForceStateBuild.store(true);
+  }
 }
 
 static void nativeProcessHttpCommandsOnMainThread()
