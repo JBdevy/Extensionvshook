@@ -3354,6 +3354,32 @@ static std::string getProjectSyncRole()
     ? role : std::string();
 }
 
+static void clearProjectSyncSessionAtProcessBoundary()
+{
+  if (!SetExtState_ptr || getTimecodeMode() != "project_sync") return;
+
+  const std::string parallelMode = getParallelTimecodeMode();
+  const char* parallelCodeRaw = GetExtState_ptr
+    ? GetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey)
+    : nullptr;
+  const std::string parallelCode = parallelCodeRaw
+    ? nativeTrim(parallelCodeRaw) : "";
+  const bool restoreTimecode =
+    (parallelMode == "receive" || parallelMode == "transmitter") &&
+    nativeTimecodeLanCodeIsValid(parallelCode);
+
+  // Project Sync vale somente para a execução atual do REAPER. Se havia um
+  // terceiro computador usando Receive/Transmitter em paralelo, restaure esse
+  // canal independente em vez de desligá-lo junto com o pareamento A/B.
+  SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
+    restoreTimecode ? parallelMode.c_str() : "", true);
+  SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
+    restoreTimecode ? parallelCode.c_str() : "", true);
+  SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
+  SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey, "", true);
+  SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey, "", true);
+}
+
 static void showComingSoonFeatureMessage()
 {
   const char* message =
@@ -68802,6 +68828,11 @@ static bool initialize()
 {
   if (g_state.initialized) return true;
 
+  // Defesa contra encerramento forçado/crash: mesmo que shutdown() não tenha
+  // sido chamado, uma nova execução nunca retoma automaticamente o código e o
+  // papel do Project Sync da sessão anterior.
+  clearProjectSyncSessionAtProcessBoundary();
+
   bool startsBypassed = false;
   if (GetExtState_ptr) {
     const char* raw =
@@ -69024,24 +69055,7 @@ static void shutdown()
   // Project Sync e um pareamento de sessao. Fechar o REAPER encerra A/B e
   // exige novo codigo/conferencia na proxima abertura. Receive/Transmitter
   // tradicionais continuam persistentes e nao sao alterados aqui.
-  if (SetExtState_ptr && getTimecodeMode() == "project_sync") {
-    const std::string parallelMode = getParallelTimecodeMode();
-    const char* parallelCodeRaw = GetExtState_ptr
-      ? GetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey)
-      : nullptr;
-    const std::string parallelCode = parallelCodeRaw
-      ? nativeTrim(parallelCodeRaw) : "";
-    const bool restoreTimecode =
-      (parallelMode == "receive" || parallelMode == "transmitter") &&
-      nativeTimecodeLanCodeIsValid(parallelCode);
-    SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
-      restoreTimecode ? parallelMode.c_str() : "", true);
-    SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
-      restoreTimecode ? parallelCode.c_str() : "", true);
-    SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
-    SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey, "", true);
-    SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey, "", true);
-  }
+  clearProjectSyncSessionAtProcessBoundary();
 
   if (g_state.projectConfigRegistered) {
     plugin_register_ptr("-projectconfig",
