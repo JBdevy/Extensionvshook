@@ -5137,6 +5137,8 @@ static std::map<std::string, NativeProjectSyncLiveItemState>
 struct NativeProjectSyncViewportState {
   double arrangeStart = 0.0;
   double arrangeEnd = 0.0;
+  double timeSelectionStart = 0.0;
+  double timeSelectionEnd = 0.0;
   int tcpScrollY = 0;
   std::string anchorTrackId;
   int anchorOffsetPx = 0;
@@ -5287,6 +5289,8 @@ struct NativeManualStopFadeoutRuntime {
 static std::mutex g_nativeManualStopFadeoutMutex;
 static NativeManualStopFadeoutRuntime g_nativeManualStopFadeoutRuntime;
 static bool g_nativeManualStopFadeoutBypass = false;
+static std::chrono::steady_clock::time_point
+  g_nativeManualStopFadeoutLastCancelAt;
 
 static void nativeUiReadManualStopFadeoutVisualState(
   bool& active,
@@ -26578,91 +26582,12 @@ static bool nativeProjectSyncApplyTimelineInPlace(
     return false;
   }
 
-  // Cor e faixa visual não participam do Project Sync. Marcadores/regiões já
-  // existentes são atualizados no lugar para preservar GUID, cor e faixa.
-  struct LocalTimelineEntry {
-    int enumIndex = -1;
-    bool region = false;
-    int number = -1;
-    int color = 0;
-    int lane = -1;
-    std::string identity;
-  };
-  std::vector<LocalTimelineEntry> localTimeline;
-  std::map<std::string, LocalTimelineEntry> localByIdentity;
-  std::map<std::string, int> identityOccurrences;
-  int markerCount = 0;
-  int regionCount = 0;
-  int total = CountProjectMarkers_ptr(project, &markerCount, &regionCount);
-  if (total <= 0) total = markerCount + regionCount;
-  for (int enumIndex = 0; enumIndex < total; ++enumIndex) {
-    bool region = false;
-    double start = 0.0;
-    double end = 0.0;
-    const char* rawName = nullptr;
-    int number = 0;
-    int color = 0;
-    if (!EnumProjectMarkers3_ptr(project, enumIndex, &region,
-          &start, &end, &rawName, &number, &color)) continue;
-    const std::string base = std::string(region ? "region_" : "marker_") +
-      std::to_string(number);
-    const std::string identity = nativeProjectSyncTimelineIdentity(
-      region, number, ++identityOccurrences[base]);
-    LocalTimelineEntry local;
-    local.enumIndex = enumIndex;
-    local.region = region;
-    local.number = number;
-    local.color = color;
-    local.lane = nativeGetRegionRulerLaneNumber(project, enumIndex);
-    local.identity = identity;
-    localTimeline.push_back(local);
-    localByIdentity[identity] = local;
-  }
-
-  std::set<std::string> sourceIdentities;
-  std::vector<NativeProjectSyncTimelineEntry> missingTimeline;
-  for (const auto& entry : sourceTimeline) {
-    sourceIdentities.insert(entry.guid);
-    const auto local = localByIdentity.find(entry.guid);
-    if (local != localByIdentity.end()) {
-      if (!SetProjectMarkerByIndex2_ptr ||
-          !SetProjectMarkerByIndex2_ptr(project, local->second.enumIndex,
-            entry.region, entry.start, entry.end, entry.number,
-            entry.name.c_str(), local->second.color, 2)) {
-        errorOut = "Nao foi possivel atualizar uma regiao ou marcador no PC B.";
-        return false;
-      }
-    } else {
-      missingTimeline.push_back(entry);
-    }
-  }
-  // Remove somente entradas extras e faz isso em ordem reversa para os
-  // indices internos permanecerem válidos durante a passagem.
-  for (auto it = localTimeline.rbegin(); it != localTimeline.rend(); ++it) {
-    if (sourceIdentities.count(it->identity) != 0) continue;
-    if (!DeleteProjectMarkerByIndex_ptr(project, it->enumIndex)) {
-      errorOut = "Nao foi possivel remover uma regiao ou marcador extra do PC B.";
-      return false;
-    }
-  }
-  if (SetProjectMarkerByIndex2_ptr) {
-    // Finaliza o modo sem reordenacao usado acima e atualiza a UI uma vez.
-    SetProjectMarkerByIndex2_ptr(
-      project, -1, false, 0.0, 0.0, -1, nullptr, 0, 2);
-  }
-  for (const auto& entry : missingTimeline) {
-    const int enumIndex = AddProjectMarker2_ptr(project, entry.region,
-      entry.start, entry.end, entry.name.c_str(), entry.number, 0);
-    if (enumIndex < 0) {
-      errorOut = "Nao foi possivel criar uma regiao ou marcador no PC B.";
-      return false;
-    }
-  }
-
   // Os itens precisam permanecer ancorados em tempo enquanto o mapa de tempo
-  // e recriado. Esta troca fica restrita a esta etapa: as pistas, os itens, as
-  // regioes e os marcadores comuns ja foram aplicados acima. Independentemente
-  // de sucesso ou falha, a saida obrigatoria e Beats (position, length, rate).
+  // e recriado. Regioes e marcadores comuns sao aplicados somente DEPOIS do
+  // mapa definitivo; caso contrario o REAPER pode reposiciona-los ao converter
+  // o mapa de tempo e eles chegam no PC B em outro ponto do grid.
+  // Independentemente de sucesso ou falha, a saida obrigatoria e Beats
+  // (position, length, rate).
   if (!nativeSetProjectItemsTimebase(project, 0)) {
     errorOut =
       "Nao foi possivel mudar o timebase para Time antes dos marcadores de tempo.";
@@ -26698,6 +26623,82 @@ static bool nativeProjectSyncApplyTimelineInPlace(
     return false;
   }
   if (!tempoApplied) return false;
+
+  // Cor e faixa visual nao participam do Project Sync. Marcadores/regioes ja
+  // existentes sao atualizados no lugar para preservar esses atributos locais.
+  struct LocalTimelineEntry {
+    int enumIndex = -1;
+    bool region = false;
+    int number = -1;
+    int color = 0;
+    std::string identity;
+  };
+  std::vector<LocalTimelineEntry> localTimeline;
+  std::map<std::string, LocalTimelineEntry> localByIdentity;
+  std::map<std::string, int> identityOccurrences;
+  int markerCount = 0;
+  int regionCount = 0;
+  int total = CountProjectMarkers_ptr(project, &markerCount, &regionCount);
+  if (total <= 0) total = markerCount + regionCount;
+  for (int enumIndex = 0; enumIndex < total; ++enumIndex) {
+    bool region = false;
+    double start = 0.0;
+    double end = 0.0;
+    const char* rawName = nullptr;
+    int number = 0;
+    int color = 0;
+    if (!EnumProjectMarkers3_ptr(project, enumIndex, &region,
+          &start, &end, &rawName, &number, &color)) continue;
+    const std::string base = std::string(region ? "region_" : "marker_") +
+      std::to_string(number);
+    const std::string identity = nativeProjectSyncTimelineIdentity(
+      region, number, ++identityOccurrences[base]);
+    LocalTimelineEntry local;
+    local.enumIndex = enumIndex;
+    local.region = region;
+    local.number = number;
+    local.color = color;
+    local.identity = identity;
+    localTimeline.push_back(local);
+    localByIdentity[identity] = local;
+  }
+
+  std::set<std::string> sourceIdentities;
+  std::vector<NativeProjectSyncTimelineEntry> missingTimeline;
+  for (const auto& entry : sourceTimeline) {
+    sourceIdentities.insert(entry.guid);
+    const auto local = localByIdentity.find(entry.guid);
+    if (local != localByIdentity.end()) {
+      if (!SetProjectMarkerByIndex2_ptr ||
+          !SetProjectMarkerByIndex2_ptr(project, local->second.enumIndex,
+            entry.region, entry.start, entry.end, entry.number,
+            entry.name.c_str(), local->second.color, 2)) {
+        errorOut = "Nao foi possivel atualizar uma regiao ou marcador no PC B.";
+        return false;
+      }
+    } else {
+      missingTimeline.push_back(entry);
+    }
+  }
+  for (auto it = localTimeline.rbegin(); it != localTimeline.rend(); ++it) {
+    if (sourceIdentities.count(it->identity) != 0) continue;
+    if (!DeleteProjectMarkerByIndex_ptr(project, it->enumIndex)) {
+      errorOut = "Nao foi possivel remover uma regiao ou marcador extra do PC B.";
+      return false;
+    }
+  }
+  if (SetProjectMarkerByIndex2_ptr) {
+    SetProjectMarkerByIndex2_ptr(
+      project, -1, false, 0.0, 0.0, -1, nullptr, 0, 2);
+  }
+  for (const auto& entry : missingTimeline) {
+    const int markerNumber = AddProjectMarker2_ptr(project, entry.region,
+      entry.start, entry.end, entry.name.c_str(), entry.number, 0);
+    if (markerNumber < 0) {
+      errorOut = "Nao foi possivel criar uma regiao ou marcador no PC B.";
+      return false;
+    }
+  }
   return true;
 }
 
@@ -53516,10 +53517,15 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
           }
-          nativeUiShowShortcutPopup(
-            "Espaco",
-            transportActive ? "Stop executado"
-                            : "Play executado");
+          // Durante o FaderOut, o indicador proprio ja mostra inicio,
+          // progresso e cancelamento. Nao desenha "Stop executado" por cima.
+          if (!transportActive ||
+              !nativeUiManualStopFadeoutEnabled()) {
+            nativeUiShowShortcutPopup(
+              "Espaco",
+              transportActive ? "Stop executado"
+                              : "Play executado");
+          }
           g_nativePartsPreparedSelectionId.clear();
           nativeApplyTransportCommand("{\"type\":\"play_button\"}");
           return 0;
@@ -63675,6 +63681,17 @@ static NativeProjectSyncViewportState nativeProjectSyncReadViewport(
   if (!std::isfinite(state.arrangeStart) ||
       !std::isfinite(state.arrangeEnd) ||
       state.arrangeEnd <= state.arrangeStart) return state;
+  if (GetSet_LoopTimeRange2_ptr) {
+    GetSet_LoopTimeRange2_ptr(project, false, false,
+      &state.timeSelectionStart, &state.timeSelectionEnd, false);
+    if (!std::isfinite(state.timeSelectionStart) ||
+        !std::isfinite(state.timeSelectionEnd) ||
+        state.timeSelectionStart < 0.0 ||
+        state.timeSelectionEnd < state.timeSelectionStart) {
+      state.timeSelectionStart = 0.0;
+      state.timeSelectionEnd = 0.0;
+    }
+  }
   HWND arrange = nativeProjectSyncArrangeWindow();
   if (arrange && CoolSB_GetScrollInfo_ptr) {
     SCROLLINFO info{};
@@ -63712,6 +63729,10 @@ static bool nativeProjectSyncViewportChanged(
   if (!left.valid || !right.valid) return left.valid != right.valid;
   return std::fabs(left.arrangeStart - right.arrangeStart) > 0.000001 ||
     std::fabs(left.arrangeEnd - right.arrangeEnd) > 0.000001 ||
+    std::fabs(left.timeSelectionStart -
+      right.timeSelectionStart) > 0.000001 ||
+    std::fabs(left.timeSelectionEnd -
+      right.timeSelectionEnd) > 0.000001 ||
     left.tcpScrollY != right.tcpScrollY ||
     left.anchorTrackId != right.anchorTrackId ||
     left.anchorOffsetPx != right.anchorOffsetPx;
@@ -63751,7 +63772,9 @@ static void nativeProjectSyncPollViewportOnMainThread()
   command << "{\"type\":\"project_sync_viewport_v1\","
           << "\"arrangeStart\":" << std::setprecision(17)
           << current.arrangeStart << ",\"arrangeEnd\":"
-          << current.arrangeEnd << ",\"tcpScrollY\":"
+          << current.arrangeEnd << ",\"timeSelectionStart\":"
+          << current.timeSelectionStart << ",\"timeSelectionEnd\":"
+          << current.timeSelectionEnd << ",\"tcpScrollY\":"
           << current.tcpScrollY << ",\"anchorTrackId\":"
           << nativeJsonString(current.anchorTrackId)
           << ",\"anchorOffsetPx\":" << current.anchorOffsetPx << '}';
@@ -64272,6 +64295,22 @@ static bool nativeApplyProjectSyncLiveCommand(
     if (std::isfinite(start) && std::isfinite(end) &&
         start >= 0.0 && end > start) {
       GetSet_ArrangeView2_ptr(project, true, 0, 0, &start, &end);
+    }
+    if (GetSet_LoopTimeRange2_ptr) {
+      const std::string selectionStartText = nativeJsonExtractString(
+        commandBody, "timeSelectionStart");
+      const std::string selectionEndText = nativeJsonExtractString(
+        commandBody, "timeSelectionEnd");
+      double selectionStart = nativeLooksNumeric(selectionStartText)
+        ? std::atof(selectionStartText.c_str()) : -1.0;
+      double selectionEnd = nativeLooksNumeric(selectionEndText)
+        ? std::atof(selectionEndText.c_str()) : -1.0;
+      if (std::isfinite(selectionStart) &&
+          std::isfinite(selectionEnd) &&
+          selectionStart >= 0.0 && selectionEnd >= selectionStart) {
+        GetSet_LoopTimeRange2_ptr(project, true, false,
+          &selectionStart, &selectionEnd, false);
+      }
     }
     HWND arrange = nativeProjectSyncArrangeWindow();
     if (arrange && CoolSB_GetScrollInfo_ptr && CoolSB_SetScrollInfo_ptr) {
@@ -66009,13 +66048,14 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
 
 
 
-static void nativeRestoreManualStopFadeoutTracksLocked()
+static void nativeRestoreManualStopFadeoutTracks(
+  const NativeManualStopFadeoutRuntime& snapshot)
 {
   if (!SetMediaTrackInfo_Value_ptr) return;
   ReaProject* project = nativeProjectIsStillOpen(
-      g_nativeManualStopFadeoutRuntime.project)
-    ? g_nativeManualStopFadeoutRuntime.project : nullptr;
-  for (const auto& item : g_nativeManualStopFadeoutRuntime.tracks) {
+      snapshot.project)
+    ? snapshot.project : nullptr;
+  for (const auto& item : snapshot.tracks) {
     if (nativeTrackPointerIsValid(project, item.track)) {
       SetMediaTrackInfo_Value_ptr(
         item.track, "D_VOL", item.before);
@@ -66033,15 +66073,34 @@ static bool nativeTryStartManualStopFadeout(ReaProject* project, const std::stri
   const bool playing = ((playState & 1) == 1) || ((playState & 4) == 4);
   if (!playing || !nativeBoolFromText(nativeReadLuaWindowExtState(kManualStopFadeoutEnabledKey), false)) return false;
 
-  std::lock_guard<std::mutex> lock(g_nativeManualStopFadeoutMutex);
-  if (g_nativeManualStopFadeoutRuntime.active) {
-    // Igual ao Lua: um segundo Stop enquanto o fade ainda esta descendo cancela a parada.
-    nativeRestoreManualStopFadeoutTracksLocked();
-    g_nativeManualStopFadeoutRuntime = NativeManualStopFadeoutRuntime{};
+  NativeManualStopFadeoutRuntime cancelledRuntime;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeManualStopFadeoutMutex);
+    const auto now = std::chrono::steady_clock::now();
+    // hookcommand e hookcommand2 podem receber a mesma tecla. O primeiro
+    // cancela; o segundo deve apenas confirmar que o gesto ja foi consumido,
+    // nunca iniciar imediatamente um novo Fadeout.
+    if (g_nativeManualStopFadeoutLastCancelAt.time_since_epoch().count() != 0 &&
+        now - g_nativeManualStopFadeoutLastCancelAt <
+          std::chrono::milliseconds(120)) {
+      return true;
+    }
+    if (g_nativeManualStopFadeoutRuntime.active) {
+      // Copia e limpa o estado sob o mutex. As APIs do REAPER sao chamadas
+      // somente depois de soltar o bloqueio para impedir reentrada da UI no
+      // Windows e o abort do C++ Runtime Library.
+      cancelledRuntime = g_nativeManualStopFadeoutRuntime;
+      g_nativeManualStopFadeoutRuntime = NativeManualStopFadeoutRuntime{};
+      g_nativeManualStopFadeoutLastCancelAt = now;
+    } else if (g_nativeManualStopFadeoutRuntime.restorePending) {
+      return true;
+    }
+  }
+  if (cancelledRuntime.active) {
+    nativeRestoreManualStopFadeoutTracks(cancelledRuntime);
     g_nativeForceStateBuild.store(true);
     return true;
   }
-  if (g_nativeManualStopFadeoutRuntime.restorePending) return true;
 
   const std::vector<std::string> selectedIds = nativeManualStopFadeoutTrackIds();
   if (selectedIds.empty()) return false;
@@ -66059,26 +66118,33 @@ static bool nativeTryStartManualStopFadeout(ReaProject* project, const std::stri
   }
   if (selectedTracks.empty()) return false;
 
-  g_nativeManualStopFadeoutRuntime = NativeManualStopFadeoutRuntime{};
-  g_nativeManualStopFadeoutRuntime.active = true;
-  g_nativeManualStopFadeoutRuntime.project = project;
-  g_nativeManualStopFadeoutRuntime.startedAt = std::chrono::steady_clock::now();
-  g_nativeManualStopFadeoutRuntime.durationSec = static_cast<double>(
-    nativeManualStopFadeoutClampDuration(nativeReadLuaWindowExtState(kManualStopFadeoutDurationKey)));
-  g_nativeManualStopFadeoutRuntime.pendingStopCommand = pendingStopCommand;
-  g_nativeManualStopFadeoutRuntime.tracks = std::move(selectedTracks);
+  {
+    std::lock_guard<std::mutex> lock(g_nativeManualStopFadeoutMutex);
+    g_nativeManualStopFadeoutRuntime = NativeManualStopFadeoutRuntime{};
+    g_nativeManualStopFadeoutRuntime.active = true;
+    g_nativeManualStopFadeoutRuntime.project = project;
+    g_nativeManualStopFadeoutRuntime.startedAt = std::chrono::steady_clock::now();
+    g_nativeManualStopFadeoutRuntime.durationSec = static_cast<double>(
+      nativeManualStopFadeoutClampDuration(nativeReadLuaWindowExtState(kManualStopFadeoutDurationKey)));
+    g_nativeManualStopFadeoutRuntime.pendingStopCommand = pendingStopCommand;
+    g_nativeManualStopFadeoutRuntime.tracks = std::move(selectedTracks);
+  }
   g_nativeForceStateBuild.store(true);
   return true;
 }
 
 static void nativeBreakManualStopFadeout()
 {
-  std::lock_guard<std::mutex> lock(g_nativeManualStopFadeoutMutex);
-  if (g_nativeManualStopFadeoutRuntime.active || g_nativeManualStopFadeoutRuntime.restorePending) {
-    nativeRestoreManualStopFadeoutTracksLocked();
+  NativeManualStopFadeoutRuntime cancelledRuntime;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeManualStopFadeoutMutex);
+    if (!g_nativeManualStopFadeoutRuntime.active &&
+        !g_nativeManualStopFadeoutRuntime.restorePending) return;
+    cancelledRuntime = g_nativeManualStopFadeoutRuntime;
     g_nativeManualStopFadeoutRuntime = NativeManualStopFadeoutRuntime{};
-    g_nativeForceStateBuild.store(true);
   }
+  nativeRestoreManualStopFadeoutTracks(cancelledRuntime);
+  g_nativeForceStateBuild.store(true);
 }
 
 static bool nativeApplyStopPauseModeCommand(const std::string& commandBody)
@@ -66435,6 +66501,8 @@ static void nativeUpdateManualStopFadeoutOnMainThread()
 {
   std::string stopCommand;
   bool finishNow = false;
+  NativeManualStopFadeoutRuntime restoreRuntime;
+  bool restoreNow = false;
   {
     std::lock_guard<std::mutex> lock(g_nativeManualStopFadeoutMutex);
     NativeManualStopFadeoutRuntime& runtime = g_nativeManualStopFadeoutRuntime;
@@ -66448,49 +66516,53 @@ static void nativeUpdateManualStopFadeoutOnMainThread()
 
     if (runtime.restorePending) {
       if (now >= runtime.restoreAt) {
-        nativeRestoreManualStopFadeoutTracksLocked();
+        restoreRuntime = runtime;
         runtime = NativeManualStopFadeoutRuntime{};
+        restoreNow = true;
         g_nativeForceStateBuild.store(true);
       }
-      return;
-    }
-
-    const int playState = (GetPlayStateEx_ptr && runtime.project) ? GetPlayStateEx_ptr(runtime.project) : 0;
-    const bool playing = ((playState & 1) == 1) || ((playState & 4) == 4);
-    if (!playing) {
-      runtime.active = false;
-      runtime.restorePending = true;
-      runtime.restoreAt = now + std::chrono::milliseconds(400);
-      return;
-    }
-
-    const double duration = std::max(0.05, runtime.durationSec);
-    const double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - runtime.startedAt).count() / 1000.0;
-    const double ratio = std::max(0.0, std::min(1.0, elapsed / duration));
-    runtime.progress = ratio;
-    const double remain = 1.0 - ratio;
-    if (SetMediaTrackInfo_Value_ptr) {
-      for (const auto& item : runtime.tracks) {
-        if (nativeTrackPointerIsValid(
-              runtime.project, item.track)) {
-          SetMediaTrackInfo_Value_ptr(
-            item.track, "D_VOL",
-            std::max(0.0, item.before * remain));
+    } else {
+      const int playState = (GetPlayStateEx_ptr && runtime.project) ? GetPlayStateEx_ptr(runtime.project) : 0;
+      const bool playing = ((playState & 1) == 1) || ((playState & 4) == 4);
+      if (!playing) {
+        runtime.active = false;
+        runtime.restorePending = true;
+        runtime.restoreAt = now + std::chrono::milliseconds(400);
+      } else {
+        const double duration = std::max(0.05, runtime.durationSec);
+        const double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - runtime.startedAt).count() / 1000.0;
+        const double ratio = std::max(0.0, std::min(1.0, elapsed / duration));
+        runtime.progress = ratio;
+        const double remain = 1.0 - ratio;
+        if (SetMediaTrackInfo_Value_ptr) {
+          for (const auto& item : runtime.tracks) {
+            if (nativeTrackPointerIsValid(
+                  runtime.project, item.track)) {
+              SetMediaTrackInfo_Value_ptr(
+                item.track, "D_VOL",
+                std::max(0.0, item.before * remain));
+            }
           }
+        }
+        // Nunca reconstrua todas as janelas de pista em cada quadro do Fadeout.
+        // Além de desnecessário para o áudio, TrackList_AdjustWindows pode entrar
+        // novamente no desenho da interface enquanto este runtime está bloqueado,
+        // causando fechamento do REAPER em projetos com muitas pistas.
+
+        if (ratio >= 1.0) {
+          stopCommand = runtime.pendingStopCommand;
+          runtime.active = false;
+          runtime.restorePending = true;
+          runtime.restoreAt = now + std::chrono::milliseconds(400);
+          finishNow = true;
+        }
       }
     }
-    // Nunca reconstrua todas as janelas de pista em cada quadro do Fadeout.
-    // Além de desnecessário para o áudio, TrackList_AdjustWindows pode entrar
-    // novamente no desenho da interface enquanto este runtime está bloqueado,
-    // causando fechamento do REAPER em projetos com muitas pistas.
+  }
 
-    if (ratio >= 1.0) {
-      stopCommand = runtime.pendingStopCommand;
-      runtime.active = false;
-      runtime.restorePending = true;
-      runtime.restoreAt = now + std::chrono::milliseconds(400);
-      finishNow = true;
-    }
+  if (restoreNow) {
+    nativeRestoreManualStopFadeoutTracks(restoreRuntime);
+    return;
   }
 
   if (finishNow && !stopCommand.empty()) {
@@ -67162,27 +67234,40 @@ static bool nativeApplyTimecodeLanCommand(
   const bool localActive = localPlayState != 0;
   const bool localPaused = (localPlayState & 2) == 2;
   const double localPosition = localActive && GetPlayPositionEx_ptr
-    ? GetPlayPositionEx_ptr(project)
-    : (GetCursorPositionEx_ptr
-        ? GetCursorPositionEx_ptr(project) : 0.0);
+    ? GetPlayPositionEx_ptr(project) : sourcePosition;
   const double drift = std::fabs(localPosition - sourcePosition);
   bool changed = false;
+
+  // SetEditCurPos2 e a unica API publica de seek preciso que funciona nos
+  // estados Play/Pause, mas ela tambem move o cursor de edicao. Conserva esse
+  // cursor antes de cada seek de transporte e o restaura sem novo seek.
+  const auto seekTransportPreservingEditCursor = [&](double position) {
+    if (!SetEditCurPos2_ptr) return;
+    const double editCursor = GetCursorPositionEx_ptr
+      ? GetCursorPositionEx_ptr(project) : position;
+    SetEditCurPos2_ptr(project, position, false, true);
+    if (GetCursorPositionEx_ptr &&
+        std::fabs(editCursor - position) > 0.000001) {
+      SetEditCurPos2_ptr(project, editCursor, false, false);
+    }
+  };
 
   if (!sourceActive) {
     if (localActive) {
       Main_OnCommand_ptr(1016, 0);
       changed = true;
     }
-    if (SetEditCurPos2_ptr && drift > 0.008) {
-      SetEditCurPos2_ptr(project, sourcePosition, true, false);
-      changed = true;
-    }
   } else if (!localActive) {
-    if (SetEditCurPos2_ptr) {
-      SetEditCurPos2_ptr(project, sourcePosition, true, false);
-    }
+    const double editCursor = GetCursorPositionEx_ptr
+      ? GetCursorPositionEx_ptr(project) : sourcePosition;
+    if (SetEditCurPos2_ptr)
+      SetEditCurPos2_ptr(project, sourcePosition, false, false);
     Main_OnCommand_ptr(1007, 0);
     if (sourcePaused) Main_OnCommand_ptr(1008, 0);
+    if (SetEditCurPos2_ptr && GetCursorPositionEx_ptr &&
+        std::fabs(editCursor - sourcePosition) > 0.000001) {
+      SetEditCurPos2_ptr(project, editCursor, false, false);
+    }
     changed = true;
   } else {
     if (sourcePaused != localPaused) {
@@ -67193,10 +67278,10 @@ static bool nativeApplyTimecodeLanCommand(
     // mais cedo sem os dois computadores se perseguirem em sentidos opostos.
     if (!sourcePaused && !localPaused &&
         SetEditCurPos2_ptr && drift > 0.045) {
-      SetEditCurPos2_ptr(project, sourcePosition, true, true);
+      seekTransportPreservingEditCursor(sourcePosition);
       changed = true;
     } else if (sourcePaused && SetEditCurPos2_ptr && drift > 0.008) {
-      SetEditCurPos2_ptr(project, sourcePosition, true, false);
+      seekTransportPreservingEditCursor(sourcePosition);
       changed = true;
     }
   }
