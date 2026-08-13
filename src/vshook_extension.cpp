@@ -130,6 +130,7 @@ using EnumProjects_t = ReaProject* (*)(int, char*, int);
 using GetProjExtState_t = int (*)(ReaProject*, const char*, const char*, char*, int);
 using SetProjExtState_t = int (*)(ReaProject*, const char*, const char*, const char*);
 using MarkProjectDirty_t = void (*)(ReaProject*);
+using Main_SaveProjectEx_t = void (*)(ReaProject*, const char*, int);
 using CountProjectMarkers_t = int (*)(ReaProject*, int*, int*);
 using EnumProjectMarkers3_t = int (*)(ReaProject*, int, bool*, double*, double*, const char**, int*, int*);
 using SetProjectMarkerByIndex2_t = bool (*)(ReaProject*, int, bool, double, double, int, const char*, int, int);
@@ -153,6 +154,10 @@ using SetRegionOrMarkerInfo_Value_t = bool (*)(ReaProject*, void*, const char*, 
 using GetSetRegionOrMarkerInfo_String_t = bool (*)(ReaProject*, void*, const char*, char*, bool);
 using GetProjectStateChangeCount_t = int (*)(ReaProject*);
 using IsProjectDirty_t = int (*)(ReaProject*);
+using GetSet_ArrangeView2_t = void (*)(ReaProject*, bool, int, int,
+  double*, double*);
+using CoolSB_GetScrollInfo_t = BOOL (WINAPI *)(HWND, int, LPSCROLLINFO);
+using CoolSB_SetScrollInfo_t = int (WINAPI *)(HWND, int, LPSCROLLINFO, BOOL);
 using GetPlayStateEx_t = int (*)(ReaProject*);
 using GetPlayPositionEx_t = double (*)(ReaProject*);
 using GetCursorPositionEx_t = double (*)(ReaProject*);
@@ -202,6 +207,8 @@ using ColorToNative_t = int (*)(int, int, int);
 using ColorFromNative_t = void (*)(int, int*, int*, int*);
 using GetTrackNumMediaItems_t = int (*)(MediaTrack*);
 using GetTrackMediaItem_t = MediaItem* (*)(MediaTrack*, int);
+using AddMediaItemToTrack_t = MediaItem* (*)(MediaTrack*);
+using MoveMediaItemToTrack_t = bool (*)(MediaItem*, MediaTrack*);
 using DeleteTrackMediaItem_t = bool (*)(MediaTrack*, MediaItem*);
 using GetMediaItemInfo_Value_t = double (*)(MediaItem*, const char*);
 using SetMediaItemInfo_Value_t = bool (*)(MediaItem*, const char*, double);
@@ -292,6 +299,7 @@ static EnumProjects_t EnumProjects_ptr = nullptr;
 static GetProjExtState_t GetProjExtState_ptr = nullptr;
 static SetProjExtState_t SetProjExtState_ptr = nullptr;
 static MarkProjectDirty_t MarkProjectDirty_ptr = nullptr;
+static Main_SaveProjectEx_t Main_SaveProjectEx_ptr = nullptr;
 static CountProjectMarkers_t CountProjectMarkers_ptr = nullptr;
 static EnumProjectMarkers3_t EnumProjectMarkers3_ptr = nullptr;
 static SetProjectMarkerByIndex2_t SetProjectMarkerByIndex2_ptr = nullptr;
@@ -313,6 +321,9 @@ static SetRegionOrMarkerInfo_Value_t SetRegionOrMarkerInfo_Value_ptr = nullptr;
 static GetSetRegionOrMarkerInfo_String_t GetSetRegionOrMarkerInfo_String_ptr = nullptr;
 static GetProjectStateChangeCount_t GetProjectStateChangeCount_ptr = nullptr;
 static IsProjectDirty_t IsProjectDirty_ptr = nullptr;
+static GetSet_ArrangeView2_t GetSet_ArrangeView2_ptr = nullptr;
+static CoolSB_GetScrollInfo_t CoolSB_GetScrollInfo_ptr = nullptr;
+static CoolSB_SetScrollInfo_t CoolSB_SetScrollInfo_ptr = nullptr;
 static GetPlayStateEx_t GetPlayStateEx_ptr = nullptr;
 static GetPlayPositionEx_t GetPlayPositionEx_ptr = nullptr;
 static GetCursorPositionEx_t GetCursorPositionEx_ptr = nullptr;
@@ -363,6 +374,8 @@ static ColorToNative_t ColorToNative_ptr = nullptr;
 static ColorFromNative_t ColorFromNative_ptr = nullptr;
 static GetTrackNumMediaItems_t GetTrackNumMediaItems_ptr = nullptr;
 static GetTrackMediaItem_t GetTrackMediaItem_ptr = nullptr;
+static AddMediaItemToTrack_t AddMediaItemToTrack_ptr = nullptr;
+static MoveMediaItemToTrack_t MoveMediaItemToTrack_ptr = nullptr;
 static DeleteTrackMediaItem_t DeleteTrackMediaItem_ptr = nullptr;
 static GetMediaItemInfo_Value_t GetMediaItemInfo_Value_ptr = nullptr;
 static SetMediaItemInfo_Value_t SetMediaItemInfo_Value_ptr = nullptr;
@@ -444,6 +457,10 @@ static const char* kTimecodeModeKey = "TIMECODE_MODE_V1";
 static const char* kTimecodePairCodeKey = "TIMECODE_PAIR_CODE_V1";
 static const char* kProjectSyncEnabledKey = "PROJECT_SYNC_ENABLED_V1";
 static const char* kProjectSyncRoleKey = "PROJECT_SYNC_ROLE_V2";
+static const char* kParallelTimecodeModeKey =
+  "TIMECODE_PARALLEL_MODE_V1";
+static const char* kParallelTimecodePairCodeKey =
+  "TIMECODE_PARALLEL_PAIR_CODE_V1";
 static const char* kExtensionBypassKey =
   "EXTENSION_GLOBAL_BYPASS_V1";
 static const char* kScriptControlSection = "VS_HOOK_SCRIPT_CONTROL";
@@ -3300,6 +3317,8 @@ static ReaProject* getCurrentProject(char* pathOut, int pathOutSize)
   return EnumProjects_ptr(-1, pathOut, pathOutSize);
 }
 
+static bool nativeTimecodeLanCodeIsValid(const std::string& value);
+
 static std::string getTimecodeMode()
 {
   if (!GetExtState_ptr) return std::string();
@@ -3309,6 +3328,18 @@ static std::string getTimecodeMode()
       mode == "project_sync"
     ? mode
     : std::string();
+}
+
+static std::string getParallelTimecodeMode()
+{
+  if (!GetExtState_ptr || getTimecodeMode() != "project_sync") {
+    return std::string();
+  }
+  const char* raw = GetExtState_ptr(
+    kExtStateSection, kParallelTimecodeModeKey);
+  const std::string mode = raw ? nativeLower(nativeTrim(raw)) : "";
+  return mode == "receive" || mode == "transmitter"
+    ? mode : std::string();
 }
 
 static std::string getProjectSyncRole()
@@ -3344,7 +3375,15 @@ static void toggleTimecodeMode(const char* requestedMode)
   }
 
   const std::string current = getTimecodeMode();
-  if (current == requested) {
+  const bool projectSyncActive = current == "project_sync";
+  std::string parallelCurrent;
+  if (projectSyncActive && GetExtState_ptr) {
+    const char* raw = GetExtState_ptr(
+      kExtStateSection, kParallelTimecodeModeKey);
+    parallelCurrent = raw ? nativeLower(nativeTrim(raw)) : "";
+  }
+  if ((!projectSyncActive && current == requested) ||
+      (projectSyncActive && parallelCurrent == requested)) {
     const int answer = ShowMessageBox_ptr
       ? ShowMessageBox_ptr(
           requested == "receive"
@@ -3353,9 +3392,16 @@ static void toggleTimecodeMode(const char* requestedMode)
           "VS Hook - Timecode", 4)
       : 6;
     if (answer == 6) {
-      SetExtState_ptr(kExtStateSection, kTimecodeModeKey, "", true);
-      SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey, "", true);
-      SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
+      if (projectSyncActive) {
+        SetExtState_ptr(kExtStateSection,
+          kParallelTimecodeModeKey, "", true);
+        SetExtState_ptr(kExtStateSection,
+          kParallelTimecodePairCodeKey, "", true);
+      } else {
+        SetExtState_ptr(kExtStateSection, kTimecodeModeKey, "", true);
+        SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey, "", true);
+        SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
+      }
     }
     return;
   }
@@ -3388,11 +3434,18 @@ static void toggleTimecodeMode(const char* requestedMode)
     }
   }
 
-  SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
-    code.c_str(), true);
-  SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
-    requested.c_str(), true);
-  SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
+  if (projectSyncActive) {
+    SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey,
+      code.c_str(), true);
+    SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey,
+      requested.c_str(), true);
+  } else {
+    SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
+      code.c_str(), true);
+    SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
+      requested.c_str(), true);
+    SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
+  }
 
   if (ShowMessageBox_ptr) {
     if (requested == "receive") {
@@ -3858,9 +3911,25 @@ static void toggleProjectSync()
           "VS Hook - Project Sync", 4)
       : 6;
     if (answer == 6) {
-      SetExtState_ptr(kExtStateSection, kTimecodeModeKey, "", true);
-      SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey, "", true);
+      const char* parallelModeRaw = GetExtState_ptr(
+        kExtStateSection, kParallelTimecodeModeKey);
+      const char* parallelCodeRaw = GetExtState_ptr(
+        kExtStateSection, kParallelTimecodePairCodeKey);
+      const std::string parallelMode = parallelModeRaw
+        ? nativeLower(nativeTrim(parallelModeRaw)) : "";
+      const std::string parallelCode = parallelCodeRaw
+        ? nativeTrim(parallelCodeRaw) : "";
+      const bool restoreTimecode =
+        (parallelMode == "receive" || parallelMode == "transmitter") &&
+        nativeTimecodeLanCodeIsValid(parallelCode);
+      SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
+        restoreTimecode ? parallelMode.c_str() : "", true);
+      SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
+        restoreTimecode ? parallelCode.c_str() : "", true);
       SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
+      SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey, "", true);
+      SetExtState_ptr(kExtStateSection,
+        kParallelTimecodePairCodeKey, "", true);
     }
     return;
   }
@@ -3894,6 +3963,22 @@ static void toggleProjectSync()
     return;
   }
 
+  const std::string previousTimecodeMode = getTimecodeMode();
+  std::string previousTimecodeCode;
+  if (previousTimecodeMode == "receive" ||
+      previousTimecodeMode == "transmitter") {
+    const char* raw = GetExtState_ptr(
+      kExtStateSection, kTimecodePairCodeKey);
+    previousTimecodeCode = raw ? nativeTrim(raw) : "";
+  }
+  if ((previousTimecodeMode == "receive" ||
+       previousTimecodeMode == "transmitter") &&
+      nativeTimecodeLanCodeIsValid(previousTimecodeCode)) {
+    SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey,
+      previousTimecodeMode.c_str(), true);
+    SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey,
+      previousTimecodeCode.c_str(), true);
+  }
   SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
     code.c_str(), true);
   SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
@@ -4337,10 +4422,12 @@ static int toggleActionState(int commandId)
     return nativeAppActivePanelIsOpen() ? 1 : 0;
   }
   if (g_timecodeReceiveCommandId != 0 && commandId == g_timecodeReceiveCommandId) {
-    return getTimecodeMode() == "receive" ? 1 : 0;
+    return (getTimecodeMode() == "receive" ||
+      getParallelTimecodeMode() == "receive") ? 1 : 0;
   }
   if (g_timecodeTransmitterCommandId != 0 && commandId == g_timecodeTransmitterCommandId) {
-    return getTimecodeMode() == "transmitter" ? 1 : 0;
+    return (getTimecodeMode() == "transmitter" ||
+      getParallelTimecodeMode() == "transmitter") ? 1 : 0;
   }
   if (g_projectSyncCommandId != 0 && commandId == g_projectSyncCommandId) {
     return getProjectSyncEnabled() ? 1 : 0;
@@ -4493,8 +4580,12 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
         nativeProjectStartupWindowEnabled(entry));
     }
     const std::string timecodeMode = getTimecodeMode();
-    setMenuCommandChecked(hMenu, g_timecodeReceiveCommandId, timecodeMode == "receive");
-    setMenuCommandChecked(hMenu, g_timecodeTransmitterCommandId, timecodeMode == "transmitter");
+    const std::string parallelTimecodeMode = getParallelTimecodeMode();
+    setMenuCommandChecked(hMenu, g_timecodeReceiveCommandId,
+      timecodeMode == "receive" || parallelTimecodeMode == "receive");
+    setMenuCommandChecked(hMenu, g_timecodeTransmitterCommandId,
+      timecodeMode == "transmitter" ||
+      parallelTimecodeMode == "transmitter");
     setMenuCommandChecked(hMenu, g_projectSyncCommandId, getProjectSyncEnabled());
     setMenuCommandChecked(hMenu, g_telepromptOneCommandId,
       nativeTelepromptWindowIsOpen(1));
@@ -4569,8 +4660,12 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   insertMenuSubMenu(vsHookMenu, startupMenu, "Startup", -1);
 
   const std::string timecodeMode = getTimecodeMode();
-  appendMenuString(timecodeMenu, "Receive", g_timecodeReceiveCommandId, timecodeMode == "receive");
-  appendMenuString(timecodeMenu, "Transmitter", g_timecodeTransmitterCommandId, timecodeMode == "transmitter");
+  const std::string parallelTimecodeMode = getParallelTimecodeMode();
+  appendMenuString(timecodeMenu, "Receive", g_timecodeReceiveCommandId,
+    timecodeMode == "receive" || parallelTimecodeMode == "receive");
+  appendMenuString(timecodeMenu, "Transmitter", g_timecodeTransmitterCommandId,
+    timecodeMode == "transmitter" ||
+    parallelTimecodeMode == "transmitter");
   appendMenuString(timecodeMenu, "Add Timecode", g_addTimecodeCommandId, false);
   insertMenuSubMenu(vsHookMenu, timecodeMenu, "Timecode", -1);
 
@@ -4846,6 +4941,35 @@ struct NativeProjectSyncTrackState {
   std::string name;
 };
 
+// Estado absoluto e leve usado depois do pareamento. O Project Sync continua
+// tendo o bundle completo para o primeiro alinhamento, mas gestos cotidianos
+// no PC A nao podem reabrir o preflight nem depender de um novo .RPP.
+struct NativeProjectSyncLiveTrackState {
+  std::string id;
+  std::string name;
+  std::string structureKey;
+  int trackIndex = 0;
+  int folderDepth = 0;
+};
+
+struct NativeProjectSyncLiveItemState {
+  std::string id;
+  std::string trackId;
+  std::string trackName;
+  std::string structureKey;
+  int trackIndex = 0;
+  int itemIndex = 0;
+  double itemVolume = 1.0;
+  double takeVolume = 1.0;
+  double mute = 0.0;
+  double position = 0.0;
+  double length = 0.0;
+  double startOffset = 0.0;
+  double playRate = 1.0;
+  double loopSource = 0.0;
+  bool hasTake = false;
+};
+
 // Project Sync preflight is intentionally kept as an immutable JSON snapshot
 // behind the LAN mutex.  The HTTP thread only serializes this cache; all
 // REAPER/project and ExtState reads happen on startupTimer's main thread.
@@ -4898,6 +5022,8 @@ struct NativeProjectSyncApplyState {
   uint64_t totalBytes = 0;
   int fileIndex = 0;
   int fileCount = 0;
+  uint64_t sequence = 0;
+  bool automatic = false;
 };
 
 struct NativeProjectSyncPendingOpen {
@@ -4916,6 +5042,7 @@ struct NativeProjectSyncPendingOpen {
   bool backupReady = false;
   std::string previousConfigSnapshot;
   std::string previousConfigRevision;
+  bool automatic = false;
 };
 
 struct NativeProjectSyncPendingPrepareConfirmation {
@@ -4936,6 +5063,7 @@ struct NativeProjectSyncPendingBundleReady {
   int projectChangeCount = -1;
   uint64_t totalBytes = 0;
   int fileCount = 0;
+  bool automatic = false;
 };
 
 // A extensão conversa somente com a Hook Center em localhost. A descoberta e
@@ -4944,6 +5072,10 @@ static std::mutex g_nativeTimecodeLanMutex;
 static std::string g_nativeTimecodeLanMode;
 static std::string g_nativeTimecodeLanCode;
 static std::string g_nativeTimecodeLanProjectSyncRole;
+static std::string g_nativeParallelTimecodeMode;
+static std::string g_nativeParallelTimecodeCode;
+static bool g_nativeParallelTimecodePeerConnected = false;
+static std::string g_nativeParallelTimecodePeerName;
 static std::deque<NativeTimecodeLanEvent> g_nativeTimecodeLanOutbox;
 static uint64_t g_nativeTimecodeLanEventSequence = 0;
 static NativeTimecodeLanTransport g_nativeTimecodeLanTransport;
@@ -4972,10 +5104,40 @@ static std::string g_nativeProjectSyncTrackMode;
 static bool g_nativeProjectSyncPublishInitialTrackSnapshot = false;
 static std::chrono::steady_clock::time_point
   g_nativeProjectSyncTrackSuppressPublishUntil;
+static std::map<std::string, NativeProjectSyncLiveTrackState>
+  g_nativeProjectSyncLiveTrackBaseline;
+static std::map<std::string, NativeProjectSyncLiveItemState>
+  g_nativeProjectSyncLiveItemBaseline;
+struct NativeProjectSyncViewportState {
+  double arrangeStart = 0.0;
+  double arrangeEnd = 0.0;
+  int tcpScrollY = 0;
+  std::string anchorTrackId;
+  int anchorOffsetPx = 0;
+  bool valid = false;
+};
+static NativeProjectSyncViewportState g_nativeProjectSyncViewportBaseline;
+static ReaProject* g_nativeProjectSyncViewportProject = nullptr;
+static std::chrono::steady_clock::time_point
+  g_nativeProjectSyncLastViewportPoll;
+static std::chrono::steady_clock::time_point
+  g_nativeProjectSyncViewportSuppressUntil;
+static std::string g_nativeProjectSyncTimelineBaselineHash;
+static ReaProject* g_nativeProjectSyncLiveProject = nullptr;
+static int g_nativeProjectSyncLiveChangeCount = -1;
+static bool g_nativeProjectSyncPublishInitialLiveSnapshot = false;
+static uint64_t g_nativeProjectSyncLiveRevision = 0;
+// Idempotencia no PC B. A sessao do processo A faz parte da chave, logo uma
+// reinicializacao do REAPER A pode recomecar a revisao sem herdar ACK antigo.
+static std::map<std::string, uint64_t>
+  g_nativeProjectSyncLiveAppliedRevisions;
+static std::chrono::steady_clock::time_point
+  g_nativeProjectSyncLastLivePoll;
 static NativeProjectSyncPreflightState
   g_nativeProjectSyncPreflight;
 static NativeProjectSyncBundleState g_nativeProjectSyncBundle;
 static NativeProjectSyncApplyState g_nativeProjectSyncApply;
+static uint64_t g_nativeProjectSyncApplySequence = 0;
 static NativeProjectSyncPendingOpen g_nativeProjectSyncPendingOpen;
 static NativeProjectSyncPendingPrepareConfirmation
   g_nativeProjectSyncPendingPrepareConfirmation;
@@ -5966,8 +6128,41 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   if (mode != "project_sync") {
     projectSyncRole.clear();
   }
+  std::string parallelMode;
+  std::string parallelCode;
+  if (GetExtState_ptr) {
+    const char* rawMode = GetExtState_ptr(
+      kExtStateSection, kParallelTimecodeModeKey);
+    const char* rawCode = GetExtState_ptr(
+      kExtStateSection, kParallelTimecodePairCodeKey);
+    parallelMode = rawMode ? nativeLower(nativeTrim(rawMode)) : "";
+    parallelCode = rawCode ? nativeTrim(rawCode) : "";
+  }
+  if (parallelMode != "receive" && parallelMode != "transmitter") {
+    parallelMode.clear();
+  }
+  if (!nativeTimecodeLanCodeIsValid(parallelCode)) {
+    parallelMode.clear();
+    parallelCode.clear();
+  }
 
   std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  const bool mainChanged = mode != g_nativeTimecodeLanMode ||
+    code != g_nativeTimecodeLanCode ||
+    projectSyncRole != g_nativeTimecodeLanProjectSyncRole;
+  const bool parallelChanged =
+    parallelMode != g_nativeParallelTimecodeMode ||
+    parallelCode != g_nativeParallelTimecodeCode;
+  if (!mainChanged && !parallelChanged) {
+    return;
+  }
+  if (parallelChanged) {
+    g_nativeParallelTimecodeMode = parallelMode;
+    g_nativeParallelTimecodeCode = parallelCode;
+    g_nativeParallelTimecodePeerConnected = false;
+    g_nativeParallelTimecodePeerName.clear();
+  }
+  if (!mainChanged) return;
   if (mode == g_nativeTimecodeLanMode &&
       code == g_nativeTimecodeLanCode &&
       projectSyncRole == g_nativeTimecodeLanProjectSyncRole) {
@@ -5983,6 +6178,22 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   g_nativeProjectSyncTrackProject = nullptr;
   g_nativeProjectSyncTrackMode.clear();
   g_nativeProjectSyncPublishInitialTrackSnapshot = false;
+  g_nativeProjectSyncLiveTrackBaseline.clear();
+  g_nativeProjectSyncLiveItemBaseline.clear();
+  g_nativeProjectSyncLiveProject = nullptr;
+  g_nativeProjectSyncLiveChangeCount = -1;
+  g_nativeProjectSyncPublishInitialLiveSnapshot = false;
+  g_nativeProjectSyncLiveRevision = 0;
+  g_nativeProjectSyncLiveAppliedRevisions.clear();
+  g_nativeProjectSyncLastLivePoll =
+    std::chrono::steady_clock::time_point{};
+  g_nativeProjectSyncViewportBaseline = NativeProjectSyncViewportState{};
+  g_nativeProjectSyncViewportProject = nullptr;
+  g_nativeProjectSyncLastViewportPoll =
+    std::chrono::steady_clock::time_point{};
+  g_nativeProjectSyncViewportSuppressUntil =
+    std::chrono::steady_clock::time_point{};
+  g_nativeProjectSyncTimelineBaselineHash.clear();
   g_nativeProjectSyncPreflight = NativeProjectSyncPreflightState{};
   g_nativeProjectSyncBundle = NativeProjectSyncBundleState{};
   g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
@@ -6019,17 +6230,32 @@ static void nativeTimecodeLanRecordCommand(
       (g_nativeTimecodeLanMode == "project_sync" &&
        g_nativeTimecodeLanProjectSyncRole != "primary")) return;
 
-  // Volume pode produzir dezenas de valores por segundo. Conserva somente o
-  // estado absoluto mais novo daquela pista; a sequencia nova permanece
-  // monotona, portanto retry/ACK nunca transforma um valor antigo no final.
+  // Volumes e drag no grid podem produzir dezenas de valores por segundo.
+  // Conserva somente o estado absoluto mais novo por entidade; a sequencia
+  // nova permanece monotona, portanto retry/ACK nunca transforma um valor
+  // antigo no estado final.
   const std::string commandType = nativeLower(nativeTrim(
     nativeJsonExtractString(commandBody, "type")));
+  const bool liveItemCommand =
+    commandType == "project_sync_live_item_state" ||
+    commandType == "project_sync_live_item_upsert" ||
+    commandType == "project_sync_live_item_delete";
+  const bool liveTrackCommand =
+    commandType == "project_sync_live_track_upsert" ||
+    commandType == "project_sync_live_track_delete";
+  const bool liveSingletonCommand =
+    commandType == "project_sync_live_timeline" ||
+    commandType == "project_sync_viewport_v1" ||
+    commandType == "project_sync_live_resync";
   if (commandType == "project_sync_track_state" ||
-      commandType == "project_sync_config_snapshot") {
+      commandType == "project_sync_config_snapshot" ||
+      liveItemCommand || liveTrackCommand || liveSingletonCommand) {
     const std::string trackId = nativeTrim(
       nativeJsonExtractString(commandBody, "trackId"));
+    const std::string itemId = nativeTrim(
+      nativeJsonExtractString(commandBody, "itemId"));
     if (commandType == "project_sync_config_snapshot" ||
-        !trackId.empty()) {
+        !trackId.empty() || !itemId.empty()) {
       g_nativeTimecodeLanOutbox.erase(
         std::remove_if(
           g_nativeTimecodeLanOutbox.begin(),
@@ -6040,9 +6266,32 @@ static void nativeTimecodeLanRecordCommand(
             if (commandType == "project_sync_config_snapshot") {
               return pendingType == commandType;
             }
-            return pendingType == "project_sync_track_state" &&
-              nativeTrim(nativeJsonExtractString(
-                pending.command, "trackId")) == trackId;
+            if (liveSingletonCommand) return pendingType == commandType;
+            const std::string pendingTrackId = nativeTrim(
+              nativeJsonExtractString(pending.command, "trackId"));
+            const std::string pendingItemId = nativeTrim(
+              nativeJsonExtractString(pending.command, "itemId"));
+            if (commandType == "project_sync_track_state") {
+              return pendingType == commandType &&
+                pendingTrackId == trackId;
+            }
+            if (liveItemCommand && pendingItemId == itemId) {
+              if (commandType == "project_sync_live_item_state") {
+                return pendingType == commandType;
+              }
+              return pendingType == "project_sync_live_item_state" ||
+                pendingType == "project_sync_live_item_upsert" ||
+                pendingType == "project_sync_live_item_delete";
+            }
+            if (liveTrackCommand && pendingTrackId == trackId) {
+              if (commandType == "project_sync_live_track_delete" &&
+                  pendingType == "project_sync_track_state") {
+                return true;
+              }
+              return pendingType == "project_sync_live_track_upsert" ||
+                pendingType == "project_sync_live_track_delete";
+            }
+            return false;
           }),
         g_nativeTimecodeLanOutbox.end());
     }
@@ -6301,12 +6550,17 @@ static std::string nativeTimecodeLanStatusJson()
        << "\"bytesDone\":" << g_nativeProjectSyncApply.bytesDone << ","
        << "\"totalBytes\":" << g_nativeProjectSyncApply.totalBytes << ","
        << "\"fileIndex\":" << g_nativeProjectSyncApply.fileIndex << ","
-       << "\"fileCount\":" << g_nativeProjectSyncApply.fileCount
+       << "\"fileCount\":" << g_nativeProjectSyncApply.fileCount << ","
+       << "\"sequence\":" << g_nativeProjectSyncApply.sequence << ","
+       << "\"automatic\":"
+       << (g_nativeProjectSyncApply.automatic ? "true" : "false")
        << "},\"projectSyncApplyRequested\":"
        << (g_nativeProjectSyncApply.state == "requested"
              ? "true" : "false") << ","
        << "\"projectSyncApplyRequestId\":"
        << nativeJsonString(g_nativeProjectSyncApply.requestId) << ","
+       << "\"projectSyncApplySequence\":"
+       << g_nativeProjectSyncApply.sequence << ","
        << "\"eventSequence\":"
        << g_nativeTimecodeLanEventSequence << ","
        << "\"transport\":{\"sequence\":"
@@ -6319,6 +6573,51 @@ static std::string nativeTimecodeLanStatusJson()
        << ",\"position\":" << std::setprecision(15)
        << transport.position << ",\"sampledAtMs\":"
        << transport.sampledAtMs << "}}";
+  return json.str();
+}
+
+static std::string nativeParallelTimecodeLanStatusJson()
+{
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  const NativeTimecodeLanTransport& transport =
+    g_nativeTimecodeLanTransport;
+  std::ostringstream json;
+  json << "{\"ok\":true,\"lanOnly\":true,\"channel\":\"parallel\","
+       << "\"sessionId\":"
+       << nativeJsonString(nativeTimecodeLanSessionId() + "-parallel") << ','
+       << "\"mode\":" << nativeJsonString(g_nativeParallelTimecodeMode)
+       << ",\"code\":" << nativeJsonString(g_nativeParallelTimecodeCode)
+       << ",\"peerConnected\":"
+       << (g_nativeParallelTimecodePeerConnected ? "true" : "false")
+       << ",\"peerName\":"
+       << nativeJsonString(g_nativeParallelTimecodePeerName)
+       << ",\"eventSequence\":0,\"transport\":{\"sequence\":"
+       << transport.sequence << ",\"controlSequence\":"
+       << transport.controlSequence << ",\"playState\":"
+       << transport.playState << ",\"playing\":"
+       << (transport.playState != 0 ? "true" : "false")
+       << ",\"audioHealthy\":"
+       << (transport.audioHealthy ? "true" : "false")
+       << ",\"position\":" << std::setprecision(15)
+       << transport.position << ",\"sampledAtMs\":"
+       << transport.sampledAtMs << "}}";
+  return json.str();
+}
+
+static std::string nativeParallelTimecodeLanOutboxJson()
+{
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  const NativeTimecodeLanTransport& transport =
+    g_nativeTimecodeLanTransport;
+  std::ostringstream json;
+  json << "{\"ok\":true,\"eventSequence\":0,\"events\":[],"
+       << "\"transport\":{\"sequence\":" << transport.sequence
+       << ",\"controlSequence\":" << transport.controlSequence
+       << ",\"playState\":" << transport.playState
+       << ",\"position\":" << std::setprecision(15)
+       << transport.position << ",\"sampledAtMs\":"
+       << transport.sampledAtMs << ",\"audioHealthy\":"
+       << (transport.audioHealthy ? "true" : "false") << "}}";
   return json.str();
 }
 
@@ -7892,6 +8191,7 @@ static bool nativeApplyTunerValue(ReaProject* project, int semitones)
       if (TrackFX_SetParamNormalized_ptr(track, fx, param, normalized)) changed = true;
     }
   }
+  if (changed && MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
   if (changed && UpdateArrange_ptr) UpdateArrange_ptr();
   return found;
 }
@@ -21973,6 +22273,11 @@ static bool nativeUiBackupKeyAllowed(
     return key == "TP1_SETTINGS_V1" ||
       key == "TP2_SETTINGS_V1";
   }
+  if (section == "JBKEYS_VSLIVE_WINDOW") {
+    return key == "PREMIX_V1" ||
+      key == "PREMIX_ENABLED_V1" ||
+      key == "PREMIX_GLOBAL_ENABLED_V1";
+  }
   return section == kAccessExtSection &&
     (key == kAccessDirectorPassKey ||
      key == kAccessRecadosPassKey ||
@@ -22489,6 +22794,9 @@ static std::string nativeProjectSyncBuildConfigSnapshot()
   }
   addGlobal(kNativeTelepromptSettingsSection, "TP1_SETTINGS_V1");
   addGlobal(kNativeTelepromptSettingsSection, "TP2_SETTINGS_V1");
+  addGlobal("JBKEYS_VSLIVE_WINDOW", "PREMIX_V1");
+  addGlobal("JBKEYS_VSLIVE_WINDOW", "PREMIX_ENABLED_V1");
+  addGlobal("JBKEYS_VSLIVE_WINDOW", "PREMIX_GLOBAL_ENABLED_V1");
 
   std::ostringstream fadeoutTracks;
   const std::vector<std::string> trackIds =
@@ -22773,6 +23081,10 @@ static std::string nativeProjectSyncBuildStructuralManifest(
         ? GetMediaItemTakeInfo_Value_ptr(take, "D_STARTOFFS") : 0.0;
       const double playRate = take && GetMediaItemTakeInfo_Value_ptr
         ? GetMediaItemTakeInfo_Value_ptr(take, "D_PLAYRATE") : 1.0;
+      const double itemVolume = GetMediaItemInfo_Value_ptr(
+        item, "D_VOL");
+      const double takeVolume = take && GetMediaItemTakeInfo_Value_ptr
+        ? GetMediaItemTakeInfo_Value_ptr(take, "D_VOL") : 1.0;
       addRecord(
         "ITEM\t" + nativeUiBackupEscape(itemGuid) + "\t" +
         nativeUiBackupEscape(trackGuid) + "\t" +
@@ -22787,7 +23099,9 @@ static std::string nativeProjectSyncBuildStructuralManifest(
         nativeProjectSyncNumber(startOffset) + "\t" +
         nativeProjectSyncNumber(playRate) + "\t" +
         (GetMediaItemInfo_Value_ptr(item, "B_LOOPSRC") > 0.5
-          ? "1" : "0"));
+          ? "1" : "0") + "\t" +
+        nativeProjectSyncNumber(itemVolume) + "\t" +
+        nativeProjectSyncNumber(takeVolume));
     }
   }
 
@@ -22923,7 +23237,8 @@ static std::string nativeProjectSyncRecordSummary(
   if (type == "TRACK" && fields.size() == 9) {
     return "Pista " + fields[2] + " - " + fields[3];
   }
-  if (type == "ITEM" && fields.size() == 13) {
+  if (type == "ITEM" &&
+      (fields.size() == 13 || fields.size() == 15)) {
     return "Arquivo " + fields[5] + " na pista " + fields[2] +
       " em " + fields[8] + " s";
   }
@@ -22978,7 +23293,8 @@ nativeProjectSyncParseManifest(const std::string& manifest)
     const std::string& type = fields[0];
     const bool validSize =
       (type == "TRACK" && fields.size() == 9) ||
-      (type == "ITEM" && fields.size() == 13) ||
+      (type == "ITEM" &&
+       (fields.size() == 13 || fields.size() == 15)) ||
       (type == "FX" && fields.size() == 9) ||
       (type == "REGION" && fields.size() == 8) ||
       (type == "MARKER" && fields.size() == 7) ||
@@ -24256,6 +24572,7 @@ struct NativeProjectSyncPrepareInput {
   std::string requestId;
   std::string bundleId;
   std::string projectPath;
+  std::string activeProjectPath;
   std::string projectDirectory;
   std::string mediaDirectory;
   std::string projectFileName;
@@ -24265,6 +24582,7 @@ struct NativeProjectSyncPrepareInput {
   std::string sourceSessionId;
   std::string resourcePath;
   int projectChangeCount = -1;
+  bool automatic = false;
 };
 
 static void nativeProjectSyncFinishBundleError(
@@ -24567,12 +24885,13 @@ static void nativeProjectSyncPrepareBundleWorker(
       g_nativeProjectSyncPendingBundleReady.descriptorPath =
         descriptorPath;
       g_nativeProjectSyncPendingBundleReady.projectPath =
-        input.projectPath;
+        input.activeProjectPath;
       g_nativeProjectSyncPendingBundleReady.projectChangeCount =
         input.projectChangeCount;
       g_nativeProjectSyncPendingBundleReady.totalBytes = totalBytes;
       g_nativeProjectSyncPendingBundleReady.fileCount =
         static_cast<int>(files.size());
+      g_nativeProjectSyncPendingBundleReady.automatic = input.automatic;
       handedOff = true;
     }
   }
@@ -24669,6 +24988,7 @@ struct NativeProjectSyncApplyInput {
   std::string previousConfigSnapshot;
   std::string previousConfigRevision;
   std::string sourceManifest;
+  bool automatic = false;
 };
 
 static void nativeProjectSyncFinishApplyError(
@@ -25026,6 +25346,7 @@ static void nativeProjectSyncApplyBundleWorker(
         previousConfigSnapshot;
       g_nativeProjectSyncPendingOpen.previousConfigRevision =
         previousConfigRevision;
+      g_nativeProjectSyncPendingOpen.automatic = input.automatic;
       handedOff = true;
     }
   }
@@ -25072,7 +25393,6 @@ static void nativeProjectSyncFinalizePreparedBundleOnMainThread()
       (!project || !IsProjectDirty_ptr ||
        !GetProjectStateChangeCount_ptr ||
        !nativeProjectSyncPathEquals(currentPath, pending.projectPath) ||
-       IsProjectDirty_ptr(project) != 0 ||
        GetProjectStateChangeCount_ptr(project) !=
          pending.projectChangeCount)) {
     validationError =
@@ -25201,6 +25521,8 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
     nativeJsonExtractString(commandBody, "requestId"));
   const std::string expectedRevision = nativeTrim(
     nativeJsonExtractString(commandBody, "expectedRevision"));
+  const bool automatic = nativeJsonBoolValue(
+    commandBody, "automatic", false);
   if (!nativeProjectSyncRequestIdIsValid(requestId)) return true;
 
   std::string role;
@@ -25238,10 +25560,11 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
       return true;
     }
   }
-  if (!g_nativeProjectSyncPendingPrepareConfirmation.active ||
+  if (!automatic &&
+      (!g_nativeProjectSyncPendingPrepareConfirmation.active ||
       g_nativeProjectSyncPendingPrepareConfirmation.requestId != requestId ||
       g_nativeProjectSyncPendingPrepareConfirmation.commandBody !=
-        commandBody) {
+        commandBody)) {
     std::string peerName = nativeTrim(
       nativeJsonExtractString(commandBody, "peerName"));
     if (peerName.size() > 80) peerName.resize(80);
@@ -25347,11 +25670,6 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
       "O REAPER nao disponibilizou as APIs de seguranca do projeto.");
     return true;
   }
-  if (IsProjectDirty_ptr(project) != 0) {
-    nativeProjectSyncFinishBundleError(requestId,
-      "O projeto do PC A tem alteracoes nao salvas. Salve e tente novamente.");
-    return true;
-  }
   const std::string projectDirectory =
     nativeProjectSyncParentPath(projectPath);
   const std::string projectFileName =
@@ -25364,6 +25682,31 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
       : structuralRevision).substr(0, 16) + "-" +
     requestId.substr(0, 16) + "-" +
     std::to_string(nativeSystemNowMs());
+  if (!Main_SaveProjectEx_ptr) {
+    nativeProjectSyncFinishBundleError(requestId,
+      "O REAPER nao disponibilizou o snapshot vivo do projeto.");
+    return true;
+  }
+  std::string snapshotError;
+  const std::string snapshotDirectory = joinPath(
+    normalizeSlashes(GetResourcePath_ptr ? GetResourcePath_ptr() : ""),
+    "VS Hook/Project Sync/Live Snapshots/" + bundleId);
+  if (!nativeProjectSyncEnsureDirectory(
+        snapshotDirectory, snapshotError)) {
+    nativeProjectSyncFinishBundleError(requestId,
+      snapshotError.empty()
+        ? "Nao foi possivel preparar o snapshot vivo do PC A."
+        : snapshotError);
+    return true;
+  }
+  const std::string snapshotProjectPath = joinPath(
+    snapshotDirectory, projectFileName);
+  Main_SaveProjectEx_ptr(project, snapshotProjectPath.c_str(), 0);
+  if (!fileExists(snapshotProjectPath)) {
+    nativeProjectSyncFinishBundleError(requestId,
+      "O REAPER nao criou o snapshot vivo do PC A.");
+    return true;
+  }
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     g_nativeProjectSyncBundle.bundleId = bundleId;
@@ -25373,13 +25716,14 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
   g_nativeProjectSyncBundleWorkerRunning.store(true);
   try {
     NativeProjectSyncPrepareInput input{
-      requestId, bundleId, projectPath, projectDirectory,
+      requestId, bundleId, snapshotProjectPath, projectPath,
+      projectDirectory,
       mediaDirectory, projectFileName, manifestRevision,
       structuralRevision, configSnapshot,
       nativeTimecodeLanSessionId(),
       normalizeSlashes(
         GetResourcePath_ptr ? GetResourcePath_ptr() : ""),
-      GetProjectStateChangeCount_ptr(project)};
+      GetProjectStateChangeCount_ptr(project), automatic};
     g_nativeProjectSyncBundleWorker = std::thread([input]() {
       try {
         nativeProjectSyncPrepareBundleWorker(input);
@@ -25448,6 +25792,8 @@ static bool nativeProjectSyncApplyBundleFromCommand(
     nativeJsonExtractString(commandBody, "descriptorPath")));
   const std::string stagingRoot = normalizeSlashes(nativeTrim(
     nativeJsonExtractString(commandBody, "stagingRoot")));
+  const bool automatic = nativeJsonBoolValue(
+    commandBody, "automatic", false);
   if (!nativeProjectSyncRequestIdIsValid(requestId)) return true;
   if (!nativeProjectSyncPortableIdIsValid(bundleId) ||
       descriptorPath.empty() || stagingRoot.empty()) {
@@ -25482,11 +25828,6 @@ static bool nativeProjectSyncApplyBundleFromCommand(
       "O REAPER nao disponibilizou as APIs de seguranca do projeto.");
     return true;
   }
-  if (IsProjectDirty_ptr(project) != 0) {
-    nativeProjectSyncFinishApplyError(requestId,
-      "O PC B tem alteracoes nao salvas. Salve antes de aplicar.");
-    return true;
-  }
   const int changeCount = GetProjectStateChangeCount_ptr(project);
   const std::string previousConfigSnapshot =
     nativeProjectSyncBuildConfigSnapshot();
@@ -25500,6 +25841,7 @@ static bool nativeProjectSyncApplyBundleFromCommand(
     g_nativeProjectSyncApply.descriptorPath = descriptorPath;
     g_nativeProjectSyncApply.stagingRoot = stagingRoot;
     g_nativeProjectSyncApply.error.clear();
+    g_nativeProjectSyncApply.automatic = automatic;
     sourceManifest = g_nativeProjectSyncPreflight.remoteManifest;
   }
   if (sourceManifest.empty()) {
@@ -25514,7 +25856,7 @@ static bool nativeProjectSyncApplyBundleFromCommand(
       requestId, bundleId, descriptorPath, stagingRoot,
       projectPath, nativeProjectSyncManagedBaseDirectory(projectPath),
       changeCount, previousConfigSnapshot, previousConfigRevision,
-      sourceManifest};
+      sourceManifest, automatic};
     g_nativeProjectSyncBundleWorker = std::thread([input]() {
       try {
         nativeProjectSyncApplyBundleWorker(input);
@@ -25632,8 +25974,13 @@ static void nativeProjectSyncApplyConfigFromDiffModal()
     nativeProjectSyncStorePreflightResult(
       requestId, result.ready, result.diffJson,
       remoteManifestRevision, remoteManifest, remoteConfigSnapshot);
-    if (result.structuralDifferenceCount > 0 ||
-        result.configDifferenceCount > 0) {
+    if ((result.structuralDifferenceCount > 0 ||
+         result.configDifferenceCount > 0) &&
+        g_nativeMainModalKind ==
+          NativeMainModalKind::ProjectSyncDiff &&
+        nativeAppActivePanelIsOpen()) {
+      // Apenas atualiza a conferencia que o handshake ja abriu. Aplicar
+      // configuracoes nunca pode ressuscitar o modal depois de ele fechar.
       nativeProjectSyncShowDiffModal(result.diffJson);
     } else {
       nativeUiCloseMainModal();
@@ -25686,6 +26033,9 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
     g_nativeProjectSyncApply.state = "requested";
     g_nativeProjectSyncApply.requestId = requestId;
     g_nativeProjectSyncApply.revision = revision;
+    g_nativeProjectSyncApply.sequence =
+      ++g_nativeProjectSyncApplySequence;
+    g_nativeProjectSyncApply.automatic = false;
     g_nativeProjectSyncConfigurationAuthorized = false;
   }
   g_nativeForceStateBuild.store(true);
@@ -26343,9 +26693,9 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
       !GetProjectStateChangeCount_ptr ||
       !nativeProjectSyncPathEquals(
         currentPath, pending.originalProjectPath) ||
-      IsProjectDirty_ptr(project) != 0 ||
-      GetProjectStateChangeCount_ptr(project) !=
-        pending.originalProjectChangeCount ||
+      (!pending.automatic &&
+       GetProjectStateChangeCount_ptr(project) !=
+         pending.originalProjectChangeCount) ||
       !pending.backupReady || !fileExists(pending.backupPath) ||
       pending.inPlaceProjectText.empty() ||
       pending.sourceManifest.empty()) {
@@ -26364,7 +26714,7 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
   if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
   bool applied = nativeProjectSyncApplyTracksInPlace(
     project, pending.inPlaceProjectText, error);
-  if (applied) {
+  if (applied && !pending.automatic) {
     applied = nativeProjectSyncApplyTimelineInPlace(
       project, pending.sourceManifest, error);
   }
@@ -26395,7 +26745,14 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
       g_nativeProjectSyncApply.error.clear();
     }
     g_nativeProjectSyncPendingOpen = NativeProjectSyncPendingOpen{};
-    g_nativeProjectSyncPreflight = NativeProjectSyncPreflightState{};
+    // Uma reconciliação automática acontece dentro da sessão já aprovada no
+    // pareamento. Manter o preflight é obrigatório para que as próximas
+    // inclusões/exclusões continuem usando o mesmo canal sem abrir novamente
+    // a janela de conferência. A aplicação manual inicial encerra o preflight
+    // antigo normalmente e será pareada contra o novo estado estrutural.
+    if (!pending.automatic) {
+      g_nativeProjectSyncPreflight = NativeProjectSyncPreflightState{};
+    }
   }
   g_nativeProjectSyncStructuralManifest.clear();
   g_nativeProjectSyncManifestProject = nullptr;
@@ -26422,6 +26779,14 @@ static bool nativeApplyProjectSyncCommand(
       type != "project_sync_apply_bundle") {
     return false;
   }
+  const std::string preflightPhase = nativeLower(nativeTrim(
+    nativeJsonExtractString(commandBody, "phase")));
+  // Regra dura: um diagnostico recebido durante heartbeat/live sync nunca
+  // toma o foco nem reabre a conferencia. Somente o handshake explicito pode
+  // autorizar a UI; o resultado continua salvo no status para o relay.
+  const bool showConference = type == "project_sync_preflight" &&
+    (nativeJsonBoolValue(commandBody, "showConference", false) ||
+     preflightPhase == "pairing");
 
   std::string localMode;
   std::string localRole;
@@ -26510,7 +26875,7 @@ static bool nativeApplyProjectSyncCommand(
           "Este computador nao esta configurado como PC B.");
       nativeProjectSyncStorePreflightResult(
         requestId, false, result.diffJson, "");
-      nativeProjectSyncShowDiffModal(result.diffJson);
+      if (showConference) nativeProjectSyncShowDiffModal(result.diffJson);
       return true;
     }
     const std::string remoteManifest =
@@ -26525,7 +26890,7 @@ static bool nativeApplyProjectSyncCommand(
           "O manifesto recebido do PC A esta incompleto ou corrompido.");
       nativeProjectSyncStorePreflightResult(
         requestId, false, result.diffJson, remoteRevision);
-      nativeProjectSyncShowDiffModal(result.diffJson);
+      if (showConference) nativeProjectSyncShowDiffModal(result.diffJson);
       return true;
     }
 
@@ -26549,7 +26914,8 @@ static bool nativeApplyProjectSyncCommand(
     nativeProjectSyncStorePreflightResult(
       requestId, result.ready, result.diffJson, remoteRevision,
       remoteManifest, result.remoteConfigSnapshot);
-    if (!result.ready || result.differenceCount > 0) {
+    if (showConference &&
+        (!result.ready || result.differenceCount > 0)) {
       nativeProjectSyncShowDiffModal(result.diffJson);
     }
     return true;
@@ -26578,7 +26944,8 @@ static bool nativeApplyProjectSyncCommand(
     nativeProjectSyncStorePreflightResult(
       requestId, ready, diff, remoteRevision);
     if (ready) g_nativeProjectSyncPublishInitialConfig = true;
-    if (!ready || nativeJsonInt64(diff, "differenceCount", 0) > 0) {
+    if (showConference &&
+        (!ready || nativeJsonInt64(diff, "differenceCount", 0) > 0)) {
       nativeProjectSyncShowDiffModal(diff);
     }
     return true;
@@ -26588,7 +26955,7 @@ static bool nativeApplyProjectSyncCommand(
     nativeProjectSyncErrorResult("Papel de preflight invalido.");
   nativeProjectSyncStorePreflightResult(
     requestId, false, result.diffJson, "");
-  nativeProjectSyncShowDiffModal(result.diffJson);
+  if (showConference) nativeProjectSyncShowDiffModal(result.diffJson);
   return true;
 }
 
@@ -27687,14 +28054,11 @@ static bool nativeUiSetPremixVolumeFromPoint(
     static_cast<int>(slider.right - slider.left));
   const double ratio = std::max(0.0, std::min(1.0,
     static_cast<double>(pointX - slider.left) / width));
-  if (!nativeSetPremixMediaItemVolume(
-        row.mediaItem, nativeUiPremixRatioToVolume(ratio))) {
-    return false;
-  }
-  if (project && MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
-  if (UpdateArrange_ptr) UpdateArrange_ptr();
-  g_nativeForceStateBuild.store(true);
-  return true;
+  std::ostringstream command;
+  command << "{\"type\":\"premix_item_set_volume\","
+          << "\"itemId\":" << nativeJsonString(row.itemId)
+          << ",\"ratio\":" << std::setprecision(17) << ratio << '}';
+  return nativeApplyPremixCommand(command.str());
 }
 
 static bool nativeUiTogglePremixMute(int rowIndex)
@@ -27714,12 +28078,12 @@ static bool nativeUiTogglePremixMute(int rowIndex)
   }
   const bool muted =
     GetMediaItemInfo_Value_ptr(row.mediaItem, "B_MUTE") > 0.5;
-  SetMediaItemInfo_Value_ptr(row.mediaItem, "B_MUTE",
-    muted ? 0.0 : 1.0);
-  if (project && MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
-  if (UpdateArrange_ptr) UpdateArrange_ptr();
-  g_nativeForceStateBuild.store(true);
-  return true;
+  std::ostringstream command;
+  command << "{\"type\":\"premix_item_toggle_mute\","
+          << "\"itemId\":" << nativeJsonString(row.itemId)
+          << ",\"desiredMute\":" << (!muted ? "true" : "false")
+          << '}';
+  return nativeApplyPremixCommand(command.str());
 }
 
 static bool nativeUiOpenBlockColor()
@@ -43229,10 +43593,15 @@ static void nativeUiToggleDocker(bool forceRight)
 static constexpr UINT_PTR kNativeBigClockTimerId = 0x5642434B;
 static constexpr int kNativeBigClockMinimumHeight = 64;
 static constexpr int kNativeBigClockDockerHeight = 69;
-static constexpr const char* kNativeBigClockDockLayoutMigratedKey =
-  "BIG_CLOCK_DOCK_LAYOUT_MIGRATED_V2";
+static constexpr int kNativeWindowStatePersistDelayMs = 250;
+static constexpr const char* kNativeDockerLayoutInitializedKey =
+  "DOCKER_LAYOUT_DEFAULTS_INITIALIZED_V1";
 static HWND g_nativeBigClockHwnd[2] = {nullptr, nullptr};
 static bool g_nativeBigClockClosing[2] = {false, false};
+static bool g_nativeBigClockWindowStateDirty[2] = {false, false};
+static int g_nativeBigClockObservedDockState[2] = {-1, -1};
+static std::chrono::steady_clock::time_point
+  g_nativeBigClockWindowStateChangedAt[2]{};
 static int g_nativeBigClockOpeningSlot = 0;
 static int g_nativeBigClockMode = -1;
 static COLORREF g_nativeBigClockForeground = RGB(255, 255, 0);
@@ -43496,62 +43865,105 @@ static bool nativePrepareBigClockDockerLayout()
     bottomModeReady && bottomHeightReady;
 }
 
-static void nativePrepareFirstUseDockerLayout()
+static bool nativeHasAnyPersistedDockerLayout()
 {
-  // Prepara o conjunto inteiro independentemente de qual janela o usuário
-  // abrir primeiro. Sem isso, abrir pelo Startup antes da interface principal
-  // deixava o REAPER criar os dockers novos todos na posição padrão inferior.
-  nativeBigClockWriteReaperConfigInt("dockposflags", 5);
-  nativeBigClockWriteReaperConfigInt("dockermode3", 3); // principal: direita
-  nativeBigClockWriteReaperConfigInt("dockheight_r", 409);
-  nativeBigClockWriteReaperConfigInt("dockermode1", 1); // controller: esquerda
-  nativeBigClockWriteReaperConfigInt("dockheight_l", 362);
-  nativePrepareBigClockDockerLayout();
+  static const char* sharedKeys[] = {
+    "DOCKSTATE_V1", "LAST_DOCKSTATE_V1",
+    "WINDOW_X_V1", "WINDOW_Y_V1", "WINDOW_W_V1", "WINDOW_H_V1",
+    "HOOK_CONTROLLER_DOCKSTATE_V1",
+    "HOOK_CONTROLLER_LAST_DOCKSTATE_V1",
+    "HOOK_CONTROLLER_X_V1", "HOOK_CONTROLLER_Y_V1",
+    "HOOK_CONTROLLER_W_V1", "HOOK_CONTROLLER_H_V1"
+  };
+  for (const char* key : sharedKeys) {
+    if (nativeAppActiveHasWindowValue(key)) return true;
+  }
+  static const char* clockSuffixes[] = {
+    "DOCKSTATE_V1", "LAST_DOCKSTATE_V1",
+    "X_V1", "Y_V1", "W_V1", "H_V1"
+  };
+  for (int slot = 0; slot < 2; ++slot) {
+    for (const char* suffix : clockSuffixes) {
+      if (nativeAppActiveHasWindowValue(
+            nativeBigClockKey(slot, suffix).c_str())) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
-static void nativeBigClockMigrateDockLayoutOnce()
+static void nativePrepareFirstUseDockerLayout()
 {
   if (!GetExtState_ptr || !SetExtState_ptr ||
       nativeAppActiveReadWindowInt(
-        kNativeBigClockDockLayoutMigratedKey, 0) != 0) {
+        kNativeDockerLayoutInitializedKey, 0) != 0) {
     return;
   }
 
-  // Builds anteriores persistiram os dois clocks antes de existir o layout
-  // aprovado. Por isso o caminho de "primeira abertura" nunca mais rodava e o
-  // REAPER continuava restaurando ambos no docker inferior e/ou com altura
-  // antiga. Migra o par atomicamente do ponto de vista da versao: se algum
-  // config var nao estiver disponivel, nao grava o marcador e tenta novamente.
-  if (!nativePrepareBigClockDockerLayout()) return;
-
-  for (int slot = 0; slot < 2; ++slot) {
-    const int dockState = nativeBigClockDefaultDockState(slot);
-    nativeAppActiveWriteWindowInt(
-      nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), dockState);
-    nativeAppActiveWriteWindowInt(
-      nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str(), dockState);
-    nativeAppActiveWriteWindowInt(
-      nativeBigClockKey(slot, "H_V1").c_str(),
-      kNativeBigClockMinimumHeight);
+  // Builds antigos ja possuem layout valido, mas nao possuem este marcador.
+  // Adota o estado existente sem tocar nas variaveis globais dos dockers.
+  if (nativeHasAnyPersistedDockerLayout()) {
+    nativeAppActiveWriteWindowInt(kNativeDockerLayoutInitializedKey, 1);
+    return;
   }
-  nativeAppActiveWriteWindowInt(kNativeBigClockDockLayoutMigratedKey, 1);
+
+  // Prepara o conjunto inteiro independentemente de qual janela o usuário
+  // abrir primeiro. Sem isso, abrir pelo Startup antes da interface principal
+  // deixava o REAPER criar os dockers novos todos na posição padrão inferior.
+  bool prepared = true;
+  prepared = nativeBigClockWriteReaperConfigInt(
+    "dockposflags", 5) && prepared;
+  prepared = nativeBigClockWriteReaperConfigInt(
+    "dockermode3", 3) && prepared; // principal: direita
+  prepared = nativeBigClockWriteReaperConfigInt(
+    "dockheight_r", 409) && prepared;
+  prepared = nativeBigClockWriteReaperConfigInt(
+    "dockermode1", 1) && prepared; // controller: esquerda
+  prepared = nativeBigClockWriteReaperConfigInt(
+    "dockheight_l", 362) && prepared;
+  prepared = nativePrepareBigClockDockerLayout() && prepared;
+  if (prepared) {
+    nativeAppActiveWriteWindowInt(kNativeDockerLayoutInitializedKey, 1);
+  }
 }
 
 static void nativeBigClockPrepareFirstOpenDock(int slot)
 {
   slot = nativeBigClockSafeSlot(slot);
   // O REAPER guarda o lado de cada docker separadamente do estado da janela.
-  // Configura apenas no primeiro uso: depois disso, qualquer posição escolhida
-  // pelo usuário é respeitada pela chave DOCKSTATE persistida.
-  nativePrepareBigClockDockerLayout();
-  const int dockState = nativeBigClockDefaultDockState(slot);
+  // Defaults globais so sao aplicados numa instalacao realmente nova; se
+  // qualquer janela ja tem layout, as escolhas atuais do usuario prevalecem.
+  nativePrepareFirstUseDockerLayout();
+  const bool hasLastDock = nativeAppActiveHasWindowValue(
+    nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str());
+  const bool hasSavedFloatingGeometry =
+    nativeAppActiveHasWindowValue(
+      nativeBigClockKey(slot, "X_V1").c_str()) ||
+    nativeAppActiveHasWindowValue(
+      nativeBigClockKey(slot, "Y_V1").c_str()) ||
+    nativeAppActiveHasWindowValue(
+      nativeBigClockKey(slot, "W_V1").c_str()) ||
+    nativeAppActiveHasWindowValue(
+      nativeBigClockKey(slot, "H_V1").c_str());
+  const int defaultDockState = nativeBigClockDefaultDockState(slot);
+  // Estado legado sem DOCKSTATE, mas com geometria/ultimo docker, representa
+  // uma escolha existente. Mantem a janela solta em vez de força-la ao docker.
+  const int dockState = hasSavedFloatingGeometry || hasLastDock
+    ? 0 : defaultDockState;
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), dockState);
-  nativeAppActiveWriteWindowInt(
-    nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str(), dockState);
-  nativeAppActiveWriteWindowInt(
-    nativeBigClockKey(slot, "H_V1").c_str(),
-    kNativeBigClockMinimumHeight);
+  if (!hasLastDock) {
+    nativeAppActiveWriteWindowInt(
+      nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str(),
+      defaultDockState);
+  }
+  if (!nativeAppActiveHasWindowValue(
+        nativeBigClockKey(slot, "H_V1").c_str())) {
+    nativeAppActiveWriteWindowInt(
+      nativeBigClockKey(slot, "H_V1").c_str(),
+      kNativeBigClockMinimumHeight);
+  }
 }
 
 static bool nativeBigClockWindowIsOpen(int slot)
@@ -43831,6 +44243,8 @@ static void nativeBigClockSaveWindowState(int slot)
   bool floatingDocker = false;
   const int dockerIndex = DockIsChildOfDock_ptr
     ? DockIsChildOfDock_ptr(g_nativeBigClockHwnd[slot], &floatingDocker) : -1;
+  g_nativeBigClockObservedDockState[slot] =
+    dockerIndex >= 0 ? dockerIndex * 256 + 1 : 0;
   if (dockerIndex >= 0) {
     const int dockState = dockerIndex * 256 + 1;
     nativeAppActiveWriteWindowInt(
@@ -43841,17 +44255,27 @@ static void nativeBigClockSaveWindowState(int slot)
   }
   RECT rect{0, 0, 0, 0};
   if (!GetWindowRect(g_nativeBigClockHwnd[slot], &rect)) return;
+  int width = static_cast<int>(rect.right - rect.left);
+  int height = static_cast<int>(rect.bottom - rect.top);
+#ifdef _WIN32
+  // No Windows os valores persistidos representam a area cliente, pois a
+  // abertura os converte com AdjustWindowRectEx. No SWELL/macOS SetWindowPos
+  // recebe diretamente o retangulo externo retornado por GetWindowRect.
+  RECT clientRect{0, 0, 0, 0};
+  if (!GetClientRect(g_nativeBigClockHwnd[slot], &clientRect)) return;
+  width = static_cast<int>(clientRect.right - clientRect.left);
+  height = static_cast<int>(clientRect.bottom - clientRect.top);
+#endif
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "X_V1").c_str(), rect.left);
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "Y_V1").c_str(), rect.top);
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "W_V1").c_str(),
-    std::max(320, static_cast<int>(rect.right - rect.left)));
+    std::max(320, width));
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "H_V1").c_str(),
-    std::max(kNativeBigClockMinimumHeight,
-      static_cast<int>(rect.bottom - rect.top)));
+    std::max(kNativeBigClockMinimumHeight, height));
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), 0);
 }
@@ -44414,15 +44838,22 @@ static void nativeBigClockDrawMarquee(
 static std::string nativeBigClockProjectSyncPcLabel()
 {
   std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
-  if (g_nativeTimecodeLanMode != "project_sync" ||
-      !g_nativeTimecodeLanPeerConnected) {
-    return {};
+  if (g_nativeTimecodeLanMode == "project_sync" &&
+      g_nativeTimecodeLanPeerConnected) {
+    if (g_nativeTimecodeLanProjectSyncRole == "primary") {
+      return "PC: A";
+    }
+    if (g_nativeTimecodeLanProjectSyncRole == "secondary") {
+      return "PC: B";
+    }
   }
-  if (g_nativeTimecodeLanProjectSyncRole == "primary") {
-    return "PC: A";
-  }
-  if (g_nativeTimecodeLanProjectSyncRole == "secondary") {
-    return "PC: B";
+  // O terceiro computador usa o canal Timecode Receive, independente do
+  // Project Sync A -> B. No Big Clock dele a identificação é sempre PC: C.
+  if ((g_nativeTimecodeLanMode == "receive" &&
+       g_nativeTimecodeLanPeerConnected) ||
+      (g_nativeParallelTimecodeMode == "receive" &&
+       g_nativeParallelTimecodePeerConnected)) {
+    return "PC: C";
   }
   return {};
 }
@@ -44922,6 +45353,7 @@ static void nativeBigClockRecreateForDock(int slot, bool dock)
   nativeBigClockLoadRuntimeSettings(slot);
   if (!nativeBigClockWindowIsOpen(slot)) return;
   nativeBigClockSaveWindowState(slot);
+  g_nativeBigClockWindowStateDirty[slot] = false;
   if (dock) {
     const int saved = nativeAppActiveReadWindowInt(
       nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str(),
@@ -45203,6 +45635,27 @@ static LRESULT CALLBACK nativeBigClockWndProc(
       return HTCLIENT;
     case WM_TIMER:
       if (wParam == kNativeBigClockTimerId) {
+        const auto now = std::chrono::steady_clock::now();
+        bool floatingDocker = false;
+        const int dockerIndex = DockIsChildOfDock_ptr
+          ? DockIsChildOfDock_ptr(hwnd, &floatingDocker) : -1;
+        const int dockState = dockerIndex >= 0
+          ? dockerIndex * 256 + 1 : 0;
+        if (g_nativeBigClockObservedDockState[slot] >= 0 &&
+            g_nativeBigClockObservedDockState[slot] != dockState) {
+          g_nativeBigClockWindowStateDirty[slot] = true;
+          g_nativeBigClockWindowStateChangedAt[slot] = now;
+        }
+        g_nativeBigClockObservedDockState[slot] = dockState;
+        if (g_nativeBigClockWindowStateDirty[slot] &&
+            g_nativeBigClockWindowStateChangedAt[slot].
+              time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - g_nativeBigClockWindowStateChangedAt[slot]).count() >=
+              kNativeWindowStatePersistDelayMs) {
+          g_nativeBigClockWindowStateDirty[slot] = false;
+          nativeBigClockSaveWindowState(slot);
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
@@ -45217,7 +45670,19 @@ static LRESULT CALLBACK nativeBigClockWndProc(
     case WM_PAINT:
       nativeBigClockPaint(hwnd);
       return 0;
+    case WM_MOVE:
+      if (!g_nativeBigClockClosing[slot]) {
+        g_nativeBigClockWindowStateDirty[slot] = true;
+        g_nativeBigClockWindowStateChangedAt[slot] =
+          std::chrono::steady_clock::now();
+      }
+      return 0;
     case WM_SIZE:
+      if (!g_nativeBigClockClosing[slot]) {
+        g_nativeBigClockWindowStateDirty[slot] = true;
+        g_nativeBigClockWindowStateChangedAt[slot] =
+          std::chrono::steady_clock::now();
+      }
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_GETMINMAXINFO: {
@@ -45251,6 +45716,11 @@ static LRESULT CALLBACK nativeBigClockWndProc(
       return 0;
     case WM_DESTROY:
     case WM_NCDESTROY:
+      if (message == WM_DESTROY &&
+          !g_nativeBigClockClosing[slot]) {
+        nativeBigClockSaveWindowState(slot);
+        g_nativeBigClockWindowStateDirty[slot] = false;
+      }
       KillTimer(hwnd, kNativeBigClockTimerId);
 #ifndef __APPLE__
       g_nativeBigClockBackBuffer[slot].reset();
@@ -45288,7 +45758,6 @@ static bool nativeOpenBigClockWindow(int slot)
     SetFocus(g_nativeBigClockHwnd[slot]);
     return true;
   }
-  nativeBigClockMigrateDockLayoutOnce();
   nativeBigClockReadSettings(slot);
   const std::string dockStateKey =
     nativeBigClockKey(slot, "DOCKSTATE_V1");
@@ -45308,6 +45777,9 @@ static bool nativeOpenBigClockWindow(int slot)
       kNativeBigClockMinimumHeight));
   const int dockState = nativeAppActiveReadWindowInt(
     dockStateKey.c_str(), nativeBigClockDefaultDockState(slot));
+  g_nativeBigClockWindowStateDirty[slot] = false;
+  g_nativeBigClockWindowStateChangedAt[slot] = {};
+  g_nativeBigClockObservedDockState[slot] = dockState;
   const char* title = nativeBigClockTitle(slot);
   const char* dockId = nativeBigClockDockId(slot);
   HWND hwnd = nullptr;
@@ -45374,6 +45846,7 @@ static void nativeCloseBigClockWindow(int slot)
   nativeBigClockLoadRuntimeSettings(slot);
   nativeBigClockSaveSettings(slot);
   nativeBigClockSaveWindowState(slot);
+  g_nativeBigClockWindowStateDirty[slot] = false;
   HWND hwnd = g_nativeBigClockHwnd[slot];
   g_nativeBigClockClosing[slot] = true;
   if (DockWindowRemove_ptr) DockWindowRemove_ptr(hwnd);
@@ -45436,6 +45909,10 @@ struct NativeHookControllerPartsState {
 
 static HWND g_nativeHookControllerHwnd = nullptr;
 static bool g_nativeHookControllerClosing = false;
+static bool g_nativeHookControllerWindowStateDirty = false;
+static int g_nativeHookControllerObservedDockState = -1;
+static std::chrono::steady_clock::time_point
+  g_nativeHookControllerWindowStateChangedAt{};
 static NativeHookControllerMode g_nativeHookControllerMode =
   NativeHookControllerMode::Songs;
 static RECT g_nativeHookControllerTabs[3]{};
@@ -45716,6 +46193,8 @@ static void nativeHookControllerSaveWindowState()
     ? DockIsChildOfDock_ptr(
         g_nativeHookControllerHwnd, &floatingDocker)
     : -1;
+  g_nativeHookControllerObservedDockState =
+    dockerIndex >= 0 ? dockerIndex * 256 + 1 : 0;
   if (dockerIndex >= 0) {
     const int dockState = dockerIndex * 256 + 1;
     nativeAppActiveWriteWindowInt(
@@ -45725,21 +46204,21 @@ static void nativeHookControllerSaveWindowState()
     return;
   }
   RECT windowRect{0, 0, 0, 0};
-  RECT clientRect{0, 0, 0, 0};
   if (!GetWindowRect(g_nativeHookControllerHwnd, &windowRect)) return;
+  int width = static_cast<int>(windowRect.right - windowRect.left);
+  int height = static_cast<int>(windowRect.bottom - windowRect.top);
 #ifdef _WIN32
+  RECT clientRect{0, 0, 0, 0};
   if (!GetClientRect(g_nativeHookControllerHwnd, &clientRect)) return;
-#else
-  GetClientRect(g_nativeHookControllerHwnd, &clientRect);
+  width = static_cast<int>(clientRect.right - clientRect.left);
+  height = static_cast<int>(clientRect.bottom - clientRect.top);
 #endif
   nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_X_V1", windowRect.left);
   nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_Y_V1", windowRect.top);
   nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_W_V1",
-    std::max(1,
-      static_cast<int>(clientRect.right - clientRect.left)));
+    std::max(1, width));
   nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_H_V1",
-    std::max(1,
-      static_cast<int>(clientRect.bottom - clientRect.top)));
+    std::max(1, height));
   nativeAppActiveWriteWindowInt(
     "HOOK_CONTROLLER_DOCKSTATE_V1", 0);
 }
@@ -47733,6 +48212,27 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       return message == WM_INITDIALOG ? TRUE : 0;
     case WM_TIMER:
       if (wParam == kNativeHookControllerTimerId) {
+        const auto now = std::chrono::steady_clock::now();
+        bool floatingDocker = false;
+        const int dockerIndex = DockIsChildOfDock_ptr
+          ? DockIsChildOfDock_ptr(hwnd, &floatingDocker) : -1;
+        const int dockState = dockerIndex >= 0
+          ? dockerIndex * 256 + 1 : 0;
+        if (g_nativeHookControllerObservedDockState >= 0 &&
+            g_nativeHookControllerObservedDockState != dockState) {
+          g_nativeHookControllerWindowStateDirty = true;
+          g_nativeHookControllerWindowStateChangedAt = now;
+        }
+        g_nativeHookControllerObservedDockState = dockState;
+        if (g_nativeHookControllerWindowStateDirty &&
+            g_nativeHookControllerWindowStateChangedAt.
+              time_since_epoch().count() != 0 &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - g_nativeHookControllerWindowStateChangedAt).count() >=
+              kNativeWindowStatePersistDelayMs) {
+          g_nativeHookControllerWindowStateDirty = false;
+          nativeHookControllerSaveWindowState();
+        }
         const bool navigationChanged =
           nativeUiAdvanceNavigationRepeat(hwnd);
         bool scrollChanged = false;
@@ -47772,6 +48272,21 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
 #endif
     case WM_PAINT:
       nativeHookControllerPaint(hwnd);
+      return 0;
+    case WM_MOVE:
+      if (!g_nativeHookControllerClosing) {
+        g_nativeHookControllerWindowStateDirty = true;
+        g_nativeHookControllerWindowStateChangedAt =
+          std::chrono::steady_clock::now();
+      }
+      return 0;
+    case WM_SIZE:
+      if (!g_nativeHookControllerClosing) {
+        g_nativeHookControllerWindowStateDirty = true;
+        g_nativeHookControllerWindowStateChangedAt =
+          std::chrono::steady_clock::now();
+      }
+      InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_LBUTTONDOWN: {
       SetFocus(hwnd);
@@ -48082,6 +48597,11 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       return 0;
     case WM_DESTROY:
     case WM_NCDESTROY:
+      if (message == WM_DESTROY &&
+          !g_nativeHookControllerClosing) {
+        nativeHookControllerSaveWindowState();
+        g_nativeHookControllerWindowStateDirty = false;
+      }
       nativeUiResetNavigationRepeat();
       g_nativeHookControllerScrollbarDragging = false;
       KillTimer(hwnd, kNativeHookControllerTimerId);
@@ -48122,9 +48642,19 @@ static bool nativeOpenHookControllerWindow()
     "HOOK_CONTROLLER_DOCKSTATE_V1");
   if (firstOpen) {
     nativePrepareFirstUseDockerLayout();
-    nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_DOCKSTATE_V1", 257);
-    nativeAppActiveWriteWindowInt(
-      "HOOK_CONTROLLER_LAST_DOCKSTATE_V1", 257);
+    const bool hasLastDock = nativeAppActiveHasWindowValue(
+      "HOOK_CONTROLLER_LAST_DOCKSTATE_V1");
+    const bool hasSavedFloatingGeometry =
+      nativeAppActiveHasWindowValue("HOOK_CONTROLLER_X_V1") ||
+      nativeAppActiveHasWindowValue("HOOK_CONTROLLER_Y_V1") ||
+      nativeAppActiveHasWindowValue("HOOK_CONTROLLER_W_V1") ||
+      nativeAppActiveHasWindowValue("HOOK_CONTROLLER_H_V1");
+    nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_DOCKSTATE_V1",
+      hasSavedFloatingGeometry || hasLastDock ? 0 : 257);
+    if (!hasLastDock) {
+      nativeAppActiveWriteWindowInt(
+        "HOOK_CONTROLLER_LAST_DOCKSTATE_V1", 257);
+    }
   }
   const int savedMode = nativeAppActiveReadWindowInt(
     "HOOK_CONTROLLER_MODE_V1", 0);
@@ -48142,6 +48672,9 @@ static bool nativeOpenHookControllerWindow()
   const int height = savedHeight > 0 ? savedHeight : 560;
   const int dockState = nativeAppActiveReadWindowInt(
     "HOOK_CONTROLLER_DOCKSTATE_V1", 257);
+  g_nativeHookControllerWindowStateDirty = false;
+  g_nativeHookControllerWindowStateChangedAt = {};
+  g_nativeHookControllerObservedDockState = dockState;
   HWND hwnd = nullptr;
 #ifdef _WIN32
   static const wchar_t* className = L"VS_HOOK_CONTROLLER_WINDOW";
@@ -48208,6 +48741,7 @@ static void nativeCloseHookControllerWindow()
     return;
   }
   nativeHookControllerSaveWindowState();
+  g_nativeHookControllerWindowStateDirty = false;
   HWND hwnd = g_nativeHookControllerHwnd;
   g_nativeHookControllerClosing = true;
   if (DockWindowRemove_ptr) DockWindowRemove_ptr(hwnd);
@@ -48223,6 +48757,7 @@ static void nativeHookControllerRecreateForDock(bool dock)
 {
   if (!nativeHookControllerWindowIsOpen()) return;
   nativeHookControllerSaveWindowState();
+  g_nativeHookControllerWindowStateDirty = false;
   if (dock) {
     const int saved = nativeAppActiveReadWindowInt(
       "HOOK_CONTROLLER_LAST_DOCKSTATE_V1", 257);
@@ -60316,6 +60851,10 @@ static void nativeLoadMultiLoopState()
       if (projectPtr && storageKey == projectPtr && pushPtr) {
         nativeParseMultiLoopState(pushPtr);
         nativeSaveMultiLoopState();
+        std::ostringstream sync;
+        sync << "{\"type\":\"multiloop_snapshot_set\",\"raw\":"
+          << nativeJsonString(pushPtr) << '}';
+        nativeTimecodeLanRecordCommand(sync.str());
       }
     }
   }
@@ -62772,6 +63311,1201 @@ static void nativeProjectSyncPollTracksOnMainThread()
   nativeProjectSyncFlushTrackVisualsOnMainThread();
 }
 
+static bool nativeProjectSyncLiveNumberChanged(
+  double before, double after, double epsilon = 0.000000001)
+{
+  return !std::isfinite(before) || !std::isfinite(after) ||
+    std::fabs(before - after) > epsilon;
+}
+
+static bool nativeProjectSyncLiveItemStateChanged(
+  const NativeProjectSyncLiveItemState& before,
+  const NativeProjectSyncLiveItemState& after)
+{
+  return before.trackId != after.trackId ||
+    before.trackIndex != after.trackIndex ||
+    before.itemIndex != after.itemIndex ||
+    before.hasTake != after.hasTake ||
+    nativeProjectSyncLiveNumberChanged(
+      before.itemVolume, after.itemVolume) ||
+    nativeProjectSyncLiveNumberChanged(
+      before.takeVolume, after.takeVolume) ||
+    (before.mute > 0.5) != (after.mute > 0.5) ||
+    nativeProjectSyncLiveNumberChanged(
+      before.position, after.position, 0.0000001) ||
+    nativeProjectSyncLiveNumberChanged(
+      before.length, after.length, 0.0000001) ||
+    nativeProjectSyncLiveNumberChanged(
+      before.startOffset, after.startOffset, 0.0000001) ||
+    nativeProjectSyncLiveNumberChanged(
+      before.playRate, after.playRate, 0.0000001) ||
+    (before.loopSource > 0.5) != (after.loopSource > 0.5);
+}
+
+static bool nativeProjectSyncLiveTrackStateChanged(
+  const NativeProjectSyncLiveTrackState& before,
+  const NativeProjectSyncLiveTrackState& after)
+{
+  return before.trackIndex != after.trackIndex ||
+    before.folderDepth != after.folderDepth ||
+    before.name != after.name;
+}
+
+static std::string nativeProjectSyncLiveTrackStructureKey(
+  MediaTrack* track)
+{
+  std::string chunk;
+  if (!nativeProjectSyncReadTrackChunk(track, chunk)) return {};
+  std::ostringstream relevant;
+  for (const auto& segment : nativeProjectSyncRppTrackSegments(chunk)) {
+    if (segment.block &&
+        (segment.key == "fxchain" || segment.key == "fxchain_rec")) {
+      relevant << segment.key << '\n' << segment.text << '\n';
+    }
+  }
+  return nativeProjectSyncHashText(relevant.str());
+}
+
+static NativeProjectSyncLiveItemState
+nativeProjectSyncReadLiveItemState(
+  ReaProject* project,
+  MediaTrack* track,
+  int trackIndex,
+  MediaItem* item,
+  int itemIndex)
+{
+  NativeProjectSyncLiveItemState state;
+  state.trackIndex = trackIndex;
+  state.itemIndex = itemIndex;
+  state.trackId = nativeProjectSyncTrackId(
+    project, track, trackIndex);
+  state.trackName = nativeTrackName(
+    track, std::max(0, trackIndex - 1));
+  state.id = nativeMediaItemGuid(
+    item, state.trackId + ":item:" + std::to_string(itemIndex));
+  if (item && GetMediaItemInfo_Value_ptr) {
+    state.itemVolume = GetMediaItemInfo_Value_ptr(item, "D_VOL");
+    state.mute = GetMediaItemInfo_Value_ptr(item, "B_MUTE");
+    state.position = GetMediaItemInfo_Value_ptr(item, "D_POSITION");
+    state.length = GetMediaItemInfo_Value_ptr(item, "D_LENGTH");
+    state.loopSource = GetMediaItemInfo_Value_ptr(item, "B_LOOPSRC");
+  }
+  MediaItem_Take* take = item && GetActiveTake_ptr
+    ? GetActiveTake_ptr(item) : nullptr;
+  state.hasTake = take != nullptr;
+  if (take && GetMediaItemTakeInfo_Value_ptr) {
+    state.takeVolume = GetMediaItemTakeInfo_Value_ptr(take, "D_VOL");
+    state.startOffset =
+      GetMediaItemTakeInfo_Value_ptr(take, "D_STARTOFFS");
+    state.playRate =
+      GetMediaItemTakeInfo_Value_ptr(take, "D_PLAYRATE");
+  }
+  std::ostringstream structure;
+  structure << state.trackId << '\n'
+            << (take && TakeIsMIDI_ptr && TakeIsMIDI_ptr(take)
+                  ? "midi" : "audio") << '\n'
+            << nativeReadTakeSourcePath(take) << '\n'
+            << nativeTakeName(item, "") << '\n'
+            << (take && TakeFX_GetCount_ptr
+                  ? std::max(0, TakeFX_GetCount_ptr(take)) : 0);
+  // Parametros de take FX e conteudo MIDI nao aparecem nos getters leves.
+  // O hash do chunk detecta essas alteracoes; os valores de posicao/volume
+  // continuam separados para o evento pequeno e coalescido.
+  if (GetItemStateChunk_ptr) {
+    for (const size_t size : {size_t(64 * 1024), size_t(512 * 1024)}) {
+      std::vector<char> buffer(size, '\0');
+      if (GetItemStateChunk_ptr(
+            item, buffer.data(), static_cast<int>(buffer.size()), false)) {
+        std::string chunk(buffer.data());
+        // Estes campos ja sao enviados de forma absoluta e mudam durante
+        // arraste continuo; remove-os da assinatura estrutural para nao
+        // transformar cada pixel do drag em um upsert grande.
+        std::istringstream lines(chunk);
+        std::string line;
+        while (std::getline(lines, line)) {
+          const std::string key = nativeProjectSyncRppLineKey(line);
+          if (key == "position" || key == "length" || key == "volpan" ||
+              key == "mute" || key == "playrate" ||
+              key == "soffs" || key == "loop") {
+            continue;
+          }
+          structure << '\n' << line;
+        }
+        break;
+      }
+    }
+  }
+  state.structureKey = nativeProjectSyncHashText(structure.str());
+  return state;
+}
+
+static bool nativeProjectSyncReadItemChunk(
+  MediaItem* item,
+  std::string& chunkOut)
+{
+  chunkOut.clear();
+  if (!item || !GetItemStateChunk_ptr) return false;
+  for (const size_t size : {
+         size_t(64 * 1024), size_t(256 * 1024),
+         size_t(512 * 1024)}) {
+    std::vector<char> buffer(size, '\0');
+    if (GetItemStateChunk_ptr(
+          item, buffer.data(), static_cast<int>(buffer.size()), false)) {
+      chunkOut.assign(buffer.data());
+      return !chunkOut.empty();
+    }
+  }
+  return false;
+}
+
+static uint64_t nativeProjectSyncNextLiveRevision()
+{
+  return ++g_nativeProjectSyncLiveRevision;
+}
+
+static std::string nativeProjectSyncLiveCommandPrefix(
+  const char* type,
+  uint64_t revision)
+{
+  std::ostringstream command;
+  command << "{\"type\":" << nativeJsonString(type ? type : "")
+          << ",\"schemaVersion\":1,\"sourceSessionId\":"
+          << nativeJsonString(nativeTimecodeLanSessionId())
+          << ",\"liveRevision\":" << revision;
+  return command.str();
+}
+
+static void nativeProjectSyncPublishLiveItem(
+  const NativeProjectSyncLiveItemState& state,
+  bool upsert,
+  const std::string& requestedChunk = std::string())
+{
+  if (state.id.empty() || state.trackId.empty()) return;
+  const uint64_t revision = nativeProjectSyncNextLiveRevision();
+  const auto build = [&](const std::string& chunk) {
+    std::ostringstream command;
+    command << nativeProjectSyncLiveCommandPrefix(
+      upsert ? "project_sync_live_item_upsert"
+             : "project_sync_live_item_state",
+      revision)
+      << ",\"itemId\":" << nativeJsonString(state.id)
+      << ",\"trackId\":" << nativeJsonString(state.trackId)
+      << ",\"trackName\":" << nativeJsonString(state.trackName)
+      << ",\"trackIndex\":" << state.trackIndex
+      << ",\"itemIndex\":" << state.itemIndex
+      << ",\"itemVolume\":" << std::setprecision(17)
+      << state.itemVolume
+      << ",\"takeVolume\":" << std::setprecision(17)
+      << state.takeVolume
+      << ",\"hasTake\":" << (state.hasTake ? "true" : "false")
+      << ",\"mute\":" << (state.mute > 0.5 ? "true" : "false")
+      << ",\"position\":" << std::setprecision(17)
+      << state.position
+      << ",\"length\":" << std::setprecision(17)
+      << state.length
+      << ",\"startOffset\":" << std::setprecision(17)
+      << state.startOffset
+      << ",\"playRate\":" << std::setprecision(17)
+      << state.playRate
+      << ",\"loopSource\":"
+      << (state.loopSource > 0.5 ? "true" : "false");
+    if (upsert && !chunk.empty()) {
+      command << ",\"itemChunk\":" << nativeJsonString(chunk);
+    }
+    command << '}';
+    return command.str();
+  };
+  std::string command = build(requestedChunk);
+  // O envelope da outbox aceita 512 KiB. Reserva margem para a serializacao
+  // do relay; se um item MIDI tiver chunk grande, ainda cria o item vazio e
+  // aplica todo o estado numerico absoluto.
+  if (command.size() > 480 * 1024) command = build("");
+  nativeTimecodeLanRecordCommand(command);
+}
+
+static void nativeProjectSyncPublishLiveItemDelete(
+  const NativeProjectSyncLiveItemState& state)
+{
+  if (state.id.empty()) return;
+  std::ostringstream command;
+  command << nativeProjectSyncLiveCommandPrefix(
+    "project_sync_live_item_delete",
+    nativeProjectSyncNextLiveRevision())
+    << ",\"itemId\":" << nativeJsonString(state.id)
+    << ",\"trackId\":" << nativeJsonString(state.trackId)
+    << ",\"trackName\":" << nativeJsonString(state.trackName)
+    << ",\"trackIndex\":" << state.trackIndex
+    << ",\"itemIndex\":" << state.itemIndex << '}';
+  nativeTimecodeLanRecordCommand(command.str());
+}
+
+static void nativeProjectSyncPublishLiveTrackUpsert(
+  const NativeProjectSyncLiveTrackState& state,
+  const std::string& requestedChunk = std::string())
+{
+  if (state.id.empty()) return;
+  const uint64_t revision = nativeProjectSyncNextLiveRevision();
+  const auto build = [&](const std::string& chunk) {
+    std::ostringstream command;
+    command << nativeProjectSyncLiveCommandPrefix(
+      "project_sync_live_track_upsert", revision)
+      << ",\"trackId\":" << nativeJsonString(state.id)
+      << ",\"trackName\":" << nativeJsonString(state.name)
+      << ",\"trackIndex\":" << state.trackIndex
+      << ",\"folderDepth\":" << state.folderDepth;
+    if (!chunk.empty()) {
+      command << ",\"trackChunk\":" << nativeJsonString(chunk);
+    }
+    command << '}';
+    return command.str();
+  };
+  std::string command = build(requestedChunk);
+  // Uma pista com muitos itens/FX pode exceder o envelope. Nesse caso nao
+  // cria uma pista incompleta: o bundle inicial/incremental e quem deve
+  // transportar esse chunk grande.
+  if (command.size() > 480 * 1024) return;
+  nativeTimecodeLanRecordCommand(command);
+}
+
+static void nativeProjectSyncPublishLiveTrackDelete(
+  const NativeProjectSyncLiveTrackState& state)
+{
+  if (state.id.empty()) return;
+  std::ostringstream command;
+  command << nativeProjectSyncLiveCommandPrefix(
+    "project_sync_live_track_delete",
+    nativeProjectSyncNextLiveRevision())
+    << ",\"trackId\":" << nativeJsonString(state.id)
+    << ",\"trackName\":" << nativeJsonString(state.name)
+    << ",\"trackIndex\":" << state.trackIndex << '}';
+  nativeTimecodeLanRecordCommand(command.str());
+}
+
+static void nativeProjectSyncRequestAutomaticResync()
+{
+  std::string revision;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    revision = g_nativeProjectSyncPreflight.structuralManifestRevision;
+  }
+  std::ostringstream command;
+  command << nativeProjectSyncLiveCommandPrefix(
+      "project_sync_live_resync", nativeProjectSyncNextLiveRevision())
+    << ",\"structuralRevision\":" << nativeJsonString(revision)
+    << ",\"automatic\":true}";
+  nativeTimecodeLanRecordCommand(command.str());
+}
+
+static std::string nativeProjectSyncLiveTimelineManifest()
+{
+  std::ostringstream timeline;
+  timeline << "VSHOOK_PROJECT_SYNC_MANIFEST\t1";
+  std::istringstream input(g_nativeProjectSyncStructuralManifest);
+  std::string line;
+  while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind("REGION\t", 0) == 0 ||
+        line.rfind("MARKER\t", 0) == 0 ||
+        line.rfind("TEMPO\t", 0) == 0) {
+      timeline << '\n' << line;
+    }
+  }
+  return timeline.str();
+}
+
+static void nativeProjectSyncPublishLiveTimeline(bool force)
+{
+  const std::string manifest = nativeProjectSyncLiveTimelineManifest();
+  const std::string hash = nativeProjectSyncHashText(manifest);
+  if (!force && hash == g_nativeProjectSyncTimelineBaselineHash) return;
+  g_nativeProjectSyncTimelineBaselineHash = hash;
+  std::ostringstream command;
+  command << nativeProjectSyncLiveCommandPrefix(
+      "project_sync_live_timeline",
+      nativeProjectSyncNextLiveRevision())
+    << ",\"manifest\":" << nativeJsonString(manifest)
+    << ",\"timelineRevision\":" << nativeJsonString(hash) << '}';
+  if (command.str().size() <= 500 * 1024) {
+    nativeTimecodeLanRecordCommand(command.str());
+  }
+}
+
+static HWND nativeProjectSyncArrangeWindow()
+{
+  HWND mainWindow = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
+  return mainWindow ? GetDlgItem(mainWindow, 0x3E8) : nullptr;
+}
+
+static NativeProjectSyncViewportState nativeProjectSyncReadViewport(
+  ReaProject* project)
+{
+  NativeProjectSyncViewportState state;
+  if (!project || !GetSet_ArrangeView2_ptr) return state;
+  GetSet_ArrangeView2_ptr(project, false, 0, 0,
+    &state.arrangeStart, &state.arrangeEnd);
+  if (!std::isfinite(state.arrangeStart) ||
+      !std::isfinite(state.arrangeEnd) ||
+      state.arrangeEnd <= state.arrangeStart) return state;
+  HWND arrange = nativeProjectSyncArrangeWindow();
+  if (arrange && CoolSB_GetScrollInfo_ptr) {
+    SCROLLINFO info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SIF_ALL;
+    if (CoolSB_GetScrollInfo_ptr(arrange, SB_VERT, &info)) {
+      state.tcpScrollY = info.nPos;
+    }
+  }
+  if (CountTracks_ptr && GetTrack_ptr && GetMediaTrackInfo_Value_ptr) {
+    const int count = CountTracks_ptr(project);
+    for (int index = 0; index < count; ++index) {
+      MediaTrack* track = GetTrack_ptr(project, index);
+      if (!track) continue;
+      const int y = static_cast<int>(std::lround(
+        GetMediaTrackInfo_Value_ptr(track, "I_TCPY")));
+      const int height = static_cast<int>(std::lround(
+        GetMediaTrackInfo_Value_ptr(track, "I_WNDH")));
+      if (y <= 0 && y + std::max(1, height) > 0) {
+        state.anchorTrackId = nativeProjectSyncTrackId(
+          project, track, index + 1);
+        state.anchorOffsetPx = y;
+        break;
+      }
+    }
+  }
+  state.valid = true;
+  return state;
+}
+
+static bool nativeProjectSyncViewportChanged(
+  const NativeProjectSyncViewportState& left,
+  const NativeProjectSyncViewportState& right)
+{
+  if (!left.valid || !right.valid) return left.valid != right.valid;
+  return std::fabs(left.arrangeStart - right.arrangeStart) > 0.000001 ||
+    std::fabs(left.arrangeEnd - right.arrangeEnd) > 0.000001 ||
+    left.tcpScrollY != right.tcpScrollY ||
+    left.anchorTrackId != right.anchorTrackId ||
+    left.anchorOffsetPx != right.anchorOffsetPx;
+}
+
+static void nativeProjectSyncPollViewportOnMainThread()
+{
+  std::string mode;
+  std::string role;
+  bool connected = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    mode = g_nativeTimecodeLanMode;
+    role = g_nativeTimecodeLanProjectSyncRole;
+    connected = g_nativeTimecodeLanPeerConnected;
+  }
+  if (mode != "project_sync" || role != "primary" || !connected) {
+    g_nativeProjectSyncViewportBaseline = NativeProjectSyncViewportState{};
+    g_nativeProjectSyncViewportProject = nullptr;
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (g_nativeProjectSyncLastViewportPoll.time_since_epoch().count() != 0 &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - g_nativeProjectSyncLastViewportPoll).count() < 33) return;
+  g_nativeProjectSyncLastViewportPoll = now;
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  const NativeProjectSyncViewportState current =
+    nativeProjectSyncReadViewport(project);
+  const bool changed = project != g_nativeProjectSyncViewportProject ||
+    nativeProjectSyncViewportChanged(
+      g_nativeProjectSyncViewportBaseline, current);
+  g_nativeProjectSyncViewportProject = project;
+  g_nativeProjectSyncViewportBaseline = current;
+  if (!changed || !current.valid) return;
+  std::ostringstream command;
+  command << "{\"type\":\"project_sync_viewport_v1\","
+          << "\"arrangeStart\":" << std::setprecision(17)
+          << current.arrangeStart << ",\"arrangeEnd\":"
+          << current.arrangeEnd << ",\"tcpScrollY\":"
+          << current.tcpScrollY << ",\"anchorTrackId\":"
+          << nativeJsonString(current.anchorTrackId)
+          << ",\"anchorOffsetPx\":" << current.anchorOffsetPx << '}';
+  nativeTimecodeLanRecordCommand(command.str());
+}
+
+static void nativeProjectSyncPollLiveProjectOnMainThread()
+{
+  std::string mode;
+  std::string role;
+  bool peerConnected = false;
+  bool publishInitial = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    mode = g_nativeTimecodeLanMode;
+    role = g_nativeTimecodeLanProjectSyncRole;
+    peerConnected = g_nativeTimecodeLanPeerConnected;
+    publishInitial = g_nativeProjectSyncPublishInitialLiveSnapshot;
+  }
+  if (mode != "project_sync" || role != "primary" ||
+      !peerConnected || !GetProjectStateChangeCount_ptr ||
+      !CountTracks_ptr || !GetTrack_ptr ||
+      !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr) {
+    g_nativeProjectSyncLiveTrackBaseline.clear();
+    g_nativeProjectSyncLiveItemBaseline.clear();
+    g_nativeProjectSyncLiveProject = nullptr;
+    g_nativeProjectSyncLiveChangeCount = -1;
+    g_nativeProjectSyncLastLivePoll =
+      std::chrono::steady_clock::time_point{};
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  if (!publishInitial &&
+      g_nativeProjectSyncLastLivePoll.time_since_epoch().count() != 0 &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - g_nativeProjectSyncLastLivePoll).count() < 30) {
+    return;
+  }
+  g_nativeProjectSyncLastLivePoll = now;
+
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project) return;
+  const int changeCount = GetProjectStateChangeCount_ptr(project);
+  const bool sameProject = g_nativeProjectSyncLiveProject == project;
+  const bool baselineEstablished = sameProject &&
+    g_nativeProjectSyncLiveProject != nullptr;
+  if (!publishInitial && sameProject &&
+      changeCount == g_nativeProjectSyncLiveChangeCount) {
+    return;
+  }
+
+  std::map<std::string, NativeProjectSyncLiveTrackState> tracks;
+  std::map<std::string, NativeProjectSyncLiveItemState> items;
+  std::map<std::string, MediaTrack*> trackPointers;
+  std::map<std::string, MediaItem*> itemPointers;
+  const int trackCount = CountTracks_ptr(project);
+  for (int trackOffset = 0; trackOffset < trackCount; ++trackOffset) {
+    MediaTrack* track = GetTrack_ptr(project, trackOffset);
+    if (!track) continue;
+    NativeProjectSyncLiveTrackState trackState;
+    trackState.trackIndex = trackOffset + 1;
+    trackState.id = nativeProjectSyncTrackId(
+      project, track, trackState.trackIndex);
+    trackState.name = nativeTrackName(track, trackOffset);
+    trackState.folderDepth = GetMediaTrackInfo_Value_ptr
+      ? static_cast<int>(std::lround(GetMediaTrackInfo_Value_ptr(
+          track, "I_FOLDERDEPTH"))) : 0;
+    trackState.structureKey =
+      nativeProjectSyncLiveTrackStructureKey(track);
+    if (trackState.id.empty()) continue;
+    tracks[trackState.id] = trackState;
+    trackPointers[trackState.id] = track;
+
+    const int itemCount = GetTrackNumMediaItems_ptr(track);
+    for (int itemOffset = 0; itemOffset < itemCount; ++itemOffset) {
+      MediaItem* item = GetTrackMediaItem_ptr(track, itemOffset);
+      if (!item) continue;
+      NativeProjectSyncLiveItemState itemState =
+        nativeProjectSyncReadLiveItemState(
+          project, track, trackState.trackIndex,
+          item, itemOffset + 1);
+      if (itemState.id.empty()) continue;
+      items[itemState.id] = itemState;
+      itemPointers[itemState.id] = item;
+    }
+  }
+
+  // Ao trocar de aba/projeto o relay encerra o pareamento pela sessao. Nao
+  // publica uma substituicao completa no pequeno intervalo antes desse ACK.
+  if (!sameProject && g_nativeProjectSyncLiveProject != nullptr &&
+      !publishInitial) {
+    g_nativeProjectSyncLiveTrackBaseline = std::move(tracks);
+    g_nativeProjectSyncLiveItemBaseline = std::move(items);
+    g_nativeProjectSyncLiveProject = project;
+    g_nativeProjectSyncLiveChangeCount = changeCount;
+    return;
+  }
+  if (!baselineEstablished && !publishInitial) {
+    g_nativeProjectSyncLiveTrackBaseline = std::move(tracks);
+    g_nativeProjectSyncLiveItemBaseline = std::move(items);
+    g_nativeProjectSyncLiveProject = project;
+    g_nativeProjectSyncLiveChangeCount = changeCount;
+    return;
+  }
+
+  // Exclusoes primeiro. Assim um item removido nao e recriado por um estado
+  // pendente e uma pista apagada leva junto somente os itens que ainda restam.
+  for (const auto& previous : g_nativeProjectSyncLiveItemBaseline) {
+    if (items.count(previous.first) == 0) {
+      nativeProjectSyncPublishLiveItemDelete(previous.second);
+    }
+  }
+  for (const auto& previous : g_nativeProjectSyncLiveTrackBaseline) {
+    if (tracks.count(previous.first) == 0) {
+      nativeProjectSyncPublishLiveTrackDelete(previous.second);
+    }
+  }
+
+  bool requiresAutomaticResync = false;
+
+  bool layoutChanged = publishInitial || !sameProject ||
+    tracks.size() != g_nativeProjectSyncLiveTrackBaseline.size();
+  if (!layoutChanged) {
+    for (const auto& entry : tracks) {
+      const auto previous =
+        g_nativeProjectSyncLiveTrackBaseline.find(entry.first);
+      if (previous == g_nativeProjectSyncLiveTrackBaseline.end() ||
+          nativeProjectSyncLiveTrackStateChanged(
+            previous->second, entry.second)) {
+        layoutChanged = true;
+        break;
+      }
+    }
+  }
+  if (layoutChanged) {
+    std::vector<NativeProjectSyncLiveTrackState> orderedTracks;
+    orderedTracks.reserve(tracks.size());
+    for (const auto& entry : tracks) orderedTracks.push_back(entry.second);
+    std::sort(orderedTracks.begin(), orderedTracks.end(),
+      [](const auto& left, const auto& right) {
+        return left.trackIndex < right.trackIndex;
+      });
+    for (const auto& trackState : orderedTracks) {
+      const bool newTrack = baselineEstablished &&
+        g_nativeProjectSyncLiveTrackBaseline.count(trackState.id) == 0;
+      if (newTrack) requiresAutomaticResync = true;
+      std::string chunk;
+      if (newTrack) {
+        const auto pointer = trackPointers.find(trackState.id);
+        if (pointer != trackPointers.end()) {
+          nativeProjectSyncReadTrackChunk(pointer->second, chunk);
+        }
+      }
+      nativeProjectSyncPublishLiveTrackUpsert(trackState, chunk);
+    }
+  }
+
+  // FX de uma pista existente também é estrutura autoritativa do PC A. O
+  // chunk é mesclado no PC B preservando exclusivamente o routing local.
+  for (const auto& entry : tracks) {
+    const auto previous =
+      g_nativeProjectSyncLiveTrackBaseline.find(entry.first);
+    if (previous == g_nativeProjectSyncLiveTrackBaseline.end() ||
+        previous->second.structureKey == entry.second.structureKey) {
+      continue;
+    }
+    // O patch curto atualiza imediatamente o FX. A reconciliação automática
+    // garante também arquivos/estado extenso que não caibam no comando LAN.
+    requiresAutomaticResync = true;
+    std::string chunk;
+    const auto pointer = trackPointers.find(entry.first);
+    if (pointer != trackPointers.end() &&
+        nativeProjectSyncReadTrackChunk(pointer->second, chunk)) {
+      nativeProjectSyncPublishLiveTrackUpsert(entry.second, chunk);
+    }
+  }
+
+  for (const auto& entry : items) {
+    const auto previous =
+      g_nativeProjectSyncLiveItemBaseline.find(entry.first);
+    const bool newItem =
+      previous == g_nativeProjectSyncLiveItemBaseline.end();
+    const bool structureChanged = newItem
+      ? baselineEstablished
+      : (previous->second.structureKey != entry.second.structureKey ||
+         previous->second.trackId != entry.second.trackId);
+    if (structureChanged) {
+      requiresAutomaticResync = true;
+      std::string chunk;
+      const auto pointer = itemPointers.find(entry.first);
+      if (pointer != itemPointers.end()) {
+        nativeProjectSyncReadItemChunk(pointer->second, chunk);
+      }
+      nativeProjectSyncPublishLiveItem(entry.second, true, chunk);
+    } else if (publishInitial ||
+        nativeProjectSyncLiveItemStateChanged(
+          previous->second, entry.second)) {
+      nativeProjectSyncPublishLiveItem(entry.second, false);
+    }
+  }
+
+  nativeProjectSyncPublishLiveTimeline(publishInitial);
+  if (publishInitial) {
+    nativeLoadMultiLoopState();
+    std::ostringstream multiloopSnapshot;
+    multiloopSnapshot
+      << "{\"type\":\"multiloop_snapshot_set\",\"raw\":"
+      << nativeJsonString(g_nativeMultiLoopRaw) << '}';
+    nativeTimecodeLanRecordCommand(multiloopSnapshot.str());
+  }
+  if (requiresAutomaticResync) {
+    nativeProjectSyncRequestAutomaticResync();
+  }
+
+  g_nativeProjectSyncLiveTrackBaseline = std::move(tracks);
+  g_nativeProjectSyncLiveItemBaseline = std::move(items);
+  g_nativeProjectSyncLiveProject = project;
+  g_nativeProjectSyncLiveChangeCount = changeCount;
+  if (publishInitial) {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    if (g_nativeTimecodeLanMode == "project_sync" &&
+        g_nativeTimecodeLanProjectSyncRole == "primary" &&
+        g_nativeTimecodeLanPeerConnected) {
+      g_nativeProjectSyncPublishInitialLiveSnapshot = false;
+    }
+  }
+}
+
+struct NativeProjectSyncResolvedItem {
+  MediaTrack* track = nullptr;
+  MediaItem* item = nullptr;
+};
+
+static NativeProjectSyncResolvedItem nativeProjectSyncResolveLiveItem(
+  ReaProject* project,
+  const std::string& rawItemId,
+  const std::string& rawTrackId,
+  const std::string& rawTrackName,
+  int trackIndex,
+  int itemIndex,
+  bool allowIndexFallback)
+{
+  NativeProjectSyncResolvedItem resolved;
+  if (!project || !CountTracks_ptr || !GetTrack_ptr ||
+      !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr) {
+    return resolved;
+  }
+  const std::string itemId = nativeTrim(rawItemId);
+  const int trackCount = CountTracks_ptr(project);
+  const bool syntheticId = itemId.find(":item:") !=
+    std::string::npos;
+  if (!itemId.empty()) {
+    for (int offset = 0; offset < trackCount; ++offset) {
+      MediaTrack* track = GetTrack_ptr(project, offset);
+      if (!track) continue;
+      const std::string trackId = nativeProjectSyncTrackId(
+        project, track, offset + 1);
+      const int itemCount = GetTrackNumMediaItems_ptr(track);
+      for (int itemOffset = 0; itemOffset < itemCount; ++itemOffset) {
+        MediaItem* item = GetTrackMediaItem_ptr(track, itemOffset);
+        if (!item) continue;
+        std::string candidateId;
+        if (GetSetMediaItemInfo_String_ptr) {
+          char guid[128] = "";
+          if (GetSetMediaItemInfo_String_ptr(
+                item, "GUID", guid, false) && guid[0]) {
+            candidateId = guid;
+          }
+        }
+        if (!candidateId.empty() && candidateId == itemId) {
+          resolved.track = track;
+          resolved.item = item;
+          return resolved;
+        }
+        if (syntheticId && candidateId.empty() &&
+            trackId + ":item:" + std::to_string(itemOffset + 1) ==
+              itemId) {
+          resolved.track = track;
+          resolved.item = item;
+          return resolved;
+        }
+      }
+    }
+  }
+  if (!allowIndexFallback || itemIndex < 1) return resolved;
+  MediaTrack* track = nativeProjectSyncResolveTrack(
+    project, rawTrackId, rawTrackName, trackIndex);
+  if (!track) return resolved;
+  const int itemCount = GetTrackNumMediaItems_ptr(track);
+  if (itemIndex > itemCount) return resolved;
+  resolved.track = track;
+  resolved.item = GetTrackMediaItem_ptr(track, itemIndex - 1);
+  return resolved;
+}
+
+struct NativeProjectSyncLiveIncomingRevision {
+  bool valid = false;
+  std::string key;
+  uint64_t revision = 0;
+};
+
+static NativeProjectSyncLiveIncomingRevision
+nativeProjectSyncParseLiveIncomingRevision(
+  const std::string& commandBody,
+  const std::string& entityKind,
+  const std::string& entityId)
+{
+  NativeProjectSyncLiveIncomingRevision incoming;
+  const std::string sourceSessionId = nativeTrim(
+    nativeJsonExtractString(commandBody, "sourceSessionId"));
+  const int64_t revision = nativeJsonInt64(
+    commandBody, "liveRevision", 0);
+  if (sourceSessionId.empty() || sourceSessionId.size() > 512 ||
+      entityId.empty() || revision <= 0) {
+    return incoming;
+  }
+  incoming.valid = true;
+  incoming.revision = static_cast<uint64_t>(revision);
+  incoming.key = sourceSessionId + '\n' + entityKind + '\n' + entityId;
+  return incoming;
+}
+
+static bool nativeProjectSyncLiveRevisionIsNew(
+  const NativeProjectSyncLiveIncomingRevision& incoming)
+{
+  if (!incoming.valid) return false;
+  const auto previous =
+    g_nativeProjectSyncLiveAppliedRevisions.find(incoming.key);
+  return previous == g_nativeProjectSyncLiveAppliedRevisions.end() ||
+    incoming.revision > previous->second;
+}
+
+static void nativeProjectSyncCommitLiveRevision(
+  const NativeProjectSyncLiveIncomingRevision& incoming)
+{
+  if (incoming.valid) {
+    g_nativeProjectSyncLiveAppliedRevisions[incoming.key] =
+      incoming.revision;
+  }
+}
+
+static bool nativeProjectSyncApplyLiveItemValues(
+  MediaItem* item,
+  const std::string& commandBody)
+{
+  if (!item || !GetMediaItemInfo_Value_ptr ||
+      !SetMediaItemInfo_Value_ptr) return false;
+  bool changed = false;
+  const auto applyItemNumber = [&](const char* jsonKey,
+                                   const char* reaperKey,
+                                   double minimum,
+                                   double maximum) {
+    const std::string text = nativeJsonExtractString(
+      commandBody, jsonKey);
+    if (!nativeLooksNumeric(text)) return;
+    const double value = std::atof(text.c_str());
+    if (!std::isfinite(value) || value < minimum || value > maximum) return;
+    if (nativeProjectSyncLiveNumberChanged(
+          GetMediaItemInfo_Value_ptr(item, reaperKey), value)) {
+      changed = SetMediaItemInfo_Value_ptr(
+        item, reaperKey, value) || changed;
+    }
+  };
+  applyItemNumber("itemVolume", "D_VOL", -1000.0, 1000.0);
+  applyItemNumber("position", "D_POSITION", 0.0, 1000000000.0);
+  applyItemNumber("length", "D_LENGTH", 0.0, 1000000000.0);
+  const std::string muteText = nativeJsonExtractString(commandBody, "mute");
+  if (!muteText.empty()) {
+    const double value = nativeBoolFromText(muteText, false) ? 1.0 : 0.0;
+    if ((GetMediaItemInfo_Value_ptr(item, "B_MUTE") > 0.5) !=
+        (value > 0.5)) {
+      changed = SetMediaItemInfo_Value_ptr(
+        item, "B_MUTE", value) || changed;
+    }
+  }
+  const std::string loopText = nativeJsonExtractString(
+    commandBody, "loopSource");
+  if (!loopText.empty()) {
+    const double value = nativeBoolFromText(loopText, false) ? 1.0 : 0.0;
+    if ((GetMediaItemInfo_Value_ptr(item, "B_LOOPSRC") > 0.5) !=
+        (value > 0.5)) {
+      changed = SetMediaItemInfo_Value_ptr(
+        item, "B_LOOPSRC", value) || changed;
+    }
+  }
+
+  MediaItem_Take* take = GetActiveTake_ptr
+    ? GetActiveTake_ptr(item) : nullptr;
+  if (take && GetMediaItemTakeInfo_Value_ptr &&
+      SetMediaItemTakeInfo_Value_ptr) {
+    const auto applyTakeNumber = [&](const char* jsonKey,
+                                     const char* reaperKey,
+                                     double minimum,
+                                     double maximum) {
+      const std::string text = nativeJsonExtractString(
+        commandBody, jsonKey);
+      if (!nativeLooksNumeric(text)) return;
+      const double value = std::atof(text.c_str());
+      if (!std::isfinite(value) || value < minimum || value > maximum) return;
+      if (nativeProjectSyncLiveNumberChanged(
+            GetMediaItemTakeInfo_Value_ptr(take, reaperKey), value)) {
+        changed = SetMediaItemTakeInfo_Value_ptr(
+          take, reaperKey, value) || changed;
+      }
+    };
+    applyTakeNumber("takeVolume", "D_VOL", -1000.0, 1000.0);
+    applyTakeNumber(
+      "startOffset", "D_STARTOFFS", -1000000000.0, 1000000000.0);
+    applyTakeNumber("playRate", "D_PLAYRATE", 0.000001, 1000.0);
+  }
+  return changed;
+}
+
+static void nativeProjectSyncFinishLiveMutation(
+  ReaProject* project,
+  bool structural,
+  bool changed)
+{
+  if (!changed || !project) return;
+  if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+  if (structural && TrackList_AdjustWindows_ptr) {
+    TrackList_AdjustWindows_ptr(false);
+  }
+  if (structural && UpdateTimeline_ptr) UpdateTimeline_ptr();
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+  g_nativeForceMixerBuild.store(true);
+  g_nativeForceSnapshotBuild.store(true);
+  g_nativeForceStateBuild.store(true);
+}
+
+static bool nativeApplyProjectSyncLiveCommand(
+  const std::string& commandBody)
+{
+  const std::string type = nativeLower(nativeTrim(
+    nativeJsonExtractString(commandBody, "type")));
+  const bool itemState = type == "project_sync_live_item_state";
+  const bool itemUpsert = type == "project_sync_live_item_upsert";
+  const bool itemDelete = type == "project_sync_live_item_delete";
+  const bool trackUpsert = type == "project_sync_live_track_upsert";
+  const bool trackDelete = type == "project_sync_live_track_delete";
+  const bool timeline = type == "project_sync_live_timeline";
+  const bool viewport = type == "project_sync_viewport_v1";
+  const bool resync = type == "project_sync_live_resync";
+  if (!itemState && !itemUpsert && !itemDelete &&
+      !trackUpsert && !trackDelete && !timeline && !viewport &&
+      !resync) return false;
+
+  // Estes comandos nunca sao aceitos do app/local ou no PC A. Somente o
+  // envelope autenticado pelo relay LAN inclui __vshookLanRemote.
+  if (!nativeJsonBoolValue(commandBody, "__vshookLanRemote", false)) {
+    return true;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    if (g_nativeTimecodeLanMode != "project_sync" ||
+        g_nativeTimecodeLanProjectSyncRole != "secondary") {
+      return true;
+    }
+  }
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project) return true;
+
+  if (resync) {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    const std::string requestId = g_nativeProjectSyncPreflight.requestId;
+    if (nativeProjectSyncRequestIdIsValid(requestId) &&
+        g_nativeProjectSyncApply.state != "requesting" &&
+        g_nativeProjectSyncApply.state != "downloading" &&
+        g_nativeProjectSyncApply.state != "verifying" &&
+        g_nativeProjectSyncApply.state != "validating" &&
+        g_nativeProjectSyncApply.state != "applying") {
+      g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
+      g_nativeProjectSyncApply.state = "requested";
+      g_nativeProjectSyncApply.requestId = requestId;
+      g_nativeProjectSyncApply.revision = nativeTrim(
+        nativeJsonExtractString(commandBody, "structuralRevision"));
+      g_nativeProjectSyncApply.sequence =
+        ++g_nativeProjectSyncApplySequence;
+      g_nativeProjectSyncApply.automatic = true;
+      g_nativeForceStateBuild.store(true);
+    }
+    return true;
+  }
+
+  if (timeline) {
+    const NativeProjectSyncLiveIncomingRevision incoming =
+      nativeProjectSyncParseLiveIncomingRevision(
+        commandBody, "timeline", "project");
+    if (!nativeProjectSyncLiveRevisionIsNew(incoming)) return true;
+    const std::string manifest = nativeJsonExtractString(
+      commandBody, "manifest");
+    if (manifest.empty() || manifest.size() > 500 * 1024) return true;
+    std::string error;
+    if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+    if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
+    const bool changed = nativeProjectSyncApplyTimelineInPlace(
+      project, manifest, error);
+    if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(-1);
+    if (Undo_EndBlock2_ptr) Undo_EndBlock2_ptr(project,
+      "VS Hook: sincronizar regioes, marcadores e tempo", -1);
+    if (!changed && Undo_DoUndo2_ptr) Undo_DoUndo2_ptr(project);
+    if (changed) nativeProjectSyncCommitLiveRevision(incoming);
+    nativeProjectSyncFinishLiveMutation(project, true, changed);
+    return true;
+  }
+
+  if (viewport) {
+    if (!GetSet_ArrangeView2_ptr) return true;
+    const std::string startText = nativeJsonExtractString(
+      commandBody, "arrangeStart");
+    const std::string endText = nativeJsonExtractString(
+      commandBody, "arrangeEnd");
+    double start = nativeLooksNumeric(startText)
+      ? std::atof(startText.c_str()) : -1.0;
+    double end = nativeLooksNumeric(endText)
+      ? std::atof(endText.c_str()) : -1.0;
+    if (std::isfinite(start) && std::isfinite(end) &&
+        start >= 0.0 && end > start) {
+      GetSet_ArrangeView2_ptr(project, true, 0, 0, &start, &end);
+    }
+    HWND arrange = nativeProjectSyncArrangeWindow();
+    if (arrange && CoolSB_GetScrollInfo_ptr && CoolSB_SetScrollInfo_ptr) {
+      SCROLLINFO info{};
+      info.cbSize = sizeof(info);
+      info.fMask = SIF_ALL;
+      if (CoolSB_GetScrollInfo_ptr(arrange, SB_VERT, &info)) {
+        int target = static_cast<int>(nativeJsonInt64(
+          commandBody, "tcpScrollY", info.nPos));
+        const std::string anchorId = nativeTrim(
+          nativeJsonExtractString(commandBody, "anchorTrackId"));
+        MediaTrack* anchor = anchorId.empty()
+          ? nullptr : nativeFindTrackById(project, anchorId);
+        if (anchor && GetMediaTrackInfo_Value_ptr) {
+          const int currentY = static_cast<int>(std::lround(
+            GetMediaTrackInfo_Value_ptr(anchor, "I_TCPY")));
+          const int wantedY = static_cast<int>(nativeJsonInt64(
+            commandBody, "anchorOffsetPx", currentY));
+          target = info.nPos + currentY - wantedY;
+        }
+        const int maximum = std::max(info.nMin,
+          info.nMax - static_cast<int>(info.nPage) + 1);
+        target = std::max(info.nMin, std::min(maximum, target));
+        info.fMask = SIF_POS;
+        info.nPos = target;
+        CoolSB_SetScrollInfo_ptr(arrange, SB_VERT, &info, TRUE);
+        SendMessage(arrange, WM_VSCROLL,
+          static_cast<WPARAM>((target << 16) | SB_THUMBPOSITION), 0);
+      }
+    }
+    g_nativeProjectSyncViewportSuppressUntil =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    g_nativeProjectSyncViewportBaseline =
+      nativeProjectSyncReadViewport(project);
+    g_nativeProjectSyncViewportProject = project;
+    return true;
+  }
+
+  if (trackUpsert || trackDelete) {
+    const std::string trackId = nativeTrim(
+      nativeJsonExtractString(commandBody, "trackId"));
+    const std::string trackName = nativeTrim(
+      nativeJsonExtractString(commandBody, "trackName"));
+    const NativeProjectSyncLiveIncomingRevision incoming =
+      nativeProjectSyncParseLiveIncomingRevision(
+        commandBody, "track", trackId);
+    if (!nativeProjectSyncLiveRevisionIsNew(incoming)) return true;
+    const int requestedIndex = std::max(1, static_cast<int>(
+      nativeJsonInt64(commandBody, "trackIndex", 1)));
+    MediaTrack* track = nativeProjectSyncResolveTrack(
+      project, trackId, "", 0);
+    bool changed = false;
+    if (trackDelete) {
+      if (track && DeleteTrack_ptr) {
+        if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+        DeleteTrack_ptr(track);
+        if (Undo_EndBlock2_ptr) Undo_EndBlock2_ptr(
+          project, "VS Hook: sincronizar exclusao de pista", -1);
+        changed = true;
+      }
+      nativeProjectSyncCommitLiveRevision(incoming);
+      nativeProjectSyncFinishLiveMutation(project, true, changed);
+      return true;
+    }
+
+    const int insertIndex = CountTracks_ptr
+      ? std::max(0, std::min(CountTracks_ptr(project),
+          requestedIndex - 1))
+      : requestedIndex - 1;
+    const bool created = track == nullptr;
+    if (created && InsertTrackAtIndex_ptr && GetTrack_ptr) {
+      const std::string sourceChunk =
+        nativeJsonExtractString(commandBody, "trackChunk");
+      if (sourceChunk.empty() || sourceChunk.size() > 480 * 1024) {
+        // Sem o chunk completo nao existe como reproduzir itens/FX da pista.
+        // Aguarda o próximo upsert/bundle em vez de criar uma pista parcial.
+        return true;
+      }
+      if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+      InsertTrackAtIndex_ptr(insertIndex, true);
+      track = GetTrack_ptr(project, insertIndex);
+      changed = track != nullptr;
+      if (track && !sourceChunk.empty() &&
+          sourceChunk.size() <= 480 * 1024 && SetTrackStateChunk_ptr) {
+        const std::string sanitized =
+          nativeProjectSyncSanitizeNewTrackChunk(sourceChunk);
+        if (!sanitized.empty()) {
+          SetTrackStateChunk_ptr(track, sanitized.c_str(), false);
+          // O chunk pode trocar o GUID e reconstruir os itens; recupera a
+          // pista exatamente no indice que acabou de ser criado.
+          track = GetTrack_ptr(project, insertIndex);
+        }
+      }
+      if (Undo_EndBlock2_ptr) Undo_EndBlock2_ptr(
+        project, "VS Hook: sincronizar criacao de pista", -1);
+    }
+    if (!track) return true;
+
+    if (!created && SetTrackStateChunk_ptr) {
+      const std::string sourceChunk = nativeJsonExtractString(
+        commandBody, "trackChunk");
+      if (!sourceChunk.empty() && sourceChunk.size() <= 480 * 1024) {
+        std::string targetChunk;
+        if (nativeProjectSyncReadTrackChunk(track, targetChunk)) {
+          const std::string merged = nativeProjectSyncMergeTrackChunk(
+            sourceChunk, targetChunk);
+          if (!merged.empty() &&
+              SetTrackStateChunk_ptr(track, merged.c_str(), false)) {
+            changed = true;
+            track = nativeProjectSyncResolveTrack(
+              project, trackId, trackName, requestedIndex);
+            if (!track && GetTrack_ptr) {
+              track = GetTrack_ptr(project,
+                std::max(0, requestedIndex - 1));
+            }
+          }
+        }
+      }
+    }
+    if (!track) return true;
+
+    const int desiredIndex = CountTracks_ptr
+      ? std::max(1, std::min(CountTracks_ptr(project), requestedIndex))
+      : requestedIndex;
+    int localIndex = nativeProjectSyncLocalTrackIndex(project, track);
+    if (localIndex > 0 && localIndex != desiredIndex &&
+        SetOnlyTrackSelected_ptr && ReorderSelectedTracks_ptr) {
+      SetOnlyTrackSelected_ptr(track);
+      if (ReorderSelectedTracks_ptr(desiredIndex - 1, 0)) {
+        changed = true;
+        track = GetTrack_ptr
+          ? GetTrack_ptr(project, desiredIndex - 1) : track;
+      }
+    }
+    if (track && SetMediaTrackInfo_Value_ptr) {
+      const int folderDepth = static_cast<int>(nativeJsonInt64(
+        commandBody, "folderDepth", 0));
+      const double current = GetMediaTrackInfo_Value_ptr
+        ? GetMediaTrackInfo_Value_ptr(track, "I_FOLDERDEPTH") : 0.0;
+      if (static_cast<int>(std::lround(current)) != folderDepth) {
+        changed = SetMediaTrackInfo_Value_ptr(
+          track, "I_FOLDERDEPTH", static_cast<double>(folderDepth)) ||
+          changed;
+      }
+    }
+    if (track && !trackName.empty() && GetSetMediaTrackInfo_String_ptr) {
+      char currentName[2048] = "";
+      GetSetMediaTrackInfo_String_ptr(
+        track, "P_NAME", currentName, false);
+      if (trackName != currentName) {
+        std::vector<char> writable(
+          trackName.begin(), trackName.end());
+        writable.push_back('\0');
+        changed = GetSetMediaTrackInfo_String_ptr(
+          track, "P_NAME", writable.data(), true) || changed;
+      }
+    }
+    nativeProjectSyncCommitLiveRevision(incoming);
+    nativeProjectSyncFinishLiveMutation(project, true, changed);
+    return true;
+  }
+
+  const std::string itemId = nativeTrim(
+    nativeJsonExtractString(commandBody, "itemId"));
+  const std::string trackId = nativeTrim(
+    nativeJsonExtractString(commandBody, "trackId"));
+  const std::string trackName = nativeTrim(
+    nativeJsonExtractString(commandBody, "trackName"));
+  const int trackIndex = std::max(1, static_cast<int>(
+    nativeJsonInt64(commandBody, "trackIndex", 1)));
+  const int itemIndex = std::max(1, static_cast<int>(
+    nativeJsonInt64(commandBody, "itemIndex", 1)));
+  const NativeProjectSyncLiveIncomingRevision incoming =
+    nativeProjectSyncParseLiveIncomingRevision(
+      commandBody, "item", itemId);
+  if (!nativeProjectSyncLiveRevisionIsNew(incoming)) return true;
+  NativeProjectSyncResolvedItem resolved =
+    nativeProjectSyncResolveLiveItem(project, itemId,
+      trackId, trackName, trackIndex, itemIndex,
+      // GUIDs nunca podem cair no indice e apagar outro item. O fallback e
+      // reservado aos IDs sinteticos de uma API antiga sem GUID.
+      itemId.find(":item:") != std::string::npos);
+  bool changed = false;
+  if (itemDelete) {
+    if (resolved.track && resolved.item && DeleteTrackMediaItem_ptr) {
+      if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+      changed = DeleteTrackMediaItem_ptr(
+        resolved.track, resolved.item);
+      if (Undo_EndBlock2_ptr) Undo_EndBlock2_ptr(
+        project, "VS Hook: sincronizar exclusao de item", -1);
+    }
+    nativeProjectSyncCommitLiveRevision(incoming);
+    nativeProjectSyncFinishLiveMutation(project, true, changed);
+    return true;
+  }
+
+  MediaTrack* destination = nativeProjectSyncResolveTrack(
+    project, trackId, trackName, trackIndex);
+  if (resolved.item && destination && resolved.track != destination &&
+      MoveMediaItemToTrack_ptr) {
+    if (MoveMediaItemToTrack_ptr(resolved.item, destination)) {
+      resolved.track = destination;
+      changed = true;
+    }
+  }
+  if (!resolved.item && itemUpsert && destination &&
+      AddMediaItemToTrack_ptr) {
+    if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+    resolved.item = AddMediaItemToTrack_ptr(destination);
+    resolved.track = destination;
+    changed = resolved.item != nullptr;
+    const std::string chunk = nativeJsonExtractString(
+      commandBody, "itemChunk");
+    const std::string trimmedChunk = nativeTrim(chunk);
+    if (resolved.item && !trimmedChunk.empty() &&
+        trimmedChunk.size() <= 480 * 1024 &&
+        nativeLower(trimmedChunk.substr(
+          0, std::min<size_t>(5, trimmedChunk.size()))) == "<item" &&
+        SetItemStateChunk_ptr) {
+      SetItemStateChunk_ptr(
+        resolved.item, trimmedChunk.c_str(), false);
+      // SetItemStateChunk pode reconstruir o objeto; nunca reutiliza o ponteiro
+      // provisório depois da troca do GUID/chunk.
+      resolved.item = nullptr;
+      NativeProjectSyncResolvedItem afterChunk =
+        nativeProjectSyncResolveLiveItem(project, itemId,
+          trackId, trackName, trackIndex, itemIndex, true);
+      if (afterChunk.item) resolved = afterChunk;
+      else return true;
+    }
+    if (Undo_EndBlock2_ptr) Undo_EndBlock2_ptr(
+      project, "VS Hook: sincronizar criacao de item", -1);
+  } else if (resolved.item && itemUpsert) {
+    // Um upsert estrutural tambem atualiza take/source/FX quando o chunk cabe
+    // no envelope. Estados numericos sao reaplicados abaixo de forma absoluta.
+    const std::string chunk = nativeJsonExtractString(
+      commandBody, "itemChunk");
+    const std::string trimmedChunk = nativeTrim(chunk);
+    if (!trimmedChunk.empty() && trimmedChunk.size() <= 480 * 1024 &&
+        nativeLower(trimmedChunk.substr(
+          0, std::min<size_t>(5, trimmedChunk.size()))) == "<item" &&
+        SetItemStateChunk_ptr) {
+      if (SetItemStateChunk_ptr(
+            resolved.item, trimmedChunk.c_str(), false)) {
+        changed = true;
+        resolved.item = nullptr;
+        NativeProjectSyncResolvedItem afterChunk =
+          nativeProjectSyncResolveLiveItem(project, itemId,
+            trackId, trackName, trackIndex, itemIndex, true);
+        if (afterChunk.item) resolved = afterChunk;
+        else return true;
+      }
+    }
+  }
+  if (!resolved.item) return true;
+  changed = nativeProjectSyncApplyLiveItemValues(
+    resolved.item, commandBody) || changed;
+  nativeProjectSyncCommitLiveRevision(incoming);
+  nativeProjectSyncFinishLiveMutation(
+    project, itemUpsert, changed);
+  return true;
+}
+
 static bool nativeApplyProjectSyncTrackStateCommand(
   const std::string& commandBody)
 {
@@ -63463,6 +65197,14 @@ static bool nativeApplyMultiLoopCommand(const std::string& commandBody)
   if (!nativeStartsWith(type, "multiloop") && !nativeStartsWith(type, "multi_loop")) return false;
   nativeTimecodeLanRecordCommand(commandBody);
   nativeLoadMultiLoopState();
+  if (type == "multiloop_snapshot_set") {
+    const std::string raw = nativeJsonExtractString(commandBody, "raw");
+    nativeParseMultiLoopState(raw);
+    nativeSaveMultiLoopState();
+    ++g_nativeMultiLoopPairCacheRevision;
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
   if (type == "multiloop_focus" || type == "multiloop_open" || type == "multi_loop_focus" || type == "multi_loop_open") {
     std::string id = nativeJsonExtractString(commandBody, "songId");
     if (id.empty()) id = nativeJsonExtractString(commandBody, "targetId");
@@ -63511,7 +65253,7 @@ static bool nativeApplyMultiLoopCommand(const std::string& commandBody)
     return true;
   }
   std::string key = nativeJsonExtractString(commandBody, "songKey");
-  if (!g_nativeMultiLoopFocusKey.empty()) {
+  if (key.empty() && !g_nativeMultiLoopFocusKey.empty()) {
     key = g_nativeMultiLoopFocusKey;
   } else {
     // Compatibilidade com clientes ainda abertos usando premixKey
@@ -65328,8 +67070,16 @@ static bool nativeApplyTimecodeLanCommand(
       commandBody, "connected", false);
     const std::string peerName = nativeTrim(
       nativeJsonExtractString(commandBody, "peerName"));
+    const bool parallel = nativeLower(nativeTrim(
+      nativeJsonExtractString(commandBody, "channel"))) == "parallel";
     std::lock_guard<std::mutex> lock(
       g_nativeTimecodeLanMutex);
+    if (parallel) {
+      g_nativeParallelTimecodePeerConnected = connected;
+      g_nativeParallelTimecodePeerName = connected
+        ? peerName : std::string();
+      return true;
+    }
     const bool becameConnected = connected &&
       !g_nativeTimecodeLanPeerConnected;
     g_nativeTimecodeLanPeerConnected = connected;
@@ -65340,8 +67090,10 @@ static bool nativeApplyTimecodeLanCommand(
         g_nativeTimecodeLanProjectSyncRole == "primary") {
       g_nativeProjectSyncPublishInitialConfig = true;
       g_nativeProjectSyncPublishInitialTrackSnapshot = true;
+      g_nativeProjectSyncPublishInitialLiveSnapshot = true;
     } else if (!connected) {
       g_nativeProjectSyncPublishInitialTrackSnapshot = false;
+      g_nativeProjectSyncPublishInitialLiveSnapshot = false;
     }
     return true;
   }
@@ -65349,12 +67101,16 @@ static bool nativeApplyTimecodeLanCommand(
   if (type != "timecode_transport_sync") return false;
 
   bool receiveMode = false;
+  const bool parallel = nativeLower(nativeTrim(
+    nativeJsonExtractString(commandBody, "channel"))) == "parallel";
   {
     std::lock_guard<std::mutex> lock(
       g_nativeTimecodeLanMutex);
-    receiveMode = g_nativeTimecodeLanMode == "receive" ||
+    receiveMode = parallel
+      ? g_nativeParallelTimecodeMode == "receive"
+      : (g_nativeTimecodeLanMode == "receive" ||
       (g_nativeTimecodeLanMode == "project_sync" &&
-       g_nativeTimecodeLanProjectSyncRole == "secondary");
+       g_nativeTimecodeLanProjectSyncRole == "secondary"));
   }
   if (!receiveMode) return true;
 
@@ -65546,6 +67302,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     nativeApplyManualStopFadeoutCommand(commandBody) ||
     nativeApplyBpmCommand(commandBody) ||
     nativeApplyTunerCommand(commandBody) ||
+    nativeApplyProjectSyncLiveCommand(commandBody) ||
     nativeApplyProjectSyncTrackStateCommand(commandBody) ||
     nativeApplyMixerCommand(commandBody) ||
     nativeApplyQueueCommand(commandBody) ||
@@ -65665,6 +67422,45 @@ static void nativeHandleClient(native_socket_t client)
   } else if (path == "/timecode/status" ||
              path == "/timecode/status.json") {
     body = nativeHttpResponse(200, nativeTimecodeLanStatusJson());
+  } else if (path == "/timecode-parallel/status" ||
+             path == "/timecode-parallel/status.json") {
+    body = nativeHttpResponse(
+      200, nativeParallelTimecodeLanStatusJson());
+  } else if (path == "/timecode-parallel/outbox" &&
+             nativeRequestIsPost(req)) {
+    body = nativeHttpResponse(
+      200, nativeParallelTimecodeLanOutboxJson());
+  } else if (path == "/timecode-parallel/inbox" &&
+             nativeRequestIsPost(req)) {
+    bool receiveMode = false;
+    {
+      std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+      receiveMode = g_nativeParallelTimecodeMode == "receive";
+    }
+    if (!receiveMode) {
+      body = nativeHttpResponse(
+        409, "{\"ok\":false,\"error\":\"receive_not_active\"}");
+    } else {
+      const std::string requestBody = nativeRequestBody(req);
+      size_t start = 0;
+      size_t queued = 0;
+      while (start < requestBody.size() && queued < 256) {
+        size_t end = requestBody.find('\n', start);
+        if (end == std::string::npos) end = requestBody.size();
+        std::string command = nativeTrim(
+          requestBody.substr(start, end - start));
+        if (!command.empty() && command.front() == '{') {
+          if (command.back() == '}') command.pop_back();
+          command += ",\"channel\":\"parallel\"}";
+          nativeQueueHttpCommand(command);
+          ++queued;
+        }
+        start = end + 1;
+      }
+      body = nativeHttpResponse(200,
+        std::string("{\"ok\":true,\"queued\":") +
+          std::to_string(queued) + "}");
+    }
   } else if (path == "/timecode/outbox" &&
              nativeRequestIsPost(req)) {
     const std::string requestBody =
@@ -66621,6 +68417,10 @@ static void startupTimer()
   nativeProjectSyncFinalizePreparedBundleOnMainThread();
   nativeProjectSyncCommitPendingOpenOnMainThread();
   nativeProjectSyncRefreshManifestOnMainThread(false);
+  nativeProjectSyncPollLiveProjectOnMainThread();
+  nativeProjectSyncPollViewportOnMainThread();
+  // Estrutura entra primeiro na outbox; assim o estado absoluto de volume da
+  // pista nunca chega ao PC B antes do upsert que cria essa pista.
   nativeProjectSyncPollTracksOnMainThread();
   nativeProcessBpmScanJobOnMainThread();
   nativeUpdateTrackMetersOnMainThread();
@@ -66758,6 +68558,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetProjExtState_ptr = reinterpret_cast<GetProjExtState_t>(rec->GetFunc("GetProjExtState"));
   SetProjExtState_ptr = reinterpret_cast<SetProjExtState_t>(rec->GetFunc("SetProjExtState"));
   MarkProjectDirty_ptr = reinterpret_cast<MarkProjectDirty_t>(rec->GetFunc("MarkProjectDirty"));
+  Main_SaveProjectEx_ptr = reinterpret_cast<Main_SaveProjectEx_t>(
+    rec->GetFunc("Main_SaveProjectEx"));
   CountProjectMarkers_ptr = reinterpret_cast<CountProjectMarkers_t>(rec->GetFunc("CountProjectMarkers"));
   EnumProjectMarkers3_ptr = reinterpret_cast<EnumProjectMarkers3_t>(rec->GetFunc("EnumProjectMarkers3"));
   SetProjectMarkerByIndex2_ptr = reinterpret_cast<SetProjectMarkerByIndex2_t>(rec->GetFunc("SetProjectMarkerByIndex2"));
@@ -66802,6 +68604,12 @@ static bool loadApi(reaper_plugin_info_t* rec)
       rec->GetFunc("GetSetRegionOrMarkerInfo_String"));
   GetProjectStateChangeCount_ptr = reinterpret_cast<GetProjectStateChangeCount_t>(rec->GetFunc("GetProjectStateChangeCount"));
   IsProjectDirty_ptr = reinterpret_cast<IsProjectDirty_t>(rec->GetFunc("IsProjectDirty"));
+  GetSet_ArrangeView2_ptr = reinterpret_cast<GetSet_ArrangeView2_t>(
+    rec->GetFunc("GetSet_ArrangeView2"));
+  CoolSB_GetScrollInfo_ptr = reinterpret_cast<CoolSB_GetScrollInfo_t>(
+    rec->GetFunc("CoolSB_GetScrollInfo"));
+  CoolSB_SetScrollInfo_ptr = reinterpret_cast<CoolSB_SetScrollInfo_t>(
+    rec->GetFunc("CoolSB_SetScrollInfo"));
   GetPlayStateEx_ptr = reinterpret_cast<GetPlayStateEx_t>(rec->GetFunc("GetPlayStateEx"));
   GetPlayPositionEx_ptr = reinterpret_cast<GetPlayPositionEx_t>(rec->GetFunc("GetPlayPositionEx"));
   GetCursorPositionEx_ptr = reinterpret_cast<GetCursorPositionEx_t>(rec->GetFunc("GetCursorPositionEx"));
@@ -66895,6 +68703,12 @@ static bool loadApi(reaper_plugin_info_t* rec)
       rec->GetFunc("ColorFromNative"));
   GetTrackNumMediaItems_ptr = reinterpret_cast<GetTrackNumMediaItems_t>(rec->GetFunc("GetTrackNumMediaItems"));
   GetTrackMediaItem_ptr = reinterpret_cast<GetTrackMediaItem_t>(rec->GetFunc("GetTrackMediaItem"));
+  AddMediaItemToTrack_ptr =
+    reinterpret_cast<AddMediaItemToTrack_t>(
+      rec->GetFunc("AddMediaItemToTrack"));
+  MoveMediaItemToTrack_ptr =
+    reinterpret_cast<MoveMediaItemToTrack_t>(
+      rec->GetFunc("MoveMediaItemToTrack"));
   DeleteTrackMediaItem_ptr =
     reinterpret_cast<DeleteTrackMediaItem_t>(
       rec->GetFunc("DeleteTrackMediaItem"));
@@ -67206,6 +69020,28 @@ static void shutdown()
   }
 
   nativeRemoveReaperMainWindowSubclass();
+
+  // Project Sync e um pareamento de sessao. Fechar o REAPER encerra A/B e
+  // exige novo codigo/conferencia na proxima abertura. Receive/Transmitter
+  // tradicionais continuam persistentes e nao sao alterados aqui.
+  if (SetExtState_ptr && getTimecodeMode() == "project_sync") {
+    const std::string parallelMode = getParallelTimecodeMode();
+    const char* parallelCodeRaw = GetExtState_ptr
+      ? GetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey)
+      : nullptr;
+    const std::string parallelCode = parallelCodeRaw
+      ? nativeTrim(parallelCodeRaw) : "";
+    const bool restoreTimecode =
+      (parallelMode == "receive" || parallelMode == "transmitter") &&
+      nativeTimecodeLanCodeIsValid(parallelCode);
+    SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
+      restoreTimecode ? parallelMode.c_str() : "", true);
+    SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
+      restoreTimecode ? parallelCode.c_str() : "", true);
+    SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
+    SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey, "", true);
+    SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey, "", true);
+  }
 
   if (g_state.projectConfigRegistered) {
     plugin_register_ptr("-projectconfig",
