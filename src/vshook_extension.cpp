@@ -22789,7 +22789,10 @@ static bool nativeProjectSyncConfigKeyAllowed(
 {
   if (section == kLuaWindowExtStateSection) {
     return nativeUiBackupContainsKey(
-      nativeUiBackupWindowGlobalKeys(), key);
+      nativeUiBackupWindowGlobalKeys(), key) ||
+      key == "PREMIX_V1" ||
+      key == "PREMIX_ENABLED_V1" ||
+      key == "PREMIX_GLOBAL_ENABLED_V1";
   }
   if (section == kNativeExtStateSection) {
     return nativeUiBackupContainsKey(
