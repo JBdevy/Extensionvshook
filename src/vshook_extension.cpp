@@ -5049,6 +5049,7 @@ struct NativeProjectSyncApplyState {
   int fileIndex = 0;
   int fileCount = 0;
   uint64_t sequence = 0;
+  int64_t stateUpdatedAtMs = 0;
   bool automatic = false;
 };
 
@@ -22757,6 +22758,38 @@ static std::string nativeProjectSyncBasename(
     ? path : path.substr(separator + 1);
 }
 
+static bool nativeProjectSyncHexPrefix20(const std::string& value)
+{
+  if (value.size() <= 21 || value[20] != '_') return false;
+  for (size_t index = 0; index < 20; ++index) {
+    const unsigned char character =
+      static_cast<unsigned char>(value[index]);
+    if (!std::isxdigit(character)) return false;
+  }
+  return true;
+}
+
+static std::string nativeProjectSyncCanonicalSourceName(
+  const std::string& rawPath)
+{
+  std::string name = nativeProjectSyncBasename(rawPath);
+  const std::string normalized = normalizeSlashes(rawPath);
+  const std::string marker = "/VS Hook Project Sync/Media/";
+#ifdef _WIN32
+  const bool managed = nativeLower(normalized).find(
+    nativeLower(marker)) != std::string::npos;
+#else
+  const bool managed = normalized.find(marker) != std::string::npos;
+#endif
+  if (!managed) return name;
+
+  // A mídia gerenciada recebe <sha20>_ no PC B. Esse prefixo pertence ao
+  // armazenamento/deduplicação, não à identidade lógica do item. Remove
+  // também prefixos duplicados gerados por builds anteriores.
+  while (nativeProjectSyncHexPrefix20(name)) name.erase(0, 21);
+  return name.empty() ? nativeProjectSyncBasename(rawPath) : name;
+}
+
 static long long nativeProjectSyncFileSize(
   const std::string& path)
 {
@@ -22785,6 +22818,65 @@ static long long nativeProjectSyncFileSize(
   }
   return static_cast<long long>(data.st_size);
 #endif
+}
+
+struct NativeProjectSyncRegularFileStamp {
+  uint64_t size = 0;
+  uint64_t modificationToken = 0;
+  double modificationTimeMs = 0.0;
+};
+
+static bool nativeProjectSyncRegularFileStamp(
+  const std::string& rawPath,
+  NativeProjectSyncRegularFileStamp& stampOut)
+{
+  stampOut = NativeProjectSyncRegularFileStamp{};
+  const std::string path = normalizeSlashes(nativeTrim(rawPath));
+  if (path.empty()) return false;
+#ifdef _WIN32
+  const std::wstring widePath = utf8ToWide(path);
+  if (widePath.empty()) return false;
+  WIN32_FILE_ATTRIBUTE_DATA data{};
+  if (!GetFileAttributesExW(
+        widePath.c_str(), GetFileExInfoStandard, &data) ||
+      (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+      (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    return false;
+  }
+  ULARGE_INTEGER size{};
+  size.HighPart = data.nFileSizeHigh;
+  size.LowPart = data.nFileSizeLow;
+  ULARGE_INTEGER modified{};
+  modified.HighPart = data.ftLastWriteTime.dwHighDateTime;
+  modified.LowPart = data.ftLastWriteTime.dwLowDateTime;
+  stampOut.size = size.QuadPart;
+  stampOut.modificationToken = modified.QuadPart;
+  constexpr double kWindowsToUnixEpochMs = 11644473600000.0;
+  stampOut.modificationTimeMs =
+    static_cast<double>(modified.QuadPart) / 10000.0 -
+      kWindowsToUnixEpochMs;
+#else
+  struct stat info{};
+  if (lstat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+      S_ISLNK(info.st_mode) || info.st_size < 0) {
+    return false;
+  }
+#ifdef __APPLE__
+  const std::time_t seconds = info.st_mtimespec.tv_sec;
+  const long nanoseconds = info.st_mtimespec.tv_nsec;
+#else
+  const std::time_t seconds = info.st_mtim.tv_sec;
+  const long nanoseconds = info.st_mtim.tv_nsec;
+#endif
+  stampOut.size = static_cast<uint64_t>(info.st_size);
+  stampOut.modificationToken =
+    static_cast<uint64_t>(seconds) * 1000000000ULL +
+      static_cast<uint64_t>(std::max<long>(0, nanoseconds));
+  stampOut.modificationTimeMs =
+    static_cast<double>(seconds) * 1000.0 +
+      static_cast<double>(nanoseconds) / 1000000.0;
+#endif
+  return true;
 }
 
 static bool nativeProjectSyncConfigKeyAllowed(
@@ -23103,7 +23195,7 @@ static std::string nativeProjectSyncBuildStructuralManifest(
         ? "midi" : (sourcePath.empty() ? "empty" : "file");
       std::string sourceName = sourcePath.empty()
         ? nativeTakeName(item, midi ? "MIDI" : "Sem arquivo")
-        : nativeProjectSyncBasename(sourcePath);
+        : nativeProjectSyncCanonicalSourceName(sourcePath);
       if (sourceName.empty()) sourceName = mediaKind;
       const bool sourceExists = midi ||
         (!resolvedSourcePath.empty() && fileExists(resolvedSourcePath));
@@ -23292,6 +23384,129 @@ static std::string nativeProjectSyncRecordSummary(
     return "Configuracao " + fields[2];
   }
   return fields.size() > 1 ? fields[1] : type;
+}
+
+struct NativeProjectSyncItemRecordComparison {
+  bool recognized = false;
+  bool equivalent = false;
+  std::string primarySummary;
+  std::string secondarySummary;
+};
+
+static bool nativeProjectSyncItemNumberEqual(
+  const std::string& left,
+  const std::string& right,
+  double tolerance)
+{
+  char* leftEnd = nullptr;
+  char* rightEnd = nullptr;
+  const double leftValue = std::strtod(left.c_str(), &leftEnd);
+  const double rightValue = std::strtod(right.c_str(), &rightEnd);
+  if (!leftEnd || leftEnd == left.c_str() || *leftEnd != '\0' ||
+      !rightEnd || rightEnd == right.c_str() || *rightEnd != '\0' ||
+      !std::isfinite(leftValue) || !std::isfinite(rightValue)) {
+    return left == right;
+  }
+  return std::fabs(leftValue - rightValue) <= tolerance;
+}
+
+static NativeProjectSyncItemRecordComparison
+nativeProjectSyncCompareItemRecords(
+  const std::string& primaryLine,
+  const std::string& secondaryLine)
+{
+  NativeProjectSyncItemRecordComparison comparison;
+  std::vector<std::string> primary =
+    nativeProjectSyncTsvFields(primaryLine);
+  std::vector<std::string> secondary =
+    nativeProjectSyncTsvFields(secondaryLine);
+  if ((primary.size() != 13 && primary.size() != 15) ||
+      (secondary.size() != 13 && secondary.size() != 15) ||
+      primary.empty() || secondary.empty() ||
+      primary[0] != "ITEM" || secondary[0] != "ITEM") {
+    return comparison;
+  }
+  for (size_t index = 1; index < primary.size(); ++index) {
+    primary[index] = nativeUiBackupUnescape(primary[index]);
+  }
+  for (size_t index = 1; index < secondary.size(); ++index) {
+    secondary[index] = nativeUiBackupUnescape(secondary[index]);
+  }
+  comparison.recognized = true;
+
+  // Manifestos v1 antigos nao tinham os volumes do item/take. O valor que o
+  // REAPER usa quando esses campos nao existem e 1.0, portanto esse e o unico
+  // default semanticamente seguro ao comparar uma versao antiga com a atual.
+  const auto field = [](const std::vector<std::string>& values,
+                        size_t index,
+                        const char* fallback = "") -> std::string {
+    return index < values.size() ? values[index] : fallback;
+  };
+  const bool stableGuid = primary[1] == secondary[1] &&
+    primary[1].size() >= 2 && primary[1].front() == '{' &&
+    primary[1].back() == '}';
+
+  struct ChangedField {
+    std::string label;
+    std::string primary;
+    std::string secondary;
+  };
+  std::vector<ChangedField> changed;
+  const auto compareText = [&](const char* label, size_t index,
+                               const char* fallback = "") {
+    const std::string left = field(primary, index, fallback);
+    const std::string right = field(secondary, index, fallback);
+    if (left != right) changed.push_back({label, left, right});
+  };
+  const auto compareNumber = [&](const char* label, size_t index,
+                                 double tolerance,
+                                 const char* suffix = "",
+                                 const char* fallback = "") {
+    const std::string left = field(primary, index, fallback);
+    const std::string right = field(secondary, index, fallback);
+    if (!nativeProjectSyncItemNumberEqual(left, right, tolerance)) {
+      changed.push_back({label, left + suffix, right + suffix});
+    }
+  };
+  const auto compareFlag = [&](const char* label, size_t index) {
+    const std::string left = field(primary, index);
+    const std::string right = field(secondary, index);
+    if (left != right) {
+      changed.push_back({label,
+        left == "1" ? "sim" : "nao",
+        right == "1" ? "sim" : "nao"});
+    }
+  };
+
+  compareText("pista", 2);
+  // A ordem interna pode divergir depois de uma edicao sem alterar o item.
+  // Ela so participa da comparacao quando nao ha GUID real e a identidade
+  // depende do fallback posicional.
+  if (!stableGuid) compareText("ordem interna", 3);
+  compareText("natureza", 4);
+  compareText("arquivo", 5);
+  compareFlag("arquivo disponivel", 6);
+  compareText("tamanho do arquivo", 7);
+  compareNumber("posicao", 8, 0.000001, " s");
+  compareNumber("duracao", 9, 0.000001, " s");
+  compareNumber("offset", 10, 0.000001, " s");
+  compareNumber("velocidade", 11, 0.000001, "x");
+  compareFlag("loop", 12);
+  compareNumber("volume do item", 13, 0.000001, "", "1.000000");
+  compareNumber("volume do take", 14, 0.000001, "", "1.000000");
+
+  comparison.equivalent = changed.empty();
+  if (comparison.equivalent) return comparison;
+
+  const std::string primaryName = field(primary, 5, "item");
+  const std::string secondaryName = field(secondary, 5, "item");
+  comparison.primarySummary = "Arquivo " + primaryName;
+  comparison.secondarySummary = "Arquivo " + secondaryName;
+  for (const ChangedField& entry : changed) {
+    comparison.primarySummary += " | " + entry.label + ": " + entry.primary;
+    comparison.secondarySummary += " | " + entry.label + ": " + entry.secondary;
+  }
+  return comparison;
 }
 
 static NativeProjectSyncParsedManifest
@@ -23556,6 +23771,15 @@ static NativeProjectSyncCompareResult nativeProjectSyncCompareManifests(
           leftValue->second == rightValue->second) {
         continue;
       }
+      NativeProjectSyncItemRecordComparison itemComparison;
+      if (!config && leftExists && rightExists &&
+          identity.rfind("ITEM\t", 0) == 0) {
+        itemComparison = nativeProjectSyncCompareItemRecords(
+          leftValue->second, rightValue->second);
+        if (itemComparison.recognized && itemComparison.equivalent) {
+          continue;
+        }
+      }
       const std::string category =
         nativeProjectSyncCategoryForIdentity(identity);
       ++result.differenceCount;
@@ -23573,14 +23797,24 @@ static NativeProjectSyncCompareResult nativeProjectSyncCompareManifests(
         ? "missing_on_secondary"
         : (!leftExists ? "extra_on_secondary" : "changed");
       if (leftExists) {
-        const auto summary = primary.summaries.find(identity);
-        difference.primary = summary != primary.summaries.end()
-          ? summary->second : difference.id;
+        if (itemComparison.recognized &&
+            !itemComparison.primarySummary.empty()) {
+          difference.primary = itemComparison.primarySummary;
+        } else {
+          const auto summary = primary.summaries.find(identity);
+          difference.primary = summary != primary.summaries.end()
+            ? summary->second : difference.id;
+        }
       }
       if (rightExists) {
-        const auto summary = secondary.summaries.find(identity);
-        difference.secondary = summary != secondary.summaries.end()
-          ? summary->second : difference.id;
+        if (itemComparison.recognized &&
+            !itemComparison.secondarySummary.empty()) {
+          difference.secondary = itemComparison.secondarySummary;
+        } else {
+          const auto summary = secondary.summaries.find(identity);
+          difference.secondary = summary != secondary.summaries.end()
+            ? summary->second : difference.id;
+        }
       }
       result.differences.push_back(std::move(difference));
     }
@@ -23842,13 +24076,22 @@ static void nativeProjectSyncRefreshManifestOnMainThread(bool force)
   ReaProject* project = getCurrentProject(nullptr, 0);
   const int changeCount = project && GetProjectStateChangeCount_ptr
     ? GetProjectStateChangeCount_ptr(project) : -1;
+  const bool lightweightRuntimeMutation = !force && project &&
+    g_nativeLightweightMutationProject == project &&
+    g_nativeLightweightMutationChangeCount == changeCount;
   const bool rebuildStructural = force ||
     project != g_nativeProjectSyncManifestProject ||
-    changeCount != g_nativeProjectSyncManifestChangeCount ||
+    (!lightweightRuntimeMutation &&
+      changeCount != g_nativeProjectSyncManifestChangeCount) ||
     g_nativeProjectSyncStructuralManifest.empty();
   if (rebuildStructural) {
     g_nativeProjectSyncStructuralManifest =
       nativeProjectSyncBuildStructuralManifest(project);
+    g_nativeProjectSyncManifestProject = project;
+    g_nativeProjectSyncManifestChangeCount = changeCount;
+  } else if (lightweightRuntimeMutation) {
+    // Repeat, time selection e volumes transitórios do Multiloops não alteram
+    // a estrutura comparada no preflight. Apenas absorve a nova revisão.
     g_nativeProjectSyncManifestProject = project;
     g_nativeProjectSyncManifestChangeCount = changeCount;
   }
@@ -23899,6 +24142,14 @@ static void nativeProjectSyncStorePreflightResult(
   const std::string& remoteConfigSnapshot = std::string())
 {
   std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  // Um novo pareamento substitui qualquer estado visual órfão da sessão
+  // anterior. Nunca interrompe um worker/pending commit ainda legítimo.
+  if (!requestId.empty() &&
+      g_nativeProjectSyncApply.requestId != requestId &&
+      !g_nativeProjectSyncBundleWorkerRunning.load() &&
+      !g_nativeProjectSyncPendingOpen.ready) {
+    g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
+  }
   g_nativeProjectSyncPreflight.requestId = requestId;
   g_nativeProjectSyncPreflight.ready = ready;
   g_nativeProjectSyncPreflight.hasResult = true;
@@ -24365,6 +24616,9 @@ static void nativeProjectSyncUpdateWorkerProgress(
     g_nativeProjectSyncApply.totalBytes = totalBytes;
     g_nativeProjectSyncApply.fileIndex = fileIndex;
     g_nativeProjectSyncApply.fileCount = fileCount;
+    // Este timestamp mede inatividade, não duração total. Projetos grandes
+    // podem levar bastante tempo, mas cada bloco lido mantém a operação viva.
+    g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
   }
   g_nativeForceStateBuild.store(true);
 }
@@ -24601,6 +24855,14 @@ struct NativeProjectSyncBundleFile {
   std::string sha256;
 };
 
+struct NativeProjectSyncBundleSource {
+  std::string id;
+  std::string absolutePath;
+  uint64_t size = 0;
+  std::string sha256;
+  double modificationTimeMs = 0.0;
+};
+
 struct NativeProjectSyncPrepareInput {
   std::string requestId;
   std::string bundleId;
@@ -24616,6 +24878,7 @@ struct NativeProjectSyncPrepareInput {
   std::string resourcePath;
   int projectChangeCount = -1;
   bool automatic = false;
+  bool supportsSourceMap = false;
 };
 
 static void nativeProjectSyncFinishBundleError(
@@ -24659,6 +24922,8 @@ static void nativeProjectSyncPrepareBundleWorker(
     nativeProjectSyncRppReferences(rpp, input.projectDirectory,
       input.mediaDirectory);
   std::map<std::string, std::string> uniqueSources;
+  std::map<std::string, NativeProjectSyncRegularFileStamp> sourceStamps;
+  bool useSourceMap = input.supportsSourceMap;
   uint64_t totalBytes = static_cast<uint64_t>(rpp.size()) +
     static_cast<uint64_t>(input.configSnapshot.size());
   for (const auto& reference : references) {
@@ -24670,22 +24935,38 @@ static void nativeProjectSyncPrepareBundleWorker(
       g_nativeProjectSyncBundleWorkerRunning.store(false);
       return;
     }
-    if (key.empty() || !fileExists(key)) {
+    NativeProjectSyncRegularFileStamp sourceStamp;
+    long long legacySize = useSourceMap
+      ? -1 : nativeProjectSyncFileSize(key);
+    bool sourceReady = false;
+    if (useSourceMap &&
+        nativeProjectSyncRegularFileStamp(key, sourceStamp)) {
+      sourceReady = true;
+    } else {
+      if (legacySize < 0) legacySize = nativeProjectSyncFileSize(key);
+      if (!key.empty() && fileExists(key) && legacySize >= 0) {
+        // Um symlink/reparse point (por exemplo OneDrive) nao pode ser servido
+        // diretamente com seguranca. Conserva a compatibilidade materializando
+        // o bundle legado inteiro, que a Hook Center nova tambem entende.
+        useSourceMap = false;
+        sourceStamp.size = static_cast<uint64_t>(legacySize);
+        sourceReady = true;
+      }
+    }
+    if (!sourceReady) {
       nativeProjectSyncFinishBundleError(input.requestId,
-        "Arquivo usado pelo projeto nao foi encontrado: " +
+        "Arquivo usado pelo projeto nao foi encontrado" +
+          std::string(useSourceMap ? " ou nao e seguro: " : ": ") +
           reference.sourcePath);
       g_nativeProjectSyncBundleWorkerRunning.store(false);
       return;
     }
+    if (!useSourceMap) {
+      sourceStamp.size = static_cast<uint64_t>(legacySize);
+    }
     if (uniqueSources.emplace(key, reference.sourcePath).second) {
-      const long long size = nativeProjectSyncFileSize(key);
-      if (size < 0) {
-        nativeProjectSyncFinishBundleError(input.requestId,
-          "Nao foi possivel medir: " + reference.sourcePath);
-        g_nativeProjectSyncBundleWorkerRunning.store(false);
-        return;
-      }
-      totalBytes += static_cast<uint64_t>(size);
+      sourceStamps.emplace(key, sourceStamp);
+      totalBytes += sourceStamp.size;
     }
   }
   if (uniqueSources.size() + 2 > 16384) {
@@ -24727,13 +25008,22 @@ static void nativeProjectSyncPrepareBundleWorker(
       }
     }
   } partialExport{root, false};
-  const std::string mediaRoot = joinPath(root, "media");
   const std::string projectRoot = joinPath(root, "project");
   const std::string configRoot = joinPath(root, "config");
-  if (!nativeProjectSyncEnsureDirectory(mediaRoot, error) ||
-      !nativeProjectSyncEnsureDirectory(projectRoot, error) ||
-      !nativeProjectSyncEnsureDirectory(configRoot, error)) {
+  if (!nativeProjectSyncEnsureDirectory(projectRoot, error) ||
+      !nativeProjectSyncEnsureDirectory(configRoot, error) ||
+      (!useSourceMap &&
+       !nativeProjectSyncEnsureDirectory(joinPath(root, "media"), error))) {
     nativeProjectSyncFinishBundleError(input.requestId, error);
+    g_nativeProjectSyncBundleWorkerRunning.store(false);
+    return;
+  }
+  if (!nativeProjectSyncPathChainIsSafe(root, projectRoot) ||
+      !nativeProjectSyncPathChainIsSafe(root, configRoot) ||
+      (!useSourceMap &&
+       !nativeProjectSyncPathChainIsSafe(root, joinPath(root, "media")))) {
+    nativeProjectSyncFinishBundleError(input.requestId,
+      "A pasta de exportacao do Project Sync nao e segura.");
     g_nativeProjectSyncBundleWorkerRunning.store(false);
     return;
   }
@@ -24748,13 +25038,23 @@ static void nativeProjectSyncPrepareBundleWorker(
   }
 
   std::vector<NativeProjectSyncBundleFile> files;
+  std::vector<NativeProjectSyncBundleSource> localSources;
   std::map<std::string, std::string> sourceToRelative;
   uint64_t bytesDone = 0;
   int fileIndex = 0;
   for (const auto& source : uniqueSources) {
     ++fileIndex;
-    const std::string temporaryPath = joinPath(mediaRoot,
-      ".vshook-" + std::to_string(fileIndex) + ".part");
+    const auto expectedStamp = sourceStamps.find(source.first);
+    if (expectedStamp == sourceStamps.end()) {
+      nativeProjectSyncFinishBundleError(input.requestId,
+        "O snapshot perdeu os metadados de uma midia.");
+      g_nativeProjectSyncBundleWorkerRunning.store(false);
+      return;
+    }
+    const std::string temporaryPath = useSourceMap
+      ? std::string()
+      : joinPath(joinPath(root, "media"),
+          ".vshook-" + std::to_string(fileIndex) + ".part");
     std::string sha256;
     if (!nativeProjectSyncCopyAndHashFile(source.first,
           temporaryPath, true, input.requestId, totalBytes,
@@ -24765,22 +25065,44 @@ static void nativeProjectSyncPrepareBundleWorker(
       g_nativeProjectSyncBundleWorkerRunning.store(false);
       return;
     }
-    const std::string relativePath = "media/" +
-      sha256.substr(0, 20) + "_" +
-      nativeProjectSyncSafeFileName(source.second);
-    const std::string finalPath = joinPath(root, relativePath);
-    if (!nativeProjectSyncMoveFile(temporaryPath, finalPath, false)) {
-      nativeProjectSyncRemoveOwnFile(temporaryPath);
+    NativeProjectSyncRegularFileStamp finalStamp;
+    const bool sourceUnchanged = useSourceMap
+      ? (nativeProjectSyncRegularFileStamp(source.first, finalStamp) &&
+          finalStamp.size == expectedStamp->second.size &&
+          finalStamp.modificationToken ==
+            expectedStamp->second.modificationToken)
+      : (nativeProjectSyncFileSize(source.first) ==
+          static_cast<long long>(expectedStamp->second.size));
+    if (!sourceUnchanged) {
       nativeProjectSyncFinishBundleError(input.requestId,
-        "Nao foi possivel finalizar um arquivo do bundle.");
+        "Uma midia mudou durante a preparacao do Project Sync: " +
+          source.second);
       g_nativeProjectSyncBundleWorkerRunning.store(false);
       return;
     }
+    if (!useSourceMap) finalStamp = expectedStamp->second;
+    const std::string relativePath = "media/" +
+      sha256.substr(0, 20) + "_" +
+      nativeProjectSyncSafeFileName(source.second);
+    const std::string fileId =
+      "media-" + std::to_string(fileIndex);
+    if (!useSourceMap) {
+      const std::string finalPath = joinPath(root, relativePath);
+      if (!nativeProjectSyncMoveFile(temporaryPath, finalPath, false)) {
+        nativeProjectSyncRemoveOwnFile(temporaryPath);
+        nativeProjectSyncFinishBundleError(input.requestId,
+          "Nao foi possivel finalizar um arquivo do bundle.");
+        g_nativeProjectSyncBundleWorkerRunning.store(false);
+        return;
+      }
+    }
     sourceToRelative[source.first] = relativePath;
-    files.push_back({"media-" + std::to_string(fileIndex),
-      relativePath, "media",
-      static_cast<uint64_t>(std::max<long long>(0,
-        nativeProjectSyncFileSize(finalPath))), sha256});
+    files.push_back({fileId, relativePath, "media",
+      finalStamp.size, sha256});
+    if (useSourceMap) {
+      localSources.push_back({fileId, source.first,
+        finalStamp.size, sha256, finalStamp.modificationTimeMs});
+    }
   }
 
   std::string portableRpp;
@@ -24889,6 +25211,45 @@ static void nativeProjectSyncPrepareBundleWorker(
     nativeProjectSyncFinishBundleError(input.requestId, error);
     g_nativeProjectSyncBundleWorkerRunning.store(false);
     return;
+  }
+
+  // Este mapa existe apenas no PC A. Ele permite que a Hook Center sirva a
+  // midia original sob demanda, sem duplicar todos os arquivos na pasta de
+  // exportacao. O descriptor enviado pela LAN continua contendo somente
+  // caminhos relativos e hashes; caminhos absolutos nunca entram nele.
+  if (useSourceMap) {
+    std::ostringstream localSourceMap;
+    localSourceMap << "{\"schemaVersion\":1,\"bundleId\":"
+      << nativeJsonString(input.bundleId)
+      << ",\"requestId\":" << nativeJsonString(input.requestId)
+      << ",\"descriptorSha256\":" << nativeJsonString(descriptorSha)
+      << ",\"sources\":[";
+    for (size_t index = 0; index < localSources.size(); ++index) {
+      if (index) localSourceMap << ',';
+      const NativeProjectSyncBundleSource& source = localSources[index];
+      localSourceMap << "{\"id\":" << nativeJsonString(source.id)
+        << ",\"absolutePath\":"
+        << nativeJsonString(source.absolutePath)
+        << ",\"size\":" << source.size
+        << ",\"sha256\":" << nativeJsonString(source.sha256)
+        << ",\"mtimeMs\":" << std::fixed << std::setprecision(3)
+        << source.modificationTimeMs << '}';
+    }
+    localSourceMap << "]}";
+    if (localSourceMap.str().size() > 8u * 1024u * 1024u) {
+      nativeProjectSyncFinishBundleError(input.requestId,
+        "O mapa local de midias excedeu o limite seguro de 8 MiB.");
+      g_nativeProjectSyncBundleWorkerRunning.store(false);
+      return;
+    }
+    std::string localSourceMapSha;
+    if (!nativeProjectSyncWriteAndHashText(
+          joinPath(root, ".vshook-source-map.json"),
+          localSourceMap.str(), localSourceMapSha, error)) {
+      nativeProjectSyncFinishBundleError(input.requestId, error);
+      g_nativeProjectSyncBundleWorkerRunning.store(false);
+      return;
+    }
   }
 
   bool handedOff = false;
@@ -25031,6 +25392,7 @@ static void nativeProjectSyncFinishApplyError(
   std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
   if (g_nativeProjectSyncApply.requestId == requestId) {
     g_nativeProjectSyncApply.state = "error";
+    g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
     g_nativeProjectSyncApply.error = error.empty()
       ? "Falha ao aplicar as modificacoes." : error;
   }
@@ -25204,6 +25566,7 @@ static void nativeProjectSyncApplyBundleWorker(
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     if (g_nativeProjectSyncApply.requestId == input.requestId) {
       g_nativeProjectSyncApply.state = "validating";
+      g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
       g_nativeProjectSyncApply.revision = sourceManifestRevision;
       g_nativeProjectSyncApply.totalBytes = totalBytes;
       g_nativeProjectSyncApply.fileCount = static_cast<int>(files.size());
@@ -25252,9 +25615,14 @@ static void nativeProjectSyncApplyBundleWorker(
     // Cada conteúdo recebe um nome estável pelo SHA. Se o mesmo arquivo já
     // foi recebido antes, ele é validado e reutilizado; não é copiado outra
     // vez para o projeto B.
-    const std::string destinationPath = joinPath(managedMediaRoot,
-      file.sha256.substr(0, 20) + "_" +
-        nativeProjectSyncSafeFileName(file.relativePath));
+    const std::string hashPrefix = file.sha256.substr(0, 20) + "_";
+    std::string managedName = nativeProjectSyncSafeFileName(
+      file.relativePath);
+    if (nativeLower(managedName).rfind(nativeLower(hashPrefix), 0) != 0) {
+      managedName = hashPrefix + managedName;
+    }
+    const std::string destinationPath = joinPath(
+      managedMediaRoot, managedName);
     bool destinationReady = false;
     if (fileExists(destinationPath) &&
         nativeProjectSyncFileSize(destinationPath) ==
@@ -25353,6 +25721,7 @@ static void nativeProjectSyncApplyBundleWorker(
         g_nativeTimecodeLanMode == "project_sync" &&
         g_nativeTimecodeLanProjectSyncRole == "secondary") {
       g_nativeProjectSyncApply.state = "ready_to_apply";
+      g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
       g_nativeProjectSyncApply.bytesDone = totalBytes;
       g_nativeProjectSyncApply.totalBytes = totalBytes;
       g_nativeProjectSyncApply.fileIndex = static_cast<int>(files.size());
@@ -25556,6 +25925,8 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
     nativeJsonExtractString(commandBody, "expectedRevision"));
   const bool automatic = nativeJsonBoolValue(
     commandBody, "automatic", false);
+  const bool supportsSourceMap = nativeJsonBoolValue(
+    commandBody, "supportsSourceMap", false);
   if (!nativeProjectSyncRequestIdIsValid(requestId)) return true;
 
   std::string role;
@@ -25619,8 +25990,9 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
     const std::string question =
       "O PC B" + (peerName.empty() ? std::string() :
         " (" + peerName + ")") +
-      " pediu uma copia completa deste projeto.\n\n"
-      "O VS Hook vai preparar um snapshot do RPP e dos arquivos usados. "
+      " pediu as modificacoes deste projeto.\n\n"
+      "O VS Hook vai preparar um snapshot do RPP e validar os arquivos usados. "
+      "Somente os arquivos que faltarem no PC B serao enviados. "
       "Nada sera apagado do PC A.\n\nPermitir o envio?";
     const int confirmation = ShowMessageBox_ptr(question.c_str(),
       "Project Sync - Autorizar envio", 4);
@@ -25756,7 +26128,8 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
       nativeTimecodeLanSessionId(),
       normalizeSlashes(
         GetResourcePath_ptr ? GetResourcePath_ptr() : ""),
-      GetProjectStateChangeCount_ptr(project), automatic};
+      GetProjectStateChangeCount_ptr(project), automatic,
+      supportsSourceMap};
     g_nativeProjectSyncBundleWorker = std::thread([input]() {
       try {
         nativeProjectSyncPrepareBundleWorker(input);
@@ -25793,6 +26166,7 @@ static bool nativeProjectSyncUpdateApplyProgressFromCommand(
     return true;
   }
   g_nativeProjectSyncApply.state = state;
+  g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
   const std::string bundleId = nativeTrim(
     nativeJsonExtractString(commandBody, "bundleId"));
   if (!bundleId.empty()) g_nativeProjectSyncApply.bundleId = bundleId;
@@ -25810,7 +26184,66 @@ static bool nativeProjectSyncUpdateApplyProgressFromCommand(
     ? nativeTrim(nativeJsonExtractString(commandBody, "error"))
     : std::string();
   g_nativeForceStateBuild.store(true);
+  // O snapshot geral pode continuar semanticamente igual enquanto somente
+  // bytes/progresso mudam. Solicita o repaint diretamente para a conferencia
+  // responder no mesmo instante, sem depender de outra interacao do usuario.
+  if (g_nativeMainModalKind == NativeMainModalKind::ProjectSyncDiff &&
+      nativeAppActivePanelIsOpen()) {
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
   return true;
+}
+
+static bool nativeProjectSyncApplyStateIsBusy(
+  const std::string& rawState)
+{
+  const std::string state = nativeLower(nativeTrim(rawState));
+  return state == "requested" || state == "requesting" ||
+    state == "downloading" || state == "verifying" ||
+    state == "validating" || state == "ready_to_open" ||
+    state == "ready_to_apply" || state == "applying" ||
+    state == "apply_started";
+}
+
+static bool nativeProjectSyncApplyIsBusy()
+{
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  return nativeProjectSyncApplyStateIsBusy(
+    g_nativeProjectSyncApply.state);
+}
+
+static void nativeProjectSyncExpireStalledApplyOnMainThread()
+{
+  const int64_t nowMs = nativeSteadyNowMs();
+  bool expired = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    const std::string state = nativeLower(nativeTrim(
+      g_nativeProjectSyncApply.state));
+    const int64_t ageMs = g_nativeProjectSyncApply.stateUpdatedAtMs > 0
+      ? nowMs - g_nativeProjectSyncApply.stateUpdatedAtMs : 0;
+    const bool requestNeverStarted = state == "requested" && ageMs > 15000;
+    const bool transferStopped =
+      (state == "requesting" || state == "downloading" ||
+       state == "verifying" || state == "validating" ||
+       state == "ready_to_apply" || state == "applying" ||
+       state == "apply_started") &&
+      ageMs > 1800000;
+    if (requestNeverStarted || transferStopped) {
+      g_nativeProjectSyncApply.state = "error";
+      g_nativeProjectSyncApply.stateUpdatedAtMs = nowMs;
+      g_nativeProjectSyncApply.error = requestNeverStarted
+        ? "A Hook Center nao iniciou a transferencia. Confira se ela esta aberta e tente novamente."
+        : "O Project Sync parou de responder. Confira a Hook Center e tente novamente.";
+      expired = true;
+    }
+  }
+  if (!expired) return;
+  g_nativeForceStateBuild.store(true);
+  if (g_nativeMainModalKind == NativeMainModalKind::ProjectSyncDiff &&
+      nativeAppActivePanelIsOpen()) {
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
 }
 
 static bool nativeProjectSyncApplyBundleFromCommand(
@@ -25870,6 +26303,7 @@ static bool nativeProjectSyncApplyBundleFromCommand(
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     g_nativeProjectSyncApply.state = "validating";
+    g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
     g_nativeProjectSyncApply.bundleId = bundleId;
     g_nativeProjectSyncApply.descriptorPath = descriptorPath;
     g_nativeProjectSyncApply.stagingRoot = stagingRoot;
@@ -26064,6 +26498,7 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
     g_nativeProjectSyncApply.state = "requested";
+    g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
     g_nativeProjectSyncApply.requestId = requestId;
     g_nativeProjectSyncApply.revision = revision;
     g_nativeProjectSyncApply.sequence =
@@ -26712,6 +27147,7 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
     pending = g_nativeProjectSyncPendingOpen;
     if (g_nativeProjectSyncApply.requestId == pending.requestId) {
       g_nativeProjectSyncApply.state = "applying";
+      g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
     }
   }
   char currentPathBuffer[8192] = "";
@@ -26770,6 +27206,7 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     if (g_nativeProjectSyncApply.requestId == pending.requestId) {
       g_nativeProjectSyncApply.state = "applied";
+      g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
       g_nativeProjectSyncApply.revision =
         pending.sourceManifestRevision;
       g_nativeProjectSyncApply.error.clear();
@@ -33691,6 +34128,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
         !g_nativeProjectSyncDiffModalConfigApplied;
       const bool canOfferApply =
         canOfferStructuralApply || canOfferConfigApply;
+      const bool applyBusy = nativeProjectSyncApplyStateIsBusy(
+        applyState.state);
       RECT title{modal.left + 12, modal.top + 7,
         modal.right - 12, modal.top + 31};
       nativeAppActiveDrawText(dc, "Project Sync - conferencia", title,
@@ -33917,11 +34356,110 @@ static void nativePaintAppActivePanel(HWND hwnd)
       }
       nativeUiEndClipRect(dc, clip);
 
-      g_nativeProjectSyncDiffModalScrollTrackRect =
-        RECT{viewport.right - 9, viewport.top + 4,
-          viewport.right - 3, viewport.bottom - 4};
+      // Depois da confirmacao, o PC B ocupa o centro da conferencia com um
+      // estado de espera inequivoco. Enquanto o PC A ainda prepara o pacote a
+      // barra e indeterminada; assim que chegam bytes, ela passa a representar
+      // exatamente o progresso informado pela Hook Center.
+      if (applyBusy) {
+        nativeAppActiveFillRect(dc, viewport, RGB(10, 14, 20));
+        const int centerY = static_cast<int>(
+          (viewport.top + viewport.bottom) / 2);
+        RECT waitTitle{viewport.left + 24, centerY - 88,
+          viewport.right - 24, centerY - 50};
+        nativeAppActiveDrawText(dc, "AGUARDE", waitTitle,
+          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+          RGB(250, 204, 21), nameFont);
+
+        std::string waitStage =
+          "O PC A esta preparando as modificacoes...";
+        if (applyState.state == "downloading") {
+          waitStage = "Recebendo arquivos e dados do PC A...";
+        } else if (applyState.state == "verifying" ||
+                   applyState.state == "validating") {
+          waitStage = "Validando os arquivos recebidos...";
+        } else if (applyState.state == "ready_to_open" ||
+                   applyState.state == "ready_to_apply" ||
+                   applyState.state == "applying" ||
+                   applyState.state == "apply_started") {
+          waitStage = "Criando backup e aplicando no projeto aberto...";
+        }
+        RECT waitStageRect{viewport.left + 24, centerY - 45,
+          viewport.right - 24, centerY - 15};
+        nativeAppActiveDrawText(dc, waitStage, waitStageRect,
+          DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+            DT_END_ELLIPSIS | DT_NOPREFIX,
+          RGB(226, 232, 240), labelFont);
+
+        const RECT progressTrack{viewport.left + 38, centerY + 2,
+          viewport.right - 38, centerY + 20};
+        nativeAppActiveFillRoundRect(dc, progressTrack,
+          RGB(15, 23, 42), RGB(71, 85, 105), 6);
+        const int progressWidth = std::max(0, static_cast<int>(
+          progressTrack.right - progressTrack.left - 4));
+        int percent = -1;
+        if (applyState.totalBytes > 0) {
+          percent = static_cast<int>(std::min<uint64_t>(100,
+            (applyState.bytesDone * 100u) / applyState.totalBytes));
+          RECT progressFill{progressTrack.left + 2,
+            progressTrack.top + 2,
+            progressTrack.left + 2 +
+              static_cast<int>((progressWidth * percent) / 100),
+            progressTrack.bottom - 2};
+          if (progressFill.right > progressFill.left) {
+            nativeAppActiveFillRoundRect(dc, progressFill,
+              RGB(34, 197, 94), RGB(34, 197, 94), 5);
+          }
+        } else if (progressWidth > 0) {
+          const int segmentWidth = std::max(28, progressWidth / 4);
+          const int travel = std::max(1, progressWidth - segmentWidth);
+          const int phase = static_cast<int>(
+            (nativeSteadyNowMs() / 8) % (travel * 2));
+          const int segmentOffset = phase <= travel
+            ? phase : travel * 2 - phase;
+          const RECT progressFill{
+            progressTrack.left + 2 + segmentOffset,
+            progressTrack.top + 2,
+            progressTrack.left + 2 + segmentOffset + segmentWidth,
+            progressTrack.bottom - 2};
+          nativeAppActiveFillRoundRect(dc, progressFill,
+            RGB(250, 204, 21), RGB(250, 204, 21), 5);
+        }
+
+        std::ostringstream progressDetail;
+        if (percent >= 0) {
+          progressDetail << percent << "%";
+          const double doneMb = static_cast<double>(
+            applyState.bytesDone) / (1024.0 * 1024.0);
+          const double totalMb = static_cast<double>(
+            applyState.totalBytes) / (1024.0 * 1024.0);
+          progressDetail << "  -  " << std::fixed << std::setprecision(1)
+            << doneMb << " de " << totalMb << " MB";
+        } else {
+          progressDetail << "Nao feche o REAPER nem a Hook Center";
+        }
+        if (applyState.fileCount > 0) {
+          progressDetail << "  -  Arquivo "
+            << std::min(applyState.fileIndex, applyState.fileCount)
+            << " de " << applyState.fileCount;
+        }
+        RECT progressText{viewport.left + 24, centerY + 28,
+          viewport.right - 24, centerY + 56};
+        nativeAppActiveDrawText(dc, progressDetail.str(), progressText,
+          DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+            DT_END_ELLIPSIS | DT_NOPREFIX,
+          RGB(148, 163, 184), statusFont);
+
+        g_nativeProjectSyncDiffModalMaxScrollPixels = 0;
+        g_nativeProjectSyncDiffModalScrollPixels = 0;
+      }
+
+      g_nativeProjectSyncDiffModalScrollTrackRect = applyBusy
+        ? RECT{0, 0, 0, 0}
+        : RECT{viewport.right - 9, viewport.top + 4,
+            viewport.right - 3, viewport.bottom - 4};
       g_nativeProjectSyncDiffModalScrollThumbRect = RECT{0, 0, 0, 0};
-      if (g_nativeProjectSyncDiffModalMaxScrollPixels > 0) {
+      if (!applyBusy &&
+          g_nativeProjectSyncDiffModalMaxScrollPixels > 0) {
         nativeAppActiveFillRoundRect(dc,
           g_nativeProjectSyncDiffModalScrollTrackRect,
           RGB(6, 9, 13), RGB(30, 41, 59), 3);
@@ -33993,28 +34531,23 @@ static void nativePaintAppActivePanel(HWND hwnd)
       g_nativeMainModalCloseRect = RECT{modal.right - 90,
         modal.bottom - 34, modal.right - 12, modal.bottom - 12};
       if (canOfferStructuralApply) {
-        const bool busy = applyState.state == "requested" ||
-          applyState.state == "requesting" ||
-          applyState.state == "downloading" ||
-          applyState.state == "verifying" ||
-          applyState.state == "validating" ||
-          applyState.state == "ready_to_open" ||
-          applyState.state == "ready_to_apply" ||
-          applyState.state == "applying" ||
-          applyState.state == "apply_started";
         const std::string applyLabel = applyState.state == "error"
           ? "Tentar novamente" : "Aplicar modificacoes";
         addModalButton("project_sync_apply", applyLabel,
           RECT{modal.right - 260, modal.bottom - 34,
             modal.right - 96, modal.bottom - 12},
-          busy ? "locked" : "play", !busy, !busy);
+          applyBusy ? "locked" : "play",
+          !applyBusy, !applyBusy);
       } else if (canOfferConfigApply) {
         addModalButton("project_sync_apply_config", "Aplicar configuracoes",
           RECT{modal.right - 260, modal.bottom - 34,
             modal.right - 96, modal.bottom - 12},
           "play", true, true);
       }
-      addModalButton("close", "Fechar",
+      // Ocultar a conferencia nao cancela o worker nem a transferencia. O
+      // botao continua disponivel durante uma operacao para que uma queda da
+      // Hook Center nunca deixe o usuario preso dentro deste modal.
+      addModalButton("close", applyBusy ? "Ocultar" : "Fechar",
         g_nativeMainModalCloseRect, "stop", true);
     } else if (g_nativeMainModalKind == NativeMainModalKind::BpmScanSelect) {
       const std::vector<NativeSongWindow> songs =
@@ -51721,6 +52254,9 @@ static bool nativeUiNeedsTimedVisualRefresh()
     !g_nativeUiTemporaryPopupText.empty();
   const bool timerModalCaret =
     g_nativeMainModalKind == NativeMainModalKind::TimerConfig;
+  const bool projectSyncApplyBusy =
+    g_nativeMainModalKind == NativeMainModalKind::ProjectSyncDiff &&
+    nativeProjectSyncApplyIsBusy();
   bool fadeoutActive = false;
   bool fadeoutRestorePending = false;
   double fadeoutProgress = 0.0;
@@ -51728,8 +52264,7 @@ static bool nativeUiNeedsTimedVisualRefresh()
   nativeUiReadManualStopFadeoutVisualState(
     fadeoutActive, fadeoutRestorePending,
     fadeoutProgress, fadeoutDurationSec);
-  return g_nativeAppActivePanelModel.loopActive ||
-    g_nativeAppActivePanelModel.multiLoopBypassActive ||
+  return g_nativeAppActivePanelModel.multiLoopBypassActive ||
     g_nativeAppActivePanelModel.liveEnabled ||
     g_nativeAppActivePanelModel.timerExpired ||
     (g_nativeAppActivePanelModel.partArmed &&
@@ -51740,6 +52275,7 @@ static bool nativeUiNeedsTimedVisualRefresh()
     g_nativeMixerRenameOpen ||
     g_nativeMainBpmEditOpen ||
     timerModalCaret ||
+    projectSyncApplyBusy ||
     fadeoutActive ||
     fadeoutRestorePending ||
     popupPending;
@@ -52889,6 +53425,9 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               nativeUiExecuteExportAudio("aiff");
             }
           } else if (wParam == VK_ESCAPE) {
+            // Fechar/ocultar o modal nao cancela o Project Sync. Isso tambem
+            // evita aprisionar a interface se a Hook Center cair no meio de
+            // uma transferencia longa.
             nativeUiCloseMainModal();
           } else if (g_nativeMainModalKind ==
                      NativeMainModalKind::MidiAssignList) {
@@ -60053,26 +60592,56 @@ static std::string nativeFindLoopBoundaryLabel(ReaProject* project, double bound
 
 static std::string nativeFindLoopRegionLabel(ReaProject* project, double loopStart, double loopEnd)
 {
-  if (!project || loopEnd <= loopStart + 0.0005) return std::string();
-  std::string ignoredMarkersJson;
-  const std::vector<NativeSongWindow> songs = nativeCollectProjectSongs(project, ignoredMarkersJson);
-  const double eps = 0.001;
-  const NativeSongWindow* best = nullptr;
-  for (const auto& song : songs) {
-    if (!nativeSongIsPlayable(song) || song.isHashParent) continue;
-    if (std::fabs(song.start - loopStart) > eps) continue;
-    if (loopEnd > song.end + eps) continue;
-    if (!best || (song.end - song.start) < (best->end - best->start)) best = &song;
+  if (!project || loopEnd <= loopStart + 0.0005 ||
+      !CountProjectMarkers_ptr || !EnumProjectMarkers3_ptr) {
+    return std::string();
   }
-  return best ? nativeCleanSongName(best->name) : std::string();
+  // Esta função roda no refresh visual enquanto Loop está ligado. Nunca use
+  // nativeCollectProjectSongs aqui: ele também procura letras de cada música
+  // varrendo todas as pistas/itens e transformava um simples label em custo
+  // músicas x itens, repetido dezenas de vezes por segundo.
+  const double eps = 0.001;
+  std::string bestName;
+  double bestLength = std::numeric_limits<double>::max();
+  int markerCount = 0;
+  int regionCount = 0;
+  int total = CountProjectMarkers_ptr(project, &markerCount, &regionCount);
+  if (total <= 0) total = markerCount + regionCount;
+  for (int index = 0; index < total; ++index) {
+    bool isRegion = false;
+    double position = 0.0;
+    double end = 0.0;
+    const char* rawName = nullptr;
+    int number = 0;
+    int color = 0;
+    if (!EnumProjectMarkers3_ptr(project, index, &isRegion, &position,
+          &end, &rawName, &number, &color) || !isRegion) {
+      continue;
+    }
+    if (std::fabs(position - loopStart) > eps || loopEnd > end + eps) {
+      continue;
+    }
+    const std::string name = nativeCleanSongName(rawName ? rawName : "");
+    const double length = end - position;
+    if (!name.empty() && length > eps && length < bestLength) {
+      bestName = name;
+      bestLength = length;
+    }
+  }
+  return bestName;
 }
 
 static bool nativeFindTransitionLoopRange(ReaProject* project, double playPos, double& startOut, double& endOut)
 {
   if (!project || !CountProjectMarkers_ptr || !EnumProjectMarkers3_ptr) return false;
 
-  std::string ignoredMarkersJson;
-  const std::vector<NativeSongWindow> songs = nativeCollectProjectSongs(project, ignoredMarkersJson);
+  // O snapshot normal já mantém esta lista. Reutilizá-la evita reconstruir
+  // letras, famílias e todos os itens de todas as pistas no clique do Loop.
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+  }
   const double eps = 0.0005;
   const NativeSongWindow* activeSong = nullptr;
 
@@ -60090,6 +60659,39 @@ static bool nativeFindTransitionLoopRange(ReaProject* project, double playPos, d
     for (const auto& song : songs) {
       if (song.isBlock) continue;
       if (playPos >= song.start - eps && playPos < song.end - eps) { activeSong = &song; break; }
+    }
+  }
+  // Durante o primeiro instante de abertura o cache pode ainda estar vazio.
+  // O fallback continua leve: enumera somente regiões, sem tocar em pistas,
+  // itens, letras ou plugins.
+  NativeSongWindow fallbackSong;
+  if (!activeSong) {
+    int markerCount = 0;
+    int regionCount = 0;
+    int total = CountProjectMarkers_ptr(project, &markerCount, &regionCount);
+    if (total <= 0) total = markerCount + regionCount;
+    double bestLength = std::numeric_limits<double>::max();
+    for (int index = 0; index < total; ++index) {
+      bool isRegion = false;
+      double position = 0.0;
+      double end = 0.0;
+      const char* rawName = nullptr;
+      int number = 0;
+      int color = 0;
+      if (!EnumProjectMarkers3_ptr(project, index, &isRegion, &position,
+            &end, &rawName, &number, &color) || !isRegion) {
+        continue;
+      }
+      const double length = end - position;
+      if (playPos >= position - eps && playPos < end - eps &&
+          length > eps && length < bestLength) {
+        fallbackSong.start = position;
+        fallbackSong.end = end;
+        bestLength = length;
+      }
+    }
+    if (bestLength < std::numeric_limits<double>::max()) {
+      activeSong = &fallbackSong;
     }
   }
   if (!activeSong || activeSong->end <= activeSong->start + eps) return false;
@@ -63819,11 +64421,18 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
   ReaProject* project = getCurrentProject(nullptr, 0);
   if (!project) return;
   const int changeCount = GetProjectStateChangeCount_ptr(project);
+  const bool lightweightRuntimeMutation =
+    g_nativeLightweightMutationProject == project &&
+    g_nativeLightweightMutationChangeCount == changeCount;
   const bool sameProject = g_nativeProjectSyncLiveProject == project;
   const bool baselineEstablished = sameProject &&
     g_nativeProjectSyncLiveProject != nullptr;
   if (!publishInitial && sameProject &&
       changeCount == g_nativeProjectSyncLiveChangeCount) {
+    return;
+  }
+  if (!publishInitial && sameProject && lightweightRuntimeMutation) {
+    g_nativeProjectSyncLiveChangeCount = changeCount;
     return;
   }
 
@@ -64249,6 +64858,7 @@ static bool nativeApplyProjectSyncLiveCommand(
         g_nativeProjectSyncApply.state != "applying") {
       g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
       g_nativeProjectSyncApply.state = "requested";
+      g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
       g_nativeProjectSyncApply.requestId = requestId;
       g_nativeProjectSyncApply.revision = nativeTrim(
         nativeJsonExtractString(commandBody, "structuralRevision"));
@@ -65255,6 +65865,10 @@ static bool nativeApplyLoopCommand(const std::string& commandBody)
   if (next) nativeSetLoopTimeRange(project, startPos, endPos);
   else nativeClearLoopTimeRange(project);
   nativeSetRepeatEnabled(project, next);
+  // Repeat/time selection alteram o contador do projeto, mas não mudam pistas,
+  // itens, FX, regiões ou markers. Impede que o Project Sync trate o clique
+  // como uma reconstrução estrutural completa.
+  nativeNoteLightweightProjectMutation(project);
   g_nativeForceStateBuild.store(true);
   return true;
 }
@@ -68529,6 +69143,7 @@ static void startupTimer()
   // REAPER. O poll fica depois do inbox para que estados remotos atualizem a
   // baseline antes de qualquer delta local ser publicado.
   nativeProjectSyncFinalizePreparedBundleOnMainThread();
+  nativeProjectSyncExpireStalledApplyOnMainThread();
   nativeProjectSyncCommitPendingOpenOnMainThread();
   nativeProjectSyncRefreshManifestOnMainThread(false);
   nativeProjectSyncPollLiveProjectOnMainThread();
