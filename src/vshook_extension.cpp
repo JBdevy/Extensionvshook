@@ -42388,6 +42388,10 @@ static void nativeUiToggleDocker(bool forceRight)
 // ==========================================================
 
 static constexpr UINT_PTR kNativeBigClockTimerId = 0x5642434B;
+static constexpr int kNativeBigClockMinimumHeight = 64;
+static constexpr int kNativeBigClockDockerHeight = 69;
+static constexpr const char* kNativeBigClockDockLayoutMigratedKey =
+  "BIG_CLOCK_DOCK_LAYOUT_MIGRATED_V2";
 static HWND g_nativeBigClockHwnd[2] = {nullptr, nullptr};
 static bool g_nativeBigClockClosing[2] = {false, false};
 static int g_nativeBigClockOpeningSlot = 0;
@@ -42625,14 +42629,32 @@ static int nativeBigClockDefaultDockState(int slot)
   return nativeBigClockSafeSlot(slot) == 0 ? 1025 : 1281;
 }
 
-static void nativeBigClockWriteReaperConfigInt(
+static bool nativeBigClockWriteReaperConfigInt(
     const char* key, int value)
 {
-  if (!get_config_var_ptr || !key) return;
+  if (!get_config_var_ptr || !key) return false;
   int size = 0;
   void* address = get_config_var_ptr(key, &size);
-  if (!address || size < static_cast<int>(sizeof(int))) return;
-  *static_cast<int*>(address) = value;
+  if (!address || size < static_cast<int>(sizeof(int))) return false;
+  int* current = static_cast<int*>(address);
+  if (*current != value) *current = value;
+  return true;
+}
+
+static bool nativePrepareBigClockDockerLayout()
+{
+  // O estado da janela escolhe o indice; estas variaveis do REAPER escolhem o
+  // lado e o tamanho desse docker. Os dois precisam concordar.
+  const bool topModeReady =
+    nativeBigClockWriteReaperConfigInt("dockermode4", 2);
+  const bool topHeightReady = nativeBigClockWriteReaperConfigInt(
+    "dockheight_t", kNativeBigClockDockerHeight);
+  const bool bottomModeReady =
+    nativeBigClockWriteReaperConfigInt("dockermode5", 0);
+  const bool bottomHeightReady = nativeBigClockWriteReaperConfigInt(
+    "dockheight", kNativeBigClockDockerHeight);
+  return topModeReady && topHeightReady &&
+    bottomModeReady && bottomHeightReady;
 }
 
 static void nativePrepareFirstUseDockerLayout()
@@ -42645,10 +42667,35 @@ static void nativePrepareFirstUseDockerLayout()
   nativeBigClockWriteReaperConfigInt("dockheight_r", 409);
   nativeBigClockWriteReaperConfigInt("dockermode1", 1); // controller: esquerda
   nativeBigClockWriteReaperConfigInt("dockheight_l", 362);
-  nativeBigClockWriteReaperConfigInt("dockermode4", 2); // clock 1: em cima
-  nativeBigClockWriteReaperConfigInt("dockheight_t", 69);
-  nativeBigClockWriteReaperConfigInt("dockermode5", 0); // clock 2: em baixo
-  nativeBigClockWriteReaperConfigInt("dockheight", 69);
+  nativePrepareBigClockDockerLayout();
+}
+
+static void nativeBigClockMigrateDockLayoutOnce()
+{
+  if (!GetExtState_ptr || !SetExtState_ptr ||
+      nativeAppActiveReadWindowInt(
+        kNativeBigClockDockLayoutMigratedKey, 0) != 0) {
+    return;
+  }
+
+  // Builds anteriores persistiram os dois clocks antes de existir o layout
+  // aprovado. Por isso o caminho de "primeira abertura" nunca mais rodava e o
+  // REAPER continuava restaurando ambos no docker inferior e/ou com altura
+  // antiga. Migra o par atomicamente do ponto de vista da versao: se algum
+  // config var nao estiver disponivel, nao grava o marcador e tenta novamente.
+  if (!nativePrepareBigClockDockerLayout()) return;
+
+  for (int slot = 0; slot < 2; ++slot) {
+    const int dockState = nativeBigClockDefaultDockState(slot);
+    nativeAppActiveWriteWindowInt(
+      nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), dockState);
+    nativeAppActiveWriteWindowInt(
+      nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str(), dockState);
+    nativeAppActiveWriteWindowInt(
+      nativeBigClockKey(slot, "H_V1").c_str(),
+      kNativeBigClockMinimumHeight);
+  }
+  nativeAppActiveWriteWindowInt(kNativeBigClockDockLayoutMigratedKey, 1);
 }
 
 static void nativeBigClockPrepareFirstOpenDock(int slot)
@@ -42657,14 +42704,15 @@ static void nativeBigClockPrepareFirstOpenDock(int slot)
   // O REAPER guarda o lado de cada docker separadamente do estado da janela.
   // Configura apenas no primeiro uso: depois disso, qualquer posição escolhida
   // pelo usuário é respeitada pela chave DOCKSTATE persistida.
-  nativePrepareFirstUseDockerLayout();
+  nativePrepareBigClockDockerLayout();
   const int dockState = nativeBigClockDefaultDockState(slot);
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), dockState);
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "LAST_DOCKSTATE_V1").c_str(), dockState);
   nativeAppActiveWriteWindowInt(
-    nativeBigClockKey(slot, "H_V1").c_str(), 64);
+    nativeBigClockKey(slot, "H_V1").c_str(),
+    kNativeBigClockMinimumHeight);
 }
 
 static bool nativeBigClockWindowIsOpen(int slot)
@@ -42963,7 +43011,8 @@ static void nativeBigClockSaveWindowState(int slot)
     std::max(320, static_cast<int>(rect.right - rect.left)));
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "H_V1").c_str(),
-    std::max(64, static_cast<int>(rect.bottom - rect.top)));
+    std::max(kNativeBigClockMinimumHeight,
+      static_cast<int>(rect.bottom - rect.top)));
   nativeAppActiveWriteWindowInt(
     nativeBigClockKey(slot, "DOCKSTATE_V1").c_str(), 0);
 }
@@ -43723,9 +43772,10 @@ static void nativeBigClockPaint(HWND hwnd)
       nameRect.left += symmetricGutter;
       nameRect.right -= symmetricGutter;
     }
+    // No modo focado o proprio contexto do Big Clock ja deixa claro que este
+    // e o nome atual. Mantem somente a musica para aproveitar toda a largura.
     const std::string focusedName =
-      std::string(playingNow ? "TOCANDO: " : "SELECIONADA: ") +
-      (playingName.empty() ? "-" : playingName);
+      playingName.empty() ? "-" : playingName;
     const int nameHeight = std::max(2,
       static_cast<int>(nameRect.bottom - nameRect.top) - 2);
     const int focusedFontSize = std::max(2,
@@ -44307,6 +44357,11 @@ static LRESULT CALLBACK nativeBigClockWndProc(
     case WM_INITDIALOG:
       SetTimer(hwnd, kNativeBigClockTimerId, 30, nullptr);
       return message == WM_INITDIALOG ? TRUE : 0;
+    case WM_NCHITTEST:
+      // O SWELL consulta o hit-test antes de entregar WM_RBUTTON* no macOS.
+      // Sem HTCLIENT, o clique no conteudo vira WM_NCRBUTTON* e o menu de
+      // configuracao do Big Clock nunca recebe o evento.
+      return HTCLIENT;
     case WM_TIMER:
       if (wParam == kNativeBigClockTimerId) {
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -44332,7 +44387,7 @@ static LRESULT CALLBACK nativeBigClockWndProc(
         limits->ptMinTrackSize.x = std::max<LONG>(
           limits->ptMinTrackSize.x, 380);
         limits->ptMinTrackSize.y = std::max<LONG>(
-          limits->ptMinTrackSize.y, 64);
+          limits->ptMinTrackSize.y, kNativeBigClockMinimumHeight);
       }
       return 0;
     }
@@ -44394,6 +44449,7 @@ static bool nativeOpenBigClockWindow(int slot)
     SetFocus(g_nativeBigClockHwnd[slot]);
     return true;
   }
+  nativeBigClockMigrateDockLayoutOnce();
   nativeBigClockReadSettings(slot);
   const std::string dockStateKey =
     nativeBigClockKey(slot, "DOCKSTATE_V1");
@@ -44407,9 +44463,10 @@ static bool nativeOpenBigClockWindow(int slot)
   const int width = std::max(320,
     nativeAppActiveReadWindowInt(
       nativeBigClockKey(slot, "W_V1").c_str(), 720));
-  const int height = std::max(64,
+  const int height = std::max(kNativeBigClockMinimumHeight,
     nativeAppActiveReadWindowInt(
-      nativeBigClockKey(slot, "H_V1").c_str(), 64));
+      nativeBigClockKey(slot, "H_V1").c_str(),
+      kNativeBigClockMinimumHeight));
   const int dockState = nativeAppActiveReadWindowInt(
     dockStateKey.c_str(), nativeBigClockDefaultDockState(slot));
   const char* title = nativeBigClockTitle(slot);
