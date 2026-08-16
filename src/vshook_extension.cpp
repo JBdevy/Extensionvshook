@@ -6503,6 +6503,7 @@ static std::string nativeTimecodeLanStatusJson()
   std::ostringstream json;
   json << "{\"ok\":true,\"lanOnly\":true,"
        << "\"hookCenterRequired\":true,"
+       << "\"projectSyncLocalMediaReuse\":true,"
        << "\"sessionId\":"
        << nativeJsonString(nativeTimecodeLanSessionId()) << ","
        << "\"mode\":"
@@ -23931,9 +23932,28 @@ static void nativeProjectSyncShowDiffModal(
   const std::string& diffJson)
 {
   std::string requestId;
+  bool applyBusy = false;
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     requestId = g_nativeProjectSyncPreflight.requestId;
+    const std::string applyState = nativeLower(nativeTrim(
+      g_nativeProjectSyncApply.state));
+    applyBusy = applyState == "requested" ||
+      applyState == "requesting" || applyState == "downloading" ||
+      applyState == "verifying" || applyState == "validating" ||
+      applyState == "ready_to_open" ||
+      applyState == "ready_to_apply" || applyState == "applying" ||
+      applyState == "apply_started";
+  }
+  if (g_nativeMainModalKind == NativeMainModalKind::ProjectSyncDiff &&
+      applyBusy) {
+    // Durante a transferencia/validacao, diagnosticos repetidos do relay nao
+    // podem substituir a tela AGUARDE pela lista de diferencas. A conferencia
+    // original permanece congelada ate sucesso ou erro terminal.
+    if (nativeAppActivePanelIsOpen()) {
+      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    }
+    return;
   }
   const std::string diagnosticKey = requestId + ":" +
     std::to_string(diffJson.size()) + ":" +
@@ -24142,10 +24162,19 @@ static void nativeProjectSyncStorePreflightResult(
   const std::string& remoteConfigSnapshot = std::string())
 {
   std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  const std::string applyState = nativeLower(nativeTrim(
+    g_nativeProjectSyncApply.state));
+  const bool applyBusy = applyState == "requested" ||
+    applyState == "requesting" || applyState == "downloading" ||
+    applyState == "verifying" || applyState == "validating" ||
+    applyState == "ready_to_open" ||
+    applyState == "ready_to_apply" || applyState == "applying" ||
+    applyState == "apply_started";
   // Um novo pareamento substitui qualquer estado visual órfão da sessão
   // anterior. Nunca interrompe um worker/pending commit ainda legítimo.
   if (!requestId.empty() &&
       g_nativeProjectSyncApply.requestId != requestId &&
+      !applyBusy &&
       !g_nativeProjectSyncBundleWorkerRunning.load() &&
       !g_nativeProjectSyncPendingOpen.ready) {
     g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
@@ -24855,6 +24884,12 @@ struct NativeProjectSyncBundleFile {
   std::string sha256;
 };
 
+struct NativeProjectSyncLocalReuseFile {
+  std::string absolutePath;
+  uint64_t size = 0;
+  std::string sha256;
+};
+
 struct NativeProjectSyncBundleSource {
   std::string id;
   std::string absolutePath;
@@ -25548,6 +25583,63 @@ static void nativeProjectSyncApplyBundleWorker(
     return;
   }
 
+  // Este bloco e acrescentado somente pela Hook Center do proprio PC B,
+  // depois de validar que o conteudo ja existe no projeto local. Ele nunca
+  // vem do PC A e cada entrada ainda precisa coincidir com tamanho e SHA do
+  // manifesto autenticado recebido pela rede.
+  std::map<std::string, NativeProjectSyncLocalReuseFile> localReuseFiles;
+  const std::string localReuseJson = nativeTrim(
+    nativeJsonExtractRawValue(descriptor, "localReuseFiles"));
+  if (!localReuseJson.empty() && localReuseJson != "null") {
+    const std::vector<std::string> reuseObjects =
+      nativeProjectSyncJsonObjectArray(localReuseJson, 16384);
+    std::map<std::string, const NativeProjectSyncBundleFile*> filesById;
+    for (const NativeProjectSyncBundleFile& file : files) {
+      filesById[file.id] = &file;
+    }
+    for (const std::string& object : reuseObjects) {
+      const std::string id = nativeTrim(
+        nativeJsonExtractString(object, "id"));
+      const auto fileFound = filesById.find(id);
+      if (!nativeProjectSyncPortableIdIsValid(id) ||
+          fileFound == filesById.end() ||
+          fileFound->second->kind != "media" ||
+          localReuseFiles.count(id) != 0) {
+        nativeProjectSyncFinishApplyError(input.requestId,
+          "O mapa local de midia contem um identificador invalido.");
+        g_nativeProjectSyncBundleWorkerRunning.store(false);
+        return;
+      }
+      NativeProjectSyncLocalReuseFile reuse;
+      reuse.absolutePath = normalizeSlashes(nativeTrim(
+        nativeJsonExtractString(object, "absolutePath")));
+      const long long reuseSize = nativeJsonInt64(object, "size", -1);
+      reuse.sha256 = nativeLower(nativeTrim(
+        nativeJsonExtractString(object, "sha256")));
+      if (reuse.absolutePath.empty() ||
+          !nativeTelepromptPathIsAbsolute(reuse.absolutePath) ||
+          reuseSize < 0 ||
+          static_cast<uint64_t>(reuseSize) != fileFound->second->size ||
+          reuse.sha256 != nativeLower(fileFound->second->sha256)) {
+        nativeProjectSyncFinishApplyError(input.requestId,
+          "O mapa local de midia nao corresponde ao manifesto recebido.");
+        g_nativeProjectSyncBundleWorkerRunning.store(false);
+        return;
+      }
+      reuse.size = static_cast<uint64_t>(reuseSize);
+      NativeProjectSyncRegularFileStamp reuseStamp;
+      if (!nativeProjectSyncRegularFileStamp(
+            reuse.absolutePath, reuseStamp) ||
+          reuseStamp.size != reuse.size) {
+        nativeProjectSyncFinishApplyError(input.requestId,
+          "Uma midia que seria reutilizada no PC B nao esta mais disponivel.");
+        g_nativeProjectSyncBundleWorkerRunning.store(false);
+        return;
+      }
+      localReuseFiles.emplace(id, std::move(reuse));
+    }
+  }
+
   const std::string managedMediaRoot = joinPath(
     input.originalProjectDirectory, "VS Hook Project Sync/Media");
   if ((nativeProjectSyncDirectoryExists(managedMediaRoot) &&
@@ -25575,13 +25667,27 @@ static void nativeProjectSyncApplyBundleWorker(
   }
   uint64_t bytesDone = 0;
   std::map<std::string, std::string> stagedMediaToLocal;
+  std::map<std::string, std::string> portableMediaToLocal;
+  const auto mediaPathKey = [](const std::string& value) {
+    std::string key = normalizeSlashes(nativeTrim(value));
+#ifdef _WIN32
+    key = nativeLower(key);
+#endif
+    return key;
+  };
   std::string sourceProjectPath;
   for (size_t index = 0; index < files.size(); ++index) {
     const NativeProjectSyncBundleFile& file = files[index];
-    const std::string sourcePath = joinPath(
+    const std::string stagedSourcePath = joinPath(
       input.stagingRoot, file.relativePath);
-    if (!nativeProjectSyncPathWithin(input.stagingRoot, sourcePath) ||
-        !nativeProjectSyncPathChainIsSafe(input.stagingRoot, sourcePath) ||
+    const auto reuseFound = localReuseFiles.find(file.id);
+    const bool reusedLocally = reuseFound != localReuseFiles.end();
+    const std::string sourcePath = reusedLocally
+      ? reuseFound->second.absolutePath : stagedSourcePath;
+    if ((!reusedLocally &&
+         (!nativeProjectSyncPathWithin(input.stagingRoot, sourcePath) ||
+          !nativeProjectSyncPathChainIsSafe(
+            input.stagingRoot, sourcePath))) ||
         !fileExists(sourcePath) ||
         nativeProjectSyncFileSize(sourcePath) !=
           static_cast<long long>(file.size)) {
@@ -25611,6 +25717,16 @@ static void nativeProjectSyncApplyBundleWorker(
       continue;
     }
     if (file.kind != "media") continue;
+
+    if (reusedLocally) {
+      // O projeto B ja referencia este conteudo. Mantem o arquivo no lugar,
+      // sem criar uma segunda copia no staging nem no cache gerenciado.
+      stagedMediaToLocal[mediaPathKey(stagedSourcePath)] = sourcePath;
+      portableMediaToLocal[mediaPathKey(file.relativePath)] = sourcePath;
+      portableMediaToLocal[mediaPathKey("../" + file.relativePath)] =
+        sourcePath;
+      continue;
+    }
 
     // Cada conteúdo recebe um nome estável pelo SHA. Se o mesmo arquivo já
     // foi recebido antes, ele é validado e reutilizado; não é copiado outra
@@ -25656,7 +25772,10 @@ static void nativeProjectSyncApplyBundleWorker(
         return;
       }
     }
-    stagedMediaToLocal[normalizeSlashes(sourcePath)] = destinationPath;
+    stagedMediaToLocal[mediaPathKey(stagedSourcePath)] = destinationPath;
+    portableMediaToLocal[mediaPathKey(file.relativePath)] = destinationPath;
+    portableMediaToLocal[mediaPathKey("../" + file.relativePath)] =
+      destinationPath;
   }
 
   if (sourceProjectPath.empty() || !fileExists(sourceProjectPath)) {
@@ -25683,9 +25802,19 @@ static void nativeProjectSyncApplyBundleWorker(
   for (const auto& reference : references) {
     if (reference.valueStart < copiedUntil ||
         reference.valueEnd > sourceProjectText.size()) continue;
-    const auto mapped = stagedMediaToLocal.find(
-      normalizeSlashes(reference.resolvedPath));
-    if (mapped == stagedMediaToLocal.end()) {
+    auto mapped = stagedMediaToLocal.find(
+      mediaPathKey(reference.resolvedPath));
+    std::string mappedPath;
+    if (mapped != stagedMediaToLocal.end()) {
+      mappedPath = mapped->second;
+    } else {
+      const auto portableMapped = portableMediaToLocal.find(
+        mediaPathKey(reference.sourcePath));
+      if (portableMapped != portableMediaToLocal.end()) {
+        mappedPath = portableMapped->second;
+      }
+    }
+    if (mappedPath.empty()) {
       nativeProjectSyncFinishApplyError(input.requestId,
         "O snapshot nao conseguiu vincular toda a midia recebida.");
       g_nativeProjectSyncBundleWorkerRunning.store(false);
@@ -25693,7 +25822,7 @@ static void nativeProjectSyncApplyBundleWorker(
     }
     inPlaceProjectText.append(sourceProjectText, copiedUntil,
       reference.valueStart - copiedUntil);
-    inPlaceProjectText += mapped->second;
+    inPlaceProjectText += mappedPath;
     copiedUntil = reference.valueEnd;
   }
   inPlaceProjectText.append(
@@ -34376,7 +34505,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           waitStage = "Recebendo arquivos e dados do PC A...";
         } else if (applyState.state == "verifying" ||
                    applyState.state == "validating") {
-          waitStage = "Validando os arquivos recebidos...";
+          waitStage = "Validando os arquivos do projeto...";
         } else if (applyState.state == "ready_to_open" ||
                    applyState.state == "ready_to_apply" ||
                    applyState.state == "applying" ||
@@ -34500,7 +34629,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         }
       } else if (applyState.state == "validating" ||
                  applyState.state == "verifying") {
-        footerNotice = "Validando todos os arquivos e SHA256...";
+        footerNotice = "Conferindo arquivos existentes e SHA256...";
       } else if (applyState.state == "ready_to_open" ||
                  applyState.state == "applying" ||
                  applyState.state == "apply_started") {
