@@ -24140,6 +24140,29 @@ static void nativeProjectSyncShowDiffModal(
   }
 }
 
+static void nativeProjectSyncOpenConferenceFromConfig()
+{
+  std::string diffJson;
+  bool conferenceAvailable = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    conferenceAvailable =
+      g_nativeTimecodeLanMode == "project_sync" &&
+      g_nativeProjectSyncPreflight.hasResult &&
+      !g_nativeProjectSyncPreflight.requestId.empty();
+    if (conferenceAvailable) {
+      diffJson = g_nativeProjectSyncPreflight.diff;
+    }
+  }
+  if (conferenceAvailable && !diffJson.empty()) {
+    nativeProjectSyncShowDiffModal(diffJson);
+    return;
+  }
+  nativeUiShowTemporaryPopup(
+    "NENHUMA CONFERENCIA OU TRANSFERENCIA DO PROJECT SYNC",
+    2.0);
+}
+
 static void nativeProjectSyncRefreshManifestOnMainThread(bool force)
 {
   std::string mode;
@@ -37261,6 +37284,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       }, 2);
       sectionY = drawSection("App, controles e acesso", sectionY, {
         {"Config Acess", "config_access", "access"},
+        {"Conferência/Progresso", "config_project_sync", "play"},
         {"Não mostrar novamente o aviso inicial de atalhos",
           "config_shortcut_notice", "page"}
       }, 2);
@@ -49890,6 +49914,11 @@ static bool nativeMainHandleModalClick(
   }
 
   if (nativeUiHandlePreviewConfigAction(action)) return true;
+
+  if (action == "config_project_sync") {
+    nativeProjectSyncOpenConferenceFromConfig();
+    return true;
+  }
 
   if (nativeStartsWith(action,
         "bpm_scan_result_select|")) {
