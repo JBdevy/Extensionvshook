@@ -59005,15 +59005,21 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     const int availableWidth = std::max(
       1, width - edge * 2 -
         (visibleClockBoxes > 1 ? stackGap : 0));
-    const int equalBoxWidth = std::max(
-      1, std::min(timerWidth,
-        availableWidth / std::max(1, visibleClockBoxes)));
+    // Com os dois relogios visiveis, a faixa inteira deve ser dividida entre
+    // eles. Limitar cada caixa ao tamanho minimo do texto ancorava o par na
+    // lateral escolhida e deixava uma grande area preta sem uso, especialmente
+    // em tela cheia/Retina no macOS. Um relogio isolado continua compacto.
+    const int equalBoxWidth = visibleClockBoxes > 1
+      ? std::max(1, availableWidth / visibleClockBoxes)
+      : std::max(1, std::min(timerWidth, availableWidth));
     const int pairWidth =
       equalBoxWidth * visibleClockBoxes +
       (visibleClockBoxes > 1 ? stackGap : 0);
-    const int pairLeft = clockAtRight
-      ? client.right - edge - pairWidth
-      : client.left + edge;
+    const int pairLeft = visibleClockBoxes > 1
+      ? client.left + edge
+      : (clockAtRight
+          ? client.right - edge - pairWidth
+          : client.left + edge);
     const RECT pairBand = allocateBand(
       clockTop, clockHeight,
       pairLeft, pairLeft + pairWidth);
