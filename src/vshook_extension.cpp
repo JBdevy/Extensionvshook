@@ -5051,6 +5051,7 @@ struct NativeProjectSyncApplyState {
   uint64_t sequence = 0;
   int64_t stateUpdatedAtMs = 0;
   bool automatic = false;
+  bool applyConfigurations = false;
 };
 
 struct NativeProjectSyncPendingOpen {
@@ -5187,6 +5188,12 @@ static std::string g_nativeProjectSyncLastAppliedConfigRevision;
 static bool g_nativeProjectSyncPublishInitialConfig = false;
 static std::chrono::steady_clock::time_point
   g_nativeProjectSyncLastManifestRefresh;
+// O REAPER pode manter o item tocando com a waveform vazia quando a source
+// ficou offline antes de o Project Sync religar o arquivo. A acao nativa
+// "Build any missing peaks" e coalescida para rodar uma unica vez depois do
+// lote, sem transferir caches .reapeaks entre computadores.
+static bool g_nativeProjectSyncMissingPeaksPending = false;
+static int64_t g_nativeProjectSyncMissingPeaksDueAtMs = 0;
 static std::atomic<bool> g_nativeForceMixerBuild{false};
 static std::string g_nativePremixSelectedSongId;
 static double g_nativePremixSelectedSongStart = 0.0;
@@ -5319,6 +5326,28 @@ static void nativeUiReadManualStopFadeoutVisualState(
       visualElapsed / durationSec);
   }
   progress = std::max(0.0, std::min(1.0, progress));
+}
+
+static void nativeProjectSyncScheduleMissingPeaks(int delayMs = 180)
+{
+  if (!Main_OnCommand_ptr) return;
+  g_nativeProjectSyncMissingPeaksPending = true;
+  g_nativeProjectSyncMissingPeaksDueAtMs =
+    nativeSteadyNowMs() + std::max(0, delayMs);
+}
+
+static void nativeProjectSyncProcessMissingPeaksOnMainThread()
+{
+  if (!g_nativeProjectSyncMissingPeaksPending || !Main_OnCommand_ptr ||
+      nativeSteadyNowMs() < g_nativeProjectSyncMissingPeaksDueAtMs) {
+    return;
+  }
+  g_nativeProjectSyncMissingPeaksPending = false;
+  g_nativeProjectSyncMissingPeaksDueAtMs = 0;
+  // REAPER action 40047: Build any missing peaks. Ela preserva selecao e
+  // agenda somente peaks ausentes; os que ja existem nao sao reconstruidos.
+  Main_OnCommand_ptr(40047, 0);
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
 }
 
 struct NativePendingSelectionCommand {
@@ -6243,6 +6272,8 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
     mode == "project_sync" && projectSyncRole == "primary";
   g_nativeProjectSyncLastManifestRefresh =
     std::chrono::steady_clock::time_point{};
+  g_nativeProjectSyncMissingPeaksPending = false;
+  g_nativeProjectSyncMissingPeaksDueAtMs = 0;
   g_nativeTimecodeLanPendingTransportIntent =
     NativeTimecodeLanPendingTransportIntent{};
   if (mode != "transmitter" && mode != "project_sync") {
@@ -23387,7 +23418,7 @@ static std::string nativeProjectSyncRecordSummary(
   return fields.size() > 1 ? fields[1] : type;
 }
 
-struct NativeProjectSyncItemRecordComparison {
+struct NativeProjectSyncRecordComparison {
   bool recognized = false;
   bool equivalent = false;
   std::string primarySummary;
@@ -23411,12 +23442,12 @@ static bool nativeProjectSyncItemNumberEqual(
   return std::fabs(leftValue - rightValue) <= tolerance;
 }
 
-static NativeProjectSyncItemRecordComparison
+static NativeProjectSyncRecordComparison
 nativeProjectSyncCompareItemRecords(
   const std::string& primaryLine,
   const std::string& secondaryLine)
 {
-  NativeProjectSyncItemRecordComparison comparison;
+  NativeProjectSyncRecordComparison comparison;
   std::vector<std::string> primary =
     nativeProjectSyncTsvFields(primaryLine);
   std::vector<std::string> secondary =
@@ -23507,6 +23538,42 @@ nativeProjectSyncCompareItemRecords(
     comparison.primarySummary += " | " + entry.label + ": " + entry.primary;
     comparison.secondarySummary += " | " + entry.label + ": " + entry.secondary;
   }
+  return comparison;
+}
+
+static NativeProjectSyncRecordComparison
+nativeProjectSyncCompareTempoRecords(
+  const std::string& primaryLine,
+  const std::string& secondaryLine)
+{
+  NativeProjectSyncRecordComparison comparison;
+  const std::vector<std::string> primary =
+    nativeProjectSyncTsvFields(primaryLine);
+  const std::vector<std::string> secondary =
+    nativeProjectSyncTsvFields(secondaryLine);
+  if (primary.size() != 9 || secondary.size() != 9 ||
+      primary[0] != "TEMPO" || secondary[0] != "TEMPO") {
+    return comparison;
+  }
+  comparison.recognized = true;
+
+  // measurePosition e beatPosition (campos 3/4) sao coordenadas derivadas.
+  // Ao recriar o mesmo mapa em Time e voltar o projeto para Beats, o REAPER
+  // pode normaliza-las de forma diferente entre Windows/macOS, embora tempo,
+  // BPM, assinatura e curva sejam identicos. Elas nao alteram a execucao e
+  // nao podem produzir um falso bloqueio.
+  const bool samePosition = nativeProjectSyncItemNumberEqual(
+    primary[2], secondary[2], 0.000001);
+  const bool sameBpm = nativeProjectSyncItemNumberEqual(
+    primary[5], secondary[5], 0.000001);
+  comparison.equivalent = samePosition && sameBpm &&
+    primary[6] == secondary[6] &&
+    primary[7] == secondary[7] &&
+    primary[8] == secondary[8];
+  if (comparison.equivalent) return comparison;
+
+  comparison.primarySummary = nativeProjectSyncRecordSummary(primary);
+  comparison.secondarySummary = nativeProjectSyncRecordSummary(secondary);
   return comparison;
 }
 
@@ -23772,12 +23839,19 @@ static NativeProjectSyncCompareResult nativeProjectSyncCompareManifests(
           leftValue->second == rightValue->second) {
         continue;
       }
-      NativeProjectSyncItemRecordComparison itemComparison;
+      NativeProjectSyncRecordComparison recordComparison;
       if (!config && leftExists && rightExists &&
           identity.rfind("ITEM\t", 0) == 0) {
-        itemComparison = nativeProjectSyncCompareItemRecords(
+        recordComparison = nativeProjectSyncCompareItemRecords(
           leftValue->second, rightValue->second);
-        if (itemComparison.recognized && itemComparison.equivalent) {
+        if (recordComparison.recognized && recordComparison.equivalent) {
+          continue;
+        }
+      } else if (!config && leftExists && rightExists &&
+                 identity.rfind("TEMPO\t", 0) == 0) {
+        recordComparison = nativeProjectSyncCompareTempoRecords(
+          leftValue->second, rightValue->second);
+        if (recordComparison.recognized && recordComparison.equivalent) {
           continue;
         }
       }
@@ -23798,9 +23872,9 @@ static NativeProjectSyncCompareResult nativeProjectSyncCompareManifests(
         ? "missing_on_secondary"
         : (!leftExists ? "extra_on_secondary" : "changed");
       if (leftExists) {
-        if (itemComparison.recognized &&
-            !itemComparison.primarySummary.empty()) {
-          difference.primary = itemComparison.primarySummary;
+        if (recordComparison.recognized &&
+            !recordComparison.primarySummary.empty()) {
+          difference.primary = recordComparison.primarySummary;
         } else {
           const auto summary = primary.summaries.find(identity);
           difference.primary = summary != primary.summaries.end()
@@ -23808,9 +23882,9 @@ static NativeProjectSyncCompareResult nativeProjectSyncCompareManifests(
         }
       }
       if (rightExists) {
-        if (itemComparison.recognized &&
-            !itemComparison.secondarySummary.empty()) {
-          difference.secondary = itemComparison.secondarySummary;
+        if (recordComparison.recognized &&
+            !recordComparison.secondarySummary.empty()) {
+          difference.secondary = recordComparison.secondarySummary;
         } else {
           const auto summary = secondary.summaries.find(identity);
           difference.secondary = summary != secondary.summaries.end()
@@ -25388,24 +25462,6 @@ static bool nativeProjectSyncPathWithin(
      path[root.size()] == '/');
 }
 
-static std::string nativeProjectSyncManagedBaseDirectory(
-  const std::string& projectPath)
-{
-  const std::string normalized = normalizeSlashes(
-    nativeTrim(projectPath));
-  const std::string marker = "/VS Hook Project Sync/Clones/";
-#ifdef _WIN32
-  const size_t position = nativeLower(normalized).find(
-    nativeLower(marker));
-#else
-  const size_t position = normalized.find(marker);
-#endif
-  if (position != std::string::npos && position > 0) {
-    return normalized.substr(0, position);
-  }
-  return nativeProjectSyncParentPath(normalized);
-}
-
 struct NativeProjectSyncApplyInput {
   std::string requestId;
   std::string bundleId;
@@ -25413,6 +25469,8 @@ struct NativeProjectSyncApplyInput {
   std::string stagingRoot;
   std::string originalProjectPath;
   std::string originalProjectDirectory;
+  std::string originalMediaDirectory;
+  std::string backupRoot;
   int originalProjectChangeCount = -1;
   std::string previousConfigSnapshot;
   std::string previousConfigRevision;
@@ -25640,14 +25698,18 @@ static void nativeProjectSyncApplyBundleWorker(
     }
   }
 
-  const std::string managedMediaRoot = joinPath(
-    input.originalProjectDirectory, "VS Hook Project Sync/Media");
-  if ((nativeProjectSyncDirectoryExists(managedMediaRoot) &&
-       nativeProjectSyncPathIsLinkOrReparse(managedMediaRoot)) ||
-      !nativeProjectSyncEnsureDirectory(managedMediaRoot, error)) {
+  // A midia recebida pertence ao proprio projeto B. Usa o caminho efetivo de
+  // gravacao/midia que o REAPER devolve por GetProjectPathEx (por exemplo,
+  // "Audio Files"), sem criar uma arvore paralela "VS Hook Project Sync".
+  const std::string projectMediaRoot =
+    input.originalMediaDirectory.empty()
+      ? input.originalProjectDirectory
+      : input.originalMediaDirectory;
+  if (projectMediaRoot.empty() ||
+      !nativeProjectSyncEnsureDirectory(projectMediaRoot, error)) {
     nativeProjectSyncFinishApplyError(input.requestId,
       error.empty()
-        ? "A pasta gerenciada de midia do Project Sync nao e segura."
+        ? "A pasta de midia do projeto B nao esta disponivel."
         : error);
     g_nativeProjectSyncBundleWorkerRunning.store(false);
     return;
@@ -25728,17 +25790,18 @@ static void nativeProjectSyncApplyBundleWorker(
       continue;
     }
 
-    // Cada conteúdo recebe um nome estável pelo SHA. Se o mesmo arquivo já
-    // foi recebido antes, ele é validado e reutilizado; não é copiado outra
-    // vez para o projeto B.
-    const std::string hashPrefix = file.sha256.substr(0, 20) + "_";
-    std::string managedName = nativeProjectSyncSafeFileName(
+    // Preserva o nome real na pasta Media/Audio Files do projeto. O prefixo
+    // SHA existe apenas no descriptor de transporte e nunca deve aparecer no
+    // projeto do usuario. O PC A e a autoridade: se ja existir outro conteudo
+    // com o mesmo nome no PC B, ele sera substituido atomicamente.
+    std::string mediaName = nativeProjectSyncSafeFileName(
       file.relativePath);
-    if (nativeLower(managedName).rfind(nativeLower(hashPrefix), 0) != 0) {
-      managedName = hashPrefix + managedName;
+    while (nativeProjectSyncHexPrefix20(mediaName)) {
+      mediaName.erase(0, 21);
     }
+    if (mediaName.empty()) mediaName = "midia";
     const std::string destinationPath = joinPath(
-      managedMediaRoot, managedName);
+      projectMediaRoot, mediaName);
     bool destinationReady = false;
     if (fileExists(destinationPath) &&
         nativeProjectSyncFileSize(destinationPath) ==
@@ -25828,9 +25891,8 @@ static void nativeProjectSyncApplyBundleWorker(
   inPlaceProjectText.append(
     sourceProjectText, copiedUntil, std::string::npos);
   const std::string backupPath = joinPath(
-    input.originalProjectDirectory,
-    "VS Hook Project Sync/Backups/" +
-      nativeProjectSyncTimestampForPath() + "-" +
+    input.backupRoot,
+    nativeProjectSyncTimestampForPath() + "-" +
       std::to_string(nativeSystemNowMs()) + "/" +
       nativeProjectSyncSafeFileName(input.originalProjectPath));
   const std::string previousConfigSnapshot =
@@ -26448,9 +26510,19 @@ static bool nativeProjectSyncApplyBundleFromCommand(
   g_nativeProjectSyncBundleWorkerCancel.store(false);
   g_nativeProjectSyncBundleWorkerRunning.store(true);
   try {
+    const std::string projectDirectory =
+      nativeProjectSyncParentPath(projectPath);
+    std::string projectMediaDirectory =
+      nativeTelepromptProjectMediaDirectory(project);
+    if (projectMediaDirectory.empty()) {
+      projectMediaDirectory = projectDirectory;
+    }
+    const std::string backupRoot = joinPath(
+      normalizeSlashes(GetResourcePath_ptr ? GetResourcePath_ptr() : ""),
+      "VS Hook/Project Sync/Backups");
     NativeProjectSyncApplyInput input{
       requestId, bundleId, descriptorPath, stagingRoot,
-      projectPath, nativeProjectSyncManagedBaseDirectory(projectPath),
+      projectPath, projectDirectory, projectMediaDirectory, backupRoot,
       changeCount, previousConfigSnapshot, previousConfigRevision,
       sourceManifest, automatic};
     g_nativeProjectSyncBundleWorker = std::thread([input]() {
@@ -26620,6 +26692,16 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
     "Continuar?",
     "Project Sync - Aplicar modificacoes", 4);
   if (confirmation != 6) return;
+  bool applyConfigurations = false;
+  if (g_nativeProjectSyncDiffModalConfigCount > 0) {
+    const int configConfirmation = ShowMessageBox_ptr(
+      "Tambem aplicar no PC B as configuracoes do VS Hook mostradas "
+      "na conferencia?\n\nIsso inclui Personalizar, FaderOut, Multiloops "
+      "e demais funcoes permitidas pelo Project Sync.\n\n"
+      "Escolha Nao para manter as configuracoes atuais do PC B.",
+      "Project Sync - Aplicar configuracoes", 4);
+    applyConfigurations = configConfirmation == 6;
+  }
   const std::string requestId =
     nativeProjectSyncRequestIdIsValid(preflightRequestId)
       ? preflightRequestId : nativeProjectSyncNewApplyRequestId();
@@ -26633,6 +26715,7 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
     g_nativeProjectSyncApply.sequence =
       ++g_nativeProjectSyncApplySequence;
     g_nativeProjectSyncApply.automatic = false;
+    g_nativeProjectSyncApply.applyConfigurations = applyConfigurations;
     g_nativeProjectSyncConfigurationAuthorized = false;
   }
   g_nativeForceStateBuild.store(true);
@@ -27270,6 +27353,9 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
 {
   nativeProjectSyncJoinFinishedBundleWorker();
   NativeProjectSyncPendingOpen pending;
+  bool applyConfigurations = false;
+  std::string remoteConfigSnapshot;
+  std::string remoteConfigRevision;
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     if (!g_nativeProjectSyncPendingOpen.ready) return;
@@ -27277,6 +27363,12 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
     if (g_nativeProjectSyncApply.requestId == pending.requestId) {
       g_nativeProjectSyncApply.state = "applying";
       g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
+      applyConfigurations =
+        g_nativeProjectSyncApply.applyConfigurations;
+      remoteConfigSnapshot =
+        g_nativeProjectSyncPreflight.remoteConfigSnapshot;
+      remoteConfigRevision =
+        g_nativeProjectSyncPreflight.remoteConfigRevision;
     }
   }
   char currentPathBuffer[8192] = "";
@@ -27331,6 +27423,22 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
   if (UpdateTimeline_ptr) UpdateTimeline_ptr();
   if (TrackList_AdjustWindows_ptr) TrackList_AdjustWindows_ptr(false);
   if (UpdateArrange_ptr) UpdateArrange_ptr();
+  nativeProjectSyncScheduleMissingPeaks();
+
+  bool configurationsApplied = false;
+  std::string configurationError;
+  if (applyConfigurations && !remoteConfigSnapshot.empty()) {
+    if (remoteConfigRevision.empty()) {
+      remoteConfigRevision =
+        nativeProjectSyncHashText(remoteConfigSnapshot);
+    }
+    configurationsApplied = nativeProjectSyncApplyConfigSnapshot(
+      remoteConfigSnapshot, remoteConfigRevision, configurationError);
+    if (configurationsApplied) {
+      std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+      g_nativeProjectSyncConfigurationAuthorized = true;
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     if (g_nativeProjectSyncApply.requestId == pending.requestId) {
@@ -27341,25 +27449,59 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
       g_nativeProjectSyncApply.error.clear();
     }
     g_nativeProjectSyncPendingOpen = NativeProjectSyncPendingOpen{};
-    // Uma reconciliação automática acontece dentro da sessão já aprovada no
-    // pareamento. Manter o preflight é obrigatório para que as próximas
-    // inclusões/exclusões continuem usando o mesmo canal sem abrir novamente
-    // a janela de conferência. A aplicação manual inicial encerra o preflight
-    // antigo normalmente e será pareada contra o novo estado estrutural.
-    if (!pending.automatic) {
-      g_nativeProjectSyncPreflight = NativeProjectSyncPreflightState{};
-    }
+    // O mesmo preflight permanece vivo depois da aplicacao. Zera-lo fazia a
+    // Hook Center iniciar outro pareamento e reabrir a conferencia para as
+    // mesmas diferencas que acabaram de ser tratadas.
   }
   g_nativeProjectSyncStructuralManifest.clear();
   g_nativeProjectSyncManifestProject = nullptr;
   g_nativeProjectSyncManifestChangeCount = -1;
   g_nativeProjectSyncLastManifestRefresh =
     std::chrono::steady_clock::time_point{};
+  nativeProjectSyncRefreshManifestOnMainThread(true);
+  std::string remoteManifest;
+  std::string localManifest;
+  std::string requestId;
+  std::string remoteManifestRevision;
+  std::string storedRemoteConfigSnapshot;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    remoteManifest = g_nativeProjectSyncPreflight.remoteManifest;
+    localManifest = g_nativeProjectSyncPreflight.manifest;
+    requestId = g_nativeProjectSyncPreflight.requestId;
+    remoteManifestRevision =
+      g_nativeProjectSyncPreflight.remoteManifestRevision;
+    storedRemoteConfigSnapshot =
+      g_nativeProjectSyncPreflight.remoteConfigSnapshot;
+  }
+  if (!remoteManifest.empty() && !localManifest.empty() &&
+      nativeProjectSyncRequestIdIsValid(requestId)) {
+    NativeProjectSyncCompareResult result =
+      nativeProjectSyncCompareManifests(remoteManifest, localManifest);
+    result.configApplied = configurationsApplied ||
+      result.configDifferenceCount == 0;
+    nativeProjectSyncBuildComparePresentation(result);
+    nativeProjectSyncStorePreflightResult(
+      requestId, result.ready, result.diffJson,
+      remoteManifestRevision, remoteManifest,
+      storedRemoteConfigSnapshot);
+  }
   g_nativeForceSnapshotBuild.store(true);
   g_nativeForceStateBuild.store(true);
   nativeUiCloseMainModal();
-  nativeUiShowTemporaryPopup(
-    "Modificacoes aplicadas no projeto aberto. Backup do PC B criado.", 2.8);
+  if (applyConfigurations && !configurationsApplied) {
+    nativeUiShowTemporaryPopup(
+      configurationError.empty()
+        ? "Projeto aplicado; as configuracoes nao puderam ser copiadas."
+        : "Projeto aplicado; falha ao copiar configuracoes do PC A.",
+      3.2);
+  } else {
+    nativeUiShowTemporaryPopup(
+      configurationsApplied
+        ? "Projeto e configuracoes aplicados. Backup do PC B criado."
+        : "Modificacoes aplicadas no projeto aberto. Backup do PC B criado.",
+      2.8);
+  }
 }
 
 static bool nativeApplyProjectSyncCommand(
@@ -65212,6 +65354,9 @@ static bool nativeApplyProjectSyncLiveCommand(
     }
     nativeProjectSyncCommitLiveRevision(incoming);
     nativeProjectSyncFinishLiveMutation(project, true, changed);
+    if (trackUpsert && changed) {
+      nativeProjectSyncScheduleMissingPeaks();
+    }
     return true;
   }
 
@@ -65313,6 +65458,9 @@ static bool nativeApplyProjectSyncLiveCommand(
   nativeProjectSyncCommitLiveRevision(incoming);
   nativeProjectSyncFinishLiveMutation(
     project, itemUpsert, changed);
+  if (itemUpsert && changed) {
+    nativeProjectSyncScheduleMissingPeaks();
+  }
   return true;
 }
 
@@ -69279,6 +69427,7 @@ static void startupTimer()
   nativeProjectSyncFinalizePreparedBundleOnMainThread();
   nativeProjectSyncExpireStalledApplyOnMainThread();
   nativeProjectSyncCommitPendingOpenOnMainThread();
+  nativeProjectSyncProcessMissingPeaksOnMainThread();
   nativeProjectSyncRefreshManifestOnMainThread(false);
   nativeProjectSyncPollLiveProjectOnMainThread();
   nativeProjectSyncPollViewportOnMainThread();
