@@ -26394,9 +26394,18 @@ static bool nativeProjectSyncUpdateApplyProgressFromCommand(
     static_cast<int>(nativeJsonInt64(commandBody, "fileIndex", 0)));
   g_nativeProjectSyncApply.fileCount = std::max<int>(0,
     static_cast<int>(nativeJsonInt64(commandBody, "fileCount", 0)));
-  g_nativeProjectSyncApply.error = state == "error"
+  std::string progressError = state == "error"
     ? nativeTrim(nativeJsonExtractString(commandBody, "error"))
     : std::string();
+  const std::string normalizedProgressError = nativeLower(progressError);
+  if (state == "error" &&
+      (progressError.empty() || progressError == "0" ||
+       normalizedProgressError == "false" ||
+       normalizedProgressError == "null")) {
+    progressError =
+      "A transferencia Project Sync foi interrompida pela Hook Center.";
+  }
+  g_nativeProjectSyncApply.error = std::move(progressError);
   g_nativeForceStateBuild.store(true);
   // O snapshot geral pode continuar semanticamente igual enquanto somente
   // bytes/progresso mudam. Solicita o repaint diretamente para a conferencia
