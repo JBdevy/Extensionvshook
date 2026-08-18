@@ -5005,6 +5005,7 @@ struct NativeProjectSyncLiveTrackState {
   std::string structureKey;
   int trackIndex = 0;
   int folderDepth = 0;
+  int itemCount = 0;
 };
 
 struct NativeProjectSyncLiveItemState {
@@ -9185,6 +9186,9 @@ static void nativeNotifyProjectPlaylistSwitchBlocked()
 // Este snapshot nao percorre tracks, markers, regioes, Parts, Premix ou Mixer;
 // apenas enumera as abas de projeto e publica a autenticacao necessaria para a
 // tela de entrada do Diretor. O heartbeat do app ativa o snapshot completo.
+static std::string nativeTelepromptProjectMediaDirectory(
+  ReaProject* project);
+
 static void nativePublishStandbyDiscoveryState()
 {
   if (!EnumProjects_ptr) return;
@@ -9198,6 +9202,9 @@ static void nativePublishStandbyDiscoveryState()
     activeProject, activeProjectName, activeProjectPath, activeProjectIndex);
   if (activeProjectName.empty()) activeProjectName = nativeBasenameNoRpp(activePathBuf);
   if (activeProjectPath.empty()) activeProjectPath = normalizeSlashes(activePathBuf);
+  const std::string activeProjectMediaPath = activeProject
+    ? nativeTelepromptProjectMediaDirectory(activeProject)
+    : std::string();
 
   const std::string directorPassword = nativeReadDirectorPassword();
   const std::string directorAuthHash = nativeDirectorPasswordHash(directorPassword);
@@ -9253,6 +9260,8 @@ static void nativePublishStandbyDiscoveryState()
   json << "\"projectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"currentProjectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"projectPath\":" << nativeJsonString(activeProjectPath) << ",";
+  json << "\"projectMediaPath\":"
+       << nativeJsonString(activeProjectMediaPath) << ",";
   json << "\"projectDirty\":"
        << ((activeProject && IsProjectDirty_ptr &&
             IsProjectDirty_ptr(activeProject) != 0) ? "true" : "false") << ",";
@@ -23238,6 +23247,65 @@ struct NativeProjectSyncRegularFileStamp {
   double modificationTimeMs = 0.0;
 };
 
+struct NativeProjectSyncCachedFileHash {
+  uint64_t size = 0;
+  uint64_t modificationToken = 0;
+  std::string sha256;
+};
+
+static std::mutex g_nativeProjectSyncFileHashCacheMutex;
+static std::map<std::string, NativeProjectSyncCachedFileHash>
+  g_nativeProjectSyncFileHashCache;
+
+static std::string nativeProjectSyncFileHashCacheKey(
+  const std::string& rawPath)
+{
+  std::string key = normalizeSlashes(nativeTrim(rawPath));
+#ifdef _WIN32
+  key = nativeLower(key);
+#endif
+  return key;
+}
+
+static bool nativeProjectSyncCachedFileHash(
+  const std::string& path,
+  const NativeProjectSyncRegularFileStamp& stamp,
+  std::string& sha256Out)
+{
+  sha256Out.clear();
+  const std::string key = nativeProjectSyncFileHashCacheKey(path);
+  if (key.empty()) return false;
+  std::lock_guard<std::mutex> lock(
+    g_nativeProjectSyncFileHashCacheMutex);
+  const auto found = g_nativeProjectSyncFileHashCache.find(key);
+  if (found == g_nativeProjectSyncFileHashCache.end() ||
+      found->second.size != stamp.size ||
+      found->second.modificationToken != stamp.modificationToken ||
+      found->second.sha256.size() != 64) {
+    return false;
+  }
+  sha256Out = found->second.sha256;
+  return true;
+}
+
+static void nativeProjectSyncRememberFileHash(
+  const std::string& path,
+  const NativeProjectSyncRegularFileStamp& stamp,
+  const std::string& sha256)
+{
+  if (sha256.size() != 64) return;
+  const std::string key = nativeProjectSyncFileHashCacheKey(path);
+  if (key.empty()) return;
+  std::lock_guard<std::mutex> lock(
+    g_nativeProjectSyncFileHashCacheMutex);
+  if (g_nativeProjectSyncFileHashCache.size() >= 32768 &&
+      g_nativeProjectSyncFileHashCache.count(key) == 0) {
+    g_nativeProjectSyncFileHashCache.clear();
+  }
+  g_nativeProjectSyncFileHashCache[key] = {
+    stamp.size, stamp.modificationToken, nativeLower(sha256)};
+}
+
 static bool nativeProjectSyncRegularFileStamp(
   const std::string& rawPath,
   NativeProjectSyncRegularFileStamp& stampOut)
@@ -25485,6 +25553,7 @@ static void nativeProjectSyncPrepareBundleWorker(
       input.mediaDirectory);
   std::map<std::string, std::string> uniqueSources;
   std::map<std::string, NativeProjectSyncRegularFileStamp> sourceStamps;
+  std::map<std::string, std::string> cachedSourceHashes;
   bool useSourceMap = input.supportsSourceMap;
   uint64_t totalBytes = static_cast<uint64_t>(rpp.size()) +
     static_cast<uint64_t>(input.configSnapshot.size());
@@ -25528,7 +25597,17 @@ static void nativeProjectSyncPrepareBundleWorker(
     }
     if (uniqueSources.emplace(key, reference.sourcePath).second) {
       sourceStamps.emplace(key, sourceStamp);
-      totalBytes += sourceStamp.size;
+    }
+  }
+  for (const auto& source : uniqueSources) {
+    const auto stamp = sourceStamps.find(source.first);
+    std::string cachedSha256;
+    if (useSourceMap && stamp != sourceStamps.end() &&
+        nativeProjectSyncCachedFileHash(
+          source.first, stamp->second, cachedSha256)) {
+      cachedSourceHashes[source.first] = cachedSha256;
+    } else if (stamp != sourceStamps.end()) {
+      totalBytes += stamp->second.size;
     }
   }
   if (uniqueSources.size() + 2 > 16384) {
@@ -25618,14 +25697,19 @@ static void nativeProjectSyncPrepareBundleWorker(
       : joinPath(joinPath(root, "media"),
           ".vshook-" + std::to_string(fileIndex) + ".part");
     std::string sha256;
-    if (!nativeProjectSyncCopyAndHashFile(source.first,
-          temporaryPath, true, input.requestId, totalBytes,
-          bytesDone, fileIndex,
-          static_cast<int>(uniqueSources.size()) + 2,
-          sha256, error)) {
-      nativeProjectSyncFinishBundleError(input.requestId, error);
-      g_nativeProjectSyncBundleWorkerRunning.store(false);
-      return;
+    const auto cachedHash = cachedSourceHashes.find(source.first);
+    if (cachedHash != cachedSourceHashes.end()) {
+      sha256 = cachedHash->second;
+    } else {
+      if (!nativeProjectSyncCopyAndHashFile(source.first,
+            temporaryPath, true, input.requestId, totalBytes,
+            bytesDone, fileIndex,
+            static_cast<int>(uniqueSources.size()) + 2,
+            sha256, error)) {
+        nativeProjectSyncFinishBundleError(input.requestId, error);
+        g_nativeProjectSyncBundleWorkerRunning.store(false);
+        return;
+      }
     }
     NativeProjectSyncRegularFileStamp finalStamp;
     const bool sourceUnchanged = useSourceMap
@@ -25641,6 +25725,10 @@ static void nativeProjectSyncPrepareBundleWorker(
           source.second);
       g_nativeProjectSyncBundleWorkerRunning.store(false);
       return;
+    }
+    if (useSourceMap && cachedHash == cachedSourceHashes.end()) {
+      nativeProjectSyncRememberFileHash(
+        source.first, finalStamp, sha256);
     }
     if (!useSourceMap) finalStamp = expectedStamp->second;
     const std::string relativePath = "media/" +
@@ -26151,6 +26239,21 @@ static void nativeProjectSyncApplyBundleWorker(
     }
   }
 
+  uint64_t validationTotalBytes = 0;
+  int validationFileCount = 0;
+  for (const NativeProjectSyncBundleFile& file : files) {
+    if (localReuseFiles.count(file.id) != 0) continue;
+    if (std::numeric_limits<uint64_t>::max() - validationTotalBytes <
+        file.size) {
+      nativeProjectSyncFinishApplyError(input.requestId,
+        "O tamanho dos arquivos novos excede o limite suportado.");
+      g_nativeProjectSyncBundleWorkerRunning.store(false);
+      return;
+    }
+    validationTotalBytes += file.size;
+    ++validationFileCount;
+  }
+
   // A midia recebida pertence ao proprio projeto B. Usa o caminho efetivo de
   // gravacao/midia que o REAPER devolve por GetProjectPathEx (por exemplo,
   // "Audio Files"), sem criar uma arvore paralela "VS Hook Project Sync".
@@ -26175,12 +26278,13 @@ static void nativeProjectSyncApplyBundleWorker(
       g_nativeProjectSyncApply.state = "validating";
       g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
       g_nativeProjectSyncApply.revision = sourceManifestRevision;
-      g_nativeProjectSyncApply.totalBytes = totalBytes;
-      g_nativeProjectSyncApply.fileCount = static_cast<int>(files.size());
+      g_nativeProjectSyncApply.totalBytes = validationTotalBytes;
+      g_nativeProjectSyncApply.fileCount = validationFileCount;
       g_nativeProjectSyncApply.error.clear();
     }
   }
   uint64_t bytesDone = 0;
+  int validationFileIndex = 0;
   std::map<std::string, std::string> stagedMediaToLocal;
   std::map<std::string, std::string> portableMediaToLocal;
   const auto mediaPathKey = [](const std::string& value) {
@@ -26197,6 +26301,7 @@ static void nativeProjectSyncApplyBundleWorker(
       input.stagingRoot, file.relativePath);
     const auto reuseFound = localReuseFiles.find(file.id);
     const bool reusedLocally = reuseFound != localReuseFiles.end();
+    if (!reusedLocally) ++validationFileIndex;
     const std::string sourcePath = reusedLocally
       ? reuseFound->second.absolutePath : stagedSourcePath;
     if ((!reusedLocally &&
@@ -26212,20 +26317,22 @@ static void nativeProjectSyncApplyBundleWorker(
       g_nativeProjectSyncBundleWorkerRunning.store(false);
       return;
     }
-    std::string actualSha256;
-    if (!nativeProjectSyncCopyAndHashFile(sourcePath,
-          "", false, input.requestId, totalBytes,
-          bytesDone, static_cast<int>(index + 1),
-          static_cast<int>(files.size()), actualSha256, error)) {
-      nativeProjectSyncFinishApplyError(input.requestId, error);
-      g_nativeProjectSyncBundleWorkerRunning.store(false);
-      return;
-    }
-    if (nativeLower(actualSha256) != nativeLower(file.sha256)) {
-      nativeProjectSyncFinishApplyError(input.requestId,
-        "SHA256 nao confere: " + file.relativePath);
-      g_nativeProjectSyncBundleWorkerRunning.store(false);
-      return;
+    if (!reusedLocally) {
+      std::string actualSha256;
+      if (!nativeProjectSyncCopyAndHashFile(sourcePath,
+            "", false, input.requestId, validationTotalBytes,
+            bytesDone, validationFileIndex,
+            validationFileCount, actualSha256, error)) {
+        nativeProjectSyncFinishApplyError(input.requestId, error);
+        g_nativeProjectSyncBundleWorkerRunning.store(false);
+        return;
+      }
+      if (nativeLower(actualSha256) != nativeLower(file.sha256)) {
+        nativeProjectSyncFinishApplyError(input.requestId,
+          "SHA256 nao confere: " + file.relativePath);
+        g_nativeProjectSyncBundleWorkerRunning.store(false);
+        return;
+      }
     }
     if (file.kind == "project") {
       sourceProjectPath = sourcePath;
@@ -26366,10 +26473,10 @@ static void nativeProjectSyncApplyBundleWorker(
         g_nativeTimecodeLanProjectSyncRole == "secondary") {
       g_nativeProjectSyncApply.state = "ready_to_apply";
       g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
-      g_nativeProjectSyncApply.bytesDone = totalBytes;
-      g_nativeProjectSyncApply.totalBytes = totalBytes;
-      g_nativeProjectSyncApply.fileIndex = static_cast<int>(files.size());
-      g_nativeProjectSyncApply.fileCount = static_cast<int>(files.size());
+      g_nativeProjectSyncApply.bytesDone = validationTotalBytes;
+      g_nativeProjectSyncApply.totalBytes = validationTotalBytes;
+      g_nativeProjectSyncApply.fileIndex = validationFileCount;
+      g_nativeProjectSyncApply.fileCount = validationFileCount;
       g_nativeProjectSyncApply.error.clear();
       g_nativeProjectSyncPendingOpen.ready = true;
       g_nativeProjectSyncPendingOpen.requestId = input.requestId;
@@ -26828,12 +26935,9 @@ static bool nativeProjectSyncUpdateApplyProgressFromCommand(
     ? nativeTrim(nativeJsonExtractString(commandBody, "error"))
     : std::string();
   const std::string normalizedProgressError = nativeLower(progressError);
-  if (state == "error" &&
-      (progressError.empty() || progressError == "0" ||
-       normalizedProgressError == "false" ||
-       normalizedProgressError == "null")) {
-    progressError =
-      "A transferencia Project Sync foi interrompida pela Hook Center.";
+  if (progressError == "0" || normalizedProgressError == "false" ||
+      normalizedProgressError == "null") {
+    progressError.clear();
   }
   g_nativeProjectSyncApply.error = std::move(progressError);
   g_nativeForceStateBuild.store(true);
@@ -62986,6 +63090,9 @@ static void nativeRebuildState(bool forceSnapshot)
   }
   if (activeProjectName.empty()) activeProjectName = nativeBasenameNoRpp(activePathBuf);
   if (activeProjectPath.empty()) activeProjectPath = normalizeSlashes(activePathBuf);
+  const std::string activeProjectMediaPath = activeProject
+    ? nativeTelepromptProjectMediaDirectory(activeProject)
+    : std::string();
 
   // O estado vivo continua em 220 ms, mas a estrutura pesada so e refeita
   // quando o projeto realmente muda ou um comando pede atualizacao. Isso evita
@@ -63673,6 +63780,8 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"projectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"currentProjectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"projectPath\":" << nativeJsonString(activeProjectPath) << ",";
+  json << "\"projectMediaPath\":"
+       << nativeJsonString(activeProjectMediaPath) << ",";
   json << "\"projectDirty\":"
        << ((activeProject && IsProjectDirty_ptr &&
             IsProjectDirty_ptr(activeProject) != 0) ? "true" : "false") << ",";
@@ -64922,9 +65031,8 @@ static void nativeProjectSyncPublishLiveItem(
     return command.str();
   };
   std::string command = build(requestedChunk);
-  // O envelope da outbox aceita 512 KiB. Reserva margem para a serializacao
-  // do relay; se um item MIDI tiver chunk grande, ainda cria o item vazio e
-  // aplica todo o estado numerico absoluto.
+  // O envelope da outbox aceita 512 KiB. Reserva margem para a serializacao;
+  // item/source novo nao usa este fallback e sempre aguarda o bundle.
   if (command.size() > 480 * 1024) command = build("");
   nativeTimecodeLanRecordCommand(command);
 }
@@ -65208,7 +65316,6 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
   std::map<std::string, NativeProjectSyncLiveTrackState> tracks;
   std::map<std::string, NativeProjectSyncLiveItemState> items;
   std::map<std::string, MediaTrack*> trackPointers;
-  std::map<std::string, MediaItem*> itemPointers;
   const int trackCount = CountTracks_ptr(project);
   for (int trackOffset = 0; trackOffset < trackCount; ++trackOffset) {
     MediaTrack* track = GetTrack_ptr(project, trackOffset);
@@ -65224,10 +65331,10 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
     trackState.structureKey =
       nativeProjectSyncLiveTrackStructureKey(track);
     if (trackState.id.empty()) continue;
+    const int itemCount = GetTrackNumMediaItems_ptr(track);
+    trackState.itemCount = itemCount;
     tracks[trackState.id] = trackState;
     trackPointers[trackState.id] = track;
-
-    const int itemCount = GetTrackNumMediaItems_ptr(track);
     for (int itemOffset = 0; itemOffset < itemCount; ++itemOffset) {
       MediaItem* item = GetTrackMediaItem_ptr(track, itemOffset);
       if (!item) continue;
@@ -65237,7 +65344,6 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
           item, itemOffset + 1);
       if (itemState.id.empty()) continue;
       items[itemState.id] = itemState;
-      itemPointers[itemState.id] = item;
     }
   }
 
@@ -65301,6 +65407,11 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
         g_nativeProjectSyncLiveTrackBaseline.count(trackState.id) == 0;
       if (newTrack) requiresAutomaticResync = true;
       std::string chunk;
+      if (newTrack && trackState.itemCount > 0) {
+        // A pista contem itens/midia. Ela so pode nascer no PC B depois que o
+        // bundle incremental baixar e validar os arquivos correspondentes.
+        continue;
+      }
       if (newTrack) {
         const auto pointer = trackPointers.find(trackState.id);
         if (pointer != trackPointers.end()) {
@@ -65342,12 +65453,8 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
          previous->second.trackId != entry.second.trackId);
     if (structureChanged) {
       requiresAutomaticResync = true;
-      std::string chunk;
-      const auto pointer = itemPointers.find(entry.first);
-      if (pointer != itemPointers.end()) {
-        nativeProjectSyncReadItemChunk(pointer->second, chunk);
-      }
-      nativeProjectSyncPublishLiveItem(entry.second, true, chunk);
+      // Nunca cria/troca source de item pelo canal vivo. O arquivo precisa
+      // chegar e ser validado primeiro; o bundle aplica o item em seguida.
     } else if (publishInitial ||
         nativeProjectSyncLiveItemStateChanged(
           previous->second, entry.second)) {
@@ -65768,6 +65875,11 @@ static bool nativeApplyProjectSyncLiveCommand(
         // Aguarda o próximo upsert/bundle em vez de criar uma pista parcial.
         return true;
       }
+      if (nativeLower(sourceChunk).find("<item") != std::string::npos) {
+        // Compatibilidade defensiva com emissores antigos: uma pista com item
+        // nao pode ser criada antes da transferencia da midia.
+        return true;
+      }
       if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
       InsertTrackAtIndex_ptr(insertIndex, true);
       track = GetTrack_ptr(project, insertIndex);
@@ -65898,33 +66010,10 @@ static bool nativeApplyProjectSyncLiveCommand(
       changed = true;
     }
   }
-  if (!resolved.item && itemUpsert && destination &&
-      AddMediaItemToTrack_ptr) {
-    if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
-    resolved.item = AddMediaItemToTrack_ptr(destination);
-    resolved.track = destination;
-    changed = resolved.item != nullptr;
-    const std::string chunk = nativeJsonExtractString(
-      commandBody, "itemChunk");
-    const std::string trimmedChunk = nativeTrim(chunk);
-    if (resolved.item && !trimmedChunk.empty() &&
-        trimmedChunk.size() <= 480 * 1024 &&
-        nativeLower(trimmedChunk.substr(
-          0, std::min<size_t>(5, trimmedChunk.size()))) == "<item" &&
-        SetItemStateChunk_ptr) {
-      SetItemStateChunk_ptr(
-        resolved.item, trimmedChunk.c_str(), false);
-      // SetItemStateChunk pode reconstruir o objeto; nunca reutiliza o ponteiro
-      // provisório depois da troca do GUID/chunk.
-      resolved.item = nullptr;
-      NativeProjectSyncResolvedItem afterChunk =
-        nativeProjectSyncResolveLiveItem(project, itemId,
-          trackId, trackName, trackIndex, itemIndex, true);
-      if (afterChunk.item) resolved = afterChunk;
-      else return true;
-    }
-    if (Undo_EndBlock2_ptr) Undo_EndBlock2_ptr(
-      project, "VS Hook: sincronizar criacao de item", -1);
+  if (!resolved.item && itemUpsert) {
+    // O item novo sera criado somente pelo apply do bundle, depois que a
+    // Hook Center confirmar todos os arquivos. Nao deixa placeholder offline.
+    return true;
   } else if (resolved.item && itemUpsert) {
     // Um upsert estrutural tambem atualiza take/source/FX quando o chunk cabe
     // no envelope. Estados numericos sao reaplicados abaixo de forma absoluta.
