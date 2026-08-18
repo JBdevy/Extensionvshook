@@ -455,12 +455,24 @@ static const char* kProjectAutoOpenHookControllerKey =
   "PROJECT_AUTO_OPEN_HOOK_CONTROLLER_V1";
 static const char* kTimecodeModeKey = "TIMECODE_MODE_V1";
 static const char* kTimecodePairCodeKey = "TIMECODE_PAIR_CODE_V1";
+// O protocolo ainda usa uma chave interna para separar tráfego legado, mas o
+// usuário não digita nem compartilha códigos. A escolha real é feita pelo ID
+// persistente e pelo nome do dispositivo anunciado pela Hook Center.
+static const char* kAutomaticLanPairCode = "000000";
+static const char* kTimecodeSelectedPeerKey =
+  "TIMECODE_SELECTED_PEER_V1";
+static const char* kTimecodeRejectedPeerKey =
+  "TIMECODE_REJECTED_PEER_V1";
 static const char* kProjectSyncEnabledKey = "PROJECT_SYNC_ENABLED_V1";
 static const char* kProjectSyncRoleKey = "PROJECT_SYNC_ROLE_V2";
 static const char* kParallelTimecodeModeKey =
   "TIMECODE_PARALLEL_MODE_V1";
 static const char* kParallelTimecodePairCodeKey =
   "TIMECODE_PARALLEL_PAIR_CODE_V1";
+static const char* kParallelTimecodeSelectedPeerKey =
+  "TIMECODE_PARALLEL_SELECTED_PEER_V1";
+static const char* kParallelTimecodeRejectedPeerKey =
+  "TIMECODE_PARALLEL_REJECTED_PEER_V1";
 static const char* kExtensionBypassKey =
   "EXTENSION_GLOBAL_BYPASS_V1";
 static const char* kScriptControlSection = "VS_HOOK_SCRIPT_CONTROL";
@@ -3330,6 +3342,7 @@ static ReaProject* getCurrentProject(char* pathOut, int pathOutSize)
 }
 
 static bool nativeTimecodeLanCodeIsValid(const std::string& value);
+static void nativeTimecodeLanRefreshConfigOnMainThread();
 
 static std::string getTimecodeMode()
 {
@@ -3409,9 +3422,17 @@ static void toggleTimecodeMode(const char* requestedMode)
           kParallelTimecodeModeKey, "", true);
         SetExtState_ptr(kExtStateSection,
           kParallelTimecodePairCodeKey, "", true);
+        SetExtState_ptr(kExtStateSection,
+          kParallelTimecodeSelectedPeerKey, "", true);
+        SetExtState_ptr(kExtStateSection,
+          kParallelTimecodeRejectedPeerKey, "", true);
       } else {
         SetExtState_ptr(kExtStateSection, kTimecodeModeKey, "", true);
         SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey, "", true);
+        SetExtState_ptr(kExtStateSection,
+          kTimecodeSelectedPeerKey, "", true);
+        SetExtState_ptr(kExtStateSection,
+          kTimecodeRejectedPeerKey, "", true);
         SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
       }
     }
@@ -3432,58 +3453,41 @@ static void toggleTimecodeMode(const char* requestedMode)
     }
   }
 
-  std::string code;
-  if (requested == "receive") {
-    const uint64_t seed =
-      static_cast<uint64_t>(
-        std::chrono::high_resolution_clock::now()
-          .time_since_epoch().count()) ^
-      static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(
-        &g_timecodeReceiveAction));
-    std::mt19937_64 generator(seed);
-    code = std::to_string(100000ULL + (generator() % 900000ULL));
-  } else {
-    char input[64] = "";
-    if (!GetUserInputs_ptr ||
-        !GetUserInputs_ptr(
-          "VS Hook - Transmitter", 1,
-          "Codigo exibido no Receive:,extrawidth=120",
-          input, static_cast<int>(sizeof(input)))) {
-      return;
-    }
-    for (char value : std::string(input)) {
-      if (value >= '0' && value <= '9') code.push_back(value);
-    }
-    if (code.size() != 6) {
-      showDiagnostic("Digite o codigo de 6 numeros exibido no computador Receive.");
-      return;
-    }
-  }
+  const std::string code = kAutomaticLanPairCode;
 
   if (projectSyncActive) {
     SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey,
       code.c_str(), true);
     SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey,
       requested.c_str(), true);
+    SetExtState_ptr(kExtStateSection,
+      kParallelTimecodeSelectedPeerKey, "", true);
+    SetExtState_ptr(kExtStateSection,
+      kParallelTimecodeRejectedPeerKey, "", true);
   } else {
     SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
       code.c_str(), true);
     SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
       requested.c_str(), true);
+    SetExtState_ptr(kExtStateSection,
+      kTimecodeSelectedPeerKey, "", true);
+    SetExtState_ptr(kExtStateSection,
+      kTimecodeRejectedPeerKey, "", true);
     SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
   }
+  nativeTimecodeLanRefreshConfigOnMainThread();
 
   if (ShowMessageBox_ptr) {
     if (requested == "receive") {
       const std::string message =
-        "Codigo do Receive: " + code +
-        "\n\nNo outro computador, abra Timecode > Transmitter e digite este codigo.\n"
-        "As duas Hook Centers precisam estar abertas na mesma rede local.";
+        "Aguardando conexao.\n\n"
+        "No computador principal, abra Timecode > Transmitter. "
+        "Ele encontrara este dispositivo pelo nome da Hook Center.";
       ShowMessageBox_ptr(message.c_str(), "VS Hook - Receive", 0);
     } else {
       const std::string message =
-        "Transmitter ativado com o codigo " + code +
-        ".\n\nA Hook Center esta procurando o computador Receive na rede local.";
+        "Procurando dispositivos Receive na rede local.\n\n"
+        "Quando um dispositivo aparecer, confirme o nome para conectar.";
       ShowMessageBox_ptr(message.c_str(), "VS Hook - Transmitter", 0);
     }
   }
@@ -3941,10 +3945,14 @@ static void toggleProjectSync()
         kExtStateSection, kParallelTimecodeModeKey);
       const char* parallelCodeRaw = GetExtState_ptr(
         kExtStateSection, kParallelTimecodePairCodeKey);
+      const char* parallelPeerRaw = GetExtState_ptr(
+        kExtStateSection, kParallelTimecodeSelectedPeerKey);
       const std::string parallelMode = parallelModeRaw
         ? nativeLower(nativeTrim(parallelModeRaw)) : "";
       const std::string parallelCode = parallelCodeRaw
         ? nativeTrim(parallelCodeRaw) : "";
+      const std::string parallelPeer = parallelPeerRaw
+        ? nativeTrim(parallelPeerRaw) : "";
       const bool restoreTimecode =
         (parallelMode == "receive" || parallelMode == "transmitter") &&
         nativeTimecodeLanCodeIsValid(parallelCode);
@@ -3952,42 +3960,35 @@ static void toggleProjectSync()
         restoreTimecode ? parallelMode.c_str() : "", true);
       SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
         restoreTimecode ? parallelCode.c_str() : "", true);
+      SetExtState_ptr(kExtStateSection, kTimecodeSelectedPeerKey,
+        restoreTimecode ? parallelPeer.c_str() : "", true);
+      SetExtState_ptr(kExtStateSection,
+        kTimecodeRejectedPeerKey, "", true);
       SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
       SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey, "", true);
       SetExtState_ptr(kExtStateSection,
         kParallelTimecodePairCodeKey, "", true);
+      SetExtState_ptr(kExtStateSection,
+        kParallelTimecodeSelectedPeerKey, "", true);
+      SetExtState_ptr(kExtStateSection,
+        kParallelTimecodeRejectedPeerKey, "", true);
     }
     return;
   }
 
-  char input[64] = "";
-  if (!GetUserInputs_ptr ||
-      !GetUserInputs_ptr(
-        "VS Hook - Project Sync", 1,
-        "Codigo do outro PC (vazio para criar):,extrawidth=180",
-        input, static_cast<int>(sizeof(input)))) {
+  if (!ShowMessageBox_ptr) {
+    showDiagnostic("Nao foi possivel escolher o papel do Project Sync.");
     return;
   }
-
-  std::string code;
-  for (char value : std::string(input)) {
-    if (value >= '0' && value <= '9') code.push_back(value);
-  }
-  const bool generatedCode = code.empty();
-  if (generatedCode) {
-    const uint64_t seed =
-      static_cast<uint64_t>(
-        std::chrono::high_resolution_clock::now()
-          .time_since_epoch().count()) ^
-      static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(
-        &g_projectSyncAction));
-    std::mt19937_64 generator(seed);
-    code = std::to_string(100000ULL + (generator() % 900000ULL));
-  } else if (code.size() != 6) {
-    showDiagnostic(
-      "Digite o codigo de 6 numeros do outro computador ou deixe vazio para criar um codigo.");
-    return;
-  }
+  const int roleAnswer = ShowMessageBox_ptr(
+    "Escolha a funcao deste computador:\n\n"
+    "SIM  = PC A - Mestre\n"
+    "NAO = PC B - Escravo\n"
+    "CANCELAR = nao ativar",
+    "VS Hook - Project Sync", 3);
+  if (roleAnswer != 6 && roleAnswer != 7) return;
+  const bool primaryRole = roleAnswer == 6;
+  const std::string code = kAutomaticLanPairCode;
 
   const std::string previousTimecodeMode = getTimecodeMode();
   std::string previousTimecodeCode;
@@ -4001,37 +4002,54 @@ static void toggleProjectSync()
     (previousTimecodeMode == "receive" ||
      previousTimecodeMode == "transmitter") &&
     nativeTimecodeLanCodeIsValid(previousTimecodeCode);
-  if ((!generatedCode && previousTimecodeActive) ||
-      (generatedCode && previousTimecodeMode == "receive" &&
+  if ((!primaryRole && previousTimecodeActive) ||
+      (primaryRole && previousTimecodeMode == "receive" &&
        previousTimecodeActive)) {
-    showDiagnostic(generatedCode
+    showDiagnostic(primaryRole
       ? "Este computador esta como Receive de Timecode. Desative o Receive antes de usa-lo como PC A do Project Sync. O PC A pode manter em paralelo somente o Transmitter para outro PC C."
       : "Este computador ja esta usando Timecode. Desative o Receive/Transmitter antes de usa-lo como PC B do Project Sync.");
     return;
   }
   SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey, "", true);
   SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey, "", true);
-  if (generatedCode && previousTimecodeMode == "transmitter" &&
+  SetExtState_ptr(kExtStateSection,
+    kParallelTimecodeSelectedPeerKey, "", true);
+  SetExtState_ptr(kExtStateSection,
+    kParallelTimecodeRejectedPeerKey, "", true);
+  if (primaryRole && previousTimecodeMode == "transmitter" &&
       previousTimecodeActive) {
+    const char* previousPeerRaw = GetExtState_ptr(
+      kExtStateSection, kTimecodeSelectedPeerKey);
+    const std::string previousPeer = previousPeerRaw
+      ? nativeTrim(previousPeerRaw) : "";
     SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey,
       previousTimecodeMode.c_str(), true);
     SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey,
       previousTimecodeCode.c_str(), true);
+    SetExtState_ptr(kExtStateSection,
+      kParallelTimecodeSelectedPeerKey, previousPeer.c_str(), true);
+    SetExtState_ptr(kExtStateSection,
+      kParallelTimecodeRejectedPeerKey, "", true);
   }
   SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
     code.c_str(), true);
   SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
     "project_sync", true);
   SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey,
-    generatedCode ? "primary" : "secondary", true);
+    primaryRole ? "primary" : "secondary", true);
+  SetExtState_ptr(kExtStateSection,
+    kTimecodeSelectedPeerKey, "", true);
+  SetExtState_ptr(kExtStateSection,
+    kTimecodeRejectedPeerKey, "", true);
+  nativeTimecodeLanRefreshConfigOnMainThread();
 
   if (ShowMessageBox_ptr) {
-    const std::string message = generatedCode
-      ? "Codigo do Project Sync: " + code +
-        "\n\nEste e o PC A (principal). No PC B, abra Project Sync e digite este codigo.\n"
-        "O PC B vai espelhar tudo que for feito neste computador."
-      : "Project Sync ativado com o codigo " + code +
-        ".\n\nEste e o PC B (escravo). A Hook Center esta procurando o PC A na rede local.";
+    const std::string message = primaryRole
+      ? "Este computador e o PC A - Mestre.\n\n"
+        "Procurando dispositivos PC B na rede local. Quando o PC B "
+        "aparecer, confirme o nome para conectar."
+      : "Este computador e o PC B - Escravo.\n\n"
+        "Aguardando conexao do PC A.";
     ShowMessageBox_ptr(
       message.c_str(), "VS Hook - Project Sync", 0);
   }
@@ -5130,8 +5148,12 @@ static std::mutex g_nativeTimecodeLanMutex;
 static std::string g_nativeTimecodeLanMode;
 static std::string g_nativeTimecodeLanCode;
 static std::string g_nativeTimecodeLanProjectSyncRole;
+static std::string g_nativeTimecodeLanSelectedPeerId;
+static std::string g_nativeTimecodeLanRejectedPeerId;
 static std::string g_nativeParallelTimecodeMode;
 static std::string g_nativeParallelTimecodeCode;
+static std::string g_nativeParallelTimecodeSelectedPeerId;
+static std::string g_nativeParallelTimecodeRejectedPeerId;
 static bool g_nativeParallelTimecodePeerConnected = false;
 static std::string g_nativeParallelTimecodePeerName;
 static std::deque<NativeTimecodeLanEvent> g_nativeTimecodeLanOutbox;
@@ -6239,21 +6261,37 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   std::string mode = getTimecodeMode();
   std::string projectSyncRole = getProjectSyncRole();
   std::string code;
+  std::string selectedPeerId;
+  std::string rejectedPeerId;
   if (GetExtState_ptr) {
     const char* raw = GetExtState_ptr(
       kExtStateSection, kTimecodePairCodeKey);
     code = raw ? raw : "";
+    const char* selectedRaw = GetExtState_ptr(
+      kExtStateSection, kTimecodeSelectedPeerKey);
+    const char* rejectedRaw = GetExtState_ptr(
+      kExtStateSection, kTimecodeRejectedPeerKey);
+    selectedPeerId = selectedRaw ? nativeTrim(selectedRaw) : "";
+    rejectedPeerId = rejectedRaw ? nativeTrim(rejectedRaw) : "";
   }
   if (!nativeTimecodeLanCodeIsValid(code)) {
     mode.clear();
     code.clear();
     projectSyncRole.clear();
+    selectedPeerId.clear();
+    rejectedPeerId.clear();
   }
   if (mode != "project_sync") {
     projectSyncRole.clear();
   }
+  if (mode.empty()) {
+    selectedPeerId.clear();
+    rejectedPeerId.clear();
+  }
   std::string parallelMode;
   std::string parallelCode;
+  std::string parallelSelectedPeerId;
+  std::string parallelRejectedPeerId;
   if (GetExtState_ptr) {
     const char* rawMode = GetExtState_ptr(
       kExtStateSection, kParallelTimecodeModeKey);
@@ -6261,6 +6299,14 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
       kExtStateSection, kParallelTimecodePairCodeKey);
     parallelMode = rawMode ? nativeLower(nativeTrim(rawMode)) : "";
     parallelCode = rawCode ? nativeTrim(rawCode) : "";
+    const char* selectedRaw = GetExtState_ptr(
+      kExtStateSection, kParallelTimecodeSelectedPeerKey);
+    const char* rejectedRaw = GetExtState_ptr(
+      kExtStateSection, kParallelTimecodeRejectedPeerKey);
+    parallelSelectedPeerId = selectedRaw
+      ? nativeTrim(selectedRaw) : "";
+    parallelRejectedPeerId = rejectedRaw
+      ? nativeTrim(rejectedRaw) : "";
   }
   if (parallelMode != "receive" && parallelMode != "transmitter") {
     parallelMode.clear();
@@ -6268,6 +6314,12 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   if (!nativeTimecodeLanCodeIsValid(parallelCode)) {
     parallelMode.clear();
     parallelCode.clear();
+    parallelSelectedPeerId.clear();
+    parallelRejectedPeerId.clear();
+  }
+  if (parallelMode.empty()) {
+    parallelSelectedPeerId.clear();
+    parallelRejectedPeerId.clear();
   }
   // Topologia valida: apenas o PC A pode manter um segundo canal, sempre como
   // Transmitter para um PC C diferente. PC B e Receive sao papeis exclusivos.
@@ -6278,43 +6330,65 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
       !parallelMode.empty() || !parallelCode.empty();
     parallelMode.clear();
     parallelCode.clear();
+    parallelSelectedPeerId.clear();
+    parallelRejectedPeerId.clear();
     if (hadInvalidParallel && SetExtState_ptr) {
       SetExtState_ptr(kExtStateSection,
         kParallelTimecodeModeKey, "", true);
       SetExtState_ptr(kExtStateSection,
         kParallelTimecodePairCodeKey, "", true);
+      SetExtState_ptr(kExtStateSection,
+        kParallelTimecodeSelectedPeerKey, "", true);
+      SetExtState_ptr(kExtStateSection,
+        kParallelTimecodeRejectedPeerKey, "", true);
     }
   }
 
   std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
-  const bool mainChanged = mode != g_nativeTimecodeLanMode ||
+  const bool mainTopologyChanged = mode != g_nativeTimecodeLanMode ||
     code != g_nativeTimecodeLanCode ||
     projectSyncRole != g_nativeTimecodeLanProjectSyncRole;
-  const bool parallelChanged =
+  const bool mainSelectionChanged =
+    selectedPeerId != g_nativeTimecodeLanSelectedPeerId ||
+    rejectedPeerId != g_nativeTimecodeLanRejectedPeerId;
+  const bool parallelTopologyChanged =
     parallelMode != g_nativeParallelTimecodeMode ||
     parallelCode != g_nativeParallelTimecodeCode;
+  const bool parallelSelectionChanged =
+    parallelSelectedPeerId !=
+      g_nativeParallelTimecodeSelectedPeerId ||
+    parallelRejectedPeerId !=
+      g_nativeParallelTimecodeRejectedPeerId;
+  const bool mainChanged =
+    mainTopologyChanged || mainSelectionChanged;
+  const bool parallelChanged =
+    parallelTopologyChanged || parallelSelectionChanged;
   if (!mainChanged && !parallelChanged) {
     return;
   }
   if (parallelChanged) {
     g_nativeParallelTimecodeMode = parallelMode;
     g_nativeParallelTimecodeCode = parallelCode;
-    g_nativeParallelTimecodePeerConnected = false;
-    g_nativeParallelTimecodePeerName.clear();
-    g_nativeParallelTimecodeLanOutbox.clear();
-    g_nativeParallelTimecodeLanEventSequence = 0;
-    g_nativeParallelTimecodeLanRemoteClock =
-      NativeTimecodeLanRemoteClock{};
+    g_nativeParallelTimecodeSelectedPeerId =
+      parallelSelectedPeerId;
+    g_nativeParallelTimecodeRejectedPeerId =
+      parallelRejectedPeerId;
+    if (parallelTopologyChanged) {
+      g_nativeParallelTimecodePeerConnected = false;
+      g_nativeParallelTimecodePeerName.clear();
+      g_nativeParallelTimecodeLanOutbox.clear();
+      g_nativeParallelTimecodeLanEventSequence = 0;
+      g_nativeParallelTimecodeLanRemoteClock =
+        NativeTimecodeLanRemoteClock{};
+    }
   }
   if (!mainChanged) return;
-  if (mode == g_nativeTimecodeLanMode &&
-      code == g_nativeTimecodeLanCode &&
-      projectSyncRole == g_nativeTimecodeLanProjectSyncRole) {
-    return;
-  }
   g_nativeTimecodeLanMode = mode;
   g_nativeTimecodeLanCode = code;
   g_nativeTimecodeLanProjectSyncRole = projectSyncRole;
+  g_nativeTimecodeLanSelectedPeerId = selectedPeerId;
+  g_nativeTimecodeLanRejectedPeerId = rejectedPeerId;
+  if (!mainTopologyChanged) return;
   g_nativeTimecodeLanPeerConnected = false;
   g_nativeTimecodeLanPeerName.clear();
   g_nativeTimecodeLanOutbox.clear();
@@ -6759,6 +6833,10 @@ static std::string nativeTimecodeLanStatusJson()
             g_nativeTimecodeLanProjectSyncRole) << ","
        << "\"code\":"
        << nativeJsonString(g_nativeTimecodeLanCode) << ","
+       << "\"selectedPeerId\":"
+       << nativeJsonString(g_nativeTimecodeLanSelectedPeerId) << ","
+       << "\"rejectedPeerId\":"
+       << nativeJsonString(g_nativeTimecodeLanRejectedPeerId) << ","
        << "\"peerConnected\":"
        << (g_nativeTimecodeLanPeerConnected ? "true" : "false")
        << ",\"projectSyncPaired\":"
@@ -6865,6 +6943,10 @@ static std::string nativeParallelTimecodeLanStatusJson()
        << nativeJsonString(nativeTimecodeLanSessionId() + "-parallel") << ','
        << "\"mode\":" << nativeJsonString(g_nativeParallelTimecodeMode)
        << ",\"code\":" << nativeJsonString(g_nativeParallelTimecodeCode)
+       << ",\"selectedPeerId\":"
+       << nativeJsonString(g_nativeParallelTimecodeSelectedPeerId)
+       << ",\"rejectedPeerId\":"
+       << nativeJsonString(g_nativeParallelTimecodeRejectedPeerId)
        << ",\"peerConnected\":"
        << (g_nativeParallelTimecodePeerConnected ? "true" : "false")
        << ",\"peerName\":"
@@ -68710,6 +68792,69 @@ static bool nativeApplyTimecodeLanCommand(
 {
   const std::string type = nativeLower(nativeTrim(
     nativeJsonExtractString(commandBody, "type")));
+  if (type == "timecode_pair_candidate") {
+    const bool parallel = nativeLower(nativeTrim(
+      nativeJsonExtractString(commandBody, "channel"))) == "parallel";
+    const std::string peerId = nativeLower(nativeTrim(
+      nativeJsonExtractString(commandBody, "peerId")));
+    std::string peerName = nativeTrim(
+      nativeJsonExtractString(commandBody, "peerName"));
+    if (peerName.empty()) peerName = "Outro computador";
+    if (peerName.size() > 120) peerName.resize(120);
+    const bool validPeerId = peerId.size() >= 32 && peerId.size() <= 128 &&
+      std::all_of(peerId.begin(), peerId.end(),
+        [](unsigned char character) {
+          return (character >= '0' && character <= '9') ||
+            (character >= 'a' && character <= 'f');
+        });
+    if (!validPeerId || !SetExtState_ptr) return true;
+
+    bool canSelect = false;
+    bool projectSync = false;
+    std::string currentSelected;
+    {
+      std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+      if (parallel) {
+        canSelect = g_nativeParallelTimecodeMode == "transmitter" &&
+          !g_nativeParallelTimecodePeerConnected;
+        currentSelected = g_nativeParallelTimecodeSelectedPeerId;
+      } else {
+        projectSync = g_nativeTimecodeLanMode == "project_sync";
+        canSelect = !g_nativeTimecodeLanPeerConnected &&
+          (g_nativeTimecodeLanMode == "transmitter" ||
+           (projectSync &&
+            g_nativeTimecodeLanProjectSyncRole == "primary"));
+        currentSelected = g_nativeTimecodeLanSelectedPeerId;
+      }
+    }
+    if (!canSelect || currentSelected == peerId) return true;
+
+    const std::string prompt =
+      "Deseja se conectar ao dispositivo:\n\n" + peerName + "?";
+    const int answer = ShowMessageBox_ptr
+      ? ShowMessageBox_ptr(prompt.c_str(),
+          projectSync ? "VS Hook - Project Sync"
+                      : "VS Hook - Timecode", 4)
+      : 7;
+    const char* selectedKey = parallel
+      ? kParallelTimecodeSelectedPeerKey
+      : kTimecodeSelectedPeerKey;
+    const char* rejectedKey = parallel
+      ? kParallelTimecodeRejectedPeerKey
+      : kTimecodeRejectedPeerKey;
+    if (answer == 6) {
+      SetExtState_ptr(kExtStateSection,
+        selectedKey, peerId.c_str(), true);
+      SetExtState_ptr(kExtStateSection, rejectedKey, "", true);
+    } else {
+      SetExtState_ptr(kExtStateSection, selectedKey, "", true);
+      SetExtState_ptr(kExtStateSection,
+        rejectedKey, peerId.c_str(), true);
+    }
+    nativeTimecodeLanRefreshConfigOnMainThread();
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
   if (type == "timecode_peer_status") {
     const bool connected = nativeJsonBoolValue(
       commandBody, "connected", false);
@@ -68817,7 +68962,7 @@ static bool nativeApplyTimecodeLanCommand(
       message += "\nAguardando reconexao automatica.";
       // Queda de cabo nunca pode abrir uma caixa modal nem injetar Stop. O
       // aviso temporario informa o papel A/B/C e desaparece sozinho enquanto
-      // a Hook Center continua procurando o mesmo codigo.
+      // a Hook Center continua procurando o mesmo dispositivo selecionado.
       nativeUiShowTemporaryPopup(message, 4.0);
     }
     return true;
