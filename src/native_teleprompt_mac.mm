@@ -26,9 +26,6 @@ struct SavedWindowState {
 };
 
 std::map<void*, SavedWindowState> g_fullscreenTeleprompts;
-NSApplicationPresentationOptions g_savedPresentationOptions =
-  NSApplicationPresentationDefault;
-bool g_hasSavedPresentationOptions = false;
 
 NSWindow* telepromptWindowFromSwellHandle(void* swellWindow)
 {
@@ -43,38 +40,6 @@ NSWindow* telepromptWindowFromSwellHandle(void* swellWindow)
   return nil;
 }
 
-void updatePresentationOptions()
-{
-  NSApplication* application = [NSApplication sharedApplication];
-  if (!application) return;
-
-  if (!g_fullscreenTeleprompts.empty()) {
-    if (!g_hasSavedPresentationOptions) {
-      g_savedPresentationOptions = [application presentationOptions];
-      g_hasSavedPresentationOptions = true;
-    }
-    NSApplicationPresentationOptions options =
-      g_savedPresentationOptions;
-    options &= ~(NSApplicationPresentationOptions)(
-      NSApplicationPresentationAutoHideDock |
-      NSApplicationPresentationHideDock |
-      NSApplicationPresentationAutoHideMenuBar |
-      NSApplicationPresentationHideMenuBar);
-    options |=
-      NSApplicationPresentationHideDock |
-      NSApplicationPresentationHideMenuBar;
-    [application setPresentationOptions:options];
-    return;
-  }
-
-  if (g_hasSavedPresentationOptions) {
-    [application setPresentationOptions:g_savedPresentationOptions];
-    g_savedPresentationOptions =
-      NSApplicationPresentationDefault;
-    g_hasSavedPresentationOptions = false;
-  }
-}
-
 } // namespace
 
 extern "C" bool VSHookMacSetTelepromptFullscreen(
@@ -87,7 +52,6 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
     telepromptWindowFromSwellHandle(swellWindow);
   if (!window) {
     g_fullscreenTeleprompts.erase(swellWindow);
-    updatePresentationOptions();
     return false;
   }
 
@@ -109,7 +73,6 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
       [window isMovableByWindowBackground];
     saved.hasShadow = [window hasShadow];
     g_fullscreenTeleprompts.emplace(swellWindow, saved);
-    updatePresentationOptions();
 
     NSScreen* screen = [window screen];
     if (!screen) screen = [NSScreen mainScreen];
@@ -150,7 +113,6 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
   [window setCollectionBehavior:saved.collectionBehavior];
   [window setFrame:saved.frame display:YES animate:NO];
   [window makeKeyAndOrderFront:nil];
-  updatePresentationOptions();
   return true;
 }
 
@@ -158,7 +120,6 @@ extern "C" void VSHookMacReleaseTelepromptFullscreen(
   void* swellWindow)
 {
   g_fullscreenTeleprompts.erase(swellWindow);
-  updatePresentationOptions();
 }
 
 extern "C" double VSHookMacTelepromptBackingScale(
