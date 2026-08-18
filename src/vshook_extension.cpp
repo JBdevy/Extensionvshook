@@ -68718,14 +68718,19 @@ static bool nativeApplyTimecodeLanCommand(
     const bool parallel = nativeLower(nativeTrim(
       nativeJsonExtractString(commandBody, "channel"))) == "parallel";
     bool becameConnected = false;
+    bool becameDisconnected = false;
     std::string connectedMode;
     std::string connectedRole;
+    std::string disconnectedPeerName;
     {
       std::lock_guard<std::mutex> lock(
         g_nativeTimecodeLanMutex);
       if (parallel) {
         becameConnected = connected &&
           !g_nativeParallelTimecodePeerConnected;
+        becameDisconnected = !connected &&
+          g_nativeParallelTimecodePeerConnected;
+        disconnectedPeerName = g_nativeParallelTimecodePeerName;
         if (connected != g_nativeParallelTimecodePeerConnected) {
           g_nativeParallelTimecodeLanRemoteClock =
             NativeTimecodeLanRemoteClock{};
@@ -68737,6 +68742,9 @@ static bool nativeApplyTimecodeLanCommand(
       } else {
         becameConnected = connected &&
           !g_nativeTimecodeLanPeerConnected;
+        becameDisconnected = !connected &&
+          g_nativeTimecodeLanPeerConnected;
+        disconnectedPeerName = g_nativeTimecodeLanPeerName;
         if (connected != g_nativeTimecodeLanPeerConnected) {
           g_nativeTimecodeLanRemoteClock = NativeTimecodeLanRemoteClock{};
         }
@@ -68794,6 +68802,23 @@ static bool nativeApplyTimecodeLanCommand(
       } else {
         nativeUiShowTemporaryPopup(message, 2.5);
       }
+    } else if (becameDisconnected) {
+      const bool projectSync = !parallel && connectedMode == "project_sync";
+      std::string computer;
+      if (projectSync) {
+        computer = connectedRole == "secondary" ? "PC A" : "PC B";
+      } else {
+        computer = connectedMode == "receive" ? "PC A" : "PC C";
+      }
+      std::string message = computer + " foi desconectado.";
+      if (!disconnectedPeerName.empty()) {
+        message += "\n" + disconnectedPeerName;
+      }
+      message += "\nAguardando reconexao automatica.";
+      // Queda de cabo nunca pode abrir uma caixa modal nem injetar Stop. O
+      // aviso temporario informa o papel A/B/C e desaparece sozinho enquanto
+      // a Hook Center continua procurando o mesmo codigo.
+      nativeUiShowTemporaryPopup(message, 4.0);
     }
     return true;
   }
