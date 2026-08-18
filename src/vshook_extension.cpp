@@ -4969,10 +4969,13 @@ struct NativeTimecodeLanTransport {
 // e provocar seeks periodicos durante um Play perfeitamente sincronizado.
 struct NativeTimecodeLanRemoteClock {
   bool valid = false;
+  bool transportStateValid = false;
   int64_t minimumArrivalOffsetMs = 0;
   int64_t minimumWindowStartedAtMs = 0;
   int64_t lastSampledAtMs = 0;
   uint64_t lastSequence = 0;
+  uint64_t lastControlSequence = 0;
+  int lastPlayState = 0;
 };
 
 struct NativeProjectSyncTrackState {
@@ -6649,6 +6652,18 @@ static void nativeTimecodeLanPollEditCursorOnMainThread()
     g_nativeTimecodeLanEditCursorProject = project;
     g_nativeTimecodeLanEditCursorBaseline = position;
     g_nativeTimecodeLanEditCursorBaselineValid = true;
+    return;
+  }
+  const int playState = GetPlayStateEx_ptr
+    ? GetPlayStateEx_ptr(project) : 0;
+  const bool transportPlaying =
+    ((playState & 1) == 1) || ((playState & 4) == 4);
+  if (transportPlaying) {
+    // Durante Play o cursor de edicao deixa de ser um estado replicado. Parts,
+    // fila/AT e markers continuam usando seus comandos semanticos proprios;
+    // um clique manual no grid nao pode disputar o cursor com o transporte.
+    // Absorve a posicao local para nao publicar um movimento antigo ao parar.
+    g_nativeTimecodeLanEditCursorBaseline = position;
     return;
   }
   if (!canPublish ||
@@ -67198,12 +67213,15 @@ static void nativeProcessPendingSelectionOnMainThread()
   const bool musicSelectionOnlyWhilePlaying = transportPlaying &&
     (command.type == "select_playlist_song" ||
      command.type == "select_region");
-  // edit_cursor_move e um comando explicito e sem seek. Ele pode acompanhar o
-  // cursor de edicao do PC A mesmo durante Play sem tocar no play cursor.
+  const bool editCursorOnlyWhilePlaying = transportPlaying &&
+    command.type == "edit_cursor_move";
+  // Durante Play somente Parts, fila/AT e outros comandos semanticos podem
+  // mover o cursor do PC B. O espelhamento manual do grid volta ao parar.
   // Toda chamada ao REAPER acontece aqui, na thread principal registrada pelo timer.
   bool editCursorChanged = false;
   if (!command.selectionOnly &&
       !musicSelectionOnlyWhilePlaying &&
+      !editCursorOnlyWhilePlaying &&
       hasTargetPos && targetPos >= 0.0) {
     if (SetEditCurPos2_ptr) {
       SetEditCurPos2_ptr(project, targetPos, true, false);
@@ -68539,16 +68557,19 @@ static bool nativeApplyTimecodeLanCommand(
   if (type != "timecode_transport_sync") return false;
 
   bool receiveMode = false;
+  bool projectSyncSecondary = false;
   const bool parallel = nativeLower(nativeTrim(
     nativeJsonExtractString(commandBody, "channel"))) == "parallel";
   {
     std::lock_guard<std::mutex> lock(
       g_nativeTimecodeLanMutex);
+    projectSyncSecondary = !parallel &&
+      g_nativeTimecodeLanMode == "project_sync" &&
+      g_nativeTimecodeLanProjectSyncRole == "secondary";
     receiveMode = parallel
       ? g_nativeParallelTimecodeMode == "receive"
       : (g_nativeTimecodeLanMode == "receive" ||
-      (g_nativeTimecodeLanMode == "project_sync" &&
-       g_nativeTimecodeLanProjectSyncRole == "secondary"));
+         projectSyncSecondary);
   }
   if (!receiveMode) return true;
 
@@ -68570,12 +68591,25 @@ static bool nativeApplyTimecodeLanCommand(
     commandBody, "sequence", 0);
   const uint64_t sourceSequence = sourceSequenceValue > 0
     ? static_cast<uint64_t>(sourceSequenceValue) : 0;
+  const int64_t sourceControlSequenceValue = nativeJsonInt64(
+    commandBody, "controlSequence", 0);
+  const uint64_t sourceControlSequence = sourceControlSequenceValue > 0
+    ? static_cast<uint64_t>(sourceControlSequenceValue) : 0;
+  NativeTimecodeLanRemoteClock& remoteClock = parallel
+    ? g_nativeParallelTimecodeLanRemoteClock
+    : g_nativeTimecodeLanRemoteClock;
+  const bool explicitControlFromRelay = nativeJsonBoolValue(
+    commandBody, "explicitControl", false);
+  const bool explicitControlSequenceAdvanced =
+    remoteClock.transportStateValid &&
+    sourceControlSequence > remoteClock.lastControlSequence;
+  const bool explicitPlayFromStopped =
+    (explicitControlFromRelay || explicitControlSequenceAdvanced) &&
+    remoteClock.transportStateValid &&
+    remoteClock.lastPlayState == 0 && sourceActive;
 
   double sourcePosition = sourceSamplePosition;
   if (sourceActive && !sourcePaused && sourceSampledAtMs > 0) {
-    NativeTimecodeLanRemoteClock& remoteClock = parallel
-      ? g_nativeParallelTimecodeLanRemoteClock
-      : g_nativeTimecodeLanRemoteClock;
     const int64_t arrivalMs = nativeSystemNowMs();
     const int64_t arrivalOffsetMs = arrivalMs - sourceSampledAtMs;
     const bool sourceRestarted = remoteClock.valid &&
@@ -68608,6 +68642,10 @@ static bool nativeApplyTimecodeLanCommand(
         arrivalOffsetMs - remoteClock.minimumArrivalOffsetMs));
     sourcePosition += static_cast<double>(sampleAgeMs) / 1000.0;
   }
+  remoteClock.transportStateValid = true;
+  remoteClock.lastControlSequence = std::max(
+    remoteClock.lastControlSequence, sourceControlSequence);
+  remoteClock.lastPlayState = sourcePlayState;
 
   const int localPlayState = GetPlayStateEx_ptr
     ? GetPlayStateEx_ptr(project)
@@ -68649,22 +68687,35 @@ static bool nativeApplyTimecodeLanCommand(
       changed = true;
     }
   } else if (!localActive) {
-    const double editCursor = GetCursorPositionEx_ptr
-      ? GetCursorPositionEx_ptr(project) : sourcePosition;
-    if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
-    if (SetEditCurPos2_ptr)
-      SetEditCurPos2_ptr(project, sourcePosition, false, false);
-    Main_OnCommand_ptr(1007, 0);
-    if (sourcePaused) Main_OnCommand_ptr(1008, 0);
-    if (SetEditCurPos2_ptr && GetCursorPositionEx_ptr &&
-        std::fabs(editCursor - sourcePosition) > 0.000001) {
-      SetEditCurPos2_ptr(project, editCursor, false, false);
+    if (explicitPlayFromStopped) {
+      // A selecao semantica/edit_cursor_move ja colocou o cursor do receptor no
+      // mesmo ponto do transmissor antes do Play. Reposiciona-lo para a amostra viva
+      // recebida alguns milissegundos depois criava a sequencia visual
+      // "Seeking" logo no inicio. Um Play normal parte diretamente do cursor
+      // sincronizado; o caminho de catch-up abaixo fica apenas para conectar o
+      // receptor quando o transmissor ja estava reproduzindo. A regra vale
+      // tanto no Project Sync quanto no Receive/Transmitter tradicional.
+      Main_OnCommand_ptr(1007, 0);
+      if (sourcePaused) Main_OnCommand_ptr(1008, 0);
+      changed = true;
+    } else {
+      const double editCursor = GetCursorPositionEx_ptr
+        ? GetCursorPositionEx_ptr(project) : sourcePosition;
+      if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
+      if (SetEditCurPos2_ptr)
+        SetEditCurPos2_ptr(project, sourcePosition, false, false);
+      Main_OnCommand_ptr(1007, 0);
+      if (sourcePaused) Main_OnCommand_ptr(1008, 0);
+      if (SetEditCurPos2_ptr && GetCursorPositionEx_ptr &&
+          std::fabs(editCursor - sourcePosition) > 0.000001) {
+        SetEditCurPos2_ptr(project, editCursor, false, false);
+      }
+      if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(-1);
+      g_nativePendingTransportEditCursorProject = project;
+      g_nativePendingTransportEditCursorPosition = editCursor;
+      g_nativePendingTransportEditCursorRestorePasses = 2;
+      changed = true;
     }
-    if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(-1);
-    g_nativePendingTransportEditCursorProject = project;
-    g_nativePendingTransportEditCursorPosition = editCursor;
-    g_nativePendingTransportEditCursorRestorePasses = 2;
-    changed = true;
   } else {
     if (sourcePaused != localPaused) {
       Main_OnCommand_ptr(1008, 0);
@@ -68672,11 +68723,13 @@ static bool nativeApplyTimecodeLanCommand(
     }
     // Com uma unica autoridade de transporte na Hook Center, podemos corrigir
     // mais cedo sem os dois computadores se perseguirem em sentidos opostos.
-    if (!sourcePaused && !localPaused &&
+    if (!explicitPlayFromStopped &&
+        !sourcePaused && !localPaused &&
         SetEditCurPos2_ptr && drift > 0.045) {
       seekTransportPreservingEditCursor(sourcePosition);
       changed = true;
-    } else if (sourcePaused && SetEditCurPos2_ptr && drift > 0.008) {
+    } else if (!explicitPlayFromStopped && sourcePaused &&
+               SetEditCurPos2_ptr && drift > 0.008) {
       seekTransportPreservingEditCursor(sourcePosition);
       changed = true;
     }
