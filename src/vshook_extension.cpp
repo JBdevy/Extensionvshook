@@ -4962,6 +4962,19 @@ struct NativeTimecodeLanTransport {
   bool audioHealthy = true;
 };
 
+// O relogio de parede dos dois computadores pode ter qualquer diferenca. Para
+// estimar somente a idade de cada pulso, o receptor aprende o menor offset de
+// chegada observado na sessao. Assim uma amostra de transporte repetida por
+// alguns ciclos e extrapolada ate o instante atual, em vez de parecer um drift
+// e provocar seeks periodicos durante um Play perfeitamente sincronizado.
+struct NativeTimecodeLanRemoteClock {
+  bool valid = false;
+  int64_t minimumArrivalOffsetMs = 0;
+  int64_t minimumWindowStartedAtMs = 0;
+  int64_t lastSampledAtMs = 0;
+  uint64_t lastSequence = 0;
+};
+
 struct NativeProjectSyncTrackState {
   double volume = 1.0;
   double mute = 0.0;
@@ -5117,6 +5130,8 @@ static std::deque<NativeTimecodeLanEvent>
   g_nativeParallelTimecodeLanOutbox;
 static uint64_t g_nativeParallelTimecodeLanEventSequence = 0;
 static NativeTimecodeLanTransport g_nativeTimecodeLanTransport;
+static NativeTimecodeLanRemoteClock g_nativeTimecodeLanRemoteClock;
+static NativeTimecodeLanRemoteClock g_nativeParallelTimecodeLanRemoteClock;
 static bool g_nativeTimecodeLanPeerConnected = false;
 static std::string g_nativeTimecodeLanPeerName;
 // Comandos recebidos do outro computador nao podem voltar para a outbox e
@@ -6246,6 +6261,8 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
     g_nativeParallelTimecodePeerName.clear();
     g_nativeParallelTimecodeLanOutbox.clear();
     g_nativeParallelTimecodeLanEventSequence = 0;
+    g_nativeParallelTimecodeLanRemoteClock =
+      NativeTimecodeLanRemoteClock{};
   }
   if (!mainChanged) return;
   if (mode == g_nativeTimecodeLanMode &&
@@ -6259,6 +6276,7 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   g_nativeTimecodeLanPeerConnected = false;
   g_nativeTimecodeLanPeerName.clear();
   g_nativeTimecodeLanOutbox.clear();
+  g_nativeTimecodeLanRemoteClock = NativeTimecodeLanRemoteClock{};
   g_nativeTimecodeLanEditCursorProject = nullptr;
   g_nativeTimecodeLanEditCursorBaseline = 0.0;
   g_nativeTimecodeLanEditCursorBaselineValid = false;
@@ -68486,6 +68504,10 @@ static bool nativeApplyTimecodeLanCommand(
     std::lock_guard<std::mutex> lock(
       g_nativeTimecodeLanMutex);
     if (parallel) {
+      if (connected != g_nativeParallelTimecodePeerConnected) {
+        g_nativeParallelTimecodeLanRemoteClock =
+          NativeTimecodeLanRemoteClock{};
+      }
       g_nativeParallelTimecodePeerConnected = connected;
       g_nativeParallelTimecodePeerName = connected
         ? peerName : std::string();
@@ -68493,6 +68515,9 @@ static bool nativeApplyTimecodeLanCommand(
     }
     const bool becameConnected = connected &&
       !g_nativeTimecodeLanPeerConnected;
+    if (connected != g_nativeTimecodeLanPeerConnected) {
+      g_nativeTimecodeLanRemoteClock = NativeTimecodeLanRemoteClock{};
+    }
     g_nativeTimecodeLanPeerConnected = connected;
     g_nativeTimecodeLanPeerName = connected
       ? peerName
@@ -68536,9 +68561,53 @@ static bool nativeApplyTimecodeLanCommand(
   const bool sourcePaused = (sourcePlayState & 2) == 2;
   const std::string positionValue = nativeJsonExtractString(
     commandBody, "position");
-  const double sourcePosition = nativeLooksNumeric(positionValue)
+  const double sourceSamplePosition = nativeLooksNumeric(positionValue)
     ? std::max(0.0, std::atof(positionValue.c_str()))
     : 0.0;
+  const int64_t sourceSampledAtMs = nativeJsonInt64(
+    commandBody, "sampledAtMs", 0);
+  const int64_t sourceSequenceValue = nativeJsonInt64(
+    commandBody, "sequence", 0);
+  const uint64_t sourceSequence = sourceSequenceValue > 0
+    ? static_cast<uint64_t>(sourceSequenceValue) : 0;
+
+  double sourcePosition = sourceSamplePosition;
+  if (sourceActive && !sourcePaused && sourceSampledAtMs > 0) {
+    NativeTimecodeLanRemoteClock& remoteClock = parallel
+      ? g_nativeParallelTimecodeLanRemoteClock
+      : g_nativeTimecodeLanRemoteClock;
+    const int64_t arrivalMs = nativeSystemNowMs();
+    const int64_t arrivalOffsetMs = arrivalMs - sourceSampledAtMs;
+    const bool sourceRestarted = remoteClock.valid &&
+      ((sourceSequence > 0 && remoteClock.lastSequence > 0 &&
+        sourceSequence < remoteClock.lastSequence) ||
+       sourceSampledAtMs < remoteClock.lastSampledAtMs);
+    const bool clockJumped = remoteClock.valid &&
+      std::llabs(arrivalOffsetMs -
+        remoteClock.minimumArrivalOffsetMs) > 5000;
+    const bool restartMinimumWindow = !remoteClock.valid ||
+      sourceRestarted || clockJumped ||
+      arrivalMs - remoteClock.minimumWindowStartedAtMs >= 10000;
+    if (restartMinimumWindow) {
+      remoteClock.valid = true;
+      remoteClock.minimumArrivalOffsetMs = arrivalOffsetMs;
+      remoteClock.minimumWindowStartedAtMs = arrivalMs;
+    } else if (arrivalOffsetMs <
+               remoteClock.minimumArrivalOffsetMs) {
+      remoteClock.minimumArrivalOffsetMs = arrivalOffsetMs;
+    }
+    remoteClock.lastSampledAtMs = sourceSampledAtMs;
+    remoteClock.lastSequence = sourceSequence;
+
+    // O menor offset da janela representa relogio entre PCs + caminho minimo.
+    // Somente o excedente e idade real da amostra dentro das filas/polls. Isso
+    // mantem a posicao continua entre duas amostras sem adivinhar se os relogios
+    // de parede dos computadores estao acertados entre si.
+    const int64_t sampleAgeMs = std::max<int64_t>(0,
+      std::min<int64_t>(250,
+        arrivalOffsetMs - remoteClock.minimumArrivalOffsetMs));
+    sourcePosition += static_cast<double>(sampleAgeMs) / 1000.0;
+  }
 
   const int localPlayState = GetPlayStateEx_ptr
     ? GetPlayStateEx_ptr(project)
@@ -69643,6 +69712,9 @@ static void nativeSetExtensionBypass(bool enabled)
       g_nativeParallelTimecodeLanOutbox.clear();
       g_nativeParallelTimecodeLanEventSequence = 0;
       g_nativeTimecodeLanTransport = NativeTimecodeLanTransport{};
+      g_nativeTimecodeLanRemoteClock = NativeTimecodeLanRemoteClock{};
+      g_nativeParallelTimecodeLanRemoteClock =
+        NativeTimecodeLanRemoteClock{};
       g_nativeTimecodeLanPeerConnected = false;
       g_nativeTimecodeLanPeerName.clear();
       g_nativeApplyingTimecodeLanRemoteCommand = false;
