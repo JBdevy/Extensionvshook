@@ -504,6 +504,7 @@ static void nativeClearAllLoopStateAfterStop(ReaProject* project);
 static void nativeUiClearMainRowSelection();
 static void nativeTelepromptReloadSettingsAfterBackup();
 static void nativeTimecodeLanMarkPendingTransportIntent(int command);
+static bool nativeTimecodeReceiveBlocksLocalSpace();
 
 static bool handleTransportQueueStopCommand(int command)
 {
@@ -2639,7 +2640,17 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
   if (g_nativeExtensionBypassActive.load()) return 0;
 
   const bool keyDown = msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN;
+  const bool keyUp = msg->message == WM_KEYUP ||
+    msg->message == WM_SYSKEYUP;
   const int vk = static_cast<int>(msg->wParam);
+
+  // PC C e um receptor operacional. O Espaco local nao pode alternar o
+  // transporte nem cancelar o Play recebido do PC A. Consome tanto DOWN quanto
+  // UP antes de qualquer janela, accelerator ou Action List do REAPER.
+  if ((keyDown || keyUp) && vk == VK_SPACE &&
+      nativeTimecodeReceiveBlocksLocalSpace()) {
+    return 1;
+  }
 
   // A Hook Controller desenha a propria lupa em uma janela customizada (nao
   // existe um controle EDIT filho). Entrega todo o teclado ao seu WndProc e
@@ -2682,8 +2693,6 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
   // diretamente ao WndProc e informa ao accelerator que o evento inteiro foi
   // consumido. As combinacoes modificadas e F10+ continuam livres (F11, por
   // exemplo, e encaminhado ao REAPER pelo proprio WndProc).
-  const bool keyUp = msg->message == WM_KEYUP ||
-    msg->message == WM_SYSKEYUP;
   if (targetsNativePanel && (keyDown || keyUp) &&
       vk >= VK_F1 && vk <= VK_F9) {
     static bool consumedFunctionKeyDown[9]{};
@@ -3357,32 +3366,6 @@ static std::string getProjectSyncRole()
     ? role : std::string();
 }
 
-static void clearProjectSyncSessionAtProcessBoundary()
-{
-  if (!SetExtState_ptr || getTimecodeMode() != "project_sync") return;
-
-  const std::string parallelMode = getParallelTimecodeMode();
-  const char* parallelCodeRaw = GetExtState_ptr
-    ? GetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey)
-    : nullptr;
-  const std::string parallelCode = parallelCodeRaw
-    ? nativeTrim(parallelCodeRaw) : "";
-  const bool restoreTimecode =
-    (parallelMode == "receive" || parallelMode == "transmitter") &&
-    nativeTimecodeLanCodeIsValid(parallelCode);
-
-  // Project Sync vale somente para a execução atual do REAPER. Se havia um
-  // terceiro computador usando Receive/Transmitter em paralelo, restaure esse
-  // canal independente em vez de desligá-lo junto com o pareamento A/B.
-  SetExtState_ptr(kExtStateSection, kTimecodeModeKey,
-    restoreTimecode ? parallelMode.c_str() : "", true);
-  SetExtState_ptr(kExtStateSection, kTimecodePairCodeKey,
-    restoreTimecode ? parallelCode.c_str() : "", true);
-  SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
-  SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey, "", true);
-  SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey, "", true);
-}
-
 static void showComingSoonFeatureMessage()
 {
   const char* message =
@@ -3433,6 +3416,20 @@ static void toggleTimecodeMode(const char* requestedMode)
       }
     }
     return;
+  }
+
+  if (projectSyncActive) {
+    const std::string role = getProjectSyncRole();
+    if (role == "secondary") {
+      showDiagnostic(
+        "Este computador ja e o PC B do Project Sync. O PC B nao pode ser usado tambem como Receive/Transmitter de Timecode.");
+      return;
+    }
+    if (requested != "transmitter") {
+      showDiagnostic(
+        "Durante o Project Sync, o PC A pode usar em paralelo apenas o Transmitter para controlar um PC C diferente.");
+      return;
+    }
   }
 
   std::string code;
@@ -4000,9 +3997,22 @@ static void toggleProjectSync()
       kExtStateSection, kTimecodePairCodeKey);
     previousTimecodeCode = raw ? nativeTrim(raw) : "";
   }
-  if ((previousTimecodeMode == "receive" ||
-       previousTimecodeMode == "transmitter") &&
-      nativeTimecodeLanCodeIsValid(previousTimecodeCode)) {
+  const bool previousTimecodeActive =
+    (previousTimecodeMode == "receive" ||
+     previousTimecodeMode == "transmitter") &&
+    nativeTimecodeLanCodeIsValid(previousTimecodeCode);
+  if ((!generatedCode && previousTimecodeActive) ||
+      (generatedCode && previousTimecodeMode == "receive" &&
+       previousTimecodeActive)) {
+    showDiagnostic(generatedCode
+      ? "Este computador esta como Receive de Timecode. Desative o Receive antes de usa-lo como PC A do Project Sync. O PC A pode manter em paralelo somente o Transmitter para outro PC C."
+      : "Este computador ja esta usando Timecode. Desative o Receive/Transmitter antes de usa-lo como PC B do Project Sync.");
+    return;
+  }
+  SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey, "", true);
+  SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey, "", true);
+  if (generatedCode && previousTimecodeMode == "transmitter" &&
+      previousTimecodeActive) {
     SetExtState_ptr(kExtStateSection, kParallelTimecodeModeKey,
       previousTimecodeMode.c_str(), true);
     SetExtState_ptr(kExtStateSection, kParallelTimecodePairCodeKey,
@@ -5140,6 +5150,12 @@ static std::string g_nativeTimecodeLanPeerName;
 // Comandos recebidos do outro computador nao podem voltar para a outbox e
 // circular indefinidamente no Project Sync bidirecional.
 static bool g_nativeApplyingTimecodeLanRemoteCommand = false;
+
+static bool nativeTimecodeReceiveBlocksLocalSpace()
+{
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  return g_nativeTimecodeLanMode == "receive";
+}
 static std::chrono::steady_clock::time_point
   g_nativeTimecodeLanSuppressLocalTransportIntentUntil;
 struct NativeTimecodeLanPendingTransportIntent {
@@ -6251,6 +6267,22 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   if (!nativeTimecodeLanCodeIsValid(parallelCode)) {
     parallelMode.clear();
     parallelCode.clear();
+  }
+  // Topologia valida: apenas o PC A pode manter um segundo canal, sempre como
+  // Transmitter para um PC C diferente. PC B e Receive sao papeis exclusivos.
+  if (mode == "project_sync" &&
+      (projectSyncRole != "primary" ||
+       parallelMode != "transmitter")) {
+    const bool hadInvalidParallel =
+      !parallelMode.empty() || !parallelCode.empty();
+    parallelMode.clear();
+    parallelCode.clear();
+    if (hadInvalidParallel && SetExtState_ptr) {
+      SetExtState_ptr(kExtStateSection,
+        kParallelTimecodeModeKey, "", true);
+      SetExtState_ptr(kExtStateSection,
+        kParallelTimecodePairCodeKey, "", true);
+    }
   }
 
   std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
@@ -53977,6 +54009,12 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           return 0;
         }
       }
+      // Defesa adicional para SWELL/macOS: mesmo que a mensagem chegue direto
+      // ao WndProc do painel, o Espaco do PC C continua sem qualquer efeito.
+      if (wParam == VK_SPACE &&
+          nativeTimecodeReceiveBlocksLocalSpace()) {
+        return 0;
+      }
       // Igual ao handle_keyboard do Lua: qualquer tecla diferente das setas
       // verticais confirma imediatamente a ultima selecao que estava em
       // repouso, para Enter/Espaco agirem sobre o alvo azul correto.
@@ -67604,6 +67642,18 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
     return true;
   }
 
+  if (wantsPlay && !wantsStop && !isPlaying &&
+      g_nativeApplyingTimecodeLanRemoteCommand) {
+    // O Play semantico e processado antes do pulso bruto que viaja no mesmo
+    // pacote. Esse pulso nao pode interpretar a pequena latencia de partida
+    // como drift e executar um segundo seek logo depois de iniciar.
+    g_nativeRemoteSemanticSeekSuppressUntil =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    g_nativePendingTransportEditCursorProject = nullptr;
+    g_nativePendingTransportEditCursorPosition = 0.0;
+    g_nativePendingTransportEditCursorRestorePasses = 0;
+  }
+
   // O BLOCO e apenas um cabecalho. Igual ao Lua Beta, o clique deixa o bloco
   // selecionado e somente o Play resolve a primeira musica ate o proximo
   // bloco. O comando explicito entra novamente aqui ja apontando para a musica
@@ -68700,6 +68750,8 @@ static bool nativeApplyTimecodeLanCommand(
     commandBody, "controlSequence", 0);
   const uint64_t sourceControlSequence = sourceControlSequenceValue > 0
     ? static_cast<uint64_t>(sourceControlSequenceValue) : 0;
+  const bool explicitControl = nativeJsonBoolValue(
+    commandBody, "explicitControl", false);
   NativeTimecodeLanRemoteClock& remoteClock = parallel
     ? g_nativeParallelTimecodeLanRemoteClock
     : g_nativeTimecodeLanRemoteClock;
@@ -68720,7 +68772,8 @@ static bool nativeApplyTimecodeLanCommand(
   // cursor ja sincronizado, independentemente do canal ou da ordem entre o
   // controlSequence e a amostra de transporte.
   const bool playFromCurrentEditCursor =
-    observedPlayFromStopped || semanticSeekRecentlyApplied;
+    explicitControl || observedPlayFromStopped ||
+    semanticSeekRecentlyApplied;
 
   double sourcePosition = sourceSamplePosition;
   if (sourceActive && !sourcePaused && sourceSampledAtMs > 0) {
@@ -68835,16 +68888,18 @@ static bool nativeApplyTimecodeLanCommand(
       Main_OnCommand_ptr(1008, 0);
       changed = true;
     }
-    // Com uma unica autoridade de transporte na Hook Center, podemos corrigir
-    // mais cedo sem os dois computadores se perseguirem em sentidos opostos.
-    if (!playFromCurrentEditCursor &&
-        !semanticSeekRecentlyApplied &&
+    // Pulsos periodicos servem para manter Play/Pause/Stop, nao para buscar a
+    // timeline repetidamente. Um seek durante reproducao so e permitido quando
+    // controlSequence provou uma nova intencao explicita no transmissor. Parts,
+    // fila e markers continuam chegando como comandos semanticos e executam o
+    // proprio seek uma unica vez. Isso evita "Seeking" ciclico e impede que a
+    // passagem por um marker volte indevidamente ao inicio da musica.
+    if (explicitControl && !semanticSeekRecentlyApplied &&
         !sourcePaused && !localPaused &&
         SetEditCurPos2_ptr && drift > 0.045) {
       seekTransportPreservingEditCursor(sourcePosition);
       changed = true;
-    } else if (!playFromCurrentEditCursor &&
-               !semanticSeekRecentlyApplied && sourcePaused &&
+    } else if (explicitControl && !semanticSeekRecentlyApplied && sourcePaused &&
                SetEditCurPos2_ptr && drift > 0.008) {
       seekTransportPreservingEditCursor(sourcePosition);
       changed = true;
@@ -70505,11 +70560,6 @@ static bool initialize()
 {
   if (g_state.initialized) return true;
 
-  // Defesa contra encerramento forçado/crash: mesmo que shutdown() não tenha
-  // sido chamado, uma nova execução nunca retoma automaticamente o código e o
-  // papel do Project Sync da sessão anterior.
-  clearProjectSyncSessionAtProcessBoundary();
-
   bool startsBypassed = false;
   if (GetExtState_ptr) {
     const char* raw =
@@ -70728,11 +70778,6 @@ static void shutdown()
   }
 
   nativeRemoveReaperMainWindowSubclass();
-
-  // Project Sync e um pareamento de sessao. Fechar o REAPER encerra A/B e
-  // exige novo codigo/conferencia na proxima abertura. Receive/Transmitter
-  // tradicionais continuam persistentes e nao sao alterados aqui.
-  clearProjectSyncSessionAtProcessBoundary();
 
   if (g_state.projectConfigRegistered) {
     plugin_register_ptr("-projectconfig",
