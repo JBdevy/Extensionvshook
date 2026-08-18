@@ -5161,6 +5161,11 @@ static uint64_t g_nativeTimecodeLanEditCursorSequence = 0;
 static ReaProject* g_nativePendingTransportEditCursorProject = nullptr;
 static double g_nativePendingTransportEditCursorPosition = 0.0;
 static int g_nativePendingTransportEditCursorRestorePasses = 0;
+// Um comando semantico remoto (Parts, fila/AT ou marker) ja posicionou os dois
+// cursores com a intencao exata do usuario. Pulsos crus de transporte colhidos
+// antes dessa acao nao podem desfazer o resultado logo em seguida.
+static std::chrono::steady_clock::time_point
+  g_nativeRemoteSemanticSeekSuppressUntil;
 static std::map<std::string, NativeProjectSyncTrackState>
   g_nativeProjectSyncTrackBaseline;
 static ReaProject* g_nativeProjectSyncTrackProject = nullptr;
@@ -5393,6 +5398,7 @@ static void nativeProjectSyncProcessMissingPeaksOnMainThread()
 
 struct NativePendingSelectionCommand {
   bool pending = false;
+  bool remote = false;
   std::string type;
   std::string id;
   double startPos = 0.0;
@@ -6288,6 +6294,8 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   g_nativePendingTransportEditCursorProject = nullptr;
   g_nativePendingTransportEditCursorPosition = 0.0;
   g_nativePendingTransportEditCursorRestorePasses = 0;
+  g_nativeRemoteSemanticSeekSuppressUntil =
+    std::chrono::steady_clock::time_point{};
   g_nativeProjectSyncTrackBaseline.clear();
   g_nativeProjectSyncTrackProject = nullptr;
   g_nativeProjectSyncTrackMode.clear();
@@ -42340,6 +42348,9 @@ static bool nativeUiRequestTimerToggle(
 
 static void nativeSetPartsColumnVisible(bool parts2, bool visible)
 {
+  const bool changed = parts2
+    ? g_nativeAppActivePanelModel.showParts2 != visible
+    : g_nativeAppActivePanelModel.showParts1 != visible;
   if (parts2) g_nativeAppActivePanelModel.showParts2 = visible;
   else g_nativeAppActivePanelModel.showParts1 = visible;
   if (SetExtState_ptr) {
@@ -42357,6 +42368,36 @@ static void nativeSetPartsColumnVisible(bool parts2, bool visible)
     g_nativeMainNavigationFocus = parts2 ? "parts2" : "parts";
   }
   g_nativeForceStateBuild.store(true);
+  if (changed) {
+    std::ostringstream command;
+    command << "{\"type\":\"parts_visibility_set\",\"partsColumn\":"
+            << (parts2 ? 2 : 1) << ",\"visible\":"
+            << (visible ? "true" : "false") << '}';
+    nativeTimecodeLanRecordCommand(command.str());
+  }
+}
+
+static bool nativeApplyPartsVisibilityCommand(
+  const std::string& commandBody)
+{
+  if (nativeLower(nativeTrim(nativeJsonExtractString(
+        commandBody, "type"))) != "parts_visibility_set") {
+    return false;
+  }
+  const int column = static_cast<int>(nativeJsonInt64(
+    commandBody, "partsColumn", 1));
+  if (column != 1 && column != 2) return true;
+  const bool visible = nativeJsonBoolValue(
+    commandBody, "visible", true);
+  if (visible && (g_nativeAppActivePanelModel.regionsPage ||
+                  g_nativeAppActivePanelModel.mixerPage)) {
+    nativeUiSetMainPageFromShortcut("playlist");
+  }
+  nativeSetPartsColumnVisible(column == 2, visible);
+  if (nativeAppActivePanelIsOpen()) {
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
+  return true;
 }
 
 static const NativeAppActivePanelModel::PartColumn& nativePartsColumnModel(bool parts2)
@@ -67242,6 +67283,13 @@ static void nativeProcessPendingSelectionOnMainThread()
       : std::max(0.0, targetPos);
     g_nativeTimecodeLanEditCursorBaselineValid = true;
   }
+  if (editCursorChanged && command.remote) {
+    g_nativePendingTransportEditCursorProject = nullptr;
+    g_nativePendingTransportEditCursorPosition = 0.0;
+    g_nativePendingTransportEditCursorRestorePasses = 0;
+    g_nativeRemoteSemanticSeekSuppressUntil =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  }
   // A repeticao das setas publica selectionOnly em cada passo. UpdateArrange
   // nesse caminho nao representa nenhuma mudanca do REAPER e obrigava a
   // timeline a redesenhar imagens e videos dezenas de vezes por segundo. O
@@ -67312,6 +67360,7 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
 
   NativePendingSelectionCommand command;
   command.pending = true;
+  command.remote = g_nativeApplyingTimecodeLanRemoteCommand;
   command.type = type;
   command.id = nativeJsonExtractString(commandBody, "targetId");
   if (command.id.empty()) command.id = nativeJsonExtractString(commandBody, "songId");
@@ -68003,6 +68052,16 @@ static bool nativeFindNextPartsMarkerInWindow(ReaProject* project, double playPo
 static void nativeMoveEditCursorAndSeek(ReaProject* project, double pos, bool seekPlayback)
 {
   if (!SetEditCurPos2_ptr || pos < 0.0) return;
+  if (g_nativeApplyingTimecodeLanRemoteCommand) {
+    // O cursor definido pelo comando da extensao e autoritativo. Cancela uma
+    // restauracao deixada por pulso de transporte anterior e dá tempo para o
+    // transmissor publicar sua nova posicao sem o receptor voltar para tras.
+    g_nativePendingTransportEditCursorProject = nullptr;
+    g_nativePendingTransportEditCursorPosition = 0.0;
+    g_nativePendingTransportEditCursorRestorePasses = 0;
+    g_nativeRemoteSemanticSeekSuppressUntil =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  }
   // Primeiro move de fato o cursor de edição. Em alguns setups, chamar apenas com seek=true
   // faz o playback buscar, mas a linha visual do cursor de edição não acompanha.
   SetEditCurPos2_ptr(project, pos, true, false);
@@ -68519,37 +68578,83 @@ static bool nativeApplyTimecodeLanCommand(
       nativeJsonExtractString(commandBody, "peerName"));
     const bool parallel = nativeLower(nativeTrim(
       nativeJsonExtractString(commandBody, "channel"))) == "parallel";
-    std::lock_guard<std::mutex> lock(
-      g_nativeTimecodeLanMutex);
-    if (parallel) {
-      if (connected != g_nativeParallelTimecodePeerConnected) {
-        g_nativeParallelTimecodeLanRemoteClock =
-          NativeTimecodeLanRemoteClock{};
+    bool becameConnected = false;
+    std::string connectedMode;
+    std::string connectedRole;
+    {
+      std::lock_guard<std::mutex> lock(
+        g_nativeTimecodeLanMutex);
+      if (parallel) {
+        becameConnected = connected &&
+          !g_nativeParallelTimecodePeerConnected;
+        if (connected != g_nativeParallelTimecodePeerConnected) {
+          g_nativeParallelTimecodeLanRemoteClock =
+            NativeTimecodeLanRemoteClock{};
+        }
+        g_nativeParallelTimecodePeerConnected = connected;
+        g_nativeParallelTimecodePeerName = connected
+          ? peerName : std::string();
+        connectedMode = g_nativeParallelTimecodeMode;
+      } else {
+        becameConnected = connected &&
+          !g_nativeTimecodeLanPeerConnected;
+        if (connected != g_nativeTimecodeLanPeerConnected) {
+          g_nativeTimecodeLanRemoteClock = NativeTimecodeLanRemoteClock{};
+        }
+        g_nativeTimecodeLanPeerConnected = connected;
+        g_nativeTimecodeLanPeerName = connected
+          ? peerName
+          : std::string();
+        connectedMode = g_nativeTimecodeLanMode;
+        connectedRole = g_nativeTimecodeLanProjectSyncRole;
+        if (becameConnected && connectedMode == "project_sync" &&
+            connectedRole == "primary") {
+          g_nativeProjectSyncPublishInitialConfig = true;
+          g_nativeProjectSyncPublishInitialTrackSnapshot = true;
+          g_nativeProjectSyncPublishInitialLiveSnapshot = true;
+          g_nativeProjectSyncPublishInitialPlaylistSnapshot = true;
+        } else if (!connected) {
+          g_nativeProjectSyncPublishInitialTrackSnapshot = false;
+          g_nativeProjectSyncPublishInitialLiveSnapshot = false;
+          g_nativeProjectSyncPublishInitialPlaylistSnapshot = false;
+        }
       }
-      g_nativeParallelTimecodePeerConnected = connected;
-      g_nativeParallelTimecodePeerName = connected
-        ? peerName : std::string();
-      return true;
     }
-    const bool becameConnected = connected &&
-      !g_nativeTimecodeLanPeerConnected;
-    if (connected != g_nativeTimecodeLanPeerConnected) {
-      g_nativeTimecodeLanRemoteClock = NativeTimecodeLanRemoteClock{};
-    }
-    g_nativeTimecodeLanPeerConnected = connected;
-    g_nativeTimecodeLanPeerName = connected
-      ? peerName
-      : std::string();
-    if (becameConnected && g_nativeTimecodeLanMode == "project_sync" &&
-        g_nativeTimecodeLanProjectSyncRole == "primary") {
-      g_nativeProjectSyncPublishInitialConfig = true;
-      g_nativeProjectSyncPublishInitialTrackSnapshot = true;
-      g_nativeProjectSyncPublishInitialLiveSnapshot = true;
-      g_nativeProjectSyncPublishInitialPlaylistSnapshot = true;
-    } else if (!connected) {
-      g_nativeProjectSyncPublishInitialTrackSnapshot = false;
-      g_nativeProjectSyncPublishInitialLiveSnapshot = false;
-      g_nativeProjectSyncPublishInitialPlaylistSnapshot = false;
+    if (becameConnected) {
+      const std::string displayPeer = peerName.empty()
+        ? std::string("outro computador") : peerName;
+      const bool projectSync = !parallel && connectedMode == "project_sync";
+      const std::string title = projectSync
+        ? "VS Hook - Project Sync" : "VS Hook - Timecode";
+      std::string message = projectSync
+        ? "Project Sync pareado com " + displayPeer + "."
+        : "Timecode pareado com " + displayPeer + ".";
+      if (projectSync) {
+        message += connectedRole == "secondary"
+          ? "\n\nEste computador esta conectado como PC B."
+          : "\n\nEste computador esta conectado como PC A.";
+      }
+      const bool publishesOperationalState =
+        connectedMode == "transmitter" ||
+        (connectedMode == "project_sync" && connectedRole == "primary");
+      if (publishesOperationalState) {
+        for (int column = 1; column <= 2; ++column) {
+          const bool visible = column == 2
+            ? g_nativeAppActivePanelModel.showParts2
+            : g_nativeAppActivePanelModel.showParts1;
+          std::ostringstream command;
+          command << "{\"type\":\"parts_visibility_set\","
+                  << "\"partsColumn\":" << column
+                  << ",\"visible\":"
+                  << (visible ? "true" : "false") << '}';
+          nativeTimecodeLanRecordCommand(command.str());
+        }
+      }
+      if (ShowMessageBox_ptr) {
+        ShowMessageBox_ptr(message.c_str(), title.c_str(), 0);
+      } else {
+        nativeUiShowTemporaryPopup(message, 2.5);
+      }
     }
     return true;
   }
@@ -68598,15 +68703,24 @@ static bool nativeApplyTimecodeLanCommand(
   NativeTimecodeLanRemoteClock& remoteClock = parallel
     ? g_nativeParallelTimecodeLanRemoteClock
     : g_nativeTimecodeLanRemoteClock;
-  const bool explicitControlFromRelay = nativeJsonBoolValue(
-    commandBody, "explicitControl", false);
-  const bool explicitControlSequenceAdvanced =
+  const bool observedPlayFromStopped = sourceActive &&
     remoteClock.transportStateValid &&
-    sourceControlSequence > remoteClock.lastControlSequence;
-  const bool explicitPlayFromStopped =
-    (explicitControlFromRelay || explicitControlSequenceAdvanced) &&
-    remoteClock.transportStateValid &&
-    remoteClock.lastPlayState == 0 && sourceActive;
+    remoteClock.lastPlayState == 0;
+  if (observedPlayFromStopped) {
+    // O backend dos dois computadores nao inicia no mesmo microssegundo. Nao
+    // trate essa pequena diferenca natural como drift logo apos apertar Play.
+    g_nativeRemoteSemanticSeekSuppressUntil =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(750);
+  }
+  const bool semanticSeekRecentlyApplied = sourceActive &&
+    std::chrono::steady_clock::now() <
+      g_nativeRemoteSemanticSeekSuppressUntil;
+  // O primeiro pulso de uma sessao ja em Play ainda precisa do catch-up. Depois
+  // de observar o receptor parado, qualquer Parado->Play e um inicio normal no
+  // cursor ja sincronizado, independentemente do canal ou da ordem entre o
+  // controlSequence e a amostra de transporte.
+  const bool playFromCurrentEditCursor =
+    observedPlayFromStopped || semanticSeekRecentlyApplied;
 
   double sourcePosition = sourceSamplePosition;
   if (sourceActive && !sourcePaused && sourceSampledAtMs > 0) {
@@ -68687,7 +68801,7 @@ static bool nativeApplyTimecodeLanCommand(
       changed = true;
     }
   } else if (!localActive) {
-    if (explicitPlayFromStopped) {
+    if (playFromCurrentEditCursor) {
       // A selecao semantica/edit_cursor_move ja colocou o cursor do receptor no
       // mesmo ponto do transmissor antes do Play. Reposiciona-lo para a amostra viva
       // recebida alguns milissegundos depois criava a sequencia visual
@@ -68723,12 +68837,14 @@ static bool nativeApplyTimecodeLanCommand(
     }
     // Com uma unica autoridade de transporte na Hook Center, podemos corrigir
     // mais cedo sem os dois computadores se perseguirem em sentidos opostos.
-    if (!explicitPlayFromStopped &&
+    if (!playFromCurrentEditCursor &&
+        !semanticSeekRecentlyApplied &&
         !sourcePaused && !localPaused &&
         SetEditCurPos2_ptr && drift > 0.045) {
       seekTransportPreservingEditCursor(sourcePosition);
       changed = true;
-    } else if (!explicitPlayFromStopped && sourcePaused &&
+    } else if (!playFromCurrentEditCursor &&
+               !semanticSeekRecentlyApplied && sourcePaused &&
                SetEditCurPos2_ptr && drift > 0.008) {
       seekTransportPreservingEditCursor(sourcePosition);
       changed = true;
@@ -68859,6 +68975,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     nativeApplyTimecodeLanCommand(commandBody) ||
     nativeApplyProjectSyncCommand(commandBody) ||
     handledAccessControlCommand ||
+    nativeApplyPartsVisibilityCommand(commandBody) ||
     nativeApplySmartSearchCommand(commandBody) ||
     nativeApplyTechnicalNoticeSettingsCommand(commandBody) ||
     nativeApplyTelepromptSettingsCommand(commandBody) ||
