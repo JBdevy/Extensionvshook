@@ -5176,6 +5176,9 @@ static std::string g_nativeProjectSyncTimelineBaselineHash;
 static ReaProject* g_nativeProjectSyncLiveProject = nullptr;
 static int g_nativeProjectSyncLiveChangeCount = -1;
 static bool g_nativeProjectSyncPublishInitialLiveSnapshot = false;
+// Repertorios criados antes do pareamento nao estao no intervalo incremental
+// da nova sessao. Ao conectar, o PC A republica o banco completo uma vez.
+static bool g_nativeProjectSyncPublishInitialPlaylistSnapshot = false;
 static uint64_t g_nativeProjectSyncLiveRevision = 0;
 // Idempotencia no PC B. A sessao do processo A faz parte da chave, logo uma
 // reinicializacao do REAPER A pode recomecar a revisao sem herdar ACK antigo.
@@ -6273,6 +6276,7 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   g_nativeProjectSyncLiveProject = nullptr;
   g_nativeProjectSyncLiveChangeCount = -1;
   g_nativeProjectSyncPublishInitialLiveSnapshot = false;
+  g_nativeProjectSyncPublishInitialPlaylistSnapshot = false;
   g_nativeProjectSyncLiveRevision = 0;
   g_nativeProjectSyncLiveAppliedRevisions.clear();
   g_nativeProjectSyncLastLivePoll =
@@ -12380,6 +12384,47 @@ static std::string nativeUiWritePlaylistRecords(
   return out.str();
 }
 
+static bool nativePublishPlaylistSnapshot(ReaProject* project)
+{
+  if (!project) return false;
+  const std::string encoded = nativeGetProjExtStateString(
+    project, kPlaylistExtSection, kPlaylistExtKey);
+  if (encoded.size() > 480 * 1024) return false;
+  const std::string activeName = nativeTrim(
+    nativeGetProjExtStateString(project, kPlaylistExtSection,
+      "LAST_PLAYLIST_NAME_V1"));
+  std::ostringstream command;
+  command << "{\"type\":\"playlist_snapshot_sync\",\"data\":"
+          << nativeJsonString(encoded)
+          << ",\"activePlaylistName\":"
+          << nativeJsonString(activeName) << '}';
+  const std::string commandBody = command.str();
+  if (commandBody.size() > 512 * 1024) return false;
+  nativeTimecodeLanRecordCommand(commandBody);
+  return true;
+}
+
+static void nativeProjectSyncPublishInitialPlaylistOnMainThread()
+{
+  bool requested = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    requested = g_nativeProjectSyncPublishInitialPlaylistSnapshot &&
+      g_nativeTimecodeLanMode == "project_sync" &&
+      g_nativeTimecodeLanProjectSyncRole == "primary" &&
+      g_nativeTimecodeLanPeerConnected;
+  }
+  if (!requested) return;
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project || !nativePublishPlaylistSnapshot(project)) return;
+  std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  if (g_nativeTimecodeLanMode == "project_sync" &&
+      g_nativeTimecodeLanProjectSyncRole == "primary" &&
+      g_nativeTimecodeLanPeerConnected) {
+    g_nativeProjectSyncPublishInitialPlaylistSnapshot = false;
+  }
+}
+
 static bool nativeUiSavePlaylistRecords(
   ReaProject* project,
   const std::vector<NativeUiPlaylistRecord>& playlists)
@@ -12388,20 +12433,7 @@ static bool nativeUiSavePlaylistRecords(
   const std::string encoded = nativeUiWritePlaylistRecords(playlists);
   SetProjExtState_ptr(project, kPlaylistExtSection, kPlaylistExtKey,
     encoded.c_str());
-  if (encoded.size() <= 480 * 1024) {
-    const std::string activeName = nativeTrim(
-      nativeGetProjExtStateString(project, kPlaylistExtSection,
-        "LAST_PLAYLIST_NAME_V1"));
-    std::ostringstream command;
-    command << "{\"type\":\"playlist_snapshot_sync\",\"data\":"
-            << nativeJsonString(encoded)
-            << ",\"activePlaylistName\":"
-            << nativeJsonString(activeName) << '}';
-    const std::string commandBody = command.str();
-    if (commandBody.size() <= 512 * 1024) {
-      nativeTimecodeLanRecordCommand(commandBody);
-    }
-  }
+  nativePublishPlaylistSnapshot(project);
   if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
   g_nativeForceSnapshotBuild.store(true);
   g_nativeForceStateBuild.store(true);
@@ -26250,7 +26282,7 @@ static void nativeProjectSyncApplyBundleWorker(
   if (!nativeProjectSyncCopyFileSimple(
         input.originalProjectPath, backupPath, error)) {
     nativeProjectSyncFinishApplyError(input.requestId,
-      error.empty() ? "Nao foi possivel criar o backup do PC B." : error);
+      error.empty() ? "Nao foi possivel preparar a aplicacao no PC B." : error);
     g_nativeProjectSyncBundleWorkerRunning.store(false);
     return;
   }
@@ -27043,7 +27075,7 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
   const int confirmation = ShowMessageBox_ptr(
     "Aplicar as modificacoes do PC A neste PC B?\n\n"
     "O VS Hook vai baixar somente os arquivos que faltam, validar o pacote, "
-    "criar um backup datado e aplicar pistas, itens, plugins e timeline "
+    "e aplicar pistas, itens, plugins e timeline "
     "diretamente neste projeto aberto. O roteamento e as cores locais nao "
     "serao alterados. As configuracoes visuais continuam separadas.\n\n"
     "Continuar?",
@@ -27744,7 +27776,7 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
       pending.inPlaceProjectText.empty() ||
       pending.sourceManifest.empty()) {
     nativeProjectSyncFinishApplyError(pending.requestId,
-      "O projeto do PC B mudou durante o download ou o backup nao foi concluido.");
+      "O projeto do PC B mudou durante o download ou a preparacao nao foi concluida.");
     return;
   }
   std::string error;
@@ -27855,8 +27887,8 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
   } else {
     nativeUiShowTemporaryPopup(
       configurationsApplied
-        ? "Projeto e configuracoes aplicados. Backup do PC B criado."
-        : "Modificacoes aplicadas no projeto aberto. Backup do PC B criado.",
+        ? "Projeto e configuracoes aplicados."
+        : "Modificacoes aplicadas no projeto aberto.",
       2.8);
   }
 }
@@ -35009,7 +35041,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
                    applyState.state == "ready_to_apply" ||
                    applyState.state == "applying" ||
                    applyState.state == "apply_started") {
-          waitStage = "Criando backup e aplicando no projeto aberto...";
+          waitStage = "Aplicando no projeto aberto...";
         }
         RECT waitStageRect{viewport.left + 24, centerY - 45,
           viewport.right - 24, centerY - 15};
@@ -35132,7 +35164,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       } else if (applyState.state == "ready_to_open" ||
                  applyState.state == "applying" ||
                  applyState.state == "apply_started") {
-        footerNotice = "Criando backup e aplicando no projeto aberto...";
+        footerNotice = "Aplicando no projeto aberto...";
       } else if (applyState.state == "error") {
         footerNotice = applyState.error.empty()
           ? "Falha ao aplicar. Confira a Hook Center e tente novamente."
@@ -67116,12 +67148,18 @@ static void nativeProcessPendingSelectionOnMainThread()
     }
   }
 
-  {
+  // O cursor de edicao e a selecao de musica sao estados independentes.
+  // Resolver uma musica pela posicao de edit_cursor_move fazia cada movimento
+  // posterior selecionar novamente a regiao que continha o cursor, apagando a
+  // selecao remota correta recebida imediatamente antes.
+  if (command.type != "edit_cursor_move") {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
-    const NativeSongWindow* song = nativeFindSongForCommand(command.id, command.startPos, command.endPos);
+    const NativeSongWindow* song = nativeFindSongForCommand(
+      command.id, command.startPos, command.endPos);
     if (song) {
       g_nativeSelectedId = song->id;
-      g_nativeSelectedTab = (command.type == "select_region") ? "regions" : "playlist";
+      g_nativeSelectedTab =
+        (command.type == "select_region") ? "regions" : "playlist";
       g_nativeSelectedStart = song->start;
       g_nativeSelectedEnd = song->end;
       if (!command.exactPosition) {
@@ -67130,7 +67168,8 @@ static void nativeProcessPendingSelectionOnMainThread()
       }
     } else if (!command.id.empty()) {
       g_nativeSelectedId = command.id;
-      g_nativeSelectedTab = (command.type == "select_region") ? "regions" : "playlist";
+      g_nativeSelectedTab =
+        (command.type == "select_region") ? "regions" : "playlist";
       g_nativeSelectedStart = command.startPos;
       g_nativeSelectedEnd = command.endPos;
     }
@@ -67155,6 +67194,17 @@ static void nativeProcessPendingSelectionOnMainThread()
       SetEditCurPos_ptr(targetPos, true, false);
       editCursorChanged = true;
     }
+  }
+  if (editCursorChanged && command.type != "edit_cursor_move") {
+    // Uma selecao semantica do VS Hook pode posicionar o cursor como efeito
+    // dela mesma. Absorve essa posicao no baseline para o poll nao publicar em
+    // seguida um edit_cursor_move redundante. Movimentos feitos diretamente
+    // no grid continuam sendo detectados e enviados normalmente.
+    g_nativeTimecodeLanEditCursorProject = project;
+    g_nativeTimecodeLanEditCursorBaseline = GetCursorPositionEx_ptr
+      ? std::max(0.0, GetCursorPositionEx_ptr(project))
+      : std::max(0.0, targetPos);
+    g_nativeTimecodeLanEditCursorBaselineValid = true;
   }
   // A repeticao das setas publica selectionOnly em cada passo. UpdateArrange
   // nesse caminho nao representa nenhuma mudanca do REAPER e obrigava a
@@ -68452,9 +68502,11 @@ static bool nativeApplyTimecodeLanCommand(
       g_nativeProjectSyncPublishInitialConfig = true;
       g_nativeProjectSyncPublishInitialTrackSnapshot = true;
       g_nativeProjectSyncPublishInitialLiveSnapshot = true;
+      g_nativeProjectSyncPublishInitialPlaylistSnapshot = true;
     } else if (!connected) {
       g_nativeProjectSyncPublishInitialTrackSnapshot = false;
       g_nativeProjectSyncPublishInitialLiveSnapshot = false;
+      g_nativeProjectSyncPublishInitialPlaylistSnapshot = false;
     }
     return true;
   }
@@ -68505,11 +68557,16 @@ static bool nativeApplyTimecodeLanCommand(
     if (!SetEditCurPos2_ptr) return;
     const double editCursor = GetCursorPositionEx_ptr
       ? GetCursorPositionEx_ptr(project) : position;
+    // SetEditCurPos2 precisa usar temporariamente o cursor de edicao para
+    // reposicionar o play cursor. Impede o arrange de pintar esse estado
+    // intermediario; o usuario enxerga somente o cursor original restaurado.
+    if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
     SetEditCurPos2_ptr(project, position, false, true);
     if (GetCursorPositionEx_ptr &&
         std::fabs(editCursor - position) > 0.000001) {
       SetEditCurPos2_ptr(project, editCursor, false, false);
     }
+    if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(-1);
     // Alguns backends do REAPER atualizam a linha de edicao novamente depois
     // do seek. Repete a restauracao nos ciclos seguintes sem novo seek.
     g_nativePendingTransportEditCursorProject = project;
@@ -68525,6 +68582,7 @@ static bool nativeApplyTimecodeLanCommand(
   } else if (!localActive) {
     const double editCursor = GetCursorPositionEx_ptr
       ? GetCursorPositionEx_ptr(project) : sourcePosition;
+    if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
     if (SetEditCurPos2_ptr)
       SetEditCurPos2_ptr(project, sourcePosition, false, false);
     Main_OnCommand_ptr(1007, 0);
@@ -68533,6 +68591,7 @@ static bool nativeApplyTimecodeLanCommand(
         std::fabs(editCursor - sourcePosition) > 0.000001) {
       SetEditCurPos2_ptr(project, editCursor, false, false);
     }
+    if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(-1);
     g_nativePendingTransportEditCursorProject = project;
     g_nativePendingTransportEditCursorPosition = editCursor;
     g_nativePendingTransportEditCursorRestorePasses = 2;
@@ -69817,6 +69876,7 @@ static void startupTimer()
   nativeProjectSyncExpireStalledApplyOnMainThread();
   nativeProjectSyncCommitPendingOpenOnMainThread();
   nativeProjectSyncProcessMissingPeaksOnMainThread();
+  nativeProjectSyncPublishInitialPlaylistOnMainThread();
   nativeProjectSyncRefreshManifestOnMainThread(false);
   nativeProjectSyncPollLiveProjectOnMainThread();
   nativeProjectSyncPollViewportOnMainThread();
