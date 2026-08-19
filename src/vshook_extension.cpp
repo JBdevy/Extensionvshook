@@ -269,6 +269,9 @@ using TrackFX_CopyToTrack_t = void (*)(MediaTrack*, int, MediaTrack*, int, bool)
 using MIDI_GetRecentInputEvent_t =
   int (*)(int, char*, int*, int*, int*, double*, int*);
 using GetMIDIInputName_t = bool (*)(int, char*, int);
+using GetNumMIDIOutputs_t = int (*)();
+using GetMIDIOutputName_t = bool (*)(int, char*, int);
+using StuffMIDIMessage_t = void (*)(int, int, int, int);
 using format_timestr_pos_t = void (*)(double, char*, int, int);
 using GR_SelectColor_t = int (*)(HWND, int*);
 using TimeMap_curFrameRate_t = double (*)(ReaProject*, bool*);
@@ -433,6 +436,9 @@ static TrackFX_CopyToTrack_t TrackFX_CopyToTrack_ptr = nullptr;
 static MIDI_GetRecentInputEvent_t
   MIDI_GetRecentInputEvent_ptr = nullptr;
 static GetMIDIInputName_t GetMIDIInputName_ptr = nullptr;
+static GetNumMIDIOutputs_t GetNumMIDIOutputs_ptr = nullptr;
+static GetMIDIOutputName_t GetMIDIOutputName_ptr = nullptr;
+static StuffMIDIMessage_t StuffMIDIMessage_ptr = nullptr;
 
 static ReaProject* getCurrentProject(char* pathOut, int pathOutSize);
 static std::string nativeTrim(std::string value);
@@ -474,6 +480,7 @@ static const char* kParallelTimecodeSelectedPeerKey =
   "TIMECODE_PARALLEL_SELECTED_PEER_V1";
 static const char* kParallelTimecodeRejectedPeerKey =
   "TIMECODE_PARALLEL_REJECTED_PEER_V1";
+static const char* kMtcOutputNameKey = "MTC_OUTPUT_NAME_V1";
 static const char* kExtensionBypassKey =
   "EXTENSION_GLOBAL_BYPASS_V1";
 static const char* kScriptControlSection = "VS_HOOK_SCRIPT_CONTROL";
@@ -3442,14 +3449,14 @@ static void toggleTimecodeMode(const char* requestedMode)
 
   if (projectSyncActive) {
     const std::string role = getProjectSyncRole();
-    if (role == "secondary") {
-      showDiagnostic(
-        "Este computador ja e o PC B do Project Sync. O PC B nao pode ser usado tambem como Receive/Transmitter de Timecode.");
-      return;
-    }
     if (requested != "transmitter") {
       showDiagnostic(
-        "Durante o Project Sync, o PC A pode usar em paralelo apenas o Transmitter para controlar um PC C diferente.");
+        "Durante o Project Sync, o PC A e o PC B podem usar em paralelo apenas o Transmitter MTC para o PC C.");
+      return;
+    }
+    if (role != "primary" && role != "secondary") {
+      showDiagnostic(
+        "Escolha primeiro se este computador e o PC A ou o PC B do Project Sync.");
       return;
     }
   }
@@ -3942,13 +3949,17 @@ static int nativeChooseProjectSyncRole()
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, 3, L"Cancelar");
 #else
-  AppendMenu(menu, MF_STRING | MF_GRAYED, 0,
+  const auto appendItem = [&](UINT flags, UINT_PTR id, const char* text) {
+    InsertMenu(menu, GetMenuItemCount(menu),
+      MF_BYPOSITION | flags, id, text ? text : "");
+  };
+  appendItem(MF_STRING | MF_GRAYED, 0,
     "Escolha a funcao deste computador");
-  AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenu(menu, MF_STRING, 1, "PC A - Mestre");
-  AppendMenu(menu, MF_STRING, 2, "PC B - Escravo");
-  AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenu(menu, MF_STRING, 3, "Cancelar");
+  appendItem(MF_SEPARATOR, 0, "");
+  appendItem(MF_STRING, 1, "PC A - Mestre");
+  appendItem(MF_STRING, 2, "PC B - Escravo");
+  appendItem(MF_SEPARATOR, 0, "");
+  appendItem(MF_STRING, 3, "Cancelar");
 #endif
 
   POINT cursor{0, 0};
@@ -5019,10 +5030,34 @@ struct NativeTimecodeLanTransport {
   int playState = 0;
   double position = 0.0;
   int64_t sampledAtMs = 0;
+  double frameRate = 30.0;
+  bool dropFrame = false;
   // Estado do dispositivo de audio, separado do transporte. Se a interface
   // cair, o REAPER pode mudar sozinho de Play para Stop; esse Stop tecnico
   // nao e uma intencao do operador e nao deve parar o PC B/SW8.
   bool audioHealthy = true;
+};
+
+// O MTC e emitido somente para uma porta MIDI que ja exista. A extensao nunca
+// cria nem remove endpoints: no Windows eles continuam sendo administrados
+// pelo Hook MIDI e no macOS pelo Driver IAC. O timer principal mantem a API do
+// REAPER na thread correta e distribui os quarter-frames pela porta escolhida.
+struct NativeMtcBridgeState {
+  bool requested = false;
+  bool playing = false;
+  bool paused = false;
+  double anchorPosition = 0.0;
+  std::chrono::steady_clock::time_point anchorAt;
+  double frameRate = 30.0;
+  bool dropFrame = false;
+  int quarterFrameIndex = 0;
+  double quarterFrameBudget = 0.0;
+  std::chrono::steady_clock::time_point lastTick;
+  std::chrono::steady_clock::time_point lastPacketAt;
+  std::chrono::steady_clock::time_point nextDeviceScan;
+  int outputDevice = -1;
+  std::string outputName;
+  std::string activeSource;
 };
 
 // O relogio de parede dos dois computadores pode ter qualquer diferenca. Para
@@ -5203,6 +5238,7 @@ static uint64_t g_nativeParallelTimecodeLanEventSequence = 0;
 static NativeTimecodeLanTransport g_nativeTimecodeLanTransport;
 static NativeTimecodeLanRemoteClock g_nativeTimecodeLanRemoteClock;
 static NativeTimecodeLanRemoteClock g_nativeParallelTimecodeLanRemoteClock;
+static NativeMtcBridgeState g_nativeMtcBridge;
 static bool g_nativeTimecodeLanPeerConnected = false;
 static std::string g_nativeTimecodeLanPeerName;
 // Comandos recebidos do outro computador nao podem voltar para a outbox e
@@ -6356,10 +6392,11 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
     parallelSelectedPeerId.clear();
     parallelRejectedPeerId.clear();
   }
-  // Topologia valida: apenas o PC A pode manter um segundo canal, sempre como
-  // Transmitter para um PC C diferente. PC B e Receive sao papeis exclusivos.
+  // PC A e PC B podem manter um segundo canal como Transmitter para o PC C.
+  // O switch do C prioriza A e usa B somente na falha, sem misturar dois MTCs.
   if (mode == "project_sync" &&
-      (projectSyncRole != "primary" ||
+      ((projectSyncRole != "primary" &&
+        projectSyncRole != "secondary") ||
        parallelMode != "transmitter")) {
     const bool hadInvalidParallel =
       !parallelMode.empty() || !parallelCode.empty();
@@ -6662,6 +6699,13 @@ static void nativeTimecodeLanUpdateTransportOnMainThread()
         ? GetCursorPositionEx_ptr(project) : 0.0);
   const bool audioHealthy =
     nativeTimecodeLanAudioDeviceHealthy();
+  bool dropFrame = false;
+  double frameRate = TimeMap_curFrameRate_ptr && project
+    ? TimeMap_curFrameRate_ptr(project, &dropFrame) : 30.0;
+  if (!std::isfinite(frameRate) || frameRate < 20.0 || frameRate > 61.0) {
+    frameRate = 30.0;
+    dropFrame = false;
+  }
 
   const int64_t nowMs = nativeSystemNowMs();
   const auto steadyNow = std::chrono::steady_clock::now();
@@ -6769,6 +6813,8 @@ static void nativeTimecodeLanUpdateTransportOnMainThread()
       state.playState == playState &&
       std::fabs(state.position - position) < 0.0005 &&
       state.audioHealthy == audioHealthy &&
+      std::fabs(state.frameRate - frameRate) < 0.000001 &&
+      state.dropFrame == dropFrame &&
       nowMs - state.sampledAtMs < 100) {
     return;
   }
@@ -6776,6 +6822,8 @@ static void nativeTimecodeLanUpdateTransportOnMainThread()
   state.position = position;
   state.sampledAtMs = nowMs;
   state.audioHealthy = audioHealthy;
+  state.frameRate = frameRate;
+  state.dropFrame = dropFrame;
   ++state.sequence;
 }
 
@@ -6963,7 +7011,10 @@ static std::string nativeTimecodeLanStatusJson()
        << (transport.audioHealthy ? "true" : "false")
        << ",\"position\":" << std::setprecision(15)
        << transport.position << ",\"sampledAtMs\":"
-       << transport.sampledAtMs << "}}";
+       << transport.sampledAtMs << ",\"frameRate\":"
+       << std::setprecision(8) << transport.frameRate
+       << ",\"dropFrame\":"
+       << (transport.dropFrame ? "true" : "false") << "}}";
   return json.str();
 }
 
@@ -6977,6 +7028,8 @@ static std::string nativeParallelTimecodeLanStatusJson()
        << "\"sessionId\":"
        << nativeJsonString(nativeTimecodeLanSessionId() + "-parallel") << ','
        << "\"mode\":" << nativeJsonString(g_nativeParallelTimecodeMode)
+       << ",\"redundancyRole\":"
+       << nativeJsonString(g_nativeTimecodeLanProjectSyncRole)
        << ",\"code\":" << nativeJsonString(g_nativeParallelTimecodeCode)
        << ",\"selectedPeerId\":"
        << nativeJsonString(g_nativeParallelTimecodeSelectedPeerId)
@@ -6997,7 +7050,10 @@ static std::string nativeParallelTimecodeLanStatusJson()
        << (transport.audioHealthy ? "true" : "false")
        << ",\"position\":" << std::setprecision(15)
        << transport.position << ",\"sampledAtMs\":"
-       << transport.sampledAtMs << "}}";
+       << transport.sampledAtMs << ",\"frameRate\":"
+       << std::setprecision(8) << transport.frameRate
+       << ",\"dropFrame\":"
+       << (transport.dropFrame ? "true" : "false") << "}}";
   return json.str();
 }
 
@@ -7032,7 +7088,10 @@ static std::string nativeParallelTimecodeLanOutboxJson(uint64_t after)
        << ",\"position\":" << std::setprecision(15)
        << transport.position << ",\"sampledAtMs\":"
        << transport.sampledAtMs << ",\"audioHealthy\":"
-       << (transport.audioHealthy ? "true" : "false") << "}}";
+       << (transport.audioHealthy ? "true" : "false")
+       << ",\"frameRate\":" << std::setprecision(8)
+       << transport.frameRate << ",\"dropFrame\":"
+       << (transport.dropFrame ? "true" : "false") << "}}";
   return json.str();
 }
 
@@ -7073,7 +7132,10 @@ static std::string nativeTimecodeLanOutboxJson(uint64_t after)
        << (transport.audioHealthy ? "true" : "false")
        << ",\"position\":" << std::setprecision(15)
        << transport.position << ",\"sampledAtMs\":"
-       << transport.sampledAtMs << "}}";
+       << transport.sampledAtMs << ",\"frameRate\":"
+       << std::setprecision(8) << transport.frameRate
+       << ",\"dropFrame\":"
+       << (transport.dropFrame ? "true" : "false") << "}}";
   return json.str();
 }
 
@@ -68927,6 +68989,236 @@ static void nativeQueueHttpCommand(const std::string& commandBody)
   g_nativeHttpCommandQueue.push_back(commandBody);
 }
 
+static int nativeMtcOutputPreference(const std::string& rawName,
+  const std::string& configuredName)
+{
+  const std::string name = nativeLower(nativeTrim(rawName));
+  const std::string configured = nativeLower(nativeTrim(configuredName));
+  if (!configured.empty() && name == configured) return 1000;
+  if (!configured.empty() && name.find(configured) != std::string::npos) {
+    return 900;
+  }
+  if (name == "hook mtc (a)") return 800;
+  if (name == "hook midi (a)") return 780;
+  if (name == "hook mtc") return 760;
+  if (name == "hook midi") return 740;
+  if (name.find("hook mtc") != std::string::npos) return 700;
+  if (name.find("hook midi") != std::string::npos) return 680;
+  return 0;
+}
+
+static bool nativeMtcFindOutputOnMainThread(bool force)
+{
+  const auto now = std::chrono::steady_clock::now();
+  if (!force && g_nativeMtcBridge.nextDeviceScan.time_since_epoch().count() &&
+      now < g_nativeMtcBridge.nextDeviceScan) {
+    return g_nativeMtcBridge.outputDevice >= 0;
+  }
+  g_nativeMtcBridge.nextDeviceScan = now + std::chrono::seconds(2);
+  g_nativeMtcBridge.outputDevice = -1;
+  g_nativeMtcBridge.outputName.clear();
+  if (!GetNumMIDIOutputs_ptr || !GetMIDIOutputName_ptr ||
+      !StuffMIDIMessage_ptr) {
+    return false;
+  }
+  std::string configuredName;
+  if (GetExtState_ptr) {
+    const char* raw = GetExtState_ptr(kExtStateSection, kMtcOutputNameKey);
+    configuredName = raw ? raw : "";
+  }
+  int bestScore = 0;
+  const int count = std::max(0, GetNumMIDIOutputs_ptr());
+  for (int device = 0; device < count; ++device) {
+    char name[512] = "";
+    if (!GetMIDIOutputName_ptr(device, name,
+          static_cast<int>(sizeof(name))) || !name[0]) {
+      continue;
+    }
+    const int score = nativeMtcOutputPreference(name, configuredName);
+    if (score <= bestScore) continue;
+    bestScore = score;
+    g_nativeMtcBridge.outputDevice = device;
+    g_nativeMtcBridge.outputName = name;
+  }
+  return g_nativeMtcBridge.outputDevice >= 0;
+}
+
+struct NativeMtcTimeFields {
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  int frame = 0;
+  int rateCode = 3;
+};
+
+static NativeMtcTimeFields nativeMtcTimeFields(double rawSeconds,
+  double rawFrameRate, bool dropFrame)
+{
+  NativeMtcTimeFields fields;
+  const double seconds = std::max(0.0, rawSeconds);
+  double frameRate = rawFrameRate;
+  if (!std::isfinite(frameRate) || frameRate < 20.0 || frameRate > 61.0) {
+    frameRate = 30.0;
+  }
+  int nominalRate = 30;
+  if (frameRate < 24.5) {
+    nominalRate = 24;
+    fields.rateCode = 0;
+    dropFrame = false;
+  } else if (frameRate < 27.0) {
+    nominalRate = 25;
+    fields.rateCode = 1;
+    dropFrame = false;
+  } else if (dropFrame || std::fabs(frameRate - 29.97) < 0.05 ||
+             std::fabs(frameRate - (30000.0 / 1001.0)) < 0.01) {
+    nominalRate = 30;
+    frameRate = 30000.0 / 1001.0;
+    fields.rateCode = 2;
+    dropFrame = true;
+  } else {
+    nominalRate = 30;
+    fields.rateCode = 3;
+    dropFrame = false;
+  }
+
+  int64_t frameNumber = static_cast<int64_t>(
+    std::floor(seconds * frameRate + 0.000001));
+  if (dropFrame) {
+    // SMPTE 29.97 DF remove os numeros 00 e 01 no inicio de cada minuto,
+    // exceto nos minutos divisiveis por dez.
+    const int64_t tenMinuteFrames = 17982;
+    const int64_t minuteFrames = 1798;
+    const int64_t tenMinuteBlocks = frameNumber / tenMinuteFrames;
+    const int64_t remainder = frameNumber % tenMinuteFrames;
+    frameNumber += 18 * tenMinuteBlocks;
+    if (remainder >= 2) {
+      frameNumber += 2 * ((remainder - 2) / minuteFrames);
+    }
+  }
+  const int64_t framesPerDay =
+    static_cast<int64_t>(nominalRate) * 60 * 60 * 24;
+  frameNumber %= framesPerDay;
+  fields.frame = static_cast<int>(frameNumber % nominalRate);
+  const int64_t totalSeconds = frameNumber / nominalRate;
+  fields.second = static_cast<int>(totalSeconds % 60);
+  fields.minute = static_cast<int>((totalSeconds / 60) % 60);
+  fields.hour = static_cast<int>((totalSeconds / 3600) % 24);
+  return fields;
+}
+
+static int nativeMtcQuarterFrameData(const NativeMtcTimeFields& fields,
+  int quarterFrameIndex)
+{
+  const int index = quarterFrameIndex & 7;
+  int nibble = 0;
+  switch (index) {
+    case 0: nibble = fields.frame & 0x0f; break;
+    case 1: nibble = (fields.frame >> 4) & 0x01; break;
+    case 2: nibble = fields.second & 0x0f; break;
+    case 3: nibble = (fields.second >> 4) & 0x03; break;
+    case 4: nibble = fields.minute & 0x0f; break;
+    case 5: nibble = (fields.minute >> 4) & 0x03; break;
+    case 6: nibble = fields.hour & 0x0f; break;
+    case 7:
+      nibble = ((fields.hour >> 4) & 0x01) |
+        ((fields.rateCode & 0x03) << 1);
+      break;
+  }
+  return (index << 4) | nibble;
+}
+
+static bool nativeMtcAcceptTransportOnMainThread(
+  const std::string& commandBody, double position, int playState)
+{
+  if (!nativeJsonBoolValue(commandBody, "mtcTransport", false) ||
+      !nativeMtcFindOutputOnMainThread(false)) {
+    return false;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  const std::string frameRateText = nativeTrim(
+    nativeJsonExtractRawValue(commandBody, "frameRate"));
+  double frameRate = nativeLooksNumeric(frameRateText)
+    ? std::atof(frameRateText.c_str()) : 30.0;
+  if (!std::isfinite(frameRate) || frameRate < 20.0 || frameRate > 61.0) {
+    frameRate = 30.0;
+  }
+  const bool sourceActive = playState != 0;
+  const bool sourcePaused = (playState & 2) == 2;
+  const bool starting = sourceActive && !sourcePaused &&
+    (!g_nativeMtcBridge.requested || !g_nativeMtcBridge.playing ||
+     std::fabs(g_nativeMtcBridge.anchorPosition - position) > 0.250);
+  g_nativeMtcBridge.requested = true;
+  g_nativeMtcBridge.playing = sourceActive && !sourcePaused;
+  g_nativeMtcBridge.paused = sourcePaused;
+  g_nativeMtcBridge.anchorPosition = std::max(0.0, position);
+  g_nativeMtcBridge.anchorAt = now;
+  g_nativeMtcBridge.lastPacketAt = now;
+  g_nativeMtcBridge.frameRate = frameRate;
+  g_nativeMtcBridge.dropFrame = nativeJsonBoolValue(
+    commandBody, "dropFrame", false);
+  const std::string nextSource = nativeTrim(
+    nativeJsonExtractString(commandBody, "mtcSource"));
+  const bool sourceChanged = !nextSource.empty() &&
+    nextSource != g_nativeMtcBridge.activeSource;
+  g_nativeMtcBridge.activeSource = nextSource;
+  if (sourceChanged) {
+    nativeUiShowTemporaryPopup(
+      nextSource == "PC B"
+        ? "MTC: PC B assumiu a sincronizacao de reserva."
+        : "MTC: PC A e a fonte principal.",
+      2.0);
+  }
+  if (starting) {
+    g_nativeMtcBridge.quarterFrameIndex = 0;
+    g_nativeMtcBridge.quarterFrameBudget = 8.0;
+    g_nativeMtcBridge.lastTick = now;
+  }
+  return true;
+}
+
+static void nativeMtcBridgeTickOnMainThread()
+{
+  if (!g_nativeMtcBridge.requested) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (g_nativeMtcBridge.lastPacketAt.time_since_epoch().count() == 0 ||
+      now - g_nativeMtcBridge.lastPacketAt > std::chrono::milliseconds(500)) {
+    g_nativeMtcBridge.requested = false;
+    g_nativeMtcBridge.playing = false;
+    g_nativeMtcBridge.quarterFrameBudget = 0.0;
+    return;
+  }
+  if (!g_nativeMtcBridge.playing ||
+      !nativeMtcFindOutputOnMainThread(false)) {
+    g_nativeMtcBridge.lastTick = now;
+    return;
+  }
+  if (g_nativeMtcBridge.lastTick.time_since_epoch().count() == 0) {
+    g_nativeMtcBridge.lastTick = now;
+  }
+  const double elapsed = std::max(0.0,
+    std::chrono::duration<double>(now - g_nativeMtcBridge.lastTick).count());
+  g_nativeMtcBridge.lastTick = now;
+  const double qfRate = std::max(80.0,
+    std::min(240.0, g_nativeMtcBridge.frameRate * 4.0));
+  g_nativeMtcBridge.quarterFrameBudget = std::min(16.0,
+    g_nativeMtcBridge.quarterFrameBudget + elapsed * qfRate);
+  const int messages = std::min(8,
+    static_cast<int>(std::floor(g_nativeMtcBridge.quarterFrameBudget)));
+  if (messages <= 0) return;
+  g_nativeMtcBridge.quarterFrameBudget -= messages;
+  const double position = std::max(0.0,
+    g_nativeMtcBridge.anchorPosition +
+      std::chrono::duration<double>(now - g_nativeMtcBridge.anchorAt).count());
+  const NativeMtcTimeFields fields = nativeMtcTimeFields(position,
+    g_nativeMtcBridge.frameRate, g_nativeMtcBridge.dropFrame);
+  for (int message = 0; message < messages; ++message) {
+    const int data = nativeMtcQuarterFrameData(fields,
+      g_nativeMtcBridge.quarterFrameIndex++);
+    StuffMIDIMessage_ptr(16 + g_nativeMtcBridge.outputDevice,
+      0xf1, data, 0);
+  }
+}
+
 static bool nativeApplyTimecodeLanCommand(
   const std::string& commandBody)
 {
@@ -69104,6 +69396,25 @@ static bool nativeApplyTimecodeLanCommand(
     return true;
   }
 
+  if (type == "mtc_output_set") {
+    std::string outputName = nativeTrim(
+      nativeJsonExtractString(commandBody, "name"));
+    if (outputName.size() > 160) outputName.resize(160);
+    if (SetExtState_ptr) {
+      SetExtState_ptr(kExtStateSection, kMtcOutputNameKey,
+        outputName.c_str(), true);
+    }
+    g_nativeMtcBridge.nextDeviceScan =
+      std::chrono::steady_clock::time_point{};
+    const bool found = nativeMtcFindOutputOnMainThread(true);
+    nativeUiShowTemporaryPopup(
+      found
+        ? "Saida MTC selecionada: " + g_nativeMtcBridge.outputName
+        : "Saida MTC nao encontrada. Crie ou ative a porta MIDI escolhida.",
+      2.5);
+    return true;
+  }
+
   if (type != "timecode_transport_sync") return false;
 
   bool receiveMode = false;
@@ -69208,6 +69519,16 @@ static bool nativeApplyTimecodeLanCommand(
   remoteClock.lastControlSequence = std::max(
     remoteClock.lastControlSequence, sourceControlSequence);
   remoteClock.lastPlayState = sourcePlayState;
+
+  // Quando existe uma porta Hook MIDI/IAC escolhida, o transporte continuo
+  // passa a ser MTC. Comandos semanticos (Parts, fila, selecao) continuam pelo
+  // protocolo VS Hook, mas os pulsos crus deixam de procurar a timeline do
+  // REAPER receptor. Se nenhuma porta MIDI existir, conserva o fallback LAN
+  // anterior para nao quebrar instalacoes ainda nao configuradas.
+  if (nativeMtcAcceptTransportOnMainThread(
+        commandBody, sourcePosition, sourcePlayState)) {
+    return true;
+  }
 
   const int localPlayState = GetPlayStateEx_ptr
     ? GetPlayStateEx_ptr(project)
@@ -70559,6 +70880,7 @@ static void startupTimer()
   // A fila HTTP precisa ser consumida antes de calcular runtimeActive: o
   // director_enter que acorda a extensao tambem chega por essa fila.
   nativeProcessHttpCommandsOnMainThread();
+  nativeMtcBridgeTickOnMainThread();
   nativeRestoreTransportEditCursorOnMainThread();
   nativeTimecodeLanPollEditCursorOnMainThread();
   // Project Sync observa tambem alteracoes feitas diretamente no TCP/MCP do
@@ -70942,6 +71264,15 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetMIDIInputName_ptr =
     reinterpret_cast<GetMIDIInputName_t>(
       rec->GetFunc("GetMIDIInputName"));
+  GetNumMIDIOutputs_ptr =
+    reinterpret_cast<GetNumMIDIOutputs_t>(
+      rec->GetFunc("GetNumMIDIOutputs"));
+  GetMIDIOutputName_ptr =
+    reinterpret_cast<GetMIDIOutputName_t>(
+      rec->GetFunc("GetMIDIOutputName"));
+  StuffMIDIMessage_ptr =
+    reinterpret_cast<StuffMIDIMessage_t>(
+      rec->GetFunc("StuffMIDIMessage"));
 
   if (!plugin_register_ptr) {
     showDiagnostic("VS Hook Loader nao carregou: plugin_register indisponivel.");
