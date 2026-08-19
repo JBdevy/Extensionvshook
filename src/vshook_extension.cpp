@@ -115,6 +115,7 @@ using GetMainHwnd_t = HWND (*)();
 using GetResourcePath_t = const char* (*)();
 using GetAppVersion_t = const char* (*)();
 using get_config_var_t = void* (*)(const char*, int*);
+using get_ini_file_t = const char* (*)();
 using Main_OnCommand_t = void (*)(int, int);
 using Main_openProject_t = void (*)(const char*);
 using GetToggleCommandState_t = int (*)(int);
@@ -287,6 +288,7 @@ static GetMainHwnd_t GetMainHwnd_ptr = nullptr;
 static GetResourcePath_t GetResourcePath_ptr = nullptr;
 static GetAppVersion_t GetAppVersion_ptr = nullptr;
 static get_config_var_t get_config_var_ptr = nullptr;
+static get_ini_file_t get_ini_file_ptr = nullptr;
 static Main_OnCommand_t Main_OnCommand_ptr = nullptr;
 static Main_openProject_t Main_openProject_ptr = nullptr;
 static GetToggleCommandState_t GetToggleCommandState_ptr = nullptr;
@@ -5251,6 +5253,11 @@ static NativeProjectSyncPreflightState
 static NativeProjectSyncBundleState g_nativeProjectSyncBundle;
 static NativeProjectSyncApplyState g_nativeProjectSyncApply;
 static uint64_t g_nativeProjectSyncApplySequence = 0;
+// Alteracoes novas podem chegar enquanto o bundle automatico anterior ainda
+// esta validando. Mantem o plano seguinte acumulado para nunca perder item,
+// pista ou FX criado durante uma transferencia em andamento.
+static std::string g_nativeProjectSyncQueuedAutomaticPlan;
+static std::string g_nativeProjectSyncQueuedAutomaticRevision;
 static NativeProjectSyncPendingOpen g_nativeProjectSyncPendingOpen;
 static NativeProjectSyncPendingPrepareConfirmation
   g_nativeProjectSyncPendingPrepareConfirmation;
@@ -6426,6 +6433,8 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   g_nativeProjectSyncPreflight = NativeProjectSyncPreflightState{};
   g_nativeProjectSyncBundle = NativeProjectSyncBundleState{};
   g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
+  g_nativeProjectSyncQueuedAutomaticPlan.clear();
+  g_nativeProjectSyncQueuedAutomaticRevision.clear();
   g_nativeProjectSyncPendingOpen = NativeProjectSyncPendingOpen{};
   g_nativeProjectSyncPendingPrepareConfirmation =
     NativeProjectSyncPendingPrepareConfirmation{};
@@ -25653,6 +25662,36 @@ static NativeProjectSyncDifferencePlan nativeProjectSyncParseDifferencePlan(
   return plan;
 }
 
+static std::string nativeProjectSyncMergeDifferencePlans(
+  const std::string& first,
+  const std::string& second)
+{
+  NativeProjectSyncDifferencePlan merged =
+    nativeProjectSyncParseDifferencePlan(first);
+  const NativeProjectSyncDifferencePlan incoming =
+    nativeProjectSyncParseDifferencePlan(second);
+  merged.trackIds.insert(
+    incoming.trackIds.begin(), incoming.trackIds.end());
+  merged.itemIds.insert(
+    incoming.itemIds.begin(), incoming.itemIds.end());
+  merged.fxTrackIds.insert(
+    incoming.fxTrackIds.begin(), incoming.fxTrackIds.end());
+  std::ostringstream output;
+  const auto append = [&](const char* kind,
+                          const std::set<std::string>& ids) {
+    for (const auto& id : ids) {
+      if (output.tellp() > 0) output << '\n';
+      output << kind << '\t' << id;
+    }
+  };
+  append("TRACK", merged.trackIds);
+  append("ITEM", merged.itemIds);
+  append("FXTRACK", merged.fxTrackIds);
+  std::string result = output.str();
+  if (result.size() > 128 * 1024) result.resize(128 * 1024);
+  return result;
+}
+
 static std::vector<NativeProjectSyncRppReference>
 nativeProjectSyncRppReferences(
   const std::string& rpp,
@@ -28654,6 +28693,34 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
   g_nativeForceSnapshotBuild.store(true);
   g_nativeForceStateBuild.store(true);
   nativeUiCloseMainModal();
+  bool queuedAutomatic = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    const std::string queuedPlan =
+      g_nativeProjectSyncQueuedAutomaticPlan;
+    const std::string queuedRevision =
+      g_nativeProjectSyncQueuedAutomaticRevision;
+    const std::string queuedRequestId =
+      g_nativeProjectSyncPreflight.requestId;
+    if (!queuedPlan.empty() &&
+        nativeProjectSyncRequestIdIsValid(queuedRequestId) &&
+        g_nativeTimecodeLanMode == "project_sync" &&
+        g_nativeTimecodeLanProjectSyncRole == "secondary") {
+      g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
+      g_nativeProjectSyncApply.state = "requested";
+      g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
+      g_nativeProjectSyncApply.requestId = queuedRequestId;
+      g_nativeProjectSyncApply.revision = queuedRevision;
+      g_nativeProjectSyncApply.sequence =
+        ++g_nativeProjectSyncApplySequence;
+      g_nativeProjectSyncApply.automatic = true;
+      g_nativeProjectSyncApply.differencePlan = queuedPlan;
+      g_nativeProjectSyncQueuedAutomaticPlan.clear();
+      g_nativeProjectSyncQueuedAutomaticRevision.clear();
+      queuedAutomatic = true;
+    }
+  }
+  if (queuedAutomatic) g_nativeForceStateBuild.store(true);
   if (applyConfigurations && !configurationsApplied) {
     nativeUiShowTemporaryPopup(
       configurationError.empty()
@@ -56032,6 +56099,33 @@ static bool nativeAppActivePanelIsOpen()
   return g_nativeAppActivePanelHwnd && IsWindow(g_nativeAppActivePanelHwnd);
 }
 
+static bool nativePromptEnablePartsSmoothSeek()
+{
+  if (!get_config_var_ptr || !ShowMessageBox_ptr) return false;
+  int size = 0;
+  void* address = get_config_var_ptr("smoothseek", &size);
+  if (!address || size < static_cast<int>(sizeof(int))) return false;
+  int* smoothSeek = static_cast<int*>(address);
+  // 1 habilita Smooth Seek e 2 escolhe "proximo marcador/fim da regiao".
+  // O valor combinado 3 e exatamente o modo exigido por Fila e Parts.
+  if ((*smoothSeek & 3) == 3) return false;
+  const int answer = ShowMessageBox_ptr(
+    "A configuracao necessaria para Fila de Espera e Parts esta "
+    "desativada.\n\nDeseja ativar agora?",
+    "VS Hook - Configuracao de Seeking", 4);
+  if (answer == 6) {
+    *smoothSeek = (*smoothSeek & ~3) | 3;
+    const char* iniFile = get_ini_file_ptr ? get_ini_file_ptr() : nullptr;
+    if (iniFile && *iniFile) {
+      char value[32] = "";
+      std::snprintf(value, sizeof(value), "%d", *smoothSeek);
+      WritePrivateProfileString(
+        "REAPER", "smoothseek", value, iniFile);
+    }
+  }
+  return true;
+}
+
 static bool nativeOpenAppActivePanel()
 {
   if (!nativeEnsureSupportedReaperVersion()) return false;
@@ -56171,7 +56265,11 @@ static bool nativeOpenAppActivePanel()
   }
   SetFocus(hwnd);
   InvalidateRect(hwnd, nullptr, FALSE);
-  nativeOpenShortcutNotice();
+  // Evita empilhar duas confirmacoes na mesma abertura. Se a preferencia de
+  // seeking ja estiver correta, o aviso normal de atalhos segue igual.
+  if (!nativePromptEnablePartsSmoothSeek()) {
+    nativeOpenShortcutNotice();
+  }
   nativeRestoreTelepromptWindowsIfRequested();
   return true;
 }
@@ -65345,9 +65443,13 @@ static bool nativeProjectSyncLiveItemStateChanged(
   const NativeProjectSyncLiveItemState& before,
   const NativeProjectSyncLiveItemState& after)
 {
+  const bool legacySyntheticId =
+    before.id.find(":item:") != std::string::npos ||
+    after.id.find(":item:") != std::string::npos;
   return before.trackId != after.trackId ||
-    before.trackIndex != after.trackIndex ||
-    before.itemIndex != after.itemIndex ||
+    (legacySyntheticId &&
+      (before.trackIndex != after.trackIndex ||
+       before.itemIndex != after.itemIndex)) ||
     before.hasTake != after.hasTake ||
     nativeProjectSyncLiveNumberChanged(
       before.itemVolume, after.itemVolume) ||
@@ -65424,8 +65526,10 @@ nativeProjectSyncReadLiveItemState(
       GetMediaItemTakeInfo_Value_ptr(take, "D_PLAYRATE");
   }
   std::ostringstream structure;
-  structure << state.trackId << '\n'
-            << (take && TakeIsMIDI_ptr && TakeIsMIDI_ptr(take)
+  // A pista de destino e um estado leve, assim como posicao e volume. Coloca-la
+  // na assinatura estrutural transformava um simples arraste entre pistas em
+  // bundle de projeto e impedia o MoveMediaItemToTrack imediato no PC B.
+  structure << (take && TakeIsMIDI_ptr && TakeIsMIDI_ptr(take)
                   ? "midi" : "audio") << '\n'
             << nativeReadTakeSourcePath(take) << '\n'
             << nativeTakeName(item, "") << '\n'
@@ -66295,24 +66399,36 @@ static bool nativeApplyProjectSyncLiveCommand(
   if (resync) {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     const std::string requestId = g_nativeProjectSyncPreflight.requestId;
-    if (nativeProjectSyncRequestIdIsValid(requestId) &&
-        g_nativeProjectSyncApply.state != "requesting" &&
-        g_nativeProjectSyncApply.state != "downloading" &&
-        g_nativeProjectSyncApply.state != "verifying" &&
-        g_nativeProjectSyncApply.state != "validating" &&
-        g_nativeProjectSyncApply.state != "applying") {
+    const std::string revision = nativeTrim(
+      nativeJsonExtractString(commandBody, "structuralRevision"));
+    const std::string plan = nativeJsonExtractString(
+      commandBody, "differencePlan").substr(0, 128 * 1024);
+    const std::string applyState = nativeLower(nativeTrim(
+      g_nativeProjectSyncApply.state));
+    const bool busy = applyState == "requested" ||
+      applyState == "requesting" || applyState == "downloading" ||
+      applyState == "verifying" || applyState == "validating" ||
+      applyState == "ready_to_open" ||
+      applyState == "ready_to_apply" || applyState == "applying" ||
+      applyState == "apply_started";
+    if (nativeProjectSyncRequestIdIsValid(requestId) && busy) {
+      g_nativeProjectSyncQueuedAutomaticPlan =
+        nativeProjectSyncMergeDifferencePlans(
+          g_nativeProjectSyncQueuedAutomaticPlan, plan);
+      if (!revision.empty()) {
+        g_nativeProjectSyncQueuedAutomaticRevision = revision;
+      }
+      g_nativeForceStateBuild.store(true);
+    } else if (nativeProjectSyncRequestIdIsValid(requestId)) {
       g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
       g_nativeProjectSyncApply.state = "requested";
       g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
       g_nativeProjectSyncApply.requestId = requestId;
-      g_nativeProjectSyncApply.revision = nativeTrim(
-        nativeJsonExtractString(commandBody, "structuralRevision"));
+      g_nativeProjectSyncApply.revision = revision;
       g_nativeProjectSyncApply.sequence =
         ++g_nativeProjectSyncApplySequence;
       g_nativeProjectSyncApply.automatic = true;
-      g_nativeProjectSyncApply.differencePlan =
-        nativeJsonExtractString(commandBody, "differencePlan").substr(
-          0, 128 * 1024);
+      g_nativeProjectSyncApply.differencePlan = plan;
       g_nativeForceStateBuild.store(true);
     }
     return true;
@@ -71301,6 +71417,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetAppVersion_ptr = reinterpret_cast<GetAppVersion_t>(rec->GetFunc("GetAppVersion"));
   get_config_var_ptr = reinterpret_cast<get_config_var_t>(
     rec->GetFunc("get_config_var"));
+  get_ini_file_ptr = reinterpret_cast<get_ini_file_t>(
+    rec->GetFunc("get_ini_file"));
   Main_OnCommand_ptr = reinterpret_cast<Main_OnCommand_t>(rec->GetFunc("Main_OnCommand"));
   Main_openProject_ptr = reinterpret_cast<Main_openProject_t>(
     rec->GetFunc("Main_openProject"));
