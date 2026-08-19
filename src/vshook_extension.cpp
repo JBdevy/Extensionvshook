@@ -5092,6 +5092,10 @@ struct NativeProjectSyncApplyState {
   int64_t stateUpdatedAtMs = 0;
   bool automatic = false;
   bool applyConfigurations = false;
+  // Plano interno, uma entidade por linha (TRACK/ITEM/FXTRACK). Ele nunca e
+  // exibido na conferencia; serve apenas para evitar varrer/aplicar o projeto
+  // inteiro quando poucas entidades realmente diferem.
+  std::string differencePlan;
 };
 
 struct NativeProjectSyncPendingOpen {
@@ -5111,6 +5115,7 @@ struct NativeProjectSyncPendingOpen {
   std::string previousConfigSnapshot;
   std::string previousConfigRevision;
   bool automatic = false;
+  std::string differencePlan;
 };
 
 struct NativeProjectSyncPendingPrepareConfirmation {
@@ -6915,6 +6920,8 @@ static std::string nativeTimecodeLanStatusJson()
        << "\"sequence\":" << g_nativeProjectSyncApply.sequence << ","
        << "\"automatic\":"
        << (g_nativeProjectSyncApply.automatic ? "true" : "false")
+       << ",\"differencePlan\":"
+       << nativeJsonString(g_nativeProjectSyncApply.differencePlan)
        << "},\"projectSyncApplyRequested\":"
        << (g_nativeProjectSyncApply.state == "requested"
              ? "true" : "false") << ","
@@ -25611,7 +25618,40 @@ struct NativeProjectSyncRppReference {
   std::string sourcePath;
   std::string resolvedPath;
   bool quoted = true;
+  std::string itemId;
 };
+
+struct NativeProjectSyncDifferencePlan {
+  bool scoped = false;
+  std::set<std::string> trackIds;
+  std::set<std::string> itemIds;
+  std::set<std::string> fxTrackIds;
+};
+
+static NativeProjectSyncDifferencePlan nativeProjectSyncParseDifferencePlan(
+  const std::string& raw)
+{
+  NativeProjectSyncDifferencePlan plan;
+  if (raw.empty() || raw.size() > 128 * 1024) return plan;
+  std::istringstream input(raw);
+  std::string line;
+  while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    const size_t tab = line.find('\t');
+    if (tab == std::string::npos) continue;
+    const std::string kind = nativeLower(nativeTrim(line.substr(0, tab)));
+    const std::string id = nativeLower(nativeTrim(line.substr(tab + 1)));
+    if (id.empty() || id.size() > 512 || id.find('\0') != std::string::npos) {
+      continue;
+    }
+    if (kind == "track") plan.trackIds.insert(id);
+    else if (kind == "item") plan.itemIds.insert(id);
+    else if (kind == "fxtrack") plan.fxTrackIds.insert(id);
+  }
+  plan.scoped = !plan.trackIds.empty() || !plan.itemIds.empty() ||
+    !plan.fxTrackIds.empty();
+  return plan;
+}
 
 static std::vector<NativeProjectSyncRppReference>
 nativeProjectSyncRppReferences(
@@ -25674,6 +25714,73 @@ nativeProjectSyncRppReferences(
     if (lineEnd == std::string::npos) break;
     position = lineEnd + 1;
   }
+
+  // Associa cada FILE ao GUID do ITEM que o contem. Isso permite que um
+  // bundle incremental calcule/transfira apenas a midia dos itens realmente
+  // diferentes, sem sequer abrir os demais arquivos do projeto.
+  struct ItemRange {
+    size_t start = 0;
+    size_t end = 0;
+    std::string id;
+  };
+  std::vector<ItemRange> itemRanges;
+  position = 0;
+  int depth = 0;
+  int itemParentDepth = -1;
+  size_t itemStart = std::string::npos;
+  while (position < rpp.size()) {
+    const size_t lineEnd = rpp.find('\n', position);
+    const size_t afterLine = lineEnd == std::string::npos
+      ? rpp.size() : lineEnd + 1;
+    const std::string trimmed = nativeTrim(
+      rpp.substr(position, afterLine - position));
+    const bool opens = !trimmed.empty() && trimmed.front() == '<';
+    const bool closes = trimmed == ">";
+    if (itemStart == std::string::npos && opens &&
+        nativeLower(trimmed).rfind("<item", 0) == 0) {
+      itemStart = position;
+      itemParentDepth = depth;
+    }
+    if (opens) ++depth;
+    if (closes) {
+      depth = std::max(0, depth - 1);
+      if (itemStart != std::string::npos && depth == itemParentDepth) {
+        std::string itemId;
+        size_t itemLine = itemStart;
+        while (itemLine < afterLine) {
+          const size_t itemLineEnd = rpp.find('\n', itemLine);
+          const size_t itemEnd = itemLineEnd == std::string::npos
+            ? afterLine : std::min(afterLine, itemLineEnd);
+          const std::string itemText = nativeTrim(
+            rpp.substr(itemLine, itemEnd - itemLine));
+          if (nativeLower(itemText).rfind("guid ", 0) == 0) {
+            itemId = nativeLower(nativeTrim(itemText.substr(5)));
+            break;
+          }
+          if (itemLineEnd == std::string::npos ||
+              itemLineEnd >= afterLine) break;
+          itemLine = itemLineEnd + 1;
+        }
+        itemRanges.push_back({itemStart, afterLine, itemId});
+        itemStart = std::string::npos;
+        itemParentDepth = -1;
+      }
+    }
+    if (lineEnd == std::string::npos) break;
+    position = afterLine;
+  }
+  size_t rangeIndex = 0;
+  for (auto& reference : references) {
+    while (rangeIndex < itemRanges.size() &&
+           reference.valueStart >= itemRanges[rangeIndex].end) {
+      ++rangeIndex;
+    }
+    if (rangeIndex < itemRanges.size() &&
+        reference.valueStart >= itemRanges[rangeIndex].start &&
+        reference.valueEnd <= itemRanges[rangeIndex].end) {
+      reference.itemId = itemRanges[rangeIndex].id;
+    }
+  }
   return references;
 }
 
@@ -25715,6 +25822,7 @@ struct NativeProjectSyncPrepareInput {
   int projectChangeCount = -1;
   bool automatic = false;
   bool supportsSourceMap = false;
+  std::string differencePlan;
 };
 
 static void nativeProjectSyncFinishBundleError(
@@ -25754,9 +25862,21 @@ static void nativeProjectSyncPrepareBundleWorker(
   // projeto enquanto o worker fazia a copia. A conferencia final acontece na
   // main thread antes de publicar ready; aqui o change count e preservado no
   // input para aquele commit.
-  const std::vector<NativeProjectSyncRppReference> references =
+  const std::vector<NativeProjectSyncRppReference> allReferences =
     nativeProjectSyncRppReferences(rpp, input.projectDirectory,
       input.mediaDirectory);
+  const NativeProjectSyncDifferencePlan differencePlan =
+    nativeProjectSyncParseDifferencePlan(input.differencePlan);
+  std::vector<NativeProjectSyncRppReference> references;
+  references.reserve(allReferences.size());
+  for (const auto& reference : allReferences) {
+    if (!differencePlan.scoped ||
+        (!reference.itemId.empty() &&
+         differencePlan.itemIds.count(
+           nativeLower(reference.itemId)) != 0)) {
+      references.push_back(reference);
+    }
+  }
   std::map<std::string, std::string> uniqueSources;
   std::map<std::string, NativeProjectSyncRegularFileStamp> sourceStamps;
   std::map<std::string, std::string> cachedSourceHashes;
@@ -26223,6 +26343,7 @@ struct NativeProjectSyncApplyInput {
   std::string previousConfigRevision;
   std::string sourceManifest;
   bool automatic = false;
+  std::string differencePlan;
 };
 
 static void nativeProjectSyncFinishApplyError(
@@ -26627,6 +26748,8 @@ static void nativeProjectSyncApplyBundleWorker(
   std::string inPlaceProjectText;
   inPlaceProjectText.reserve(
     sourceProjectText.size() + references.size() * 64);
+  const NativeProjectSyncDifferencePlan differencePlan =
+    nativeProjectSyncParseDifferencePlan(input.differencePlan);
   size_t copiedUntil = 0;
   for (const auto& reference : references) {
     if (reference.valueStart < copiedUntil ||
@@ -26644,6 +26767,11 @@ static void nativeProjectSyncApplyBundleWorker(
       }
     }
     if (mappedPath.empty()) {
+      if (differencePlan.scoped) {
+        // O bloco deste item permanece exatamente como ja esta no PC B.
+        // Logo esta referencia igual nao precisa de hash, copia ou relink.
+        continue;
+      }
       nativeProjectSyncFinishApplyError(input.requestId,
         "O snapshot nao conseguiu vincular toda a midia recebida.");
       g_nativeProjectSyncBundleWorkerRunning.store(false);
@@ -26706,6 +26834,8 @@ static void nativeProjectSyncApplyBundleWorker(
       g_nativeProjectSyncPendingOpen.previousConfigRevision =
         previousConfigRevision;
       g_nativeProjectSyncPendingOpen.automatic = input.automatic;
+      g_nativeProjectSyncPendingOpen.differencePlan =
+        input.differencePlan;
       handedOff = true;
     }
   }
@@ -26884,6 +27014,9 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
     commandBody, "automatic", false);
   const bool supportsSourceMap = nativeJsonBoolValue(
     commandBody, "supportsSourceMap", false);
+  const std::string differencePlan =
+    nativeJsonExtractString(commandBody, "differencePlan").substr(
+      0, 128 * 1024);
   if (!nativeProjectSyncRequestIdIsValid(requestId)) return true;
 
   std::string role;
@@ -27026,7 +27159,7 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
       normalizeSlashes(
         GetResourcePath_ptr ? GetResourcePath_ptr() : ""),
       GetProjectStateChangeCount_ptr(project), automatic,
-      supportsSourceMap};
+      supportsSourceMap, differencePlan};
     g_nativeProjectSyncBundleWorker = std::thread([input]() {
       try {
         nativeProjectSyncPrepareBundleWorker(input);
@@ -27203,6 +27336,7 @@ static bool nativeProjectSyncApplyBundleFromCommand(
   const std::string previousConfigRevision =
     nativeProjectSyncHashText(previousConfigSnapshot);
   std::string sourceManifest;
+  std::string differencePlan;
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     g_nativeProjectSyncApply.state = "validating";
@@ -27213,6 +27347,7 @@ static bool nativeProjectSyncApplyBundleFromCommand(
     g_nativeProjectSyncApply.error.clear();
     g_nativeProjectSyncApply.automatic = automatic;
     sourceManifest = g_nativeProjectSyncPreflight.remoteManifest;
+    differencePlan = g_nativeProjectSyncApply.differencePlan;
   }
   if (sourceManifest.empty()) {
     nativeProjectSyncFinishApplyError(requestId,
@@ -27236,7 +27371,7 @@ static bool nativeProjectSyncApplyBundleFromCommand(
       requestId, bundleId, descriptorPath, stagingRoot,
       projectPath, projectDirectory, projectMediaDirectory, backupRoot,
       changeCount, previousConfigSnapshot, previousConfigRevision,
-      sourceManifest, automatic};
+      sourceManifest, automatic, differencePlan};
     g_nativeProjectSyncBundleWorker = std::thread([input]() {
       try {
         nativeProjectSyncApplyBundleWorker(input);
@@ -27374,6 +27509,11 @@ static void nativeProjectSyncApplyConfigFromDiffModal()
     "Configuracoes do PC A aplicadas no PC B.", 2.0);
 }
 
+static bool nativeProjectSyncApplyTimelineInPlace(
+  ReaProject* project,
+  const std::string& sourceManifest,
+  std::string& errorOut);
+
 static void nativeProjectSyncRequestApplyFromDiffModal()
 {
   std::string role;
@@ -27414,9 +27554,244 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
       "Project Sync - Aplicar configuracoes", 4);
     applyConfigurations = configConfirmation == 6;
   }
+
+  // Alteracoes que nao carregam ITEM/FX nao precisam criar snapshot, calcular
+  // hashes ou percorrer a pasta de midia. O caminho leve abaixo aplica pistas,
+  // timeline e configuracoes diretamente no projeto B. Somente diferencas que
+  // realmente dependem de arquivos/chunks seguem para o bundle.
+  std::string remoteManifest;
+  std::string localManifest;
+  std::string remoteConfigSnapshot;
+  std::string remoteConfigRevision;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    remoteManifest = g_nativeProjectSyncPreflight.remoteManifest;
+    localManifest = g_nativeProjectSyncPreflight.manifest;
+    remoteConfigSnapshot =
+      g_nativeProjectSyncPreflight.remoteConfigSnapshot;
+    remoteConfigRevision =
+      g_nativeProjectSyncPreflight.remoteConfigRevision;
+  }
+  const NativeProjectSyncParsedManifest remoteParsed =
+    nativeProjectSyncParseManifest(remoteManifest);
+  const NativeProjectSyncParsedManifest localParsed =
+    nativeProjectSyncParseManifest(localManifest);
+  NativeProjectSyncCompareResult currentComparison =
+    nativeProjectSyncCompareManifests(remoteManifest, localManifest);
+  bool requiresFileBundle = !remoteParsed.valid || !localParsed.valid;
+  bool timelineDiffers = false;
+  bool tracksDiffer = false;
+  const auto categoryCount = [&](const char* category) {
+    const auto found = currentComparison.categoryCounts.find(category);
+    return found == currentComparison.categoryCounts.end()
+      ? 0 : found->second;
+  };
+  requiresFileBundle = requiresFileBundle ||
+    categoryCount("files") > 0 || categoryCount("plugins") > 0 ||
+    categoryCount("project") > 0;
+  tracksDiffer = categoryCount("tracks") > 0;
+  timelineDiffers = categoryCount("regions") > 0 ||
+    categoryCount("markers") > 0 ||
+    categoryCount("tempoMarkers") > 0;
+
+  if (!requiresFileBundle) {
+    struct TrackTarget {
+      int index = 0;
+      std::string guid;
+      std::string name;
+      int folderDepth = 0;
+      double volume = 1.0;
+      bool mute = false;
+      int solo = 0;
+      MediaTrack* track = nullptr;
+    };
+    ReaProject* project = getCurrentProject(nullptr, 0);
+    std::vector<TrackTarget> targets;
+    bool directReady = project && CountTracks_ptr && GetTrack_ptr &&
+      SetOnlyTrackSelected_ptr && ReorderSelectedTracks_ptr &&
+      GetSetMediaTrackInfo_String_ptr && SetMediaTrackInfo_Value_ptr;
+    if (directReady && tracksDiffer) {
+      std::map<std::string, MediaTrack*> localTracks;
+      const int localTrackCount = CountTracks_ptr(project);
+      for (int index = 0; index < localTrackCount; ++index) {
+        MediaTrack* track = GetTrack_ptr(project, index);
+        if (track) {
+          localTracks[nativeLower(nativeTrackGuid(track, index))] = track;
+        }
+      }
+      for (const auto& record : remoteParsed.structural) {
+        if (record.first.rfind("TRACK\t", 0) != 0) continue;
+        std::vector<std::string> fields =
+          nativeProjectSyncTsvFields(record.second);
+        if (fields.size() != 9) {
+          directReady = false;
+          break;
+        }
+        for (size_t field = 1; field < fields.size(); ++field) {
+          fields[field] = nativeUiBackupUnescape(fields[field]);
+        }
+        TrackTarget target;
+        target.guid = nativeLower(nativeTrim(fields[1]));
+        target.index = std::max(0, std::atoi(fields[2].c_str()) - 1);
+        target.name = fields[3];
+        target.folderDepth = std::atoi(fields[4].c_str());
+        target.volume = std::atof(fields[6].c_str());
+        target.mute = fields[7] == "1";
+        target.solo = std::atoi(fields[8].c_str());
+        const auto found = localTracks.find(target.guid);
+        if (found == localTracks.end()) {
+          directReady = false;
+          break;
+        }
+        target.track = found->second;
+        targets.push_back(std::move(target));
+      }
+      if (static_cast<int>(targets.size()) != localTrackCount) {
+        directReady = false;
+      }
+      std::sort(targets.begin(), targets.end(),
+        [](const TrackTarget& left, const TrackTarget& right) {
+          return left.index < right.index;
+        });
+    }
+
+    if (directReady) {
+      std::string directError;
+      if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+      if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
+      bool directApplied = true;
+      if (tracksDiffer) {
+        for (size_t targetIndex = 0;
+             targetIndex < targets.size(); ++targetIndex) {
+          MediaTrack* track = targets[targetIndex].track;
+          SetOnlyTrackSelected_ptr(track);
+          if (!ReorderSelectedTracks_ptr(
+                static_cast<int>(targetIndex), 0)) {
+            directApplied = false;
+            directError = "Nao foi possivel alinhar a ordem das pistas.";
+            break;
+          }
+          track = GetTrack_ptr(project, static_cast<int>(targetIndex));
+          std::vector<char> writableName(
+            targets[targetIndex].name.begin(),
+            targets[targetIndex].name.end());
+          writableName.push_back('\0');
+          if (!track || !GetSetMediaTrackInfo_String_ptr(
+                track, "P_NAME", writableName.data(), true)) {
+            directApplied = false;
+            directError = "Nao foi possivel atualizar uma pista.";
+            break;
+          }
+          SetMediaTrackInfo_Value_ptr(track, "I_FOLDERDEPTH",
+            targets[targetIndex].folderDepth);
+          SetMediaTrackInfo_Value_ptr(track, "D_VOL",
+            targets[targetIndex].volume);
+          SetMediaTrackInfo_Value_ptr(track, "B_MUTE",
+            targets[targetIndex].mute ? 1.0 : 0.0);
+          SetMediaTrackInfo_Value_ptr(track, "I_SOLO",
+            targets[targetIndex].solo);
+        }
+      }
+      if (directApplied && timelineDiffers) {
+        directApplied = nativeProjectSyncApplyTimelineInPlace(
+          project, remoteManifest, directError);
+      }
+      if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(-1);
+      if (Undo_EndBlock2_ptr) {
+        Undo_EndBlock2_ptr(project,
+          "VS Hook: aplicar diferencas do Project Sync", -1);
+      }
+      if (!directApplied) {
+        if (Undo_DoUndo2_ptr) Undo_DoUndo2_ptr(project);
+        nativeUiShowTemporaryPopup(
+          directError.empty() ? "Falha ao aplicar as diferencas."
+                              : directError, 2.5);
+        return;
+      }
+      if (applyConfigurations && !remoteConfigSnapshot.empty()) {
+        std::string configError;
+        if (!nativeProjectSyncApplyConfigSnapshot(
+              remoteConfigSnapshot, remoteConfigRevision, configError)) {
+          if (Undo_DoUndo2_ptr) Undo_DoUndo2_ptr(project);
+          nativeUiShowTemporaryPopup(
+            configError.empty()
+              ? "Falha ao aplicar as configuracoes."
+              : configError, 2.5);
+          return;
+        }
+        std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+        g_nativeProjectSyncConfigurationAuthorized = true;
+      }
+      if (MarkProjectDirty_ptr && (tracksDiffer || timelineDiffers)) {
+        MarkProjectDirty_ptr(project);
+      }
+      if (TrackList_AdjustWindows_ptr) TrackList_AdjustWindows_ptr(false);
+      if (UpdateTimeline_ptr) UpdateTimeline_ptr();
+      if (UpdateArrange_ptr) UpdateArrange_ptr();
+      nativeProjectSyncRefreshManifestOnMainThread(true);
+      {
+        std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+        localManifest = g_nativeProjectSyncPreflight.manifest;
+      }
+      NativeProjectSyncCompareResult refreshed =
+        nativeProjectSyncCompareManifests(remoteManifest, localManifest);
+      nativeProjectSyncBuildComparePresentation(refreshed);
+      nativeProjectSyncStorePreflightResult(
+        preflightRequestId, refreshed.ready, refreshed.diffJson,
+        revision, remoteManifest, remoteConfigSnapshot);
+      if (refreshed.differenceCount == 0) {
+        nativeUiCloseMainModal();
+      } else {
+        nativeProjectSyncShowDiffModal(refreshed.diffJson);
+      }
+      g_nativeForceSnapshotBuild.store(true);
+      g_nativeForceStateBuild.store(true);
+      nativeUiShowTemporaryPopup(
+        "Diferencas aplicadas no PC B.", 2.0);
+      return;
+    }
+  }
+
   const std::string requestId =
     nativeProjectSyncRequestIdIsValid(preflightRequestId)
       ? preflightRequestId : nativeProjectSyncNewApplyRequestId();
+  std::string differencePlan;
+  if (!currentComparison.truncated) {
+    std::set<std::string> planLines;
+    for (const auto& difference : currentComparison.differences) {
+      const std::string id = nativeLower(nativeTrim(difference.id));
+      if (id.empty()) continue;
+      if (difference.category == "files") {
+        planLines.insert("ITEM\t" + id);
+      } else if (difference.category == "tracks") {
+        planLines.insert("TRACK\t" + id);
+      } else if (difference.category == "plugins") {
+        const std::string identity = "FX\t" + difference.id;
+        const auto primary = remoteParsed.structural.find(identity);
+        const auto secondary = localParsed.structural.find(identity);
+        std::string selectedLine;
+        if (primary != remoteParsed.structural.end()) {
+          selectedLine = primary->second;
+        } else if (secondary != localParsed.structural.end()) {
+          selectedLine = secondary->second;
+        }
+        if (!selectedLine.empty()) {
+          const std::vector<std::string> fields =
+            nativeProjectSyncTsvFields(selectedLine);
+          if (fields.size() == 9) {
+            planLines.insert("FXTRACK\t" + nativeLower(nativeTrim(
+              nativeUiBackupUnescape(fields[2]))));
+          }
+        }
+      }
+    }
+    std::ostringstream encodedPlan;
+    for (const auto& line : planLines) {
+      if (encodedPlan.tellp() > 0) encodedPlan << '\n';
+      encodedPlan << line;
+    }
+    differencePlan = encodedPlan.str();
+  }
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
@@ -27428,6 +27803,7 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
       ++g_nativeProjectSyncApplySequence;
     g_nativeProjectSyncApply.automatic = false;
     g_nativeProjectSyncApply.applyConfigurations = applyConfigurations;
+    g_nativeProjectSyncApply.differencePlan = differencePlan;
     g_nativeProjectSyncConfigurationAuthorized = false;
   }
   g_nativeForceStateBuild.store(true);
@@ -27637,20 +28013,59 @@ static bool nativeProjectSyncTrackChunkIsRoutingLine(
     segment.key == "midiout" || segment.key == "nchan";
 }
 
+static std::string nativeProjectSyncRppItemGuid(
+  const std::string& chunk)
+{
+  std::istringstream input(chunk);
+  std::string line;
+  while (std::getline(input, line)) {
+    const std::string trimmed = nativeTrim(line);
+    if (nativeLower(trimmed).rfind("guid ", 0) == 0) {
+      return nativeLower(nativeTrim(trimmed.substr(5)));
+    }
+  }
+  return {};
+}
+
 static std::string nativeProjectSyncMergeTrackChunk(
   const std::string& source,
-  const std::string& target)
+  const std::string& target,
+  const NativeProjectSyncDifferencePlan* differencePlan = nullptr)
 {
   const auto sourceSegments = nativeProjectSyncRppTrackSegments(source);
   const auto targetSegments = nativeProjectSyncRppTrackSegments(target);
   if (sourceSegments.size() < 2 || targetSegments.size() < 2) return {};
+  const bool scoped = differencePlan && differencePlan->scoped;
+  const std::string sourceTrackGuid =
+    nativeProjectSyncRppTrackGuid(source);
+  const bool importTrackMetadata = !scoped ||
+    differencePlan->trackIds.count(sourceTrackGuid) != 0;
+  const bool importFx = !scoped || importTrackMetadata ||
+    differencePlan->fxTrackIds.count(sourceTrackGuid) != 0;
   std::map<std::string, std::string> sourceLines;
-  std::vector<std::string> sourceImportedBlocks;
+  std::vector<std::string> sourceFxBlocks;
+  std::vector<std::string> sourceItemBlocks;
+  std::map<std::string, std::string> targetItemsByGuid;
+  std::vector<std::pair<std::string, std::string>> targetItemBlocks;
+  std::vector<std::string> targetFxBlocks;
   for (const auto& segment : sourceSegments) {
-    if (nativeProjectSyncTrackChunkIsImportedBlock(segment)) {
-      sourceImportedBlocks.push_back(segment.text);
+    if (segment.block &&
+        (segment.key == "fxchain" || segment.key == "fxchain_rec")) {
+      sourceFxBlocks.push_back(segment.text);
+    } else if (segment.block && segment.key == "item") {
+      sourceItemBlocks.push_back(segment.text);
     } else if (!segment.block && !segment.key.empty()) {
       sourceLines[segment.key] = segment.text;
+    }
+  }
+  for (const auto& segment : targetSegments) {
+    if (segment.block &&
+        (segment.key == "fxchain" || segment.key == "fxchain_rec")) {
+      targetFxBlocks.push_back(segment.text);
+    } else if (segment.block && segment.key == "item") {
+      const std::string id = nativeProjectSyncRppItemGuid(segment.text);
+      targetItemBlocks.push_back({id, segment.text});
+      if (!id.empty()) targetItemsByGuid[id] = segment.text;
     }
   }
   bool wroteName = false;
@@ -27666,19 +28081,19 @@ static std::string nativeProjectSyncMergeTrackChunk(
     const auto replacement = sourceLines.find(segment.key);
     if (segment.key == "name" || segment.key == "isbus" ||
         segment.key == "trackid") {
-      result << (replacement != sourceLines.end()
+      result << (importTrackMetadata && replacement != sourceLines.end()
         ? replacement->second : segment.text);
       if (segment.key == "name") wroteName = true;
       else if (segment.key == "isbus") wroteFolder = true;
       else wroteTrackId = true;
     } else if (segment.key == "volpan" &&
-               replacement != sourceLines.end()) {
+               importTrackMetadata && replacement != sourceLines.end()) {
       // D_VOL é o primeiro campo. PAN e os demais parâmetros continuam B.
       result << nativeProjectSyncMergeNumericLine(
         replacement->second, segment.text, 1);
       wroteVolume = true;
     } else if (segment.key == "mutesolo" &&
-               replacement != sourceLines.end()) {
+               importTrackMetadata && replacement != sourceLines.end()) {
       // B_MUTE e I_SOLO são os dois primeiros campos.
       result << nativeProjectSyncMergeNumericLine(
         replacement->second, segment.text, 2);
@@ -27696,19 +28111,47 @@ static std::string nativeProjectSyncMergeTrackChunk(
     const bool written = key == "name" ? wroteName
       : (key == "isbus" ? wroteFolder : wroteTrackId);
     const auto sourceLine = sourceLines.find(key);
-    if (!written && sourceLine != sourceLines.end()) {
+    if (importTrackMetadata && !written &&
+        sourceLine != sourceLines.end()) {
       result << sourceLine->second;
     }
   }
-  if (!wroteVolume) {
+  if (importTrackMetadata && !wroteVolume) {
     const auto sourceLine = sourceLines.find("volpan");
     if (sourceLine != sourceLines.end()) result << sourceLine->second;
   }
-  if (!wroteMuteSolo) {
+  if (importTrackMetadata && !wroteMuteSolo) {
     const auto sourceLine = sourceLines.find("mutesolo");
     if (sourceLine != sourceLines.end()) result << sourceLine->second;
   }
-  for (const auto& block : sourceImportedBlocks) result << block;
+  for (const auto& block : (importFx ? sourceFxBlocks : targetFxBlocks)) {
+    result << block;
+  }
+  std::set<std::string> sourceItemIds;
+  for (const auto& block : sourceItemBlocks) {
+    const std::string id = nativeProjectSyncRppItemGuid(block);
+    if (!id.empty()) sourceItemIds.insert(id);
+    if (!scoped || (!id.empty() &&
+        differencePlan->itemIds.count(id) != 0)) {
+      result << block;
+      continue;
+    }
+    const auto local = targetItemsByGuid.find(id);
+    if (local != targetItemsByGuid.end()) result << local->second;
+  }
+  if (scoped) {
+    for (const auto& local : targetItemBlocks) {
+      if (!local.first.empty() && sourceItemIds.count(local.first) != 0) {
+        continue;
+      }
+      // Item extra so e removido se ele aparece explicitamente no plano.
+      if (!local.first.empty() &&
+          differencePlan->itemIds.count(local.first) != 0) {
+        continue;
+      }
+      result << local.second;
+    }
+  }
   result << targetSegments.back().text;
   return result.str();
 }
@@ -27749,7 +28192,8 @@ static bool nativeProjectSyncReadTrackChunk(
 static bool nativeProjectSyncApplyTracksInPlace(
   ReaProject* project,
   const std::string& sourceRpp,
-  std::string& errorOut)
+  std::string& errorOut,
+  const NativeProjectSyncDifferencePlan* differencePlan = nullptr)
 {
   if (!project || !CountTracks_ptr || !GetTrack_ptr ||
       !InsertTrackAtIndex_ptr || !DeleteTrack_ptr ||
@@ -27836,7 +28280,7 @@ static bool nativeProjectSyncApplyTracksInPlace(
         return false;
       }
       finalChunk = nativeProjectSyncMergeTrackChunk(
-        sourceChunk, targetChunk);
+        sourceChunk, targetChunk, differencePlan);
     }
     if (finalChunk.empty() ||
         !SetTrackStateChunk_ptr(target, finalChunk.c_str(), false)) {
@@ -27848,7 +28292,13 @@ static bool nativeProjectSyncApplyTracksInPlace(
   for (int index = CountTracks_ptr(project) - 1;
        index >= static_cast<int>(sourceChunks.size()); --index) {
     MediaTrack* extra = GetTrack_ptr(project, index);
-    if (extra) DeleteTrack_ptr(extra);
+    if (!extra) continue;
+    if (differencePlan && differencePlan->scoped) {
+      const std::string extraId = nativeLower(
+        nativeTrackGuid(extra, index));
+      if (differencePlan->trackIds.count(extraId) == 0) continue;
+    }
+    DeleteTrack_ptr(extra);
   }
   return true;
 }
@@ -28111,8 +28561,11 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
   }
   Undo_BeginBlock2_ptr(project);
   if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
+  const NativeProjectSyncDifferencePlan differencePlan =
+    nativeProjectSyncParseDifferencePlan(pending.differencePlan);
   bool applied = nativeProjectSyncApplyTracksInPlace(
-    project, pending.inPlaceProjectText, error);
+    project, pending.inPlaceProjectText, error,
+    differencePlan.scoped ? &differencePlan : nullptr);
   if (applied && !pending.automatic) {
     applied = nativeProjectSyncApplyTimelineInPlace(
       project, pending.sourceManifest, error);
@@ -35184,53 +35637,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
         addCategory(difference.category);
       }
 
-      const int contentWidth = std::max(120,
-        static_cast<int>(viewport.right - viewport.left) - 22);
       std::vector<NativeProjectSyncDiffLayoutRow> layoutRows;
       int contentHeight = 8;
       for (const std::string& category : categories) {
         layoutRows.push_back(
-          {true, category, nullptr, contentHeight, 27});
-        contentHeight += 27;
-        for (const auto& difference :
-             g_nativeProjectSyncDiffModalDifferences) {
-          if (difference.category != category) continue;
-          std::string kindLabel;
-          if (difference.kind == "missing_on_secondary") {
-            kindLabel = "Falta no PC B";
-          } else if (difference.kind == "extra_on_secondary") {
-            kindLabel = "Existe somente no PC B";
-          } else if (difference.kind == "changed") {
-            kindLabel = "Valores diferentes";
-          } else if (difference.kind == "config_apply_failed") {
-            kindLabel = "Falha ao aplicar configuracao";
-          } else if (difference.kind == "invalid") {
-            kindLabel = "Falha de validacao";
-          } else {
-            kindLabel = difference.kind.empty()
-              ? "Diferenca" : difference.kind;
-          }
-          if (!difference.id.empty()) kindLabel += ": " + difference.id;
-          const std::string primary = "PC A: " +
-            (difference.primary.empty()
-              ? std::string("nao existe") : difference.primary);
-          const std::string secondary = "PC B: " +
-            (difference.secondary.empty()
-              ? std::string("nao existe") : difference.secondary);
-          const UINT wrapFlags = DT_LEFT | DT_TOP |
-            DT_WORDBREAK | DT_NOPREFIX;
-          const int kindHeight = nativeAppActiveMeasureTextHeight(
-            dc, kindLabel, contentWidth - 18, wrapFlags, labelFont);
-          const int primaryHeight = nativeAppActiveMeasureTextHeight(
-            dc, primary, contentWidth - 18, wrapFlags, statusFont);
-          const int secondaryHeight = nativeAppActiveMeasureTextHeight(
-            dc, secondary, contentWidth - 18, wrapFlags, statusFont);
-          const int rowHeight = 9 + kindHeight + 5 +
-            primaryHeight + 4 + secondaryHeight + 10;
-          layoutRows.push_back({false, category, &difference,
-            contentHeight, std::max(70, rowHeight)});
-          contentHeight += std::max(70, rowHeight) + 6;
-        }
+          {true, category, nullptr, contentHeight, 38});
+        contentHeight += 44;
       }
       if (layoutRows.empty()) contentHeight = 48;
 
@@ -35246,7 +35658,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         nativeUiBeginClipRect(dc, viewport);
       if (layoutRows.empty()) {
         nativeAppActiveDrawText(dc,
-          "Nenhuma diferenca detalhada foi recebida.",
+          "Nenhuma diferenca encontrada.",
           RECT{viewport.left + 12, viewport.top + 12,
             viewport.right - 20, viewport.top + 38},
           DT_LEFT | DT_VCENTER | DT_SINGLELINE |
@@ -35283,58 +35695,6 @@ static void nativePaintAppActivePanel(HWND hwnd)
             accent, labelFont);
           continue;
         }
-        if (!row.difference) continue;
-        const auto& difference = *row.difference;
-        std::string kindLabel;
-        if (difference.kind == "missing_on_secondary") {
-          kindLabel = "Falta no PC B";
-        } else if (difference.kind == "extra_on_secondary") {
-          kindLabel = "Existe somente no PC B";
-        } else if (difference.kind == "changed") {
-          kindLabel = "Valores diferentes";
-        } else if (difference.kind == "config_apply_failed") {
-          kindLabel = "Falha ao aplicar configuracao";
-        } else if (difference.kind == "invalid") {
-          kindLabel = "Falha de validacao";
-        } else {
-          kindLabel = difference.kind.empty()
-            ? "Diferenca" : difference.kind;
-        }
-        if (!difference.id.empty()) kindLabel += ": " + difference.id;
-        const std::string primary = "PC A: " +
-          (difference.primary.empty()
-            ? std::string("nao existe") : difference.primary);
-        const std::string secondary = "PC B: " +
-          (difference.secondary.empty()
-            ? std::string("nao existe") : difference.secondary);
-        const UINT wrapFlags = DT_LEFT | DT_TOP |
-          DT_WORDBREAK | DT_NOPREFIX;
-        const int textWidth = contentWidth - 18;
-        const int kindHeight = nativeAppActiveMeasureTextHeight(
-          dc, kindLabel, textWidth, wrapFlags, labelFont);
-        const int primaryHeight = nativeAppActiveMeasureTextHeight(
-          dc, primary, textWidth, wrapFlags, statusFont);
-        const int secondaryHeight = nativeAppActiveMeasureTextHeight(
-          dc, secondary, textWidth, wrapFlags, statusFont);
-        const RECT card{viewport.left + 7, rowTop,
-          viewport.right - 15, rowBottom};
-        nativeAppActiveFillRoundRect(dc, card,
-          RGB(24, 29, 37), RGB(55, 65, 81), 4);
-        int textTop = card.top + 8;
-        nativeAppActiveDrawText(dc, kindLabel,
-          RECT{card.left + 9, textTop, card.right - 9,
-            textTop + kindHeight},
-          wrapFlags, RGB(248, 250, 252), labelFont);
-        textTop += kindHeight + 5;
-        nativeAppActiveDrawText(dc, primary,
-          RECT{card.left + 9, textTop, card.right - 9,
-            textTop + primaryHeight},
-          wrapFlags, RGB(103, 232, 249), statusFont);
-        textTop += primaryHeight + 4;
-        nativeAppActiveDrawText(dc, secondary,
-          RECT{card.left + 9, textTop, card.right - 9,
-            textTop + secondaryHeight},
-          wrapFlags, RGB(196, 181, 253), statusFont);
       }
       nativeUiEndClipRect(dc, clip);
 
@@ -65243,7 +65603,8 @@ static void nativeProjectSyncPublishLiveTrackDelete(
   nativeTimecodeLanRecordCommand(command.str());
 }
 
-static void nativeProjectSyncRequestAutomaticResync()
+static void nativeProjectSyncRequestAutomaticResync(
+  const std::set<std::string>& differencePlanLines)
 {
   std::string revision;
   {
@@ -65254,7 +65615,16 @@ static void nativeProjectSyncRequestAutomaticResync()
   command << nativeProjectSyncLiveCommandPrefix(
       "project_sync_live_resync", nativeProjectSyncNextLiveRevision())
     << ",\"structuralRevision\":" << nativeJsonString(revision)
-    << ",\"automatic\":true}";
+    << ",\"automatic\":true";
+  if (!differencePlanLines.empty()) {
+    std::ostringstream plan;
+    for (const auto& line : differencePlanLines) {
+      if (plan.tellp() > 0) plan << '\n';
+      plan << line;
+    }
+    command << ",\"differencePlan\":" << nativeJsonString(plan.str());
+  }
+  command << '}';
   nativeTimecodeLanRecordCommand(command.str());
 }
 
@@ -65527,6 +65897,7 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
   }
 
   bool requiresAutomaticResync = false;
+  std::set<std::string> automaticDifferencePlan;
 
   bool layoutChanged = publishInitial || !sameProject ||
     tracks.size() != g_nativeProjectSyncLiveTrackBaseline.size();
@@ -65553,7 +65924,11 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
     for (const auto& trackState : orderedTracks) {
       const bool newTrack = baselineEstablished &&
         g_nativeProjectSyncLiveTrackBaseline.count(trackState.id) == 0;
-      if (newTrack) requiresAutomaticResync = true;
+      if (newTrack) {
+        requiresAutomaticResync = true;
+        automaticDifferencePlan.insert(
+          "TRACK\t" + nativeLower(trackState.id));
+      }
       std::string chunk;
       if (newTrack && trackState.itemCount > 0) {
         // A pista contem itens/midia. Ela so pode nascer no PC B depois que o
@@ -65582,6 +65957,8 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
     // O patch curto atualiza imediatamente o FX. A reconciliação automática
     // garante também arquivos/estado extenso que não caibam no comando LAN.
     requiresAutomaticResync = true;
+    automaticDifferencePlan.insert(
+      "FXTRACK\t" + nativeLower(entry.first));
     std::string chunk;
     const auto pointer = trackPointers.find(entry.first);
     if (pointer != trackPointers.end() &&
@@ -65597,15 +65974,19 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
       previous == g_nativeProjectSyncLiveItemBaseline.end();
     const bool structureChanged = newItem
       ? baselineEstablished
-      : (previous->second.structureKey != entry.second.structureKey ||
-         previous->second.trackId != entry.second.trackId);
+      : previous->second.structureKey != entry.second.structureKey;
     if (structureChanged) {
       requiresAutomaticResync = true;
+      automaticDifferencePlan.insert(
+        "ITEM\t" + nativeLower(entry.first));
       // Nunca cria/troca source de item pelo canal vivo. O arquivo precisa
       // chegar e ser validado primeiro; o bundle aplica o item em seguida.
     } else if (publishInitial ||
         nativeProjectSyncLiveItemStateChanged(
           previous->second, entry.second)) {
+      // Mover um item no tempo ou para outra pista nao altera sua midia. O
+      // receptor ja resolve o GUID e MoveMediaItemToTrack aplica o destino;
+      // portanto isso deve viajar imediatamente, sem bundle/rescan.
       nativeProjectSyncPublishLiveItem(entry.second, false);
     }
   }
@@ -65620,7 +66001,7 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
     nativeTimecodeLanRecordCommand(multiloopSnapshot.str());
   }
   if (requiresAutomaticResync) {
-    nativeProjectSyncRequestAutomaticResync();
+    nativeProjectSyncRequestAutomaticResync(automaticDifferencePlan);
   }
 
   g_nativeProjectSyncLiveTrackBaseline = std::move(tracks);
@@ -65657,6 +66038,7 @@ static NativeProjectSyncResolvedItem nativeProjectSyncResolveLiveItem(
     return resolved;
   }
   const std::string itemId = nativeTrim(rawItemId);
+  const std::string normalizedItemId = nativeLower(itemId);
   const int trackCount = CountTracks_ptr(project);
   const bool syntheticId = itemId.find(":item:") !=
     std::string::npos;
@@ -65678,7 +66060,8 @@ static NativeProjectSyncResolvedItem nativeProjectSyncResolveLiveItem(
             candidateId = guid;
           }
         }
-        if (!candidateId.empty() && candidateId == itemId) {
+        if (!candidateId.empty() &&
+            nativeLower(nativeTrim(candidateId)) == normalizedItemId) {
           resolved.track = track;
           resolved.item = item;
           return resolved;
@@ -65927,6 +66310,9 @@ static bool nativeApplyProjectSyncLiveCommand(
       g_nativeProjectSyncApply.sequence =
         ++g_nativeProjectSyncApplySequence;
       g_nativeProjectSyncApply.automatic = true;
+      g_nativeProjectSyncApply.differencePlan =
+        nativeJsonExtractString(commandBody, "differencePlan").substr(
+          0, 128 * 1024);
       g_nativeForceStateBuild.store(true);
     }
     return true;
