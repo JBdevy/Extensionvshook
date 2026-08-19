@@ -102,6 +102,7 @@ if(WIN32)
     mfreadwrite
     mfuuid
     propsys
+    normaliz
     windowscodecs
   )
 endif()

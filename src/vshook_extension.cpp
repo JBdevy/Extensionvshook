@@ -37,6 +37,7 @@
 #include <utility>
 
 #ifdef __APPLE__
+  #include <CoreFoundation/CoreFoundation.h>
   #include <CoreGraphics/CoreGraphics.h>
   #include "native_keyboard_mac.h"
   #include "native_teleprompt_mac.h"
@@ -3927,6 +3928,49 @@ static bool getProjectSyncEnabled()
   return getTimecodeMode() == "project_sync";
 }
 
+static int nativeChooseProjectSyncRole()
+{
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return 0;
+
+#ifdef _WIN32
+  AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
+    L"Escolha a funcao deste computador");
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, 1, L"PC A - Mestre");
+  AppendMenuW(menu, MF_STRING, 2, L"PC B - Escravo");
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, 3, L"Cancelar");
+#else
+  AppendMenu(menu, MF_STRING | MF_GRAYED, 0,
+    "Escolha a funcao deste computador");
+  AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenu(menu, MF_STRING, 1, "PC A - Mestre");
+  AppendMenu(menu, MF_STRING, 2, "PC B - Escravo");
+  AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenu(menu, MF_STRING, 3, "Cancelar");
+#endif
+
+  POINT cursor{0, 0};
+#ifdef _WIN32
+  if (!GetCursorPos(&cursor)) {
+    cursor.x = 100;
+    cursor.y = 100;
+  }
+#else
+  GetCursorPos(&cursor);
+#endif
+  HWND owner = g_nativeAppActivePanelHwnd &&
+      IsWindow(g_nativeAppActivePanelHwnd)
+    ? g_nativeAppActivePanelHwnd
+    : (GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr);
+  const int choice = TrackPopupMenu(menu,
+    TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+    cursor.x, cursor.y, 0, owner, nullptr);
+  DestroyMenu(menu);
+  return choice == 1 || choice == 2 ? choice : 0;
+}
+
 static void toggleProjectSync()
 {
   if (!SetExtState_ptr || !GetExtState_ptr) {
@@ -3976,18 +4020,9 @@ static void toggleProjectSync()
     return;
   }
 
-  if (!ShowMessageBox_ptr) {
-    showDiagnostic("Nao foi possivel escolher o papel do Project Sync.");
-    return;
-  }
-  const int roleAnswer = ShowMessageBox_ptr(
-    "Escolha a funcao deste computador:\n\n"
-    "SIM  = PC A - Mestre\n"
-    "NAO = PC B - Escravo\n"
-    "CANCELAR = nao ativar",
-    "VS Hook - Project Sync", 3);
-  if (roleAnswer != 6 && roleAnswer != 7) return;
-  const bool primaryRole = roleAnswer == 6;
+  const int roleChoice = nativeChooseProjectSyncRole();
+  if (roleChoice == 0) return;
+  const bool primaryRole = roleChoice == 1;
   const std::string code = kAutomaticLanPairCode;
 
   const std::string previousTimecodeMode = getTimecodeMode();
@@ -23252,6 +23287,66 @@ static std::string nativeProjectSyncNumber(double value)
   return text.str();
 }
 
+// O macOS normalmente entrega nomes de arquivo em Unicode decomposto (NFD),
+// enquanto o Windows usa a forma composta (NFC). Visualmente os nomes sao
+// iguais, mas uma comparacao byte a byte os tratava como arquivos diferentes.
+static std::string nativeProjectSyncNormalizeUnicodeNfc(
+  const std::string& value)
+{
+  if (value.empty()) return value;
+#ifdef _WIN32
+  const std::wstring wide = utf8ToWide(value);
+  if (wide.empty()) return value;
+  const int required = NormalizeString(NormalizationC, wide.data(),
+    static_cast<int>(wide.size()), nullptr, 0);
+  if (required <= 0) return value;
+  std::wstring normalized(static_cast<size_t>(required), L'\0');
+  const int written = NormalizeString(NormalizationC, wide.data(),
+    static_cast<int>(wide.size()), normalized.data(), required);
+  if (written <= 0) return value;
+  normalized.resize(static_cast<size_t>(written));
+  const int utf8Required = WideCharToMultiByte(CP_UTF8, 0,
+    normalized.data(), static_cast<int>(normalized.size()),
+    nullptr, 0, nullptr, nullptr);
+  if (utf8Required <= 0) return value;
+  std::string result(static_cast<size_t>(utf8Required), '\0');
+  const int utf8Written = WideCharToMultiByte(CP_UTF8, 0,
+    normalized.data(), static_cast<int>(normalized.size()),
+    result.data(), utf8Required, nullptr, nullptr);
+  if (utf8Written <= 0) return value;
+  result.resize(static_cast<size_t>(utf8Written));
+  return result;
+#elif defined(__APPLE__)
+  CFStringRef source = CFStringCreateWithBytes(kCFAllocatorDefault,
+    reinterpret_cast<const UInt8*>(value.data()),
+    static_cast<CFIndex>(value.size()), kCFStringEncodingUTF8, false);
+  if (!source) return value;
+  CFMutableStringRef normalized = CFStringCreateMutableCopy(
+    kCFAllocatorDefault, 0, source);
+  CFRelease(source);
+  if (!normalized) return value;
+  CFStringNormalize(normalized, kCFStringNormalizationFormC);
+  const CFIndex maximum = CFStringGetMaximumSizeForEncoding(
+    CFStringGetLength(normalized), kCFStringEncodingUTF8) + 1;
+  std::vector<char> buffer(static_cast<size_t>(std::max<CFIndex>(1, maximum)));
+  const bool converted = CFStringGetCString(normalized, buffer.data(),
+    static_cast<CFIndex>(buffer.size()), kCFStringEncodingUTF8);
+  CFRelease(normalized);
+  return converted ? std::string(buffer.data()) : value;
+#else
+  return value;
+#endif
+}
+
+static bool nativeProjectSyncUnicodeEqual(
+  const std::string& left,
+  const std::string& right)
+{
+  return left == right ||
+    nativeProjectSyncNormalizeUnicodeNfc(left) ==
+      nativeProjectSyncNormalizeUnicodeNfc(right);
+}
+
 static std::string nativeProjectSyncBasename(
   const std::string& rawPath)
 {
@@ -23284,13 +23379,14 @@ static std::string nativeProjectSyncCanonicalSourceName(
 #else
   const bool managed = normalized.find(marker) != std::string::npos;
 #endif
-  if (!managed) return name;
+  if (!managed) return nativeProjectSyncNormalizeUnicodeNfc(name);
 
   // A mídia gerenciada recebe <sha20>_ no PC B. Esse prefixo pertence ao
   // armazenamento/deduplicação, não à identidade lógica do item. Remove
   // também prefixos duplicados gerados por builds anteriores.
   while (nativeProjectSyncHexPrefix20(name)) name.erase(0, 21);
-  return name.empty() ? nativeProjectSyncBasename(rawPath) : name;
+  return nativeProjectSyncNormalizeUnicodeNfc(
+    name.empty() ? nativeProjectSyncBasename(rawPath) : name);
 }
 
 static long long nativeProjectSyncFileSize(
@@ -23673,17 +23769,14 @@ static std::string nativeProjectSyncBuildStructuralManifest(
     addRecord(
       "TRACK\t" + nativeUiBackupEscape(trackGuid) + "\t" +
       std::to_string(trackIndex + 1) + "\t" +
-      nativeUiBackupEscape(trackName) + "\t" +
+      nativeUiBackupEscape(
+        nativeProjectSyncNormalizeUnicodeNfc(trackName)) + "\t" +
       std::to_string(folderDepth) + "\t" +
       std::to_string(itemCount) + "\t" +
-      nativeProjectSyncNumber(GetMediaTrackInfo_Value_ptr
-        ? GetMediaTrackInfo_Value_ptr(track, "D_VOL") : 1.0) + "\t" +
-      ((GetMediaTrackInfo_Value_ptr &&
-        GetMediaTrackInfo_Value_ptr(track, "B_MUTE") > 0.5)
-          ? "1" : "0") + "\t" +
-      std::to_string(GetMediaTrackInfo_Value_ptr
-        ? static_cast<int>(std::lround(GetMediaTrackInfo_Value_ptr(
-            track, "I_SOLO"))) : 0));
+      // Volume, mute e solo sao estado vivo do mixer. O snapshot absoluto de
+      // pistas os aplica logo apos o pareamento; eles nao devem bloquear o
+      // preflight nem iniciar copia de projeto/midia.
+      "1.000000\t0\t0");
 
     const int fxCount = TrackFX_GetCount_ptr
       ? std::max(0, TrackFX_GetCount_ptr(track)) : 0;
@@ -23704,6 +23797,8 @@ static std::string nativeProjectSyncBuildStructuralManifest(
           track, fxIndex, fxNameBuffer,
           static_cast<int>(sizeof(fxNameBuffer)));
       }
+      const std::string normalizedFxName =
+        nativeProjectSyncNormalizeUnicodeNfc(fxNameBuffer);
       std::ostringstream parameterState;
       const int parameterCount = TrackFX_GetNumParams_ptr
         ? std::max(0, TrackFX_GetNumParams_ptr(track, fxIndex)) : 0;
@@ -23728,7 +23823,7 @@ static std::string nativeProjectSyncBuildStructuralManifest(
         nativeUiBackupEscape(trackGuid) + "\t" +
         std::to_string(fxIndex + 1) + "\t" +
         nativeUiBackupEscape(fxGuid) + "\t" +
-        nativeUiBackupEscape(fxNameBuffer) + "\t" +
+        nativeUiBackupEscape(normalizedFxName) + "\t" +
         ((!TrackFX_GetEnabled_ptr ||
           TrackFX_GetEnabled_ptr(track, fxIndex)) ? "1" : "0") + "\t" +
         ((TrackFX_GetOffline_ptr &&
@@ -23759,6 +23854,7 @@ static std::string nativeProjectSyncBuildStructuralManifest(
         ? nativeTakeName(item, midi ? "MIDI" : "Sem arquivo")
         : nativeProjectSyncCanonicalSourceName(sourcePath);
       if (sourceName.empty()) sourceName = mediaKind;
+      sourceName = nativeProjectSyncNormalizeUnicodeNfc(sourceName);
       const bool sourceExists = midi ||
         (!resolvedSourcePath.empty() && fileExists(resolvedSourcePath));
       const long long sourceSize = sourcePath.empty()
@@ -23821,7 +23917,8 @@ static std::string nativeProjectSyncBuildStructuralManifest(
       std::string record = type + "\t" +
         nativeUiBackupEscape(identity) + "\t" +
         std::to_string(number) + "\t" +
-        nativeUiBackupEscape(rawName ? rawName : "") + "\t" +
+        nativeUiBackupEscape(nativeProjectSyncNormalizeUnicodeNfc(
+          rawName ? rawName : "")) + "\t" +
         nativeProjectSyncNumber(start) + "\t";
       if (region) record += nativeProjectSyncNumber(end) + "\t";
       // A cor de regiao/marcador e apenas visual e o COLORREF nativo ainda
@@ -24018,7 +24115,9 @@ nativeProjectSyncCompareItemRecords(
                                const char* fallback = "") {
     const std::string left = field(primary, index, fallback);
     const std::string right = field(secondary, index, fallback);
-    if (left != right) changed.push_back({label, left, right});
+    if (!nativeProjectSyncUnicodeEqual(left, right)) {
+      changed.push_back({label, left, right});
+    }
   };
   const auto compareNumber = [&](const char* label, size_t index,
                                  double tolerance,
@@ -24067,6 +24166,40 @@ nativeProjectSyncCompareItemRecords(
   for (const ChangedField& entry : changed) {
     comparison.primarySummary += " | " + entry.label + ": " + entry.primary;
     comparison.secondarySummary += " | " + entry.label + ": " + entry.secondary;
+  }
+  return comparison;
+}
+
+static NativeProjectSyncRecordComparison
+nativeProjectSyncCompareTrackRecords(
+  const std::string& primaryLine,
+  const std::string& secondaryLine)
+{
+  NativeProjectSyncRecordComparison comparison;
+  std::vector<std::string> primary =
+    nativeProjectSyncTsvFields(primaryLine);
+  std::vector<std::string> secondary =
+    nativeProjectSyncTsvFields(secondaryLine);
+  if (primary.size() != 9 || secondary.size() != 9 ||
+      primary[0] != "TRACK" || secondary[0] != "TRACK") {
+    return comparison;
+  }
+  for (size_t index = 1; index < primary.size(); ++index) {
+    primary[index] = nativeUiBackupUnescape(primary[index]);
+    secondary[index] = nativeUiBackupUnescape(secondary[index]);
+  }
+  comparison.recognized = true;
+
+  // Campos 6/7/8 sao D_VOL, B_MUTE e I_SOLO. Eles sao sincronizados por
+  // comandos absolutos do mixer e nao fazem parte da estrutura do projeto.
+  comparison.equivalent = primary[1] == secondary[1] &&
+    primary[2] == secondary[2] &&
+    nativeProjectSyncUnicodeEqual(primary[3], secondary[3]) &&
+    primary[4] == secondary[4] &&
+    primary[5] == secondary[5];
+  if (!comparison.equivalent) {
+    comparison.primarySummary = nativeProjectSyncRecordSummary(primary);
+    comparison.secondarySummary = nativeProjectSyncRecordSummary(secondary);
   }
   return comparison;
 }
@@ -24371,7 +24504,14 @@ static NativeProjectSyncCompareResult nativeProjectSyncCompareManifests(
       }
       NativeProjectSyncRecordComparison recordComparison;
       if (!config && leftExists && rightExists &&
-          identity.rfind("ITEM\t", 0) == 0) {
+          identity.rfind("TRACK\t", 0) == 0) {
+        recordComparison = nativeProjectSyncCompareTrackRecords(
+          leftValue->second, rightValue->second);
+        if (recordComparison.recognized && recordComparison.equivalent) {
+          continue;
+        }
+      } else if (!config && leftExists && rightExists &&
+                 identity.rfind("ITEM\t", 0) == 0) {
         recordComparison = nativeProjectSyncCompareItemRecords(
           leftValue->second, rightValue->second);
         if (recordComparison.recognized && recordComparison.equivalent) {
@@ -35036,8 +35176,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       }
       const bool canOfferStructuralApply =
         projectSyncRole == "secondary" &&
-        g_nativeProjectSyncDiffModalStructuralCount > 0 &&
-        applyState.state != "applied";
+        g_nativeProjectSyncDiffModalStructuralCount > 0;
       // Quando a estrutura ja e compativel, configuracoes diferentes sao uma
       // escolha opcional e independente. Nunca chama o fluxo de bundle.
       const bool canOfferConfigApply =
@@ -35450,7 +35589,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
       g_nativeMainModalCloseRect = RECT{modal.right - 90,
         modal.bottom - 34, modal.right - 12, modal.bottom - 12};
       if (canOfferStructuralApply) {
-        const std::string applyLabel = applyState.state == "error"
+        const std::string applyLabel =
+          (applyState.state == "error" || applyState.state == "applied")
           ? "Tentar novamente" : "Aplicar modificacoes";
         addModalButton("project_sync_apply", applyLabel,
           RECT{modal.right - 260, modal.bottom - 34,
@@ -68916,8 +69056,6 @@ static bool nativeApplyTimecodeLanCommand(
       const std::string displayPeer = peerName.empty()
         ? std::string("outro computador") : peerName;
       const bool projectSync = !parallel && connectedMode == "project_sync";
-      const std::string title = projectSync
-        ? "VS Hook - Project Sync" : "VS Hook - Timecode";
       std::string message = projectSync
         ? "Project Sync pareado com " + displayPeer + "."
         : "Timecode pareado com " + displayPeer + ".";
@@ -68942,11 +69080,9 @@ static bool nativeApplyTimecodeLanCommand(
           nativeTimecodeLanRecordCommand(command.str());
         }
       }
-      if (ShowMessageBox_ptr) {
-        ShowMessageBox_ptr(message.c_str(), title.c_str(), 0);
-      } else {
-        nativeUiShowTemporaryPopup(message, 2.5);
-      }
+      // A confirmacao de pareamento nunca bloqueia a thread principal nem
+      // exige OK. O mesmo aviso temporario e usado em A, B e C.
+      nativeUiShowTemporaryPopup(message, 1.0);
     } else if (becameDisconnected) {
       const bool projectSync = !parallel && connectedMode == "project_sync";
       std::string computer;
