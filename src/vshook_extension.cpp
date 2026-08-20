@@ -5272,6 +5272,10 @@ static std::chrono::steady_clock::time_point
   g_nativeProjectSyncLastLivePoll;
 static NativeProjectSyncPreflightState
   g_nativeProjectSyncPreflight;
+// Se o usuario fechar a interface durante uma conferencia, atualizacoes do
+// mesmo fluxo continuam salvas no status, mas nao podem ressuscitar a janela.
+// O botao Config > Conferencia/Progresso libera a abertura novamente.
+static bool g_nativeProjectSyncConferenceAutoOpenSuppressed = false;
 static NativeProjectSyncRoleHandoverState
   g_nativeProjectSyncRoleHandover;
 static NativeProjectSyncBundleState g_nativeProjectSyncBundle;
@@ -6464,6 +6468,7 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
     std::chrono::steady_clock::time_point{};
   g_nativeProjectSyncTimelineBaselineHash.clear();
   g_nativeProjectSyncPreflight = NativeProjectSyncPreflightState{};
+  g_nativeProjectSyncConferenceAutoOpenSuppressed = false;
   g_nativeProjectSyncBundle = NativeProjectSyncBundleState{};
   g_nativeProjectSyncApply = NativeProjectSyncApplyState{};
   g_nativeProjectSyncQueuedAutomaticPlan.clear();
@@ -24786,6 +24791,10 @@ static void nativeProjectSyncShowDiffModal(
       applyState == "ready_to_apply" || applyState == "applying" ||
       applyState == "apply_started";
   }
+  if (!nativeAppActivePanelIsOpen() &&
+      g_nativeProjectSyncConferenceAutoOpenSuppressed) {
+    return;
+  }
   if (g_nativeMainModalKind == NativeMainModalKind::ProjectSyncDiff &&
       applyBusy) {
     // Durante a transferencia/validacao, diagnosticos repetidos do relay nao
@@ -24972,6 +24981,9 @@ static void nativeProjectSyncOpenConferenceFromConfig()
     }
   }
   if (conferenceAvailable && !diffJson.empty()) {
+    // Esta chamada nasceu de uma acao explicita do usuario. Permite reabrir a
+    // janela mesmo que ele a tenha ocultado durante uma atualizacao anterior.
+    g_nativeProjectSyncConferenceAutoOpenSuppressed = false;
     nativeProjectSyncShowDiffModal(diffJson);
     return;
   }
@@ -56511,6 +56523,13 @@ static void nativeCloseAppActivePanel()
   }
 
   HWND hwnd = g_nativeAppActivePanelHwnd;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    if (g_nativeTimecodeLanMode == "project_sync" &&
+        g_nativeProjectSyncPreflight.hasResult) {
+      g_nativeProjectSyncConferenceAutoOpenSuppressed = true;
+    }
+  }
   nativeAppActiveSaveWindowState();
   g_nativeAppActivePanelClosing = true;
   if (DockWindowRemove_ptr) DockWindowRemove_ptr(hwnd);
