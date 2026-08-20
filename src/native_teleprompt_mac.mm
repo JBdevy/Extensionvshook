@@ -19,6 +19,7 @@ struct SavedWindowState {
   NSWindowTitleVisibility titleVisibility = NSWindowTitleVisible;
   NSRect frame = NSZeroRect;
   NSInteger level = NSNormalWindowLevel;
+  NSWindow* parentWindow = nil;
   bool titlebarAppearsTransparent = false;
   bool movable = true;
   bool movableByWindowBackground = false;
@@ -66,6 +67,7 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
     saved.titleVisibility = [window titleVisibility];
     saved.frame = [window frame];
     saved.level = [window level];
+    saved.parentWindow = [window parentWindow];
     saved.titlebarAppearsTransparent =
       [window titlebarAppearsTransparent];
     saved.movable = [window isMovable];
@@ -73,6 +75,13 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
       [window isMovableByWindowBackground];
     saved.hasShadow = [window hasShadow];
     g_fullscreenTeleprompts.emplace(swellWindow, saved);
+
+    // Dialogs SWELL normalmente nascem como child/owned windows do REAPER.
+    // Em tela cheia o Teleprompt e uma saida independente: remove o vinculo
+    // para que minimizar o REAPER nao esconda o segundo monitor.
+    if (saved.parentWindow) {
+      [saved.parentWindow removeChildWindow:window];
+    }
 
     NSScreen* screen = [window screen];
     if (!screen) screen = [NSScreen mainScreen];
@@ -112,6 +121,9 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
   [window setLevel:saved.level];
   [window setCollectionBehavior:saved.collectionBehavior];
   [window setFrame:saved.frame display:YES animate:NO];
+  if (saved.parentWindow) {
+    [saved.parentWindow addChildWindow:window ordered:NSWindowAbove];
+  }
   [window makeKeyAndOrderFront:nil];
   return true;
 }

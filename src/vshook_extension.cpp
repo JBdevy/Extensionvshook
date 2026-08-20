@@ -5100,6 +5100,16 @@ struct NativeProjectSyncApplyState {
   std::string differencePlan;
 };
 
+// Troca coordenada de autoridade A <-> B. O pedido nasce somente no PC A;
+// a Hook Center entrega primeiro a nova autoridade ao PC B e, em seguida,
+// rebaixa o PC A. O mesmo codigo/sessao e preservado para o novo pareamento.
+struct NativeProjectSyncRoleHandoverState {
+  std::string state = "idle";
+  std::string requestId;
+  std::string error;
+  int64_t updatedAtMs = 0;
+};
+
 struct NativeProjectSyncPendingOpen {
   bool ready = false;
   std::string requestId;
@@ -5197,6 +5207,11 @@ static ReaProject* g_nativeTimecodeLanEditCursorProject = nullptr;
 static double g_nativeTimecodeLanEditCursorBaseline = 0.0;
 static bool g_nativeTimecodeLanEditCursorBaselineValid = false;
 static uint64_t g_nativeTimecodeLanEditCursorSequence = 0;
+// A aba ativa e um comando semantico da extensao.  O identificador suprimido
+// evita que a troca recebida do outro PC volte como uma nova troca local no
+// tick seguinte.
+static std::string g_nativeTimecodeLanLastPublishedProjectSignature;
+static std::string g_nativeTimecodeLanSuppressedRemoteProjectSignature;
 static ReaProject* g_nativePendingTransportEditCursorProject = nullptr;
 static double g_nativePendingTransportEditCursorPosition = 0.0;
 static int g_nativePendingTransportEditCursorRestorePasses = 0;
@@ -5250,6 +5265,8 @@ static std::chrono::steady_clock::time_point
   g_nativeProjectSyncLastLivePoll;
 static NativeProjectSyncPreflightState
   g_nativeProjectSyncPreflight;
+static NativeProjectSyncRoleHandoverState
+  g_nativeProjectSyncRoleHandover;
 static NativeProjectSyncBundleState g_nativeProjectSyncBundle;
 static NativeProjectSyncApplyState g_nativeProjectSyncApply;
 static uint64_t g_nativeProjectSyncApplySequence = 0;
@@ -6403,6 +6420,8 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   g_nativeTimecodeLanEditCursorBaseline = 0.0;
   g_nativeTimecodeLanEditCursorBaselineValid = false;
   g_nativeTimecodeLanEditCursorSequence = 0;
+  g_nativeTimecodeLanLastPublishedProjectSignature.clear();
+  g_nativeTimecodeLanSuppressedRemoteProjectSignature.clear();
   g_lastCursorMoveSeq.store(0);
   g_nativePendingTransportEditCursorProject = nullptr;
   g_nativePendingTransportEditCursorPosition = 0.0;
@@ -6815,6 +6834,60 @@ static void nativeTimecodeLanPollEditCursorOnMainThread()
   nativeTimecodeLanRecordCommand(command.str());
 }
 
+// Replica a aba ativa como um gesto da extensao, tanto no Timecode comum
+// (Transmitter -> Receive) quanto no Project Sync (PC A -> PC B).  O caminho
+// do RPP nao e usado para decidir no destino porque os computadores podem
+// ter pastas diferentes; nome e indice tornam a troca deterministica.
+static void nativeTimecodeLanPublishActiveProjectTabOnMainThread(
+  const std::string& projectSignature)
+{
+  if (projectSignature.empty()) return;
+  bool canPublish = false;
+  bool peerConnected = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    canPublish = g_nativeTimecodeLanMode == "transmitter" ||
+      (g_nativeTimecodeLanMode == "project_sync" &&
+       g_nativeTimecodeLanProjectSyncRole == "primary");
+    peerConnected = g_nativeTimecodeLanPeerConnected;
+  }
+  if (!canPublish || !peerConnected) return;
+
+  if (projectSignature == g_nativeTimecodeLanSuppressedRemoteProjectSignature) {
+    g_nativeTimecodeLanLastPublishedProjectSignature = projectSignature;
+    g_nativeTimecodeLanSuppressedRemoteProjectSignature.clear();
+    return;
+  }
+  if (projectSignature == g_nativeTimecodeLanLastPublishedProjectSignature) {
+    return;
+  }
+
+  char pathBuf[2048] = "";
+  ReaProject* active = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!active || !EnumProjects_ptr) return;
+  int activeIndex = -1;
+  for (int index = 0; index < 64; ++index) {
+    if (EnumProjects_ptr(index, nullptr, 0) == active) {
+      activeIndex = index;
+      break;
+    }
+  }
+  if (activeIndex < 0) return;
+  const std::string projectPath = normalizeSlashes(pathBuf);
+  std::string projectName = nativeBasenameNoRpp(projectPath);
+  if (projectName.empty()) projectName = "Projeto " +
+    std::to_string(activeIndex + 1);
+
+  std::ostringstream command;
+  command << "{\"type\":\"select_project_tab\","
+          << "\"projectTabIndex\":" << activeIndex << ","
+          << "\"projectName\":" << nativeJsonString(projectName)
+          << "}";
+  nativeTimecodeLanRecordCommand(command.str());
+  g_nativeTimecodeLanLastPublishedProjectSignature = projectSignature;
+}
+
 static void nativeRestoreTransportEditCursorOnMainThread()
 {
   if (g_nativePendingTransportEditCursorRestorePasses <= 0) return;
@@ -6938,6 +7011,15 @@ static std::string nativeTimecodeLanStatusJson()
        << nativeJsonString(g_nativeProjectSyncApply.requestId) << ","
        << "\"projectSyncApplySequence\":"
        << g_nativeProjectSyncApply.sequence << ","
+       << "\"projectSyncRoleHandover\":{"
+       << "\"state\":"
+       << nativeJsonString(g_nativeProjectSyncRoleHandover.state) << ","
+       << "\"requestId\":"
+       << nativeJsonString(g_nativeProjectSyncRoleHandover.requestId) << ","
+       << "\"error\":"
+       << nativeJsonString(g_nativeProjectSyncRoleHandover.error) << ","
+       << "\"updatedAtMs\":"
+       << g_nativeProjectSyncRoleHandover.updatedAtMs << "},"
        << "\"eventSequence\":"
        << g_nativeTimecodeLanEventSequence << ","
        << "\"transport\":{\"sequence\":"
@@ -27851,6 +27933,46 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
   }
 }
 
+static void nativeProjectSyncRequestRoleHandoverFromDiffModal()
+{
+  std::string role;
+  bool peerConnected = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    role = g_nativeTimecodeLanProjectSyncRole;
+    peerConnected = g_nativeTimecodeLanPeerConnected;
+  }
+  if (role != "primary" || !peerConnected) {
+    nativeUiShowTemporaryPopup(
+      "A troca de mestre so pode ser iniciada pelo PC A conectado ao PC B.",
+      2.4);
+    return;
+  }
+  if (!ShowMessageBox_ptr) return;
+  const int answer = ShowMessageBox_ptr(
+    "Transferir o controle mestre para o PC B?\n\n"
+    "Este computador passara a ser o PC B Escravo e o outro computador "
+    "assumira como PC A Mestre. O Project Sync continuara ativo e "
+    "reconectara automaticamente.\n\nContinuar?",
+    "Project Sync - Transferir mestre", 4);
+  if (answer != 6) return;
+
+  const std::string requestId = nativeProjectSyncHashText(
+    "handover|" + std::to_string(nativeSystemNowMs()) + "|" +
+    std::to_string(reinterpret_cast<std::uintptr_t>(
+      &g_nativeProjectSyncRoleHandover)));
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    g_nativeProjectSyncRoleHandover.state = "requested";
+    g_nativeProjectSyncRoleHandover.requestId = requestId;
+    g_nativeProjectSyncRoleHandover.error.clear();
+    g_nativeProjectSyncRoleHandover.updatedAtMs = nativeSteadyNowMs();
+  }
+  g_nativeForceStateBuild.store(true);
+  nativeUiShowTemporaryPopup(
+    "Transferindo o controle mestre para o PC B...", 2.0);
+}
+
 struct NativeProjectSyncRppSegment {
   std::string key;
   std::string text;
@@ -28746,7 +28868,9 @@ static bool nativeApplyProjectSyncCommand(
       type != "project_sync_prepare_bundle" &&
       type != "project_sync_bundle_consumed" &&
       type != "project_sync_bundle_progress" &&
-      type != "project_sync_apply_bundle") {
+      type != "project_sync_apply_bundle" &&
+      type != "project_sync_role_handover" &&
+      type != "project_sync_role_handover_state") {
     return false;
   }
   const std::string preflightPhase = nativeLower(nativeTrim(
@@ -28766,6 +28890,50 @@ static bool nativeApplyProjectSyncCommand(
     localRole = g_nativeTimecodeLanProjectSyncRole;
   }
   if (localMode != "project_sync") return true;
+
+  if (type == "project_sync_role_handover_state") {
+    const std::string state = nativeLower(nativeTrim(
+      nativeJsonExtractString(commandBody, "state")));
+    const std::string requestId = nativeTrim(
+      nativeJsonExtractString(commandBody, "requestId"));
+    const std::string error = nativeTrim(
+      nativeJsonExtractString(commandBody, "error"));
+    if (state == "completed" || state == "error") {
+      std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+      g_nativeProjectSyncRoleHandover.state = state;
+      g_nativeProjectSyncRoleHandover.requestId = requestId;
+      g_nativeProjectSyncRoleHandover.error = error;
+      g_nativeProjectSyncRoleHandover.updatedAtMs = nativeSteadyNowMs();
+      g_nativeForceStateBuild.store(true);
+    }
+    return true;
+  }
+
+  if (type == "project_sync_role_handover") {
+    const std::string targetRole = nativeLower(nativeTrim(
+      nativeJsonExtractString(commandBody, "role")));
+    const std::string requestId = nativeTrim(
+      nativeJsonExtractString(commandBody, "requestId"));
+    if ((targetRole != "primary" && targetRole != "secondary") ||
+        !SetExtState_ptr) return true;
+    SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey,
+      targetRole.c_str(), true);
+    nativeTimecodeLanRefreshConfigOnMainThread();
+    {
+      std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+      g_nativeProjectSyncRoleHandover.state = "completed";
+      g_nativeProjectSyncRoleHandover.requestId = requestId;
+      g_nativeProjectSyncRoleHandover.error.clear();
+      g_nativeProjectSyncRoleHandover.updatedAtMs = nativeSteadyNowMs();
+    }
+    g_nativeForceStateBuild.store(true);
+    nativeUiShowTemporaryPopup(
+      targetRole == "primary"
+        ? "Este computador agora e o PC A Mestre. Reconectando..."
+        : "Este computador agora e o PC B Escravo. Reconectando...",
+      2.4);
+    return true;
+  }
 
   if (type == "project_sync_prepare_bundle") {
     return nativeProjectSyncPrepareBundleFromCommand(commandBody);
@@ -28916,6 +29084,13 @@ static bool nativeApplyProjectSyncCommand(
     if (ready) g_nativeProjectSyncPublishInitialConfig = true;
     if (showConference &&
         (!ready || nativeJsonInt64(diff, "differenceCount", 0) > 0)) {
+      nativeProjectSyncShowDiffModal(diff);
+    } else if (g_nativeMainModalKind ==
+                 NativeMainModalKind::ProjectSyncDiff) {
+      // O PC A pode ter aberto primeiro um projeto vazio e depois trocado
+      // para o projeto correto. O PC B recalcula o diff pelo snapshot vivo;
+      // se a Conferencia ja esta aberta, troca seu conteudo imediatamente em
+      // vez de manter o diagnostico preso ao projeto/aba anterior.
       nativeProjectSyncShowDiffModal(diff);
     }
     return true;
@@ -35613,10 +35788,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
       const COLORREF accent = RGB(250, 204, 21);
       NativeProjectSyncApplyState applyState;
       std::string projectSyncRole;
+      bool projectSyncPeerConnected = false;
       {
         std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
         applyState = g_nativeProjectSyncApply;
         projectSyncRole = g_nativeTimecodeLanProjectSyncRole;
+        projectSyncPeerConnected = g_nativeTimecodeLanPeerConnected;
       }
       const bool canOfferStructuralApply =
         projectSyncRole == "secondary" &&
@@ -35632,6 +35809,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
         canOfferStructuralApply || canOfferConfigApply;
       const bool applyBusy = nativeProjectSyncApplyStateIsBusy(
         applyState.state);
+      const bool canOfferRoleHandover =
+        projectSyncRole == "primary" && projectSyncPeerConnected &&
+        !applyBusy;
       RECT title{modal.left + 12, modal.top + 7,
         modal.right - 12, modal.top + 31};
       nativeAppActiveDrawText(dc, "Project Sync - conferencia", title,
@@ -35952,6 +36132,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
         addModalButton("project_sync_apply_config", "Aplicar configuracoes",
           RECT{modal.right - 260, modal.bottom - 34,
             modal.right - 96, modal.bottom - 12},
+          "play", true, true);
+      }
+      if (canOfferRoleHandover) {
+        addModalButton("project_sync_handover", "Tornar este PC B",
+          RECT{modal.left + 12, modal.bottom - 34,
+            modal.left + 168, modal.bottom - 12},
           "play", true, true);
       }
       // Ocultar a conferencia nao cancela o worker nem a transferencia. O
@@ -51116,6 +51302,10 @@ static bool nativeMainHandleModalClick(
     nativeProjectSyncApplyConfigFromDiffModal();
     return true;
   }
+  if (action == "project_sync_handover") {
+    nativeProjectSyncRequestRoleHandoverFromDiffModal();
+    return true;
+  }
 
   if (action == "close") {
     nativeUiCloseMainModal();
@@ -56447,6 +56637,7 @@ struct NativeTelepromptWindowState {
   RECT restoreRect{0, 0, 0, 0};
 #ifdef _WIN32
   LONG_PTR restoreStyle = 0;
+  HWND restoreOwner = nullptr;
 #endif
 };
 
@@ -60702,6 +60893,12 @@ static void nativeTelepromptToggleFullscreen(int slot)
 #ifdef _WIN32
     window.restoreStyle =
       GetWindowLongPtr(window.hwnd, GWL_STYLE);
+    // A janela normal e criada como owned pelo REAPER para acompanhar o
+    // aplicativo. Em tela cheia ela e uma tela de exibicao independente: se
+    // o usuario minimizar o REAPER, o Teleprompt precisa continuar visivel.
+    window.restoreOwner = reinterpret_cast<HWND>(
+      GetWindowLongPtr(window.hwnd, GWLP_HWNDPARENT));
+    SetWindowLongPtr(window.hwnd, GWLP_HWNDPARENT, 0);
     SetWindowLongPtr(window.hwnd, GWL_STYLE,
       WS_POPUP | WS_VISIBLE);
     if (monitor) {
@@ -60731,6 +60928,9 @@ static void nativeTelepromptToggleFullscreen(int slot)
       window.restoreStyle
         ? window.restoreStyle
         : (WS_POPUP | WS_THICKFRAME | WS_VISIBLE));
+    SetWindowLongPtr(window.hwnd, GWLP_HWNDPARENT,
+      reinterpret_cast<LONG_PTR>(window.restoreOwner));
+    window.restoreOwner = nullptr;
     SetWindowPos(window.hwnd, nullptr,
       window.restoreRect.left, window.restoreRect.top,
       window.restoreRect.right - window.restoreRect.left,
@@ -69054,26 +69254,33 @@ static bool nativeSelectProjectFromCommand(const std::string& commandBody)
   std::string pathValue = normalizeSlashes(nativeJsonExtractString(commandBody, "projectPath"));
 
   ReaProject* target = nullptr;
-  if (!idxValue.empty() && nativeLooksNumeric(idxValue)) {
+  // Caminhos e ponteiros nao sao portaveis entre os PCs. Prioriza o nome da
+  // aba (que e o que o usuario enxerga), depois o caminho quando coincidir e
+  // deixa o indice somente como fallback para projetos sem nome salvo.
+  for (int i = 0; i < 64 && !target; ++i) {
     char pathBuf[2048] = "";
-    target = EnumProjects_ptr(std::atoi(idxValue.c_str()), pathBuf, static_cast<int>(sizeof(pathBuf)));
-  }
-  if (!target) {
-    for (int i = 0; i < 64; ++i) {
-      char pathBuf[2048] = "";
-      ReaProject* p = EnumProjects_ptr(i, pathBuf, static_cast<int>(sizeof(pathBuf)));
-      if (!p) break;
-      const std::string pid = std::to_string(reinterpret_cast<std::uintptr_t>(p));
-      const std::string ppath = normalizeSlashes(pathBuf);
-      const std::string pname = nativeBasenameNoRpp(ppath);
-      if ((!idValue.empty() && idValue == pid) || (!pathValue.empty() && pathValue == ppath) || (!nameValue.empty() && nameValue == pname)) {
-        target = p;
-        break;
-      }
+    ReaProject* p = EnumProjects_ptr(i, pathBuf,
+      static_cast<int>(sizeof(pathBuf)));
+    if (!p) break;
+    const std::string pid = std::to_string(
+      reinterpret_cast<std::uintptr_t>(p));
+    const std::string ppath = normalizeSlashes(pathBuf);
+    const std::string pname = nativeBasenameNoRpp(ppath);
+    if ((!idValue.empty() && idValue == pid) ||
+        (!nameValue.empty() && nameValue == pname) ||
+        (!pathValue.empty() && pathValue == ppath)) {
+      target = p;
     }
+  }
+  if (!target && !idxValue.empty() && nativeLooksNumeric(idxValue)) {
+    char pathBuf[2048] = "";
+    target = EnumProjects_ptr(std::atoi(idxValue.c_str()), pathBuf,
+      static_cast<int>(sizeof(pathBuf)));
   }
   if (!target) return false;
   SelectProjectInstance_ptr(target);
+  g_nativeTimecodeLanSuppressedRemoteProjectSignature =
+    getCurrentProjectSignature();
   g_nativeForceStateBuild.store(true);
   return true;
 }
@@ -69682,6 +69889,12 @@ static bool nativeApplyTimecodeLanCommand(
       SetExtState_ptr(kExtStateSection,
         selectedKey, peerId.c_str(), true);
       SetExtState_ptr(kExtStateSection, rejectedKey, "", true);
+      // Substitui o aviso longo de "procurando" assim que o usuario escolhe
+      // um dispositivo. A Central ainda pode precisar executar o preflight,
+      // mas jamais deve parecer que ignorou a confirmacao.
+      nativeUiShowTemporaryPopup(
+        "CONECTANDO AO DISPOSITIVO\n\n" + peerName + "...",
+        20.0);
     } else {
       SetExtState_ptr(kExtStateSection, selectedKey, "", true);
       SetExtState_ptr(kExtStateSection,
@@ -71248,10 +71461,15 @@ static void startupTimer()
     g_state.projectStableTicks = 0;
     if (switchedExistingProject) {
       nativeUiResetForProjectTabChange();
+      nativeTimecodeLanPublishActiveProjectTabOnMainThread(
+        projectSignature);
     }
   } else {
     ++g_state.projectStableTicks;
   }
+  // Tambem publica uma vez quando o pareamento terminou com uma aba ja
+  // aberta; a funcao interna deduplica os ticks seguintes.
+  nativeTimecodeLanPublishActiveProjectTabOnMainThread(projectSignature);
   nativeRestorePanelAfterProjectLoadIfReady();
   nativeLoadLiveMarksForCurrentProject(projectSignature);
   {
