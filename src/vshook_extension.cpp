@@ -5183,6 +5183,11 @@ static std::string g_nativeTimecodeLanPeerName;
 // Comandos recebidos do outro computador nao podem voltar para a outbox e
 // circular indefinidamente no Project Sync bidirecional.
 static bool g_nativeApplyingTimecodeLanRemoteCommand = false;
+// Diferencia comandos enfileirados pela bridge HTTP (apps/Hook Center) das
+// chamadas feitas diretamente pela interface nativa. Uma selecao externa deve
+// substituir a selecao azul local, mas um clique nativo precisa conservar o
+// mapa local para Shift/Ctrl e navegacao por teclado.
+static bool g_nativeApplyingExternalHttpCommand = false;
 
 static bool nativeTimecodeReceiveBlocksLocalSpace()
 {
@@ -5229,6 +5234,8 @@ static std::string g_nativeProjectSyncTrackMode;
 static bool g_nativeProjectSyncPublishInitialTrackSnapshot = false;
 static std::chrono::steady_clock::time_point
   g_nativeProjectSyncTrackSuppressPublishUntil;
+static std::chrono::steady_clock::time_point
+  g_nativeProjectSyncLastTrackPoll;
 static std::map<std::string, NativeProjectSyncLiveTrackState>
   g_nativeProjectSyncLiveTrackBaseline;
 static std::map<std::string, NativeProjectSyncLiveItemState>
@@ -6437,6 +6444,8 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   g_nativeProjectSyncTrackProject = nullptr;
   g_nativeProjectSyncTrackMode.clear();
   g_nativeProjectSyncPublishInitialTrackSnapshot = false;
+  g_nativeProjectSyncLastTrackPoll =
+    std::chrono::steady_clock::time_point{};
   g_nativeProjectSyncLiveTrackBaseline.clear();
   g_nativeProjectSyncLiveItemBaseline.clear();
   g_nativeProjectSyncLiveProject = nullptr;
@@ -24990,10 +24999,12 @@ static void nativeProjectSyncRefreshManifestOnMainThread(bool force)
   }
 
   const auto now = std::chrono::steady_clock::now();
+  const int refreshIntervalMs = peerConnected ? 200 : 500;
   if (!force &&
       g_nativeProjectSyncLastManifestRefresh.time_since_epoch().count() != 0 &&
       std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - g_nativeProjectSyncLastManifestRefresh).count() < 200) {
+        now - g_nativeProjectSyncLastManifestRefresh).count() <
+          refreshIntervalMs) {
     return;
   }
   g_nativeProjectSyncLastManifestRefresh = now;
@@ -53916,9 +53927,7 @@ static bool nativeUiNeedsTimedVisualRefresh()
   nativeUiReadManualStopFadeoutVisualState(
     fadeoutActive, fadeoutRestorePending,
     fadeoutProgress, fadeoutDurationSec);
-  return g_nativeAppActivePanelModel.multiLoopBypassActive ||
-    g_nativeAppActivePanelModel.liveEnabled ||
-    g_nativeAppActivePanelModel.timerExpired ||
+  return g_nativeAppActivePanelModel.timerExpired ||
     (g_nativeAppActivePanelModel.partArmed &&
       (g_nativeAppActivePanelModel.showParts1 ||
        g_nativeAppActivePanelModel.showParts2)) ||
@@ -61738,6 +61747,11 @@ static void nativeRefreshAppActivePanelModel()
 {
   if (!nativeAppActivePanelIsOpen() &&
       !nativeHookControllerWindowIsOpen()) return;
+  const bool panelVisible = nativeAppActivePanelIsOpen() &&
+    IsWindowVisible(g_nativeAppActivePanelHwnd);
+  const bool controllerVisible = nativeHookControllerWindowIsOpen() &&
+    IsWindowVisible(g_nativeHookControllerHwnd);
+  if (!panelVisible && !controllerVisible) return;
 
   const auto modelNow = std::chrono::steady_clock::now();
   const bool recentlyInteracted =
@@ -65565,12 +65579,24 @@ static void nativeProjectSyncPollTracksOnMainThread()
   const bool shouldPublishInitialTrackSnapshot =
     mode == "project_sync" && projectSyncRole == "primary" &&
     peerConnected && publishInitialTrackSnapshot;
+  const auto pollNow = std::chrono::steady_clock::now();
+  const int pollIntervalMs = canPublish && peerConnected ? 50 : 200;
+  if (!shouldPublishInitialTrackSnapshot &&
+      g_nativeProjectSyncLastTrackPoll.time_since_epoch().count() != 0 &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        pollNow - g_nativeProjectSyncLastTrackPoll).count() <
+          pollIntervalMs) {
+    return;
+  }
+  g_nativeProjectSyncLastTrackPoll = pollNow;
   ReaProject* project = enabled ? getCurrentProject(nullptr, 0) : nullptr;
   if (!enabled || !project || !GetMediaTrackInfo_Value_ptr ||
       !CountTracks_ptr || !GetTrack_ptr) {
     g_nativeProjectSyncTrackBaseline.clear();
     g_nativeProjectSyncTrackProject = nullptr;
     g_nativeProjectSyncTrackMode.clear();
+    g_nativeProjectSyncLastTrackPoll =
+      std::chrono::steady_clock::time_point{};
     nativeProjectSyncFlushTrackVisualsOnMainThread();
     return;
   }
@@ -66140,7 +66166,7 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
   if (!publishInitial &&
       g_nativeProjectSyncLastLivePoll.time_since_epoch().count() != 0 &&
       std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - g_nativeProjectSyncLastLivePoll).count() < 30) {
+        now - g_nativeProjectSyncLastLivePoll).count() < 50) {
     return;
   }
   g_nativeProjectSyncLastLivePoll = now;
@@ -68350,10 +68376,11 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
   if (type != "edit_cursor_move" && type != "select_playlist_song" && type != "select_region" && type != "clear_selection" && type != "clear_selected_song" && type != "set_page") return false;
   nativeTimecodeLanRecordCommand(commandBody);
 
-  const bool remoteMusicSelection =
-    g_nativeApplyingTimecodeLanRemoteCommand &&
+  const bool externalMusicSelection =
+    (g_nativeApplyingTimecodeLanRemoteCommand ||
+     g_nativeApplyingExternalHttpCommand) &&
     (type == "select_playlist_song" || type == "select_region");
-  if (remoteMusicSelection) {
+  if (externalMusicSelection) {
     // A selecao local da janela tinha prioridade sobre g_nativeSelected* na
     // pintura. Por isso o cursor remoto mudava no grid, mas o azul permanecia
     // preso na musica clicada neste computador. A origem remota passa a ser a
@@ -68403,7 +68430,8 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
 
   NativePendingSelectionCommand command;
   command.pending = true;
-  command.remote = g_nativeApplyingTimecodeLanRemoteCommand;
+  command.remote = g_nativeApplyingTimecodeLanRemoteCommand ||
+    g_nativeApplyingExternalHttpCommand;
   command.type = type;
   command.id = nativeJsonExtractString(commandBody, "targetId");
   if (command.id.empty()) command.id = nativeJsonExtractString(commandBody, "songId");
@@ -70282,6 +70310,9 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
 {
   if (commandBody.empty()) return;
 
+  const bool previousExternalHttpCommandState =
+    g_nativeApplyingExternalHttpCommand;
+  g_nativeApplyingExternalHttpCommand = true;
   const bool previousRemoteCommandState =
     g_nativeApplyingTimecodeLanRemoteCommand;
   if (nativeJsonBoolValue(
@@ -70425,6 +70456,8 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
 
   g_nativeApplyingTimecodeLanRemoteCommand =
     previousRemoteCommandState;
+  g_nativeApplyingExternalHttpCommand =
+    previousExternalHttpCommandState;
 
   if (handledByNative) nativeMirrorCommandToLuaIfNeeded(commandType, commandBody);
 
