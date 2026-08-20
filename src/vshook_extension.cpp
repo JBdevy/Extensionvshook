@@ -5290,6 +5290,11 @@ static bool g_nativeProjectSyncConfigurationAuthorized = false;
 static std::string g_nativeProjectSyncStructuralManifest;
 static ReaProject* g_nativeProjectSyncManifestProject = nullptr;
 static int g_nativeProjectSyncManifestChangeCount = -1;
+// O REAPER pode carregar outro RPP na mesma aba, reutilizando o ponteiro do
+// ReaProject e ate o contador inicial de mudancas. O caminho/assinatura e a
+// identidade adicional que impede o manifesto do projeto anterior de vazar
+// para a conferencia do projeto que acabou de ser aberto.
+static std::string g_nativeProjectSyncManifestProjectSignature;
 static std::string g_nativeProjectSyncLastPublishedConfigRevision;
 static std::string g_nativeProjectSyncLastAppliedConfigRevision;
 static bool g_nativeProjectSyncPublishInitialConfig = false;
@@ -6463,6 +6468,7 @@ static void nativeTimecodeLanRefreshConfigOnMainThread()
   g_nativeProjectSyncStructuralManifest.clear();
   g_nativeProjectSyncManifestProject = nullptr;
   g_nativeProjectSyncManifestChangeCount = -1;
+  g_nativeProjectSyncManifestProjectSignature.clear();
   g_nativeProjectSyncLastPublishedConfigRevision.clear();
   g_nativeProjectSyncLastAppliedConfigRevision.clear();
   g_nativeProjectSyncPublishInitialConfig =
@@ -24993,6 +24999,7 @@ static void nativeProjectSyncRefreshManifestOnMainThread(bool force)
   g_nativeProjectSyncLastManifestRefresh = now;
 
   ReaProject* project = getCurrentProject(nullptr, 0);
+  const std::string projectSignature = getCurrentProjectSignature();
   const int changeCount = project && GetProjectStateChangeCount_ptr
     ? GetProjectStateChangeCount_ptr(project) : -1;
   const bool lightweightRuntimeMutation = !force && project &&
@@ -25000,6 +25007,7 @@ static void nativeProjectSyncRefreshManifestOnMainThread(bool force)
     g_nativeLightweightMutationChangeCount == changeCount;
   const bool rebuildStructural = force ||
     project != g_nativeProjectSyncManifestProject ||
+    projectSignature != g_nativeProjectSyncManifestProjectSignature ||
     (!lightweightRuntimeMutation &&
       changeCount != g_nativeProjectSyncManifestChangeCount) ||
     g_nativeProjectSyncStructuralManifest.empty();
@@ -25008,11 +25016,13 @@ static void nativeProjectSyncRefreshManifestOnMainThread(bool force)
       nativeProjectSyncBuildStructuralManifest(project);
     g_nativeProjectSyncManifestProject = project;
     g_nativeProjectSyncManifestChangeCount = changeCount;
+    g_nativeProjectSyncManifestProjectSignature = projectSignature;
   } else if (lightweightRuntimeMutation) {
     // Repeat, time selection e volumes transitórios do Multiloops não alteram
     // a estrutura comparada no preflight. Apenas absorve a nova revisão.
     g_nativeProjectSyncManifestProject = project;
     g_nativeProjectSyncManifestChangeCount = changeCount;
+    g_nativeProjectSyncManifestProjectSignature = projectSignature;
   }
   const std::string configSnapshot =
     nativeProjectSyncBuildConfigSnapshot();
@@ -27937,14 +27947,18 @@ static void nativeProjectSyncRequestRoleHandoverFromDiffModal()
 {
   std::string role;
   bool peerConnected = false;
+  bool conferenceConnected = false;
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     role = g_nativeTimecodeLanProjectSyncRole;
     peerConnected = g_nativeTimecodeLanPeerConnected;
+    conferenceConnected = g_nativeProjectSyncPreflight.hasResult &&
+      nativeProjectSyncRequestIdIsValid(
+        g_nativeProjectSyncPreflight.requestId);
   }
-  if (role != "primary" || !peerConnected) {
+  if (role != "primary" || (!peerConnected && !conferenceConnected)) {
     nativeUiShowTemporaryPopup(
-      "A troca de mestre so pode ser iniciada pelo PC A conectado ao PC B.",
+      "A troca de mestre exige uma conferencia ativa entre o PC A e o PC B.",
       2.4);
     return;
   }
@@ -28782,6 +28796,7 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
   g_nativeProjectSyncStructuralManifest.clear();
   g_nativeProjectSyncManifestProject = nullptr;
   g_nativeProjectSyncManifestChangeCount = -1;
+  g_nativeProjectSyncManifestProjectSignature.clear();
   g_nativeProjectSyncLastManifestRefresh =
     std::chrono::steady_clock::time_point{};
   nativeProjectSyncRefreshManifestOnMainThread(true);
@@ -35789,11 +35804,16 @@ static void nativePaintAppActivePanel(HWND hwnd)
       NativeProjectSyncApplyState applyState;
       std::string projectSyncRole;
       bool projectSyncPeerConnected = false;
+      bool projectSyncConferenceConnected = false;
       {
         std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
         applyState = g_nativeProjectSyncApply;
         projectSyncRole = g_nativeTimecodeLanProjectSyncRole;
         projectSyncPeerConnected = g_nativeTimecodeLanPeerConnected;
+        projectSyncConferenceConnected =
+          g_nativeProjectSyncPreflight.hasResult &&
+          nativeProjectSyncRequestIdIsValid(
+            g_nativeProjectSyncPreflight.requestId);
       }
       const bool canOfferStructuralApply =
         projectSyncRole == "secondary" &&
@@ -35809,9 +35829,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
         canOfferStructuralApply || canOfferConfigApply;
       const bool applyBusy = nativeProjectSyncApplyStateIsBusy(
         applyState.state);
+      // O atalho de trocar A/B pertence sempre ao PC A. Antes de o PC B
+      // concluir o vinculo ele fica visivel, mas bloqueado, para deixar claro
+      // por que ainda nao pode ser acionado em vez de simplesmente sumir da
+      // Conferencia.
+      const bool canShowRoleHandover =
+        projectSyncRole == "primary" && !applyBusy;
       const bool canOfferRoleHandover =
-        projectSyncRole == "primary" && projectSyncPeerConnected &&
-        !applyBusy;
+        canShowRoleHandover && (projectSyncPeerConnected ||
+          projectSyncConferenceConnected);
       RECT title{modal.left + 12, modal.top + 7,
         modal.right - 12, modal.top + 31};
       nativeAppActiveDrawText(dc, "Project Sync - conferencia", title,
@@ -36134,11 +36160,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
             modal.right - 96, modal.bottom - 12},
           "play", true, true);
       }
-      if (canOfferRoleHandover) {
-        addModalButton("project_sync_handover", "Tornar este PC B",
+      if (canShowRoleHandover) {
+        addModalButton("project_sync_handover",
+          canOfferRoleHandover ? "Tornar este PC B" : "Aguardando PC B",
           RECT{modal.left + 12, modal.bottom - 34,
             modal.left + 168, modal.bottom - 12},
-          "play", true, true);
+          canOfferRoleHandover ? "play" : "locked",
+          canOfferRoleHandover, canOfferRoleHandover);
       }
       // Ocultar a conferencia nao cancela o worker nem a transferencia. O
       // botao continua disponivel durante uma operacao para que uma queda da
