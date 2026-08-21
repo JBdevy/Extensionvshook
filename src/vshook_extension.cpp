@@ -62739,7 +62739,7 @@ static double nativePremixVolumeToRatio(double volume)
   if (!std::isfinite(volume) || volume <= 0.0000001) return 0.0;
   const double db = 20.0 * std::log10(volume);
   const double minDb = -90.0;
-  const double maxDb = 12.0;
+  const double maxDb = 24.0;
   const double zeroRatio = 0.76;
   const double curve = 1.35;
   if (db <= minDb) return 0.0;
@@ -62756,7 +62756,7 @@ static double nativePremixRatioToVolume(double ratio)
   ratio = std::max(0.0, std::min(1.0, ratio));
   if (ratio <= 0.0) return 0.0;
   const double minDb = -90.0;
-  const double maxDb = 12.0;
+  const double maxDb = 24.0;
   const double zeroRatio = 0.76;
   const double curve = 1.35;
   double db = 0.0;
@@ -69652,9 +69652,15 @@ static std::string nativeBuildTpMediaResponse(const std::string& req)
 static void nativeQueueHttpCommand(const std::string& commandBody)
 {
   if (commandBody.empty()) return;
+  const std::string commandType = nativeLower(nativeTrim(
+    nativeJsonExtractString(commandBody, "type")));
   const bool replacePendingTransportPulse =
-    nativeLower(nativeTrim(nativeJsonExtractString(
-      commandBody, "type"))) == "timecode_transport_sync";
+    commandType == "timecode_transport_sync";
+  const bool prioritizeLatestMusicSelection =
+    commandType == "select_playlist_song" ||
+    commandType == "select_region" ||
+    commandType == "clear_selection" ||
+    commandType == "clear_selected_song";
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   if (replacePendingTransportPulse) {
     g_nativeHttpCommandQueue.erase(
@@ -69667,12 +69673,35 @@ static void nativeQueueHttpCommand(const std::string& commandBody)
         }),
       g_nativeHttpCommandQueue.end());
   }
+  if (prioritizeLatestMusicSelection) {
+    // A selecao do Diretor e um estado absoluto. Descarta selecoes ainda nao
+    // consumidas e entrega somente o toque mais recente antes de pulsos de
+    // transporte/Project Sync que possam estar acumulados. As APIs do REAPER
+    // continuam sendo chamadas exclusivamente pelo startupTimer.
+    g_nativeHttpCommandQueue.erase(
+      std::remove_if(
+        g_nativeHttpCommandQueue.begin(),
+        g_nativeHttpCommandQueue.end(),
+        [](const std::string& queuedCommand) {
+          const std::string queuedType = nativeLower(nativeTrim(
+            nativeJsonExtractString(queuedCommand, "type")));
+          return queuedType == "select_playlist_song" ||
+            queuedType == "select_region" ||
+            queuedType == "clear_selection" ||
+            queuedType == "clear_selected_song";
+        }),
+      g_nativeHttpCommandQueue.end());
+  }
   // Limite defensivo: em uso normal o timer esvazia esta fila no ciclo
   // seguinte. O teto impede um cliente abandonado de consumir memoria sem fim.
   if (g_nativeHttpCommandQueue.size() >= 1024) {
     g_nativeHttpCommandQueue.pop_front();
   }
-  g_nativeHttpCommandQueue.push_back(commandBody);
+  if (prioritizeLatestMusicSelection) {
+    g_nativeHttpCommandQueue.push_front(commandBody);
+  } else {
+    g_nativeHttpCommandQueue.push_back(commandBody);
+  }
 }
 
 static int nativeMtcOutputPreference(const std::string& rawName,
