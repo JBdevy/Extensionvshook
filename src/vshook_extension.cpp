@@ -280,6 +280,15 @@ using GetProjectTimeSignature2_t = void (*)(ReaProject*, double*, double*);
 using Audio_IsRunning_t = int (*)();
 using GetAudioDeviceInfo_t =
   bool (*)(const char*, char*, int);
+using GetNumAudioOutputs_t = int (*)();
+using GetOutputChannelName_t = const char* (*)(int);
+using GetTrackNumSends_t = int (*)(MediaTrack*, int);
+using GetTrackSendInfo_Value_t =
+  double (*)(MediaTrack*, int, int, const char*);
+using SetTrackSendInfo_Value_t =
+  bool (*)(MediaTrack*, int, int, const char*, double);
+using CreateTrackSend_t = int (*)(MediaTrack*, MediaTrack*);
+using RemoveTrackSend_t = bool (*)(MediaTrack*, int, int);
 
 static plugin_register_t plugin_register_ptr = nullptr;
 static plugin_getapi_t plugin_getapi_ptr = nullptr;
@@ -357,6 +366,13 @@ static TimeMap_curFrameRate_t TimeMap_curFrameRate_ptr = nullptr;
 static GetProjectTimeSignature2_t GetProjectTimeSignature2_ptr = nullptr;
 static Audio_IsRunning_t Audio_IsRunning_ptr = nullptr;
 static GetAudioDeviceInfo_t GetAudioDeviceInfo_ptr = nullptr;
+static GetNumAudioOutputs_t GetNumAudioOutputs_ptr = nullptr;
+static GetOutputChannelName_t GetOutputChannelName_ptr = nullptr;
+static GetTrackNumSends_t GetTrackNumSends_ptr = nullptr;
+static GetTrackSendInfo_Value_t GetTrackSendInfo_Value_ptr = nullptr;
+static SetTrackSendInfo_Value_t SetTrackSendInfo_Value_ptr = nullptr;
+static CreateTrackSend_t CreateTrackSend_ptr = nullptr;
+static RemoveTrackSend_t RemoveTrackSend_ptr = nullptr;
 
 static CountTracks_t CountTracks_ptr = nullptr;
 static GetTrack_t GetTrack_ptr = nullptr;
@@ -15842,15 +15858,16 @@ static HFONT nativeUiConfiguredFont(const std::string& rawMode)
   const auto found = g_nativeUiConfiguredFonts.find(mode);
   if (found != g_nativeUiConfiguredFonts.end()) return found->second;
 
+  const bool bold = mode == "bold";
   const char* fontName = "Arial";
   if (mode == "verdana") fontName = "Verdana";
   else if (mode == "trebuchet") fontName = "Trebuchet MS";
   else if (mode == "georgia") fontName = "Georgia";
   else if (mode == "courier") fontName = "Courier New";
 #ifdef _WIN32
-  else if (mode == "system") fontName = "Segoe UI";
+  else if (mode == "system" || bold) fontName = "Segoe UI";
 #else
-  else if (mode == "system") fontName = "Arial";
+  else if (mode == "system" || bold) fontName = "Arial";
 #endif
 #ifdef __APPLE__
   constexpr int fontSize = 15;
@@ -15858,7 +15875,7 @@ static HFONT nativeUiConfiguredFont(const std::string& rawMode)
   constexpr int fontSize = 14;
 #endif
   HFONT font = CreateFont(fontSize, 0, 0, 0,
-    FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
     DEFAULT_QUALITY, DEFAULT_PITCH, fontName);
   if (!font) return nativeUiSharedFont();
@@ -15888,11 +15905,12 @@ static HFONT nativeUiCompactBlockFont(const std::string& rawMode)
 {
   std::string mode = nativeLower(nativeTrim(rawMode));
   if (mode.empty()) mode = "default";
+  const bool bold = mode == "bold";
   const auto found = g_nativeUiCompactBlockFonts.find(mode);
   if (found != g_nativeUiCompactBlockFonts.end()) return found->second;
 
 #ifdef _WIN32
-  const char* fontName = mode == "default" ? "Segoe UI" : "Arial";
+  const char* fontName = (mode == "default" || bold) ? "Segoe UI" : "Arial";
 #else
   const char* fontName = "Arial";
 #endif
@@ -15908,7 +15926,7 @@ static HFONT nativeUiCompactBlockFont(const std::string& rawMode)
 
   constexpr int fontSize = 11;
   HFONT font = CreateFont(fontSize, 0, 0, 0,
-    FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
     DEFAULT_QUALITY, DEFAULT_PITCH, fontName);
   if (!font) return nativeUiConfiguredFont(mode);
@@ -40637,7 +40655,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
         const std::vector<std::pair<std::string, std::string>> fontOptions = {
           {"default", "Padrão"}, {"arial", "Arial"},
           {"verdana", "Verdana"}, {"trebuchet", "Trebuchet"},
-          {"georgia", "Georgia"}, {"courier", "Courier"}
+          {"georgia", "Georgia"}, {"courier", "Courier"},
+          {"bold", "Negrito"}
         };
         struct FontGroup {
           const char* title;
@@ -62480,6 +62499,69 @@ static bool nativeFindTransitionLoopRange(ReaProject* project, double playPos, d
   return false;
 }
 
+static std::string nativeBuildMixerHardwareRouteIdsJson(MediaTrack* track)
+{
+  std::ostringstream json;
+  json << "[";
+  bool first = true;
+  std::set<std::string> seen;
+  if (track && GetTrackNumSends_ptr && GetTrackSendInfo_Value_ptr) {
+    const int count = std::max(0, GetTrackNumSends_ptr(track, 1));
+    for (int index = 0; index < count; ++index) {
+      const int destination = static_cast<int>(std::lround(
+        GetTrackSendInfo_Value_ptr(track, 1, index, "I_DSTCHAN")));
+      const int channel = destination & 1023;
+      const bool mono = (destination & 1024) != 0;
+      const std::string id = std::string(mono ? "mono:" : "stereo:") +
+        std::to_string(channel);
+      if (!seen.insert(id).second) continue;
+      if (!first) json << ",";
+      first = false;
+      json << nativeJsonString(id);
+    }
+  }
+  json << "]";
+  return json.str();
+}
+
+static std::string nativeBuildMixerHardwareOutputsJson()
+{
+  std::ostringstream json;
+  json << "[";
+  bool first = true;
+  const int outputCount = GetNumAudioOutputs_ptr
+    ? std::max(0, std::min(256, GetNumAudioOutputs_ptr())) : 0;
+  std::vector<std::string> names(static_cast<size_t>(outputCount));
+  for (int channel = 0; channel < outputCount; ++channel) {
+    const char* rawName = GetOutputChannelName_ptr
+      ? GetOutputChannelName_ptr(channel) : nullptr;
+    names[static_cast<size_t>(channel)] = rawName && *rawName
+      ? rawName : (std::string("Saida ") + std::to_string(channel + 1));
+  }
+  auto append = [&](const std::string& id, const std::string& kind,
+                    int channel, const std::string& label) {
+    if (!first) json << ",";
+    first = false;
+    json << "{\"id\":" << nativeJsonString(id)
+         << ",\"kind\":" << nativeJsonString(kind)
+         << ",\"channel\":" << channel
+         << ",\"label\":" << nativeJsonString(label) << "}";
+  };
+  for (int channel = 0; channel + 1 < outputCount; channel += 2) {
+    const std::string label = "STEREO " + std::to_string(channel + 1) + "/" +
+      std::to_string(channel + 2) + " - " + names[static_cast<size_t>(channel)] +
+      " / " + names[static_cast<size_t>(channel + 1)];
+    append("stereo:" + std::to_string(channel), "stereo", channel, label);
+  }
+  for (int channel = 0; channel < outputCount; ++channel) {
+    const std::string label = "MONO " + std::to_string(channel + 1) + " - " +
+      names[static_cast<size_t>(channel)];
+    append("mono:" + std::to_string(channel), "mono", channel, label);
+  }
+  json << "]";
+  return json.str();
+}
+
 static void nativeBuildMixerTrackListsJson(ReaProject* project, std::string& tracksOut, std::string& groupsOut)
 {
   std::ostringstream tracks;
@@ -62534,6 +62616,11 @@ static void nativeBuildMixerTrackListsJson(ReaProject* project, std::string& tra
     row << "\"displayScale\":\"db\",";
     row << "\"mute\":" << (mute ? "true" : "false") << ",";
     row << "\"solo\":" << (solo ? "true" : "false") << ",";
+    const bool parentSend = GetMediaTrackInfo_Value_ptr
+      ? GetMediaTrackInfo_Value_ptr(track, "B_MAINSEND") > 0.5 : true;
+    row << "\"parentSend\":" << (parentSend ? "true" : "false") << ",";
+    row << "\"hardwareRoutes\":"
+        << nativeBuildMixerHardwareRouteIdsJson(track) << ",";
     row << "\"folderDepth\":" << folderDelta << ",";
     row << "\"group\":" << (group ? "true" : "false") << ",";
     row << "\"hasCustomColor\":" << (hasCustomColor ? "true" : "false") << ",";
@@ -62572,7 +62659,10 @@ static std::string nativeBuildMixerMasterJson(ReaProject* project)
   oss << "\"db\":" << nativeNumber(nativeVolumeToDb(vol), 3) << ",";
   oss << "\"displayScale\":\"db\",";
   oss << "\"mute\":" << (mute ? "true" : "false") << ",";
-  oss << "\"solo\":" << (solo ? "true" : "false");
+  oss << "\"solo\":" << (solo ? "true" : "false") << ",";
+  oss << "\"parentSend\":false,";
+  oss << "\"hardwareRoutes\":"
+      << nativeBuildMixerHardwareRouteIdsJson(master);
   oss << "}";
   return oss.str();
 }
@@ -63981,6 +64071,7 @@ static void nativeRebuildState(bool forceSnapshot)
   static std::string cachedMixerTracksJson = "[]";
   static std::string cachedMixerGroupsJson = "[]";
   static std::string cachedMixerMasterJson = "{}";
+  static std::string cachedMixerHardwareOutputsJson = "[]";
   static std::string cachedPremixJson = "{}";
   static std::chrono::steady_clock::time_point cachedMixerRefreshAt;
   const int projectChangeCount = GetProjectStateChangeCount_ptr
@@ -64162,8 +64253,11 @@ static void nativeRebuildState(bool forceSnapshot)
   if (refreshMixer) {
     nativeBuildMixerTrackListsJson(activeProject, cachedMixerTracksJson, cachedMixerGroupsJson);
     cachedMixerMasterJson = nativeBuildMixerMasterJson(activeProject);
+    cachedMixerHardwareOutputsJson = nativeBuildMixerHardwareOutputsJson();
     cachedMixerJson = std::string("{\"tracks\":") + cachedMixerTracksJson +
-      ",\"groups\":" + cachedMixerGroupsJson + ",\"master\":" + cachedMixerMasterJson + "}";
+      ",\"groups\":" + cachedMixerGroupsJson + ",\"master\":" +
+      cachedMixerMasterJson + ",\"hardwareOutputs\":" +
+      cachedMixerHardwareOutputsJson + "}";
     cachedMixerRefreshAt = snapshotNow;
   }
   const std::string& regionsJson = cachedRegionsJson;
@@ -64679,6 +64773,8 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"mixerTracks\":" << cachedMixerTracksJson << ",";
   json << "\"mixerGroups\":" << cachedMixerGroupsJson << ",";
   json << "\"mixerMaster\":" << cachedMixerMasterJson << ",";
+  json << "\"mixerHardwareOutputs\":"
+       << cachedMixerHardwareOutputsJson << ",";
   json << "\"manualStopFadeout\":" << manualStopFadeoutJson << ",";
   json << "\"manualStopFadeoutEnabled\":" << (nativeBoolFromText(nativeReadLuaWindowExtState(kManualStopFadeoutEnabledKey), false) ? "true" : "false") << ",";
   json << "\"manualStopFadeoutDuration\":" << nativeManualStopFadeoutClampDuration(nativeReadLuaWindowExtState(kManualStopFadeoutDurationKey)) << ",";
@@ -67106,6 +67202,7 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
       type != "mixer_toggle_solo" &&
       type != "mixer_select_track" &&
       type != "mixer_route" &&
+      type != "mixer_set_route" &&
       type != "mixer_bulk_unmute" &&
       type != "mixer_bulk_unsolo") {
     return false;
@@ -67209,6 +67306,71 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
     }
     if (UpdateArrange_ptr) UpdateArrange_ptr();
     return true;
+  }
+  if (type == "mixer_set_route") {
+    const std::string routeKind = nativeLower(nativeTrim(
+      nativeJsonExtractString(commandBody, "routeKind")));
+    const bool enabled = nativeJsonBoolValue(
+      commandBody, "enabled", true);
+    bool changed = false;
+    if (routeKind == "parent") {
+      MediaTrack* master = GetMasterTrack_ptr
+        ? GetMasterTrack_ptr(project) : nullptr;
+      if (tr == master || !SetMediaTrackInfo_Value_ptr) return false;
+      const bool current = GetMediaTrackInfo_Value_ptr
+        ? GetMediaTrackInfo_Value_ptr(tr, "B_MAINSEND") > 0.5 : false;
+      if (current != enabled) {
+        changed = SetMediaTrackInfo_Value_ptr(
+          tr, "B_MAINSEND", enabled ? 1.0 : 0.0);
+      }
+    } else if (routeKind == "stereo" || routeKind == "mono") {
+      if (!GetTrackNumSends_ptr || !GetTrackSendInfo_Value_ptr ||
+          !SetTrackSendInfo_Value_ptr || !CreateTrackSend_ptr ||
+          !RemoveTrackSend_ptr) {
+        return false;
+      }
+      const int outputCount = GetNumAudioOutputs_ptr
+        ? std::max(0, GetNumAudioOutputs_ptr()) : 0;
+      int channel = static_cast<int>(nativeJsonInt64(
+        commandBody, "channel", -1));
+      if (channel < 0 || channel >= outputCount ||
+          (routeKind == "stereo" && channel + 1 >= outputCount)) {
+        return false;
+      }
+      const bool wantMono = routeKind == "mono";
+      std::vector<int> matches;
+      const int sendCount = std::max(0, GetTrackNumSends_ptr(tr, 1));
+      for (int sendIndex = 0; sendIndex < sendCount; ++sendIndex) {
+        const int destination = static_cast<int>(std::lround(
+          GetTrackSendInfo_Value_ptr(tr, 1, sendIndex, "I_DSTCHAN")));
+        if ((destination & 1023) == channel &&
+            ((destination & 1024) != 0) == wantMono) {
+          matches.push_back(sendIndex);
+        }
+      }
+      if (enabled && matches.empty()) {
+        const int sendIndex = CreateTrackSend_ptr(tr, nullptr);
+        if (sendIndex < 0) return false;
+        const int destination = channel | (wantMono ? 1024 : 0);
+        changed = SetTrackSendInfo_Value_ptr(
+          tr, 1, sendIndex, "I_DSTCHAN", destination);
+        SetTrackSendInfo_Value_ptr(tr, 1, sendIndex, "I_SRCCHAN", 0.0);
+      } else if (!enabled && !matches.empty()) {
+        for (auto it = matches.rbegin(); it != matches.rend(); ++it) {
+          changed = RemoveTrackSend_ptr(tr, 1, *it) || changed;
+        }
+      }
+    } else {
+      return false;
+    }
+    if (changed) {
+      if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+      if (TrackList_AdjustWindows_ptr) TrackList_AdjustWindows_ptr(false);
+      if (UpdateArrange_ptr) UpdateArrange_ptr();
+      g_nativeForceMixerBuild.store(true);
+      g_nativeForceStateBuild.store(true);
+    }
+    return changed;
   }
   if (!SetMediaTrackInfo_Value_ptr) return false;
   bool changed = false;
@@ -71863,6 +72025,22 @@ static bool loadApi(reaper_plugin_info_t* rec)
     rec->GetFunc("Audio_IsRunning"));
   GetAudioDeviceInfo_ptr = reinterpret_cast<GetAudioDeviceInfo_t>(
     rec->GetFunc("GetAudioDeviceInfo"));
+  GetNumAudioOutputs_ptr = reinterpret_cast<GetNumAudioOutputs_t>(
+    rec->GetFunc("GetNumAudioOutputs"));
+  GetOutputChannelName_ptr = reinterpret_cast<GetOutputChannelName_t>(
+    rec->GetFunc("GetOutputChannelName"));
+  GetTrackNumSends_ptr = reinterpret_cast<GetTrackNumSends_t>(
+    rec->GetFunc("GetTrackNumSends"));
+  GetTrackSendInfo_Value_ptr =
+    reinterpret_cast<GetTrackSendInfo_Value_t>(
+      rec->GetFunc("GetTrackSendInfo_Value"));
+  SetTrackSendInfo_Value_ptr =
+    reinterpret_cast<SetTrackSendInfo_Value_t>(
+      rec->GetFunc("SetTrackSendInfo_Value"));
+  CreateTrackSend_ptr = reinterpret_cast<CreateTrackSend_t>(
+    rec->GetFunc("CreateTrackSend"));
+  RemoveTrackSend_ptr = reinterpret_cast<RemoveTrackSend_t>(
+    rec->GetFunc("RemoveTrackSend"));
   CountTracks_ptr = reinterpret_cast<CountTracks_t>(rec->GetFunc("CountTracks"));
   GetTrack_ptr = reinterpret_cast<GetTrack_t>(rec->GetFunc("GetTrack"));
   GetMasterTrack_ptr = reinterpret_cast<GetMasterTrack_t>(rec->GetFunc("GetMasterTrack"));
