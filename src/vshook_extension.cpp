@@ -8149,6 +8149,9 @@ static std::string g_nativeDrawerSymbolColor = "yellow";
 static uint64_t g_nativeDirectorListScrollRevision = 0;
 static double g_nativeSelectedStart = 0.0;
 static double g_nativeSelectedEnd = 0.0;
+// Separa uma navegacao deliberada (clique/setas/app) da musica que apenas
+// comecou a tocar. Somente a primeira pode virar destino do cursor no Stop.
+static bool g_nativeSelectedNavigationIntent = false;
 static uint64_t g_nativeStopReadySequence = 0;
 static std::chrono::steady_clock::time_point g_nativeSuppressStoppedTransitionPrepareUntil;
 static std::string g_nativeSelectedMarkerId;
@@ -12548,6 +12551,7 @@ static bool nativeApplyPlaylistCommand(const std::string& commandBody)
     g_nativeSelectedTab.clear();
     g_nativeSelectedStart = 0.0;
     g_nativeSelectedEnd = 0.0;
+    g_nativeSelectedNavigationIntent = false;
     g_nativeDirectorActivePage = "playlist";
     ++g_nativeDirectorListScrollRevision;
   }
@@ -14167,6 +14171,7 @@ static bool nativeApplyPlaylistNumberSortCommand(const std::string& commandBody)
     g_nativeSelectedTab.clear();
     g_nativeSelectedStart = 0.0;
     g_nativeSelectedEnd = 0.0;
+    g_nativeSelectedNavigationIntent = false;
   }
   nativeUiClearMainRowSelection();
 
@@ -14246,6 +14251,7 @@ static void nativeClearSelectedSongLocked()
   g_nativeSelectedTab.clear();
   g_nativeSelectedStart = 0.0;
   g_nativeSelectedEnd = 0.0;
+  g_nativeSelectedNavigationIntent = false;
 }
 
 static void nativeRefreshLuaControlHeartbeatFromExtState()
@@ -14369,6 +14375,7 @@ static bool nativePrepareStopSelectionFromQueueOrCurrent(ReaProject* project, bo
       g_nativeSelectedTab = stopSelectionTab == "regions" ? "regions" : "playlist";
       g_nativeSelectedStart = stopStartPos;
       g_nativeSelectedEnd = stopEndPos;
+      g_nativeSelectedNavigationIntent = false;
       finalId = g_nativeSelectedId;
       finalTab = g_nativeSelectedTab;
       finalStart = stopStartPos;
@@ -14378,6 +14385,7 @@ static bool nativePrepareStopSelectionFromQueueOrCurrent(ReaProject* project, bo
       g_nativeSelectedTab = stopSelectionTab == "regions" ? "regions" : "playlist";
       g_nativeSelectedStart = selectedSong->start;
       g_nativeSelectedEnd = selectedSong->end;
+      g_nativeSelectedNavigationIntent = false;
       finalId = selectedSong->id;
       finalTab = g_nativeSelectedTab;
       finalStart = selectedSong->start;
@@ -14388,6 +14396,7 @@ static bool nativePrepareStopSelectionFromQueueOrCurrent(ReaProject* project, bo
       g_nativeSelectedTab = stopSelectionTab == "regions" ? "regions" : "playlist";
       g_nativeSelectedStart = stopStartPos;
       g_nativeSelectedEnd = stopEndPos;
+      g_nativeSelectedNavigationIntent = false;
       finalId = g_nativeSelectedId;
       finalTab = g_nativeSelectedTab;
     }
@@ -14441,6 +14450,7 @@ static bool nativeStopTransportAndPrepareExplicitSelection(ReaProject* project, 
       (!g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) ||
       (!g_nativeAutoBlocoTargetSongId.empty() && g_nativeAutoBlocoTargetEnd > g_nativeAutoBlocoTargetStart + 0.0005);
     hasSelectedStopTarget =
+      g_nativeSelectedNavigationIntent &&
       !g_nativeSelectedId.empty() &&
       g_nativeSelectedEnd > g_nativeSelectedStart + 0.0005;
     if (hasSelectedStopTarget) {
@@ -14565,6 +14575,7 @@ static bool nativeStopTransportAndPrepareExplicitSelection(ReaProject* project, 
       g_nativeSelectedTab = stopSelectionTab == "regions" ? "regions" : "playlist";
       g_nativeSelectedStart = stopStartPos;
       g_nativeSelectedEnd = stopEndPos;
+      g_nativeSelectedNavigationIntent = false;
       finalSelectionId = g_nativeSelectedId;
       finalSelectionTab = g_nativeSelectedTab;
       finalSelectionStart = stopStartPos;
@@ -15413,6 +15424,7 @@ static void nativeMaintainAutoStop(
       hasUiNavigationSelection &&
       std::fabs(uiNavigationSelectionStart - currentSongStart) > 0.001;
     const bool engineTargetIsOtherSong =
+      g_nativeSelectedNavigationIntent &&
       !g_nativeSelectedId.empty() &&
       g_nativeSelectedEnd > g_nativeSelectedStart + 0.0005 &&
       std::fabs(g_nativeSelectedStart - currentSongStart) > 0.001;
@@ -34505,6 +34517,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
     }
     const bool useLocalMainSelection =
       g_nativeUiMainSelectionAuthoritative;
+    // O destaque azul pertence exclusivamente a navegacao da interface.
+    // Enquanto o usuario trabalha no arrange/grid, o alvo funcional pode
+    // continuar existindo no motor, mas nao volta a ser pintado por fallback.
+    const bool mainPanelHasKeyboardFocus =
+      GetFocus() == hwnd;
     // Igual a vshook_navigation_selection_color_20260716 do Lua: quando uma
     // coluna Parts esta aberta, as selecoes das tres listas continuam
     // visiveis, mas somente a coluna navegada usa o azul forte.
@@ -34635,9 +34652,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
       // navegacao por setas/MIDI e a busca continuam azuis para o usuario poder
       // confirmar a fila com Enter. A propria musica tocando nunca recebe azul.
       const bool selectionVisualAllowed =
-        !g_nativeAppActivePanelModel.playing ||
-        g_nativeUiMusicSelectionVisualActive ||
-        g_nativeMainSearchFocused;
+        mainPanelHasKeyboardFocus &&
+        (!g_nativeAppActivePanelModel.playing ||
+         g_nativeUiMusicSelectionVisualActive ||
+         g_nativeMainSearchFocused);
       const bool isSelected =
         selectionVisualAllowed && !isPlaying &&
         (useLocalMainSelection
@@ -48243,6 +48261,66 @@ static bool nativeHookControllerWindowIsOpen()
     IsWindow(g_nativeHookControllerHwnd);
 }
 
+// Quando o usuario sai das janelas de musica do VS Hook para editar o arrange,
+// a selecao funcional precisa desaparecer junto com o azul. Sem isso o Stop
+// ainda enxergava a ultima musica como destino deliberado e puxava o cursor de
+// volta ao inicio dela. O poll cobre dockers/SWELL que nem sempre entregam
+// WM_KILLFOCUS para a janela filha correta.
+static bool nativeUiReleaseMusicSelectionForArrangeEditing()
+{
+  const auto belongsToWindow = [](HWND target, HWND owner) {
+    if (!target || !owner) return false;
+    for (HWND current = target; current; current = GetParent(current)) {
+      if (current == owner) return true;
+    }
+    return false;
+  };
+  const HWND focused = GetFocus();
+  if (belongsToWindow(focused, g_nativeAppActivePanelHwnd) ||
+      belongsToWindow(focused, g_nativeHookControllerHwnd)) {
+    return false;
+  }
+
+  bool hasLocalVisualSelection = false;
+  for (const auto& entry : g_nativeUiSelectedRows) {
+    if (entry.second) {
+      hasLocalVisualSelection = true;
+      break;
+    }
+  }
+  bool releaseFunctionalSelection =
+    hasLocalVisualSelection ||
+    g_nativeUiPendingMusicNavigation.pending;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    const bool pendingLocalMusicSelection =
+      g_nativePendingSelection.pending &&
+      !g_nativePendingSelection.remote &&
+      (g_nativePendingSelection.type == "select_playlist_song" ||
+       g_nativePendingSelection.type == "select_region");
+    if (pendingLocalMusicSelection) {
+      g_nativePendingSelection = NativePendingSelectionCommand{};
+      releaseFunctionalSelection = true;
+    }
+    if (g_nativeUiMainSelectionAuthoritative &&
+        g_nativeSelectedNavigationIntent) {
+      releaseFunctionalSelection = true;
+    }
+    if (releaseFunctionalSelection) {
+      nativeClearSelectedSongLocked();
+      nativeBumpSharedRevisionLocked("pc");
+      g_nativeForceStateBuild.store(true);
+    }
+  }
+  if (!releaseFunctionalSelection) return false;
+
+  nativeUiCancelPendingMusicNavigation();
+  nativeUiClearMainRowSelection();
+  // Mantem o mapa vazio como autoridade ate o snapshot sem selecao chegar.
+  g_nativeUiMainSelectionAuthoritative = true;
+  return true;
+}
+
 static int nativeTranslateHookControllerKeyboardMessage(const MSG* msg)
 {
   if (!msg || !nativeHookControllerWindowIsOpen()) return 0;
@@ -50747,8 +50825,13 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
+    case WM_SETFOCUS:
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
     case WM_KILLFOCUS:
       nativeUiResetNavigationRepeat();
+      nativeUiReleaseMusicSelectionForArrangeEditing();
+      InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_KEYUP:
     case WM_SYSKEYUP:
@@ -54062,6 +54145,8 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_TIMER:
       if (wParam == kNativeUiFrameTimerId) {
         nativeUiAdvanceNavigationRepeat(hwnd);
+        const bool selectionReleasedForEditing =
+          nativeUiReleaseMusicSelectionForArrangeEditing();
         const bool scrollChanged =
           nativeUiAdvanceSmoothScrolls();
         const bool dragScrollChanged =
@@ -54090,7 +54175,8 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         if (IsWindowVisible(hwnd) &&
             (scrollChanged || dragScrollChanged ||
              searchQueryCommitted ||
-             navigationCommitted || localClockChanged ||
+              navigationCommitted || selectionReleasedForEditing ||
+              localClockChanged ||
              batteryChanged || timedRefresh)) {
           InvalidateRect(hwnd, nullptr, FALSE);
           // A animação da lista não depende da fila normal de WM_PAINT:
@@ -54840,6 +54926,8 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     }
     case WM_KILLFOCUS:
       nativeUiResetNavigationRepeat();
+      nativeUiReleaseMusicSelectionForArrangeEditing();
+      InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_SYSKEYUP:
     case WM_KEYUP:
@@ -68486,6 +68574,7 @@ static void nativeProcessPendingSelectionOnMainThread()
         (command.type == "select_region") ? "regions" : "playlist";
       g_nativeSelectedStart = song->start;
       g_nativeSelectedEnd = song->end;
+      g_nativeSelectedNavigationIntent = true;
       if (!command.exactPosition) {
         targetPos = song->start;
         hasTargetPos = true;
@@ -68496,6 +68585,7 @@ static void nativeProcessPendingSelectionOnMainThread()
         (command.type == "select_region") ? "regions" : "playlist";
       g_nativeSelectedStart = command.startPos;
       g_nativeSelectedEnd = command.endPos;
+      g_nativeSelectedNavigationIntent = true;
     }
   }
 
@@ -68995,10 +69085,12 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
         g_nativeSelectedId = song->id;
         g_nativeSelectedStart = song->start;
         g_nativeSelectedEnd = song->end;
+        g_nativeSelectedNavigationIntent = false;
       } else if (!idValue.empty()) {
         g_nativeSelectedId = idValue;
         g_nativeSelectedStart = startPos;
         g_nativeSelectedEnd = endPos;
+        g_nativeSelectedNavigationIntent = false;
       }
 
       const NativeSongWindow* expectedSong = song;
