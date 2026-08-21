@@ -64702,6 +64702,15 @@ static void nativeRebuildState(bool forceSnapshot)
       bridgeVisualPrefs, "no_block_text_color_mode", "none"));
   const std::string liveMarkColorMode =
     nativeUiLiveMarkColorMode(bridgeVisualPrefs);
+  const bool batteryWarningEnabled = nativeUiVisualPrefBool(
+    bridgeVisualPrefs, "battery_warning_enabled", true);
+  const int batteryWarningThreshold = std::max(10, std::min(45,
+    std::atoi(nativeUiVisualPref(
+      bridgeVisualPrefs,
+      "battery_warning_threshold", "20").c_str())));
+  const std::string batteryWarningColorMode = nativeLower(
+    nativeUiVisualPref(
+      bridgeVisualPrefs, "battery_warning_color_mode", "red"));
   const COLORREF liveMarkBorderColor =
     liveMarkColorMode == "none"
       ? nativeUiListPanelBackgroundColor(bridgeVisualPrefs)
@@ -64715,6 +64724,17 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"nativeBridge\":true,";
   json << "\"bridgeVersion\":2,";
   json << "\"extensionVersion\":" << nativeJsonString(VSHOOK_EXTENSION_VERSION) << ",";
+  json << "\"batteryPresent\":"
+       << (g_nativeUiBatteryPresent ? "true" : "false") << ",";
+  json << "\"batteryPercent\":" << g_nativeUiBatteryPercent << ",";
+  json << "\"batteryCharging\":"
+       << (g_nativeUiBatteryCharging ? "true" : "false") << ",";
+  json << "\"batteryWarningEnabled\":"
+       << (batteryWarningEnabled ? "true" : "false") << ",";
+  json << "\"batteryWarningThreshold\":"
+       << batteryWarningThreshold << ",";
+  json << "\"batteryWarningColorMode\":"
+       << nativeJsonString(batteryWarningColorMode) << ",";
   json << "\"blockHeightMode\":"
        << nativeJsonString(blockHeightMode) << ",";
   json << "\"block_height_mode\":"
@@ -71909,6 +71929,10 @@ static void startupTimer()
     nativeProcessGlobalStopPauseOnMainThread();
     nativeUpdateManualStopFadeoutOnMainThread();
     nativeProcessPendingSelectionOnMainThread();
+    // Mantem o estado de bateria atualizado para o App Diretor mesmo quando
+    // a janela nativa do VS Hook esta fechada. A funcao limita a leitura a
+    // uma vez a cada quatro segundos.
+    nativeUiPollBatteryState();
     // Arma o Multiloops antes da manutencao da fila. Assim o mesmo ciclo ja
     // publica Repeat ativo e impede o seek da fila de disputar o cursor.
     nativeProcessMultiLoopsOnMainThread();
