@@ -132,6 +132,7 @@ using EnumProjects_t = ReaProject* (*)(int, char*, int);
 using GetProjExtState_t = int (*)(ReaProject*, const char*, const char*, char*, int);
 using SetProjExtState_t = int (*)(ReaProject*, const char*, const char*, const char*);
 using MarkProjectDirty_t = void (*)(ReaProject*);
+using Main_SaveProject_t = void (*)(ReaProject*, bool);
 using Main_SaveProjectEx_t = void (*)(ReaProject*, const char*, int);
 using CountProjectMarkers_t = int (*)(ReaProject*, int*, int*);
 using EnumProjectMarkers3_t = int (*)(ReaProject*, int, bool*, double*, double*, const char**, int*, int*);
@@ -314,6 +315,7 @@ static EnumProjects_t EnumProjects_ptr = nullptr;
 static GetProjExtState_t GetProjExtState_ptr = nullptr;
 static SetProjExtState_t SetProjExtState_ptr = nullptr;
 static MarkProjectDirty_t MarkProjectDirty_ptr = nullptr;
+static Main_SaveProject_t Main_SaveProject_ptr = nullptr;
 static Main_SaveProjectEx_t Main_SaveProjectEx_ptr = nullptr;
 static CountProjectMarkers_t CountProjectMarkers_ptr = nullptr;
 static EnumProjectMarkers3_t EnumProjectMarkers3_ptr = nullptr;
@@ -461,6 +463,8 @@ static StuffMIDIMessage_t StuffMIDIMessage_ptr = nullptr;
 static ReaProject* getCurrentProject(char* pathOut, int pathOutSize);
 static std::string nativeTrim(std::string value);
 static std::string nativeLower(std::string value);
+static bool nativeUiSetProjectString(
+  ReaProject* project, const char* key, const std::string& value);
 
 static const char* kExtStateSection = "VS_HOOK_LOADER";
 static const char* kAutoOpenModeKey = "AUTO_OPEN_VSHOOK_MODE";
@@ -652,6 +656,9 @@ static custom_action_register_t g_addTimecodeAction = {
 static custom_action_register_t g_projectSyncAction = {
   0, "VSHOOKNEWPROJECTSYNC", "VS Hook: Sync to project", nullptr
 };
+static custom_action_register_t g_exportProjectAction = {
+  0, "VSHOOKEXPORTPROJECT", "VS Hook: Export Project", nullptr
+};
 static custom_action_register_t g_telepromptOneAction = {
   0, "VSHOOKNEWTELEPROMPT1", "VS Hook: Abrir Teleprompt 1", nullptr
 };
@@ -682,6 +689,7 @@ static int g_timecodeReceiveCommandId = 0;
 static int g_timecodeTransmitterCommandId = 0;
 static int g_addTimecodeCommandId = 0;
 static int g_projectSyncCommandId = 0;
+static int g_exportProjectCommandId = 0;
 static int g_telepromptOneCommandId = 0;
 static int g_telepromptTwoCommandId = 0;
 static int g_telepromptSettingsCommandId = 0;
@@ -1427,7 +1435,9 @@ enum class NativeUiPremixRowKind {
 struct NativeUiPremixItemRow {
   NativeUiPremixRowKind kind = NativeUiPremixRowKind::Item;
   MediaItem* mediaItem = nullptr;
+  MediaTrack* mediaTrack = nullptr;
   std::string itemId;
+  std::string trackId;
   std::string name;
   std::string trackName;
   int itemNumber = 0;
@@ -4041,6 +4051,241 @@ static void toggleProjectSync()
   nativeUiShowTemporaryPopup(waitingMessage, 12.0 * 60.0 * 60.0);
 }
 
+static bool nativeSetReaperConfigInt(const char* key, int value)
+{
+  if (!get_config_var_ptr || !key) return false;
+  int size = 0;
+  void* address = get_config_var_ptr(key, &size);
+  if (!address || size < static_cast<int>(sizeof(int))) return false;
+  *static_cast<int*>(address) = value;
+  return true;
+}
+
+struct NativeExportProjectFindChild {
+  int controlId = 0;
+  HWND hwnd = nullptr;
+};
+
+static BOOL nativeExportProjectFindChildCallback(HWND hwnd, LPARAM param)
+{
+  NativeExportProjectFindChild* search =
+    reinterpret_cast<NativeExportProjectFindChild*>(param);
+  if (!search || search->hwnd) return FALSE;
+  if (GetWindowLong(hwnd, GWL_ID) == search->controlId) {
+    search->hwnd = hwnd;
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static HWND nativeExportProjectFindChild(HWND root, int controlId)
+{
+  if (!root) return nullptr;
+  NativeExportProjectFindChild search;
+  search.controlId = controlId;
+  EnumChildWindows(root, nativeExportProjectFindChildCallback,
+    reinterpret_cast<LPARAM>(&search));
+  return search.hwnd;
+}
+
+struct NativeExportProjectFindDialog {
+  int firstControlId = 0;
+  int secondControlId = 0;
+  HWND excluded = nullptr;
+  HWND hwnd = nullptr;
+};
+
+static BOOL nativeExportProjectFindDialogCallback(HWND hwnd, LPARAM param)
+{
+  NativeExportProjectFindDialog* search =
+    reinterpret_cast<NativeExportProjectFindDialog*>(param);
+  if (!search || search->hwnd) return FALSE;
+  if (hwnd == search->excluded || !IsWindowVisible(hwnd)) return TRUE;
+#ifdef _WIN32
+  DWORD processId = 0;
+  GetWindowThreadProcessId(hwnd, &processId);
+  if (processId != GetCurrentProcessId()) return TRUE;
+#endif
+  if (nativeExportProjectFindChild(hwnd, search->firstControlId) &&
+      nativeExportProjectFindChild(hwnd, search->secondControlId)) {
+    search->hwnd = hwnd;
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static HWND nativeExportProjectFindDialog(
+  int firstControlId, int secondControlId, HWND excluded = nullptr)
+{
+  NativeExportProjectFindDialog search;
+  search.firstControlId = firstControlId;
+  search.secondControlId = secondControlId;
+  search.excluded = excluded;
+  EnumWindows(nativeExportProjectFindDialogCallback,
+    reinterpret_cast<LPARAM>(&search));
+  return search.hwnd;
+}
+
+static bool nativeExportProjectPostControlClick(HWND control)
+{
+  if (!control || !IsWindowEnabled(control)) return false;
+  const LPARAM point = static_cast<LPARAM>((8 & 0xffff) | (8 << 16));
+  PostMessage(control, WM_LBUTTONDOWN, MK_LBUTTON, point);
+  PostMessage(control, WM_LBUTTONUP, 0, point);
+  return true;
+}
+
+static int nativeExportProjectFindComboItem(
+  HWND combo, const std::string& wantedText)
+{
+  if (!combo || wantedText.empty()) return -1;
+  const int count = static_cast<int>(
+    SendMessage(combo, CB_GETCOUNT, 0, 0));
+  const std::string wanted = nativeLower(nativeTrim(wantedText));
+  for (int index = 0; index < count; ++index) {
+    char text[512] = "";
+    SendMessage(combo, CB_GETLBTEXT,
+      static_cast<WPARAM>(index), reinterpret_cast<LPARAM>(text));
+    const std::string candidate = nativeLower(nativeTrim(text));
+    if (candidate == wanted || candidate.find(wanted) != std::string::npos) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+static bool nativeExportProjectSelectComboText(
+  HWND dialog, int controlId, const std::string& wantedText)
+{
+  HWND combo = nativeExportProjectFindChild(dialog, controlId);
+  const int item = nativeExportProjectFindComboItem(combo, wantedText);
+  if (!combo || item < 0) return false;
+  SendMessage(combo, CB_SETCURSEL, static_cast<WPARAM>(item), 0);
+  const WPARAM command = static_cast<WPARAM>(
+    (controlId & 0xffff) | (CBN_SELCHANGE << 16));
+  PostMessage(dialog, WM_COMMAND, command,
+    reinterpret_cast<LPARAM>(combo));
+  return true;
+}
+
+static void nativeExportProjectConfigureSaveDialog(
+  bool convertToMp3, std::atomic<bool>* cancelled)
+{
+  using namespace std::chrono_literals;
+  HWND saveDialog = nullptr;
+  for (int attempt = 0; attempt < 400 &&
+       (!cancelled || !cancelled->load()); ++attempt) {
+    saveDialog = nativeExportProjectFindDialog(0x413, 0x421);
+    if (saveDialog) break;
+    std::this_thread::sleep_for(25ms);
+  }
+  if (!saveDialog || (cancelled && cancelled->load())) return;
+
+  HWND copyMedia = nativeExportProjectFindChild(saveDialog, 0x413);
+  HWND convertMedia = nativeExportProjectFindChild(saveDialog, 0x421);
+  if (copyMedia && SendMessage(copyMedia, BM_GETCHECK, 0, 0) == 0) {
+    nativeExportProjectPostControlClick(copyMedia);
+    std::this_thread::sleep_for(80ms);
+  }
+  const bool conversionChecked = convertMedia &&
+    SendMessage(convertMedia, BM_GETCHECK, 0, 0) != 0;
+  if (convertMedia && conversionChecked != convertToMp3) {
+    nativeExportProjectPostControlClick(convertMedia);
+    std::this_thread::sleep_for(100ms);
+  }
+  if (!convertToMp3 || !convertMedia ||
+      SendMessage(convertMedia, BM_GETCHECK, 0, 0) == 0) {
+    return;
+  }
+
+  HWND formatButton = nativeExportProjectFindChild(saveDialog, 0x420);
+  if (!nativeExportProjectPostControlClick(formatButton)) return;
+
+  HWND formatDialog = nullptr;
+  for (int attempt = 0; attempt < 240 &&
+       (!cancelled || !cancelled->load()); ++attempt) {
+    formatDialog = nativeExportProjectFindDialog(0x45C, IDOK, saveDialog);
+    if (formatDialog) break;
+    std::this_thread::sleep_for(25ms);
+  }
+  if (!formatDialog || (cancelled && cancelled->load())) return;
+
+  if (!nativeExportProjectSelectComboText(formatDialog, 0x45C, "MP3")) {
+    return;
+  }
+  std::this_thread::sleep_for(120ms);
+  nativeExportProjectSelectComboText(
+    formatDialog, 0x3F6, "Maximum bitrate/quality");
+  nativeExportProjectSelectComboText(
+    formatDialog, 0x3EE, "100 (best)");
+  nativeExportProjectSelectComboText(
+    formatDialog, 0x3EB, "320 kbps");
+  std::this_thread::sleep_for(80ms);
+  nativeExportProjectPostControlClick(
+    nativeExportProjectFindChild(formatDialog, IDOK));
+}
+
+static void nativeExportProject()
+{
+  if (!Main_SaveProject_ptr) {
+    showDiagnostic(
+      "REAPER nao entregou a funcao necessaria para exportar o projeto.");
+    return;
+  }
+
+  const int saveAnswer = ShowMessageBox_ptr
+    ? ShowMessageBox_ptr(
+        "Deseja salvar este projeto?",
+        "VS Hook - Export Project", 1)
+    : 1;
+  if (saveAnswer != 1) return;
+
+  const int mp3Answer = ShowMessageBox_ptr
+    ? ShowMessageBox_ptr(
+        "Deseja salvar este projeto ja convertendo as midias para MP3?",
+        "VS Hook - Export Project", 4)
+    : 7;
+  const bool convertToMp3 = mp3Answer == 6;
+
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project) {
+    showDiagnostic("Nenhum projeto esta aberto para exportar.");
+    return;
+  }
+
+  // Estes valores preparam o estado inicial. Algumas versoes do REAPER
+  // reescrevem esse estado ao criar a janela; o configurador abaixo confirma
+  // diretamente os controles visiveis antes de devolver a janela ao usuario.
+  nativeSetReaperConfigInt(
+    "saveFlags", convertToMp3 ? 16 : 2);
+  // Zero faz o dialogo usar APPLYFX_FORMAT do projeto, configurado abaixo.
+  nativeSetReaperConfigInt("saveFlags_fmtused", 0);
+
+  if (GetSetProjectInfo_ptr) {
+    GetSetProjectInfo_ptr(
+      project, "RECFMT_OPENCOPY", convertToMp3 ? 1.0 : 0.0, true);
+    GetSetProjectInfo_ptr(
+      project, "OPENCOPY_CFGIDX", convertToMp3 ? 1.0 : 0.0, true);
+  }
+  if (convertToMp3) {
+    // MP3 a 320 kbps no modo de qualidade maxima. APPLYFX_FORMAT e a
+    // configuracao usada pelo proprio REAPER ao converter midia no Save As.
+    nativeUiSetProjectString(project, "APPLYFX_FORMAT",
+      "bDNwbUABAAAAAAAACgAAAP////8EAAAAQAEAAAAAAAAI");
+  }
+
+  std::atomic<bool> dialogClosed{false};
+  std::thread dialogConfigurator(
+    nativeExportProjectConfigureSaveDialog,
+    convertToMp3, &dialogClosed);
+
+  // forceSaveAs=true abre a janela nativa para o usuario escolher destino e
+  // nome. O REAPER executa a copia/conversao e atualiza o projeto resultante.
+  Main_SaveProject_ptr(project, true);
+  dialogClosed.store(true);
+  if (dialogConfigurator.joinable()) dialogConfigurator.join();
+}
+
 static std::string getCurrentProjectSignature()
 {
   char path[2048] = "";
@@ -4256,6 +4501,11 @@ static bool hookCommand(int command, int flag)
     toggleProjectSync();
     return true;
   }
+  if (g_exportProjectCommandId != 0 &&
+      command == g_exportProjectCommandId) {
+    nativeExportProject();
+    return true;
+  }
   if (g_telepromptOneCommandId != 0 &&
       command == g_telepromptOneCommandId) {
     nativeToggleTelepromptWindow(1);
@@ -4382,6 +4632,11 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   }
   if (g_projectSyncCommandId != 0 && command == g_projectSyncCommandId) {
     toggleProjectSync();
+    return true;
+  }
+  if (g_exportProjectCommandId != 0 &&
+      command == g_exportProjectCommandId) {
+    nativeExportProject();
     return true;
   }
   if (g_telepromptOneCommandId != 0 &&
@@ -4715,6 +4970,10 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   appendMenuString(projectSyncMenu, "Sync to project", g_projectSyncCommandId, getProjectSyncEnabled());
   insertMenuSubMenu(vsHookMenu, projectSyncMenu, "Project Sync", -1);
 
+  InsertMenu(vsHookMenu, GetMenuItemCount(vsHookMenu),
+    MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+  appendMenuString(vsHookMenu, "Export Project",
+    g_exportProjectCommandId, false);
   InsertMenu(vsHookMenu, GetMenuItemCount(vsHookMenu),
     MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
   appendMenuString(vsHookMenu, "Bypass",
@@ -5337,6 +5596,20 @@ static std::atomic<bool> g_nativeForceMixerBuild{false};
 static std::string g_nativePremixSelectedSongId;
 static double g_nativePremixSelectedSongStart = 0.0;
 static double g_nativePremixSelectedSongEnd = 0.0;
+struct NativePremixUniqueSoloItemRestore {
+  std::string itemId;
+  double previousMute = 0.0;
+  double forcedMute = 0.0;
+};
+struct NativePremixUniqueSoloState {
+  ReaProject* project = nullptr;
+  std::string itemId;
+  std::string trackId;
+  double previousTrackSolo = 0.0;
+  std::vector<NativePremixUniqueSoloItemRestore> itemRestores;
+  bool active = false;
+};
+static NativePremixUniqueSoloState g_nativePremixUniqueSolo;
 static std::chrono::steady_clock::time_point g_nativeLastDirectorHeartbeat;
 static std::chrono::steady_clock::time_point g_nativeLastLuaControlHeartbeat;
 static std::string g_nativeLastLuaControlHeartbeatToken;
@@ -30084,12 +30357,14 @@ static void nativeUiAppendPremixItems(
       NativeUiPremixItemRow row;
       row.kind = NativeUiPremixRowKind::Item;
       row.mediaItem = item;
+      row.mediaTrack = track;
       row.itemNumber = visualIndex;
       const std::string fallbackId =
         std::string("premix_item_") +
         std::to_string(trackIndex + 1) + "_" +
         std::to_string(itemIndex + 1);
       row.itemId = nativeMediaItemGuid(item, fallbackId);
+      row.trackId = nativeTrackGuid(track, trackIndex);
       row.name = nativeTakeName(item,
         std::string("Item ") + std::to_string(visualIndex));
       row.trackName = trackName;
@@ -30297,6 +30572,98 @@ static bool nativeUiTogglePremixMute(int rowIndex)
           << ",\"desiredMute\":" << (!muted ? "true" : "false")
           << '}';
   return nativeApplyPremixCommand(command.str());
+}
+
+static bool nativeUiResetPremixVolume(int rowIndex)
+{
+  if (rowIndex < 0 || rowIndex >= static_cast<int>(
+        g_nativeUiPremixRows.size())) {
+    return false;
+  }
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  auto& row = g_nativeUiPremixRows[static_cast<size_t>(rowIndex)];
+  if (row.kind != NativeUiPremixRowKind::Item ||
+      !nativeUiPremixMediaItemIsValid(project, row.mediaItem)) {
+    return false;
+  }
+  constexpr double zeroDbRatio = 0.76;
+  std::ostringstream command;
+  command << "{\"type\":\"premix_item_set_volume\","
+          << "\"itemId\":" << nativeJsonString(row.itemId)
+          << ",\"ratio\":" << std::setprecision(17) << zeroDbRatio << '}';
+  return nativeApplyPremixCommand(command.str());
+}
+
+static bool nativeUiTogglePremixTrackSolo(int rowIndex)
+{
+  if (rowIndex < 0 || rowIndex >= static_cast<int>(
+        g_nativeUiPremixRows.size()) ||
+      !GetMediaTrackInfo_Value_ptr) {
+    return false;
+  }
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  auto& row = g_nativeUiPremixRows[static_cast<size_t>(rowIndex)];
+  if (row.kind != NativeUiPremixRowKind::Item ||
+      !nativeUiPremixMediaItemIsValid(project, row.mediaItem) ||
+      !row.mediaTrack || row.trackId.empty()) {
+    return false;
+  }
+  const bool solo =
+    GetMediaTrackInfo_Value_ptr(row.mediaTrack, "I_SOLO") > 0.5;
+  std::ostringstream command;
+  command << "{\"type\":\"premix_item_set_track_solo\","
+          << "\"itemId\":" << nativeJsonString(row.itemId) << ","
+          << "\"trackId\":" << nativeJsonString(row.trackId) << ","
+          << "\"desiredSolo\":" << (!solo ? "true" : "false")
+          << '}';
+  return nativeApplyPremixCommand(command.str());
+}
+
+static bool nativeUiTogglePremixUniqueSolo(int rowIndex)
+{
+  if (rowIndex < 0 || rowIndex >= static_cast<int>(
+        g_nativeUiPremixRows.size())) {
+    return false;
+  }
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  auto& row = g_nativeUiPremixRows[static_cast<size_t>(rowIndex)];
+  if (row.kind != NativeUiPremixRowKind::Item ||
+      !nativeUiPremixMediaItemIsValid(project, row.mediaItem) ||
+      row.itemId.empty()) {
+    return false;
+  }
+  const bool active = g_nativePremixUniqueSolo.active &&
+    g_nativePremixUniqueSolo.project == project &&
+    g_nativePremixUniqueSolo.itemId == row.itemId;
+  std::ostringstream command;
+  command << "{\"type\":\"premix_item_set_unique_solo\","
+          << "\"itemId\":" << nativeJsonString(row.itemId) << ","
+          << "\"trackId\":" << nativeJsonString(row.trackId) << ","
+          << "\"desiredUniqueSolo\":"
+          << (!active ? "true" : "false") << '}';
+  return nativeApplyPremixCommand(command.str());
+}
+
+static bool nativeUiHandlePremixItemButtonAction(
+  const std::string& action)
+{
+  const bool mute = nativeStartsWith(action, "premix_mute|");
+  const bool solo = nativeStartsWith(action, "premix_solo|");
+  const bool unique = nativeStartsWith(action, "premix_unique|");
+  if (!mute && !solo && !unique) return false;
+  const size_t separator = action.find('|');
+  const int rowIndex = separator == std::string::npos
+    ? -1 : std::atoi(action.substr(separator + 1).c_str());
+  if (mute) nativeUiTogglePremixMute(rowIndex);
+  else if (solo) nativeUiTogglePremixTrackSolo(rowIndex);
+  else nativeUiTogglePremixUniqueSolo(rowIndex);
+  return true;
 }
 
 static bool nativeUiOpenBlockColor()
@@ -32882,6 +33249,198 @@ static void nativeUiPaintMixerPage(
     "Tracks", "mixer_main", tracks,
     g_nativeMixerTracksLayout, g_nativeMixerTracksScroll,
     labelFont, statusFont);
+}
+
+static void nativeUiPaintPremixMixerItemRow(
+  HDC dc,
+  const RECT& rowRect,
+  const NativeUiPremixItemRow& row,
+  int rowIndex,
+  ReaProject* project,
+  HFONT labelFont,
+  HFONT statusFont)
+{
+  const bool validMediaItem =
+    nativeUiPremixMediaItemIsValid(project, row.mediaItem);
+  const bool muted = validMediaItem &&
+    GetMediaItemInfo_Value_ptr &&
+    GetMediaItemInfo_Value_ptr(row.mediaItem, "B_MUTE") > 0.5;
+  const bool trackSolo = validMediaItem && row.mediaTrack &&
+    GetMediaTrackInfo_Value_ptr &&
+    GetMediaTrackInfo_Value_ptr(row.mediaTrack, "I_SOLO") > 0.5;
+  const bool uniqueSolo = validMediaItem && trackSolo &&
+    g_nativePremixUniqueSolo.active &&
+    g_nativePremixUniqueSolo.project == project &&
+    g_nativePremixUniqueSolo.itemId == row.itemId;
+  const double volume = validMediaItem
+    ? nativePremixMediaItemVolume(row.mediaItem) : 1.0;
+
+  bool hasTint = false;
+  COLORREF knobTint = RGB(34, 211, 238);
+  if (row.mediaTrack) {
+    nativeUiTrackTint(row.mediaTrack, false, hasTint, knobTint);
+  }
+  const COLORREF accent = hasTint
+    ? knobTint : RGB(34, 211, 238);
+  const COLORREF stateAccent = uniqueSolo
+    ? RGB(34, 197, 94) : accent;
+  const COLORREF cardFill = uniqueSolo
+    ? nativeUiBlendColor(RGB(24, 28, 34),
+        RGB(34, 197, 94), 0.18)
+    : nativeUiBlendColor(RGB(24, 28, 34), accent, 0.08);
+  const COLORREF cardEdge = uniqueSolo
+    ? RGB(34, 197, 94)
+    : (trackSolo
+        ? nativeUiBlendColor(RGB(61, 70, 82),
+            RGB(250, 204, 21), 0.48)
+        : nativeUiBlendColor(RGB(61, 70, 82), accent, 0.18));
+  nativeAppActiveFillRoundRect(dc, rowRect,
+    cardFill, cardEdge, 7);
+  nativeAppActiveFillRoundRect(dc,
+    RECT{rowRect.left + 2, rowRect.top + 3,
+      rowRect.left + 8, rowRect.bottom - 3},
+    stateAccent, stateAccent, 3);
+
+  constexpr int pad = 8;
+  constexpr int controlGap = 4;
+  constexpr int controlW = 28;
+  constexpr int controlH = 24;
+  const int controlTop = rowRect.top + 6;
+  const int muteLeft = rowRect.right - pad - controlW;
+  const int soloLeft = muteLeft - controlGap - controlW;
+  const int uniqueLeft = soloLeft - controlGap - controlW;
+  const int badgeLeft = rowRect.left + 12;
+  RECT numberBadge{badgeLeft, rowRect.top + 7,
+    badgeLeft + 36, rowRect.bottom - 7};
+  nativeAppActiveFillRoundRect(dc, numberBadge,
+    RGB(12, 15, 19), cardEdge, 5);
+  char numberText[16] = "";
+  std::snprintf(numberText, sizeof(numberText), "%02d",
+    std::max(1, row.itemNumber));
+  nativeAppActiveDrawText(dc, numberText, numberBadge,
+    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    stateAccent, labelFont);
+
+  RECT trackNameRect{numberBadge.right + 8, rowRect.top + 3,
+    std::max(static_cast<int>(numberBadge.right) + 16,
+      uniqueLeft - 7),
+    rowRect.top + 17};
+  nativeAppActiveDrawText(dc,
+    nativeUpperNamePtBr(row.trackName), trackNameRect,
+    DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+      DT_END_ELLIPSIS | DT_NOPREFIX,
+    RGB(226, 232, 240), labelFont);
+  RECT itemNameRect{trackNameRect.left, trackNameRect.bottom,
+    trackNameRect.right, controlTop + controlH + 2};
+  nativeAppActiveDrawText(dc,
+    nativeUpperNamePtBr(row.name), itemNameRect,
+    DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+      DT_END_ELLIPSIS | DT_NOPREFIX,
+    RGB(148, 163, 184), statusFont);
+
+  const auto paintControl = [&](const RECT& rect,
+      const char* text, COLORREF activeColor, bool active,
+      const std::string& action) {
+    const COLORREF fill = active
+      ? activeColor : RGB(13, 16, 21);
+    const COLORREF edge = active
+      ? activeColor : RGB(65, 75, 88);
+    nativeAppActiveFillRoundRect(dc, rect, fill, edge, 5);
+    nativeAppActiveDrawText(dc, text, rect,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      active ? RGB(10, 12, 15) : RGB(203, 213, 225),
+      statusFont);
+    if (validMediaItem) {
+      g_nativeMainModalButtons.push_back({rect, action, text});
+    }
+  };
+  const RECT uniqueRect{uniqueLeft, controlTop,
+    uniqueLeft + controlW, controlTop + controlH};
+  const RECT soloRect{soloLeft, controlTop,
+    soloLeft + controlW, controlTop + controlH};
+  const RECT muteRect{muteLeft, controlTop,
+    muteLeft + controlW, controlTop + controlH};
+  paintControl(uniqueRect, "U", RGB(34, 197, 94), uniqueSolo,
+    "premix_unique|" + std::to_string(rowIndex));
+  paintControl(soloRect, "S", RGB(250, 204, 21), trackSolo,
+    "premix_solo|" + std::to_string(rowIndex));
+  paintControl(muteRect, "M", RGB(239, 68, 68), muted,
+    "premix_mute|" + std::to_string(rowIndex));
+
+  const int bottomTop = rowRect.bottom - 21;
+  RECT dbRect{numberBadge.right + 8, bottomTop,
+    numberBadge.right + 69, rowRect.bottom - 6};
+  nativeAppActiveFillRoundRect(dc, dbRect,
+    RGB(10, 13, 17), RGB(53, 61, 72), 4);
+  nativeAppActiveDrawText(dc,
+    nativeUiFormatDb(nativeVolumeToDb(volume)), dbRect,
+    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    RGB(250, 204, 21), statusFont);
+
+  constexpr int meterW = 72;
+  const int meterLeft = rowRect.right - pad - meterW;
+  RECT faderRect{dbRect.right + 8, bottomTop + 4,
+    meterLeft - 7, rowRect.bottom - 9};
+  if (faderRect.right > faderRect.left + 8) {
+    nativeAppActiveFillRoundRect(dc, faderRect,
+      RGB(8, 11, 15), RGB(55, 65, 77), 4);
+    const double ratio = nativeVolumeToRatio(volume);
+    RECT levelRect{faderRect.left + 2, faderRect.top + 2,
+      faderRect.left + 2 + std::max(0,
+        static_cast<int>((faderRect.right - faderRect.left - 4) * ratio)),
+      faderRect.bottom - 2};
+    if (levelRect.right > levelRect.left) {
+      nativeAppActiveFillRoundRect(dc, levelRect,
+        nativeUiBlendColor(accent, RGB(255, 255, 255), 0.10),
+        accent, 3);
+    }
+    const int zeroX = faderRect.left +
+      static_cast<int>((faderRect.right - faderRect.left) * 0.76);
+    nativeAppActiveFillRect(dc,
+      RECT{zeroX, faderRect.top - 2,
+        zeroX + 1, faderRect.bottom + 2},
+      RGB(148, 163, 184));
+    const int knobX = faderRect.left +
+      static_cast<int>((faderRect.right - faderRect.left - 5) * ratio);
+    nativeAppActiveFillRoundRect(dc,
+      RECT{knobX, faderRect.top - 4,
+        knobX + 5, faderRect.bottom + 4},
+      RGB(248, 250, 252), accent, 2);
+    g_nativeUiPremixSliderHits.push_back({
+      RECT{faderRect.left, faderRect.top - 7,
+        faderRect.right, faderRect.bottom + 7}, rowIndex});
+  }
+
+  const auto meterRatio = [](double peak) {
+    if (!std::isfinite(peak) || peak <= 0.000001) return 0.0;
+    const double db = 20.0 * std::log10(peak);
+    return std::max(0.0, std::min(1.0,
+      (db + 60.0) / 60.0));
+  };
+  const auto paintMeter = [&](int top, double peak) {
+    RECT meter{meterLeft, top, rowRect.right - pad, top + 5};
+    nativeAppActiveFillRoundRect(dc, meter,
+      RGB(7, 10, 13), RGB(45, 55, 65), 2);
+    const double ratio = meterRatio(peak);
+    RECT fill{meter.left + 1, meter.top + 1,
+      meter.left + 1 + std::max(0,
+        static_cast<int>((meter.right - meter.left - 2) * ratio)),
+      meter.bottom - 1};
+    if (fill.right > fill.left) {
+      const COLORREF meterColor = peak >= 1.0
+        ? RGB(239, 68, 68)
+        : (ratio >= 0.82 ? RGB(250, 204, 21)
+                         : RGB(34, 197, 94));
+      nativeAppActiveFillRoundRect(dc, fill,
+        meterColor, meterColor, 1);
+    }
+  };
+  const double peakLeft = row.mediaTrack
+    ? nativeSafeTrackPeak(row.mediaTrack, 0) : 0.0;
+  const double peakRight = row.mediaTrack
+    ? nativeSafeTrackPeak(row.mediaTrack, 1) : 0.0;
+  paintMeter(bottomTop + 2, peakLeft);
+  paintMeter(bottomTop + 9, peakRight);
 }
 
 static void nativePaintAppActivePanel(HWND hwnd)
@@ -35811,7 +36370,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     // COLORS.modal_panel do Lua: todos os modais usam o mesmo cinza-base.
     // Campos, listas e previews continuam com suas cores funcionais proprias.
     nativeAppActiveFillRect(dc, modal, RGB(34, 38, 43));
-    if (mixerBulkConfigModal || mixerBulkTracksModal ||
+    if (mixerBulkConfigModal || mixerBulkTracksModal || premixModal ||
         mixerBulkCaptureModal || manualStopConfigModal ||
         manualStopTracksModal || projectSyncDiffModal) {
       const COLORREF edge = RGB(71, 85, 105);
@@ -36999,27 +37558,48 @@ static void nativePaintAppActivePanel(HWND hwnd)
         modal.right - 10, modal.top + 68};
       nativeAppActiveDrawText(dc,
         g_nativeUiPremixFamilyMode
-          ? "Premix separado por música filha. Mute e volume direto no item."
-          : "Itens em ordem das tracks do projeto. Mute e volume direto no item.",
+          ? "Premix por música filha. U: item, S: pista, M: mute."
+          : "U: solo do item, S: solo da pista, M: mute.",
         hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
           DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(148, 163, 184), statusFont);
 
       RECT list{modal.left + 10, modal.top + 72,
         modal.right - 10, modal.bottom - 40};
-      nativeAppActiveFillRect(dc, list, RGB(3, 7, 14));
-      const COLORREF listEdge = RGB(51, 65, 85);
+      nativeAppActiveFillRoundRect(dc, list,
+        RGB(34, 38, 43), RGB(74, 82, 89), 6);
+      constexpr int listHeaderH = 22;
+      RECT listHeader{list.left, list.top, list.right,
+        std::min(static_cast<int>(list.bottom),
+          static_cast<int>(list.top) + listHeaderH)};
+      nativeAppActiveFillRect(dc, listHeader, RGB(16, 19, 22));
       nativeAppActiveFillRect(dc,
-        RECT{list.left, list.top, list.right, list.top + 1}, listEdge);
-      nativeAppActiveFillRect(dc,
-        RECT{list.left, list.bottom - 1, list.right, list.bottom}, listEdge);
-      nativeAppActiveFillRect(dc,
-        RECT{list.left, list.top, list.left + 1, list.bottom}, listEdge);
-      nativeAppActiveFillRect(dc,
-        RECT{list.right - 1, list.top, list.right, list.bottom}, listEdge);
-      const int premixRowH = 44;
+        RECT{listHeader.left, listHeader.bottom - 1,
+          listHeader.right, listHeader.bottom},
+        RGB(74, 82, 89));
+      nativeAppActiveDrawText(dc, "ITENS DO PREMIX",
+        RECT{listHeader.left + 7, listHeader.top + 1,
+          listHeader.right - 210, listHeader.bottom - 1},
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+          DT_END_ELLIPSIS | DT_NOPREFIX,
+        RGB(248, 250, 252), labelFont);
+      nativeAppActiveDrawText(dc,
+        "U ITEM   •   S PISTA   •   M MUTE",
+        RECT{listHeader.left + 150, listHeader.top + 1,
+          listHeader.right - 8, listHeader.bottom - 1},
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE |
+          DT_END_ELLIPSIS | DT_NOPREFIX,
+        RGB(148, 163, 184), statusFont);
+      RECT listBody{list.left, listHeader.bottom,
+        list.right, list.bottom};
+      constexpr int premixRowHeight = 54;
+      constexpr int premixRowGap = 5;
+      constexpr int premixRowPitch =
+        premixRowHeight + premixRowGap;
+      const int premixAvailableH = std::max(0,
+        static_cast<int>(listBody.bottom - listBody.top) - 6);
       g_nativeUiPremixVisibleRows = std::max(1,
-        static_cast<int>(list.bottom - list.top) / premixRowH);
+        (premixAvailableH + premixRowGap) / premixRowPitch);
       const int maxScroll = std::max(0,
         static_cast<int>(g_nativeUiPremixRows.size()) -
           g_nativeUiPremixVisibleRows);
@@ -37035,8 +37615,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
         premixProjectPath,
         static_cast<int>(sizeof(premixProjectPath)));
       if (g_nativeUiPremixRows.empty()) {
-        RECT empty{list.left + 10, list.top + 8,
-          list.right - 10, list.top + 34};
+        RECT empty{listBody.left + 10, listBody.top + 8,
+          listBody.right - 10, listBody.top + 34};
         nativeAppActiveDrawText(dc,
           g_nativeUiPremixFamilyMode
             ? "Nenhuma música filha encontrada nesta região."
@@ -37050,25 +37630,31 @@ static void nativePaintAppActivePanel(HWND hwnd)
         const int drawIndex = index - g_nativeUiPremixScroll;
         const auto& row = g_nativeUiPremixRows[
           static_cast<size_t>(index)];
-        const int rowTop = list.top + drawIndex * premixRowH;
-        RECT rowRect{list.left + 3, rowTop + 1,
-          list.right - 3 - scrollbarSafeW,
-          std::min(static_cast<int>(list.bottom),
-            rowTop + premixRowH - 1)};
+        const int rowTop = listBody.top + 3 +
+          drawIndex * premixRowPitch;
+        RECT rowRect{listBody.left + 4, rowTop,
+          listBody.right - 4 - scrollbarSafeW,
+          std::min(static_cast<int>(listBody.bottom - 2),
+            rowTop + premixRowHeight)};
         if (row.kind == NativeUiPremixRowKind::ChildHeader) {
           nativeAppActiveFillRoundRect(dc,
-            RECT{rowRect.left, rowRect.top + 2,
-              rowRect.right, rowRect.bottom - 2},
-            RGB(20, 71, 82), RGB(38, 199, 224), 4);
-          RECT headerText{rowRect.left + 9, rowRect.top + 2,
+            rowRect, RGB(22, 26, 32), RGB(34, 211, 238), 6);
+          nativeAppActiveFillRoundRect(dc,
+            RECT{rowRect.left + 2, rowRect.top + 3,
+              rowRect.left + 8, rowRect.bottom - 3},
+            RGB(34, 211, 238), RGB(34, 211, 238), 3);
+          RECT headerText{rowRect.left + 16, rowRect.top + 2,
             rowRect.right - 8, rowRect.bottom - 2};
-          nativeAppActiveDrawText(dc, row.name, headerText,
+          nativeAppActiveDrawText(dc,
+            nativeUpperNamePtBr(row.name), headerText,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE |
               DT_END_ELLIPSIS | DT_NOPREFIX,
-            RGB(194, 250, 255), labelFont);
+            RGB(226, 232, 240), labelFont);
           continue;
         }
         if (row.kind == NativeUiPremixRowKind::Empty) {
+          nativeAppActiveFillRoundRect(dc, rowRect,
+            RGB(19, 23, 28), RGB(48, 57, 68), 6);
           RECT emptyText{rowRect.left + 13, rowRect.top,
             rowRect.right - 8, rowRect.bottom};
           nativeAppActiveDrawText(dc, row.name, emptyText,
@@ -37077,84 +37663,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
             RGB(148, 163, 184), statusFont);
           continue;
         }
-        nativeAppActiveFillRect(dc,
-          RECT{rowRect.left + 1, rowRect.bottom - 1,
-            rowRect.right - 1, rowRect.bottom},
-          RGB(71, 78, 91));
-        const int indexW = 34;
-        const int muteW = 30;
-        const int dbW = 58;
-        const int gap2 = 5;
-        const int topY = rowRect.top + 4;
-        const int buttonHeight = 20;
-        const int sliderHeight = 10;
-        const int sliderY = rowRect.bottom - 14;
-        const int nameX = rowRect.left + indexW;
-        const int muteX = rowRect.right - 6 - muteW;
-        const int dbX = muteX - gap2 - dbW;
-        const int sliderX = nameX;
-        const int sliderW = std::max(90, dbX - gap2 - sliderX);
-        char numberText[16] = "";
-        std::snprintf(numberText, sizeof(numberText), "%02d",
-          std::max(1, row.itemNumber));
-        RECT numberRect{rowRect.left + 4, topY,
-          nameX - 2, topY + buttonHeight};
-        nativeAppActiveDrawText(dc, numberText, numberRect,
-          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-          RGB(148, 163, 184), statusFont);
-        std::string itemTitle = row.name;
-        if (!row.trackName.empty()) {
-          itemTitle += "  ·  " + row.trackName;
-        }
-        RECT itemName{nameX, topY,
-          std::max(nameX + 30, muteX - gap2), topY + buttonHeight};
-        nativeAppActiveDrawText(dc, itemTitle, itemName,
-          DT_LEFT | DT_VCENTER | DT_SINGLELINE |
-            DT_END_ELLIPSIS | DT_NOPREFIX,
-          RGB(248, 250, 252), statusFont);
-        const bool validMediaItem =
-          nativeUiPremixMediaItemIsValid(
-            premixProject, row.mediaItem);
-        const bool muted = validMediaItem &&
-          GetMediaItemInfo_Value_ptr &&
-          GetMediaItemInfo_Value_ptr(row.mediaItem, "B_MUTE") > 0.5;
-        addModalButton("premix_mute|" + std::to_string(index), "M",
-          RECT{muteX, topY, muteX + muteW, topY + buttonHeight},
-          muted ? "stop" : "page", muted);
-        const double volume = validMediaItem
-          ? nativePremixMediaItemVolume(row.mediaItem) : 1.0;
-        RECT dbRect{dbX, sliderY - 8,
-          dbX + dbW, sliderY + sliderHeight + 2};
-        nativeAppActiveDrawText(dc,
-          nativeUiFormatDb(nativeVolumeToDb(volume)), dbRect,
-          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-          RGB(255, 224, 46), statusFont);
-        RECT slider{sliderX, sliderY,
-          sliderX + sliderW, sliderY + sliderHeight};
-        nativeAppActiveFillRoundRect(dc, slider,
-          RGB(20, 20, 20), RGB(71, 85, 105), 3);
-        const int zeroX = slider.left + static_cast<int>(
-          std::floor((slider.right - slider.left - 2) * 0.76));
-        nativeAppActiveFillRect(dc,
-          RECT{zeroX, slider.top - 3, zeroX + 2,
-            slider.bottom + 3}, RGB(107, 107, 107));
-        const double knobRatio = nativeVolumeToRatio(volume);
-        const int knobW = 12;
-        const int knobX = slider.left + static_cast<int>(
-          std::floor((slider.right - slider.left - knobW) *
-            knobRatio));
-        nativeAppActiveFillRoundRect(dc,
-          RECT{knobX, slider.top - 5, knobX + knobW,
-            slider.bottom + 5},
-          RGB(255, 224, 46), RGB(26, 26, 26), 4);
-        g_nativeUiPremixSliderHits.push_back({
-          RECT{slider.left, slider.top - 7,
-            slider.right, slider.bottom + 7}, index});
+        nativeUiPaintPremixMixerItemRow(dc, rowRect, row,
+          index, premixProject, labelFont, statusFont);
       }
       if (hasScrollbar) {
-        RECT track{list.right - 6, list.top + 1,
-          list.right - 2, list.bottom - 1};
-        nativeAppActiveFillRect(dc, track, RGB(30, 41, 59));
+        RECT track{listBody.right - 6, listBody.top + 2,
+          listBody.right - 2, listBody.bottom - 2};
+        nativeAppActiveFillRect(dc, track, RGB(87, 69, 10));
         const int trackH = std::max(1,
           static_cast<int>(track.bottom - track.top));
         const int thumbH = std::max(14, static_cast<int>(
@@ -37168,7 +37683,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
             std::max(1, maxScroll)));
         nativeAppActiveFillRect(dc,
           RECT{track.left, thumbY, track.right, thumbY + thumbH},
-          RGB(100, 116, 139));
+          RGB(245, 209, 41));
       }
       addModalButton("premix_back", "Voltar",
         RECT{modal.left + 10, modal.bottom - 28,
@@ -46160,6 +46675,28 @@ static bool nativeHasAnyPersistedDockerLayout()
   return false;
 }
 
+static bool nativeUiHandlePremixFaderDoubleClick(
+  const POINT& point)
+{
+  static std::chrono::steady_clock::time_point lastClickAt{};
+  static int lastRowIndex = -1;
+  for (const auto& slider : g_nativeUiPremixSliderHits) {
+    if (!PtInRect(&slider.rect, point)) continue;
+    const auto now = std::chrono::steady_clock::now();
+    const bool doubleClick =
+      slider.rowIndex == lastRowIndex &&
+      lastClickAt.time_since_epoch().count() != 0 &&
+      now - lastClickAt <= std::chrono::milliseconds(350);
+    lastClickAt = now;
+    lastRowIndex = slider.rowIndex;
+    if (!doubleClick) return false;
+    if (!nativeUiResetPremixVolume(slider.rowIndex)) return false;
+    g_nativeMixerSuppressNextMouseUp = true;
+    return true;
+  }
+  return false;
+}
+
 static void nativePrepareFirstUseDockerLayout()
 {
   if (!GetExtState_ptr || !SetExtState_ptr ||
@@ -51567,9 +52104,7 @@ static bool nativeMainHandleModalClick(
   } else if (action == "rename_block_custom_toggle") {
     g_nativeUiRenameBlockCustomName =
       !g_nativeUiRenameBlockCustomName;
-  } else if (nativeStartsWith(action, "premix_mute|")) {
-    nativeUiTogglePremixMute(std::atoi(action.substr(
-      std::string("premix_mute|").size()).c_str()));
+  } else if (nativeUiHandlePremixItemButtonAction(action)) {
   } else if (action == "premix_back") {
     nativeApplyPremixCommand("{\"type\":\"premix_close\"}");
     g_nativeUiPremixRows.clear();
@@ -54365,6 +54900,10 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       if (mouseDown && !g_state.directorInterfaceBlocked &&
           g_nativeMainModalKind ==
             NativeMainModalKind::PremixItemEditor) {
+        if (nativeUiHandlePremixFaderDoubleClick(point)) {
+          InvalidateRect(hwnd, nullptr, FALSE);
+          return 0;
+        }
         for (const auto& slider : g_nativeUiPremixSliderHits) {
           if (!PtInRect(&slider.rect, point)) continue;
           g_nativeUiPremixSliderDragging = true;
@@ -58654,14 +59193,13 @@ static void nativeTelepromptDrawPreview(
 
   const COLORREF fallbackColor = nativeTelepromptColor(
     settings.queueNameColor, RGB(255, 234, 0));
-  // Estados do Preview são fixos: Tocando em verde e Fila em amarelo.
-  // As preferências de letra do TP não podem eliminar esse contraste.
-  const COLORREF playingColor = RGB(0, 255, 85);
-  const COLORREF queuedColor = RGB(255, 234, 0);
-  const auto nowMs =
-    std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now().time_since_epoch()).count();
-  const bool showPlaying = ((nowMs / 350) % 2) == 0;
+  // O Preview repete os estados funcionais da lista principal: Tocando usa
+  // fundo vermelho e progresso verde; Fila usa fundo laranja e regresso
+  // amarelo. As cores do bloco continuam valendo para as demais músicas.
+  const COLORREF playingBackground = RGB(205, 20, 20);
+  const COLORREF playingProgress = RGB(0, 210, 90);
+  const COLORREF queuedBackground = RGB(230, 122, 41);
+  const COLORREF queuedRegress = RGB(255, 214, 20);
 
   if (state.preview.blocks.empty()) {
     nativeAppActiveFillOutlinedRect(
@@ -58751,7 +59289,6 @@ static void nativeTelepromptDrawPreview(
         label += "  •  " +
           nativeAppActiveFormatDuration(song.durationSec);
       }
-      if (song.playing || song.queued) label = "[ " + label + " ]";
       wrappedSongs.push_back(nativeTelepromptPreviewWrapLines(
         dc, label, textWidth, songFont, 2));
       songsHeight += std::max(
@@ -58816,25 +59353,37 @@ static void nativeTelepromptDrawPreview(
           card.bottom - padY) {
         break;
       }
-      // O pisca apaga somente os pixels. A medição e o avanço vertical
-      // permanecem idênticos para a lista não saltar a cada 350 ms.
-      if (!song.playing || showPlaying) {
-        const COLORREF songColor = song.playing
-          ? playingColor
-          : (song.queued
-              ? queuedColor
-              : (whitenOtherSongs
-                  ? RGB(255, 255, 255)
-                  : blockColor));
-        nativeTelepromptDrawPreviewLines(
-          dc, songLines,
-          RECT{card.left + padX, songTop,
-            card.right - padX,
-          songTop + songHeight},
-          songLineHeight, false,
-          songColor, songFont,
-          settings.previewUnderlineEnabled);
+      RECT songRect{card.left + padX, songTop,
+        card.right - padX, songTop + songHeight};
+      if (song.playing || song.queued) {
+        nativeAppActiveFillRect(dc, songRect,
+          song.playing ? playingBackground : queuedBackground);
+        const double ratio = std::max(0.0, std::min(1.0,
+          song.playing ? state.progress : 1.0 - state.progress));
+        const int fillWidth = std::max(0,
+          static_cast<int>(std::floor(
+            (songRect.right - songRect.left) * ratio +
+            (song.queued ? 0.5 : 0.0))));
+        if (fillWidth > 0) {
+          nativeAppActiveFillRect(dc,
+            RECT{songRect.left, songRect.bottom - 3,
+              std::min<LONG>(songRect.right,
+                songRect.left + fillWidth), songRect.bottom},
+            song.playing ? playingProgress : queuedRegress);
+        }
       }
+      const COLORREF songColor = song.playing || song.queued
+        ? RGB(13, 13, 13)
+        : (whitenOtherSongs ? RGB(255, 255, 255) : blockColor);
+      nativeTelepromptDrawPreviewLines(
+        dc, songLines,
+        RECT{songRect.left + (song.playing || song.queued ? 3 : 0),
+          songRect.top,
+          songRect.right - (song.playing || song.queued ? 3 : 0),
+          songRect.bottom},
+        songLineHeight, false,
+        songColor, songFont,
+        settings.previewUnderlineEnabled);
       songTop += songHeight + songGap;
     }
     columnTops[static_cast<size_t>(column)] = card.bottom + gap;
@@ -62983,6 +63532,8 @@ static std::string nativeBuildPremixItemRowsJson(ReaProject* project, const Nati
       }
       const double volume = nativePremixMediaItemVolume(item);
       const bool mute = GetMediaItemInfo_Value_ptr(item, "B_MUTE") > 0.5;
+      const bool trackSolo = GetMediaTrackInfo_Value_ptr &&
+        GetMediaTrackInfo_Value_ptr(track, "I_SOLO") > 0.5;
       ++visualIndex;
       const std::string fallbackId = std::string("premix_item_") + std::to_string(trackIndex + 1) + "_" + std::to_string(itemIndex + 1);
       const std::string guid = nativeMediaItemGuid(item, fallbackId);
@@ -63005,7 +63556,13 @@ static std::string nativeBuildPremixItemRowsJson(ReaProject* project, const Nati
       oss << "\"volume\":" << nativeNumber(volume) << ",";
       oss << "\"volumeRatio\":" << nativeNumber(nativePremixVolumeToRatio(volume), 6) << ",";
       oss << "\"db\":" << nativeNumber(nativeVolumeToDb(volume), 3) << ",";
-      oss << "\"mute\":" << (mute ? "true" : "false");
+      oss << "\"mute\":" << (mute ? "true" : "false") << ",";
+      oss << "\"trackSolo\":" << (trackSolo ? "true" : "false") << ",";
+      oss << "\"uniqueSolo\":"
+          << ((trackSolo && g_nativePremixUniqueSolo.active &&
+               g_nativePremixUniqueSolo.project == project &&
+               g_nativePremixUniqueSolo.itemId == guid)
+                ? "true" : "false");
       oss << "}";
     }
   }
@@ -68151,10 +68708,23 @@ static bool nativeApplyMultiLoopCommand(const std::string& commandBody)
   return true;
 }
 
-static MediaItem* nativeFindPremixMediaItemById(ReaProject* project, const std::string& rawId)
+struct NativePremixResolvedItem {
+  MediaItem* item = nullptr;
+  MediaTrack* track = nullptr;
+  std::string itemId;
+  std::string trackId;
+};
+
+static NativePremixResolvedItem nativeResolvePremixMediaItemById(
+  ReaProject* project,
+  const std::string& rawId)
 {
+  NativePremixResolvedItem resolved;
   const std::string id = nativeTrim(rawId);
-  if (!project || id.empty() || !CountTracks_ptr || !GetTrack_ptr || !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr) return nullptr;
+  if (!project || id.empty() || !CountTracks_ptr || !GetTrack_ptr ||
+      !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr) {
+    return resolved;
+  }
   const int trackCount = CountTracks_ptr(project);
   for (int trackIndex = 0; trackIndex < trackCount; ++trackIndex) {
     MediaTrack* track = GetTrack_ptr(project, trackIndex);
@@ -68164,10 +68734,140 @@ static MediaItem* nativeFindPremixMediaItemById(ReaProject* project, const std::
       MediaItem* item = GetTrackMediaItem_ptr(track, itemIndex);
       if (!item) continue;
       const std::string fallbackId = std::string("premix_item_") + std::to_string(trackIndex + 1) + "_" + std::to_string(itemIndex + 1);
-      if (nativeMediaItemGuid(item, fallbackId) == id) return item;
+      const std::string itemId = nativeMediaItemGuid(item, fallbackId);
+      if (itemId == id) {
+        resolved.item = item;
+        resolved.track = track;
+        resolved.itemId = itemId;
+        resolved.trackId = nativeTrackGuid(track, trackIndex);
+        return resolved;
+      }
     }
   }
-  return nullptr;
+  return resolved;
+}
+
+static MediaItem* nativeFindPremixMediaItemById(
+  ReaProject* project,
+  const std::string& rawId)
+{
+  return nativeResolvePremixMediaItemById(project, rawId).item;
+}
+
+static bool nativeRestorePremixUniqueSolo()
+{
+  if (!g_nativePremixUniqueSolo.active) return false;
+  NativePremixUniqueSoloState restore =
+    std::move(g_nativePremixUniqueSolo);
+  g_nativePremixUniqueSolo = NativePremixUniqueSoloState{};
+  if (!restore.project || !nativeProjectIsStillOpen(restore.project)) {
+    return false;
+  }
+
+  // Mesmo quando os valores fisicos ja coincidiam, desligar o U altera o
+  // estado visual/semantico e precisa publicar um snapshot novo.
+  bool changed = true;
+  MediaTrack* track = nativeFindTrackById(
+    restore.project, restore.trackId);
+  if (track && GetMediaTrackInfo_Value_ptr &&
+      SetMediaTrackInfo_Value_ptr) {
+    const double current =
+      GetMediaTrackInfo_Value_ptr(track, "I_SOLO");
+    // So restaura se o valor ainda for o que o U aplicou. Uma mudanca
+    // manual feita durante o solo exclusivo pertence ao usuario.
+    if (std::fabs(current - 1.0) <= 0.001) {
+      changed = SetMediaTrackInfo_Value_ptr(
+        track, "I_SOLO", restore.previousTrackSolo) || changed;
+    }
+  }
+  if (GetMediaItemInfo_Value_ptr && SetMediaItemInfo_Value_ptr) {
+    for (const auto& row : restore.itemRestores) {
+      MediaItem* item = nativeFindPremixMediaItemById(
+        restore.project, row.itemId);
+      if (!item) continue;
+      const double current =
+        GetMediaItemInfo_Value_ptr(item, "B_MUTE");
+      if (std::fabs(current - row.forcedMute) <= 0.001) {
+        changed = SetMediaItemInfo_Value_ptr(
+          item, "B_MUTE", row.previousMute) || changed;
+      }
+    }
+  }
+  return changed;
+}
+
+static bool nativeApplyPremixUniqueSolo(
+  ReaProject* project,
+  const NativePremixResolvedItem& target,
+  bool enabled)
+{
+  const bool alreadyActive = g_nativePremixUniqueSolo.active &&
+    g_nativePremixUniqueSolo.project == project &&
+    (!target.itemId.empty()
+      ? g_nativePremixUniqueSolo.itemId == target.itemId
+      : true);
+  if (!enabled) {
+    return alreadyActive ? nativeRestorePremixUniqueSolo() : false;
+  }
+  if (!project || !target.item || !target.track ||
+      target.itemId.empty() || target.trackId.empty() ||
+      !GetMediaTrackInfo_Value_ptr ||
+      !SetMediaTrackInfo_Value_ptr ||
+      !GetMediaItemInfo_Value_ptr ||
+      !SetMediaItemInfo_Value_ptr ||
+      !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr) {
+    return false;
+  }
+
+  if (alreadyActive) {
+    return SetMediaTrackInfo_Value_ptr(
+      target.track, "I_SOLO", 1.0);
+  }
+
+  bool changed = nativeRestorePremixUniqueSolo();
+  NativePremixUniqueSoloState state;
+  state.project = project;
+  state.itemId = target.itemId;
+  state.trackId = target.trackId;
+  state.previousTrackSolo =
+    GetMediaTrackInfo_Value_ptr(target.track, "I_SOLO");
+
+  const double targetStart =
+    GetMediaItemInfo_Value_ptr(target.item, "D_POSITION");
+  const double targetEnd = targetStart + std::max(0.0,
+    GetMediaItemInfo_Value_ptr(target.item, "D_LENGTH"));
+  constexpr double epsilon = 0.0005;
+  const int itemCount = GetTrackNumMediaItems_ptr(target.track);
+  for (int itemIndex = 0; itemIndex < itemCount; ++itemIndex) {
+    MediaItem* item = GetTrackMediaItem_ptr(target.track, itemIndex);
+    if (!item) continue;
+    const double itemStart =
+      GetMediaItemInfo_Value_ptr(item, "D_POSITION");
+    const double itemEnd = itemStart + std::max(0.0,
+      GetMediaItemInfo_Value_ptr(item, "D_LENGTH"));
+    if (itemEnd <= targetStart + epsilon ||
+        itemStart >= targetEnd - epsilon) {
+      continue;
+    }
+    const std::string fallbackId =
+      std::string("premix_item_") + target.trackId + "_" +
+      std::to_string(itemIndex + 1);
+    NativePremixUniqueSoloItemRestore saved;
+    saved.itemId = nativeMediaItemGuid(item, fallbackId);
+    saved.previousMute =
+      GetMediaItemInfo_Value_ptr(item, "B_MUTE");
+    saved.forcedMute = item == target.item ? 0.0 : 1.0;
+    state.itemRestores.push_back(saved);
+    if (std::fabs(saved.previousMute - saved.forcedMute) > 0.001) {
+      changed = SetMediaItemInfo_Value_ptr(
+        item, "B_MUTE", saved.forcedMute) || changed;
+    }
+  }
+  changed = SetMediaTrackInfo_Value_ptr(
+    target.track, "I_SOLO", 1.0) || changed;
+  state.active = true;
+  g_nativePremixUniqueSolo = std::move(state);
+  return true;
 }
 
 static bool nativeApplyPremixCommand(const std::string& commandBody)
@@ -68215,7 +68915,9 @@ static bool nativeApplyPremixCommand(const std::string& commandBody)
   }
 
   if (type != "premix_set_volume" && type != "premix_item_set_volume" &&
-      type != "premix_toggle_mute" && type != "premix_item_toggle_mute") {
+      type != "premix_toggle_mute" && type != "premix_item_toggle_mute" &&
+      type != "premix_item_set_track_solo" &&
+      type != "premix_item_set_unique_solo") {
     // Mantém compatibilidade com comandos antigos de Premix ainda não usados nesta tela.
     g_nativeForceStateBuild.store(true);
     return true;
@@ -68232,8 +68934,44 @@ static bool nativeApplyPremixCommand(const std::string& commandBody)
   if (targetId.empty()) targetId = nativeJsonExtractString(commandBody, "guid");
 
   bool changed = false;
-  MediaItem* mediaItem = nativeFindPremixMediaItemById(project, targetId);
-  if (mediaItem && GetMediaItemInfo_Value_ptr) {
+  const NativePremixResolvedItem resolved =
+    nativeResolvePremixMediaItemById(project, targetId);
+  MediaItem* mediaItem = resolved.item;
+  if (type == "premix_item_set_track_solo" &&
+      resolved.track && GetMediaTrackInfo_Value_ptr &&
+      SetMediaTrackInfo_Value_ptr) {
+    const bool current =
+      GetMediaTrackInfo_Value_ptr(resolved.track, "I_SOLO") > 0.5;
+    std::string desired =
+      nativeJsonExtractString(commandBody, "desiredSolo");
+    if (desired.empty()) desired =
+      nativeJsonExtractString(commandBody, "solo");
+    if (desired.empty()) desired =
+      nativeJsonExtractString(commandBody, "enabled");
+    const bool next = desired.empty()
+      ? !current : nativeBoolFromText(desired, current);
+    if (!next && g_nativePremixUniqueSolo.active &&
+        g_nativePremixUniqueSolo.project == project &&
+        g_nativePremixUniqueSolo.trackId == resolved.trackId) {
+      changed = nativeRestorePremixUniqueSolo() || changed;
+    }
+    changed = SetMediaTrackInfo_Value_ptr(
+      resolved.track, "I_SOLO", next ? 1.0 : 0.0) || changed;
+  } else if (type == "premix_item_set_unique_solo") {
+    const bool current = g_nativePremixUniqueSolo.active &&
+      g_nativePremixUniqueSolo.project == project &&
+      g_nativePremixUniqueSolo.itemId == resolved.itemId;
+    std::string desired = nativeJsonExtractString(
+      commandBody, "desiredUniqueSolo");
+    if (desired.empty()) desired =
+      nativeJsonExtractString(commandBody, "uniqueSolo");
+    if (desired.empty()) desired =
+      nativeJsonExtractString(commandBody, "enabled");
+    const bool next = desired.empty()
+      ? !current : nativeBoolFromText(desired, current);
+    changed = nativeApplyPremixUniqueSolo(
+      project, resolved, next) || changed;
+  } else if (mediaItem && GetMediaItemInfo_Value_ptr) {
     if (type == "premix_set_volume" || type == "premix_item_set_volume") {
       std::string ratioText = nativeJsonExtractString(commandBody, "ratio");
       if (ratioText.empty()) ratioText = nativeJsonExtractString(commandBody, "volumeRatio");
@@ -68266,6 +69004,15 @@ static bool nativeApplyPremixCommand(const std::string& commandBody)
   }
 
   if (changed && UpdateArrange_ptr) UpdateArrange_ptr();
+  if (changed && TrackList_AdjustWindows_ptr &&
+      (type == "premix_item_set_track_solo" ||
+       type == "premix_item_set_unique_solo")) {
+    TrackList_AdjustWindows_ptr(false);
+  }
+  if (changed && type != "premix_set_volume" &&
+      type != "premix_item_set_volume") {
+    g_nativeForceSnapshotBuild.store(true);
+  }
   g_nativeForceStateBuild.store(true);
   return true;
 }
@@ -71235,6 +71982,7 @@ static void nativeReleaseRuntimeControlOnMainThread()
   g_globalStopBreakRequested.store(false);
   g_globalStopPauseRequested.store(false);
   nativeBreakManualStopFadeout();
+  nativeRestorePremixUniqueSolo();
 
   const bool ownedLoop = g_nativeMultiLoopActivePair.valid;
   if (ownedLoop || !g_nativeMultiLoopRestore.empty() || !g_nativeMultiLoopFadeTracks.empty()) {
@@ -71727,6 +72475,7 @@ static void nativeUiResetForProjectTabChange()
   }
   nativeRestoreMultiLoopBypassVolumes(true);
   nativeBreakManualStopFadeout();
+  nativeRestorePremixUniqueSolo();
   g_nativeMultiLoopActivePair = NativeMultiLoopPair();
   g_nativeMultiLoopDisarmedPairKey.clear();
 
@@ -72044,6 +72793,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetProjExtState_ptr = reinterpret_cast<GetProjExtState_t>(rec->GetFunc("GetProjExtState"));
   SetProjExtState_ptr = reinterpret_cast<SetProjExtState_t>(rec->GetFunc("SetProjExtState"));
   MarkProjectDirty_ptr = reinterpret_cast<MarkProjectDirty_t>(rec->GetFunc("MarkProjectDirty"));
+  Main_SaveProject_ptr = reinterpret_cast<Main_SaveProject_t>(
+    rec->GetFunc("Main_SaveProject"));
   Main_SaveProjectEx_ptr = reinterpret_cast<Main_SaveProjectEx_t>(
     rec->GetFunc("Main_SaveProjectEx"));
   CountProjectMarkers_ptr = reinterpret_cast<CountProjectMarkers_t>(rec->GetFunc("CountProjectMarkers"));
@@ -72383,6 +73134,11 @@ static bool initialize()
   if (g_projectSyncCommandId != 0) {
     hasRegisteredAction = true;
   }
+  g_exportProjectCommandId =
+    plugin_register_ptr("custom_action", (void*)&g_exportProjectAction);
+  if (g_exportProjectCommandId != 0) {
+    hasRegisteredAction = true;
+  }
   g_telepromptOneCommandId =
     plugin_register_ptr("custom_action", (void*)&g_telepromptOneAction);
   if (g_telepromptOneCommandId != 0) hasRegisteredAction = true;
@@ -72618,6 +73374,10 @@ static void shutdown()
   if (g_projectSyncCommandId != 0) {
     plugin_register_ptr("-custom_action", (void*)&g_projectSyncAction);
     g_projectSyncCommandId = 0;
+  }
+  if (g_exportProjectCommandId != 0) {
+    plugin_register_ptr("-custom_action", (void*)&g_exportProjectAction);
+    g_exportProjectCommandId = 0;
   }
   if (g_telepromptOneCommandId != 0) {
     plugin_register_ptr("-custom_action", (void*)&g_telepromptOneAction);
