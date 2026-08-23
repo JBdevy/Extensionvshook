@@ -1748,6 +1748,7 @@ static void nativeOpenShortcutNotice();
 static void nativeCloseShortcutNotice();
 static std::vector<int> nativeUiReadPreviewBlocks(int slot);
 static void nativeRefreshAppActivePanelModel();
+static UINT nativeUiDesiredFrameInterval();
 static bool nativeUiSmartSearchSettingEnabled(
   const char* key);
 static bool nativeUiToggleSmartSearchSetting(
@@ -2762,7 +2763,7 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
 #endif
   if (targetsNativePanel) return -1;
 
-  // Fora do foco, a extensão reserva somente R, L e Esc. Todas as demais
+  // Fora do foco, a extensão reserva somente R e Esc. Todas as demais
   // teclas, atalhos configuráveis e combinações pertencem integralmente ao
   // REAPER.
   if (nativeAppActivePanelIsOpen()) {
@@ -2784,7 +2785,6 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
     if (nativeHotkeyHasCommandModifier()) return 0;
     const bool globalKey =
       vk == VK_ESCAPE ||
-      vk == 'L' || vk == 'l' ||
       vk == 'R' || vk == 'r';
     if (!globalKey) return 0;
 
@@ -2812,7 +2812,6 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
   else if (vk == VK_RETURN) key = "enter";
   else if (vk == VK_SPACE) key = "space";
   else if (vk == 'R' || vk == 'r') key = "r";
-  else if (vk == 'L' || vk == 'l') key = "l";
   else if (vk == 'B' || vk == 'b') key = "b";
   else return 0;
 
@@ -5035,7 +5034,7 @@ static const char* kNativeCommandsExtKey = "COMMANDS_JSON_V1";
 static const char* kNativeAutoplayExtKey = "AUTOPLAY_ENABLED_V1";
 static const char* kNativeAutoplayModeExtKey = "AUTOPLAY_MODE_V1";
 static const char* kNativeShortcutNoticeSuppressExtKey =
-  "SHORTCUT_NOTICE_SUPPRESS_V1";
+  "SHORTCUT_NOTICE_SUPPRESS_V2";
 static const char* kNativeAutoStopExtKey = "AUTO_STOP_ENABLED_V1";
 static const char* kNativeNormalStopExtKey = "NORMAL_STOP_ENABLED_V1";
 static const char* kNativeAutoBlocoExtKey = "AUTO_BLOCO_ENABLED_V1";
@@ -19215,7 +19214,7 @@ nativeUiVisualFixedDefaultPreset()
     result["block_symbol_mode"] = "angle";
     result["playlist_font_mode"] = "bold";
     result["regions_font_mode"] = "bold";
-    result["button_font_mode"] = "georgia";
+    result["button_font_mode"] = "verdana";
     result["status_current_top"] = "0";
     result["status_current_bottom"] = "1";
     result["status_queue_top"] = "0";
@@ -32167,7 +32166,7 @@ nativeUiHelpTopicContent(const std::string& topic)
     return {"Atalhos e simbolos", {
       "Espaco: Play/Stop.",
       stopBreakShortcut,
-      "L ou R: aciona Loop.",
+      "R: aciona Loop.",
       "C: ativa/desativa o cronometro visual.",
       "F1: abre Repertorios.",
       "F2: abre Musicas.",
@@ -32255,6 +32254,45 @@ static std::string nativeUiReadMixerBinding(
     raw = legacy ? legacy : "";
   }
   return raw;
+}
+
+// O indicador visual de mapeamento pertence a configuracao da pista e nao ao
+// estado de transporte. Consultar quatro ExtStates para cada pista em cada
+// paint fazia o TCP multiplicar acesso ao projeto por pista x quadro. O cache
+// e separado por projeto e e invalidado imediatamente por qualquer gravacao
+// feita pela propria interface.
+static ReaProject* g_nativeUiMixerMappingCacheProject = nullptr;
+static std::map<std::string, bool> g_nativeUiMixerMappingCache;
+
+static void nativeUiInvalidateMixerMappingCache()
+{
+  g_nativeUiMixerMappingCacheProject = nullptr;
+  g_nativeUiMixerMappingCache.clear();
+}
+
+static bool nativeUiMixerTrackHasButtonMapping(
+  const std::string& trackId,
+  ReaProject* project)
+{
+  if (project != g_nativeUiMixerMappingCacheProject) {
+    g_nativeUiMixerMappingCacheProject = project;
+    g_nativeUiMixerMappingCache.clear();
+  }
+  const auto cached = g_nativeUiMixerMappingCache.find(trackId);
+  if (cached != g_nativeUiMixerMappingCache.end()) {
+    return cached->second;
+  }
+  const bool mapped =
+    !nativeUiReadMixerBinding(
+      trackId, "mute", "keyboard").empty() ||
+    !nativeUiReadMixerBinding(
+      trackId, "mute", "midi").empty() ||
+    !nativeUiReadMixerBinding(
+      trackId, "solo", "keyboard").empty() ||
+    !nativeUiReadMixerBinding(
+      trackId, "solo", "midi").empty();
+  g_nativeUiMixerMappingCache[trackId] = mapped;
+  return mapped;
 }
 
 static std::string nativeUiKeyboardBindingLabel(
@@ -32584,6 +32622,7 @@ static bool nativeUiWriteMixerBinding(
     if (!SetExtState_ptr) return false;
     SetExtState_ptr(kMixerBindingExtSection,
       key.c_str(), value.c_str(), true);
+    nativeUiInvalidateMixerMappingCache();
     return true;
   }
   char pathBuf[2048] = "";
@@ -32592,6 +32631,7 @@ static bool nativeUiWriteMixerBinding(
   if (!project || !SetProjExtState_ptr) return false;
   SetProjExtState_ptr(project, kMixerBindingExtSection,
     key.c_str(), value.c_str());
+  nativeUiInvalidateMixerMappingCache();
   if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
   return true;
 }
@@ -32692,7 +32732,8 @@ static COLORREF nativeUiTrackTint(
 static NativeMixerPaintTrack nativeUiMixerTrackItem(
   MediaTrack* track,
   int index,
-  bool master)
+  bool master,
+  ReaProject* project)
 {
   NativeMixerPaintTrack item;
   item.index = index;
@@ -32713,14 +32754,7 @@ static NativeMixerPaintTrack nativeUiMixerTrackItem(
   item.group = !master && GetMediaTrackInfo_Value_ptr &&
     GetMediaTrackInfo_Value_ptr(track, "I_FOLDERDEPTH") > 0.5;
   item.hasButtonMapping =
-    !nativeUiReadMixerBinding(
-      item.id, "mute", "keyboard").empty() ||
-    !nativeUiReadMixerBinding(
-      item.id, "mute", "midi").empty() ||
-    !nativeUiReadMixerBinding(
-      item.id, "solo", "keyboard").empty() ||
-    !nativeUiReadMixerBinding(
-      item.id, "solo", "midi").empty();
+    nativeUiMixerTrackHasButtonMapping(item.id, project);
   item.tint = nativeUiTrackTint(
     track, master, item.hasTint, item.knobTint);
   return item;
@@ -32739,7 +32773,7 @@ static void nativeUiBuildMixerPaintLists(
   if (GetMasterTrack_ptr) {
     MediaTrack* masterTrack = GetMasterTrack_ptr(project);
     if (masterTrack) {
-      master = nativeUiMixerTrackItem(masterTrack, 0, true);
+      master = nativeUiMixerTrackItem(masterTrack, 0, true, project);
       hasMaster = true;
     }
   }
@@ -32752,7 +32786,7 @@ static void nativeUiBuildMixerPaintLists(
     MediaTrack* track = GetTrack_ptr(project, index);
     if (!track) continue;
     NativeMixerPaintTrack item =
-      nativeUiMixerTrackItem(track, index + 1, false);
+      nativeUiMixerTrackItem(track, index + 1, false, project);
     if (item.id.empty()) continue;
     projectIds.push_back(item.id);
     byId[item.id] = item;
@@ -33685,7 +33719,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
   const int navY = 55;
   const int actionY = 82;
   const int buttonH = 20;
-  const int cardH = 24;
+  // Os tres campos do transporte usam a mesma altura compacta. Antes,
+  // Tocando Agora e Fila de Espera ocupavam 24 px enquanto Multiloops usava
+  // 19 px, consumindo espaco vertical sem necessidade.
+  const int cardH = 19;
   const int multiLoopCardH = 19;
   const int timerStatusH = 26;
   const int rowH = 22;
@@ -33697,7 +33734,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
   const int navY = 52;
   const int actionY = 76;
   const int buttonH = 16;
-  const int cardH = 24;
+  // Mantem Tocando Agora, Fila de Espera e Multiloops alinhados e compactos.
+  const int cardH = 18;
   const int multiLoopCardH = 18;
   const int timerStatusH = 24;
   const int rowH = 18;
@@ -34571,8 +34609,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
       multiLoop ? nativeUiMultiLoopFont() : labelFont;
     HFONT panelNameFont =
       multiLoop ? nativeUiMultiLoopFont() : nameFont;
-    const int panelTextTop = multiLoop ? 2 : 5;
-    const int panelTextBottom = multiLoop ? 2 : 3;
+    const int panelTextTop = 2;
+    const int panelTextBottom = 2;
     RECT card{pad, panelY, width - pad, panelY + panelHeight};
     nativeAppActiveFillRoundRect(dc, card,
       nativeUiTransportFillColor(paintVisualPrefs),
@@ -42879,7 +42917,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           MediaTrack* track = GetTrack_ptr(project, index);
           if (track) {
             tracks.push_back(nativeUiMixerTrackItem(
-              track, index + 1, false));
+              track, index + 1, false, project));
           }
         }
       }
@@ -48992,6 +49030,7 @@ static RECT g_nativeHookControllerMixerTracksRect{0, 0, 0, 0};
 static NativeHookControllerPartsState
   g_nativeHookControllerPartsState[2];
 static constexpr UINT_PTR kNativeHookControllerTimerId = 0x56484354;
+static UINT g_nativeHookControllerTimerIntervalMs = 0;
 static constexpr const char* kNativeHookControllerTitle =
   "Hook Controller";
 static constexpr const char* kNativeHookControllerDockId =
@@ -49010,6 +49049,34 @@ static std::unique_ptr<WDL_WinMemBitmap> g_nativeHookControllerBackBuffer;
 static int g_nativeHookControllerBackBufferWidth = 0;
 static int g_nativeHookControllerBackBufferHeight = 0;
 #endif
+
+static UINT nativeHookControllerDesiredFrameInterval()
+{
+  if (g_nativeHookControllerMode == NativeHookControllerMode::Tcp) {
+    // O TCP nao possui medidores nem barras animadas. Mantem 60 FPS somente
+    // enquanto o usuario manipula um controle; parado, cinco leituras por
+    // segundo sao suficientes para refletir alteracoes feitas no REAPER.
+    if (g_nativeMixerVolumeDragging ||
+        g_nativeHookControllerScrollbarDragging ||
+        g_nativeMixerReorderDrag.pressed) {
+      return kNativeUiFrameFastIntervalMs;
+    }
+    return kNativeUiFrameIdleIntervalMs;
+  }
+  return nativeUiDesiredFrameInterval();
+}
+
+static void nativeHookControllerSetFrameTimerInterval(
+  HWND hwnd,
+  UINT intervalMs)
+{
+  if (!hwnd) return;
+  intervalMs = std::max<UINT>(1, intervalMs);
+  if (g_nativeHookControllerTimerIntervalMs == intervalMs) return;
+  KillTimer(hwnd, kNativeHookControllerTimerId);
+  SetTimer(hwnd, kNativeHookControllerTimerId, intervalMs, nullptr);
+  g_nativeHookControllerTimerIntervalMs = intervalMs;
+}
 
 static bool nativeHookControllerWindowIsOpen()
 {
@@ -50451,7 +50518,7 @@ static void nativeHookControllerPaintTcp(HDC dc,
   if (project && GetMasterTrack_ptr) {
     if (MediaTrack* master = GetMasterTrack_ptr(project)) {
       NativeMixerPaintTrack item =
-        nativeUiMixerTrackItem(master, 0, true);
+        nativeUiMixerTrackItem(master, 0, true, project);
       tracks.push_back(std::move(item));
     }
   }
@@ -50464,7 +50531,7 @@ static void nativeHookControllerPaintTcp(HDC dc,
       MediaTrack* track = GetTrack_ptr(project, index);
       if (!track) continue;
       NativeMixerPaintTrack item = nativeUiMixerTrackItem(
-        track, index + 1, false);
+        track, index + 1, false, project);
       item.folderDepth = std::max(0, folderDepth);
       item.insideGroup = item.folderDepth > 0;
       item.folderDelta = GetMediaTrackInfo_Value_ptr
@@ -50962,6 +51029,8 @@ static void nativeHookControllerHandleClick(
     }
     g_nativeHookControllerScroll = 0;
     nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_MODE_V1", index);
+    nativeHookControllerSetFrameTimerInterval(
+      hwnd, nativeHookControllerDesiredFrameInterval());
     InvalidateRect(hwnd, nullptr, FALSE);
     return;
   }
@@ -50971,6 +51040,8 @@ static void nativeHookControllerHandleClick(
       nativeAppActiveWriteWindowInt(
         "HOOK_CONTROLLER_MODE_V1", 0);
       g_nativeHookControllerSearchFocused = true;
+      nativeHookControllerSetFrameTimerInterval(
+        hwnd, nativeHookControllerDesiredFrameInterval());
       g_nativeHookControllerSearchCursor =
         nativeUiTextCursorFromPoint(hwnd,
           g_nativeHookControllerSearchRect,
@@ -51236,8 +51307,9 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
-      SetTimer(hwnd, kNativeHookControllerTimerId,
-        kNativeUiFrameFastIntervalMs, nullptr);
+      g_nativeHookControllerTimerIntervalMs = 0;
+      nativeHookControllerSetFrameTimerInterval(
+        hwnd, nativeHookControllerDesiredFrameInterval());
       return message == WM_INITDIALOG ? TRUE : 0;
     case WM_TIMER:
       if (wParam == kNativeHookControllerTimerId) {
@@ -51279,9 +51351,17 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
             scrollChanged;
         }
         nativeUiCommitPendingMusicNavigation(false);
-        nativeRefreshAppActivePanelModel();
+        // O TCP le diretamente as pistas durante o paint e nao usa o modelo
+        // de musicas/Parts. Reconstruir esse modelo aqui duplicava o trabalho
+        // do timer principal da extensao.
+        if (g_nativeHookControllerMode !=
+            NativeHookControllerMode::Tcp) {
+          nativeRefreshAppActivePanelModel();
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         if (navigationChanged || scrollChanged) UpdateWindow(hwnd);
+        nativeHookControllerSetFrameTimerInterval(
+          hwnd, nativeHookControllerDesiredFrameInterval());
         return 0;
       }
       break;
@@ -51361,6 +51441,8 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
           g_nativeMixerVolumeDragging = true;
           g_nativeMixerVolumeDragRect = hit.rect;
           g_nativeMixerVolumeDragTrackId = hit.trackId;
+          nativeHookControllerSetFrameTimerInterval(
+            hwnd, kNativeUiFrameFastIntervalMs);
           SetCapture(hwnd);
           nativeUiSetMixerVolumeAtPoint(
             hit.trackId, hit.rect, point.x);
@@ -51405,6 +51487,8 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
           g_nativeMixerVolumeDragRect, point.x);
         g_nativeMixerVolumeDragging = false;
         g_nativeMixerVolumeDragTrackId.clear();
+        nativeHookControllerSetFrameTimerInterval(
+          hwnd, nativeHookControllerDesiredFrameInterval());
         if (GetCapture() == hwnd) ReleaseCapture();
         g_nativeForceStateBuild.store(true);
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -51473,6 +51557,8 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       if (g_nativeMixerVolumeDragging) {
         g_nativeMixerVolumeDragging = false;
         g_nativeMixerVolumeDragTrackId.clear();
+        nativeHookControllerSetFrameTimerInterval(
+          hwnd, nativeHookControllerDesiredFrameInterval());
         InvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeMainListDrag.pressed) {
@@ -51639,6 +51725,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       nativeUiResetNavigationRepeat();
       g_nativeHookControllerScrollbarDragging = false;
       KillTimer(hwnd, kNativeHookControllerTimerId);
+      g_nativeHookControllerTimerIntervalMs = 0;
 #ifndef __APPLE__
       g_nativeHookControllerBackBuffer.reset();
       g_nativeHookControllerBackBufferWidth = 0;
@@ -56464,14 +56551,11 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           return 0;
         }
         if (!commandModifier && !altModifier &&
-            (wParam == 'L' ||
-             (wParam == 'R' &&
-              (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0)) &&
+            wParam == 'R' &&
+            (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0 &&
             !g_nativeAppActivePanelModel.regionsPage) {
-          const std::string key =
-            wParam == 'L' ? "L" : "R";
           nativeUiShowShortcutPopup(
-            key, g_nativeAppActivePanelModel.loopActive
+            "R", g_nativeAppActivePanelModel.loopActive
               ? "Loop desativado" : "Loop ativado");
           nativeApplyLoopCommand("{\"type\":\"loop_toggle\"}");
           InvalidateRect(hwnd, nullptr, FALSE);
@@ -56883,7 +56967,7 @@ static LRESULT CALLBACK nativeShortcutNoticeWndProc(
       RECT title{client.left + 20, client.top + 14,
         client.right - 20, client.top + 44};
       nativeAppActiveDrawText(dc,
-        "ATENÇÃO AOS ATALHOS DO VS HOOK", title,
+        "A TECLA L FOI LIBERADA", title,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE |
           DT_NOPREFIX,
         RGB(255, 224, 46), titleFont);
@@ -56891,8 +56975,8 @@ static LRESULT CALLBACK nativeShortcutNoticeWndProc(
       RECT warning{client.left + 24, client.top + 48,
         client.right - 24, client.top + 92};
       nativeAppActiveDrawText(dc,
-        "O VS Hook tem algumas teclas de atalhos próprias. "
-        "Tome cuidado para não acioná-las sem querer.",
+        "A tecla L não ativa nem desativa mais o Loop no VS Hook. "
+        "Use a tecla R ou o botão Loop da interface.",
         warning, DT_LEFT | DT_TOP | DT_WORDBREAK |
           DT_NOPREFIX,
         RGB(226, 232, 240), textFont);
@@ -56905,6 +56989,7 @@ static LRESULT CALLBACK nativeShortcutNoticeWndProc(
         "Ctrl + ↑/↓: Repertório anterior ou próximo";
 #endif
       const char* shortcuts[] = {
+        "R: Ativar ou desativar Loop",
         "F1: Abrir Repertórios",
         "F2: Abrir Músicas",
         "F3: Abrir Mixer",
@@ -59579,7 +59664,7 @@ static void nativeTelepromptDrawPreview(
           songRect.bottom},
         songLineHeight, false,
         songColor, songFont,
-        settings.previewUnderlineEnabled);
+        settings.previewUnderlineEnabled && !song.playing);
       songTop += songHeight + songGap;
     }
     columnTops[static_cast<size_t>(column)] = card.bottom + gap;
@@ -61229,7 +61314,13 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   int clockFontSize = std::max(24,
     static_cast<int>(std::min(width / 11.0, height / 8.0) *
       effectiveClockScale));
-  const int clockHeight = clockFontSize + 18;
+  // Quando cronometro e horario local dividem a mesma faixa, reduz apenas a
+  // folga vertical das duas caixas. Assim elas continuam iguais e liberam
+  // mais area para o contorno das letras do Teleprompt.
+  const bool equalSideClockPair =
+    sideClockLayout && showNoticeClock && showNoticeLocalClock;
+  const int clockHeight = clockFontSize +
+    (equalSideClockPair ? 10 : 18);
   HFONT clockFont =
     nativeTelepromptFont("Consolas", clockFontSize, FW_BOLD);
   const int timerTextWidth = std::max(
@@ -63126,7 +63217,11 @@ static void nativeRefreshAppActivePanelModel()
       nativeUiDesiredFrameInterval());
     InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
-  if (nativeHookControllerWindowIsOpen()) {
+  // O TCP nao depende deste modelo. Durante Play, a variacao da barra de
+  // progresso fazia o atualizador geral invalidar o TCP a 30 FPS mesmo sem
+  // nenhuma pista mudar, anulando o timer adaptativo da Hook Controller.
+  if (nativeHookControllerWindowIsOpen() &&
+      g_nativeHookControllerMode != NativeHookControllerMode::Tcp) {
     InvalidateRect(g_nativeHookControllerHwnd, nullptr, FALSE);
   }
 }
