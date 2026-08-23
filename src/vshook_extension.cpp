@@ -15950,7 +15950,9 @@ static void nativeAppActiveFillRoundRect(HDC dc, const RECT& rect, COLORREF fill
   const RECT paintRect = nativeUiCustomizePaintRect(rect);
   if (!dc || paintRect.right <= paintRect.left ||
       paintRect.bottom <= paintRect.top) return;
-  if (g_nativeUiModernButtonDesign && radius > 0) {
+  // Paineis e a superficie principal conservam seus proprios raios. A
+  // preferencia Quadrado/Redondo controla somente os botoes.
+  if (radius > 0) {
     const NativeUiBrushRef brush = nativeUiBrush(fill);
     const NativeUiPenRef pen = nativeUiPen(border);
     if (brush.handle && pen.handle) {
@@ -15996,10 +15998,29 @@ static void nativeAppActiveStrokeRoundRect(
   COLORREF color,
   int cornerRadius)
 {
-  (void)cornerRadius;
   const RECT paintRect = nativeUiCustomizePaintRect(rect);
   if (!dc || paintRect.right <= paintRect.left ||
       paintRect.bottom <= paintRect.top) return;
+  if (cornerRadius > 0) {
+    const NativeUiPenRef pen = nativeUiPen(color);
+    HGDIOBJ hollowBrush = GetStockObject(NULL_BRUSH);
+    if (pen.handle && hollowBrush) {
+      HGDIOBJ oldPen = SelectObject(dc, pen.handle);
+      HGDIOBJ oldBrush = SelectObject(dc, hollowBrush);
+#ifdef __APPLE__
+      const int curve = std::max(3, cornerRadius * 3);
+#else
+      const int curve = std::max(3, cornerRadius * 2);
+#endif
+      RoundRect(dc, paintRect.left, paintRect.top,
+        paintRect.right, paintRect.bottom, curve, curve);
+      if (oldBrush) SelectObject(dc, oldBrush);
+      if (oldPen) SelectObject(dc, oldPen);
+      if (pen.temporary) DeleteObject(pen.handle);
+      return;
+    }
+    if (pen.temporary && pen.handle) DeleteObject(pen.handle);
+  }
   const NativeUiBrushRef edge = nativeUiBrush(color);
   if (!edge.handle) return;
   const RECT edges[] = {
@@ -16021,6 +16042,131 @@ static void nativeAppActiveFillRect(HDC dc, const RECT& rect, COLORREF fill)
   if (!brush.handle) return;
   FillRect(dc, &paintRect, brush.handle);
   if (brush.temporary) DeleteObject(brush.handle);
+}
+
+static COLORREF nativeUiGradientColor(
+  COLORREF start,
+  COLORREF end,
+  double ratio)
+{
+  ratio = std::max(0.0, std::min(1.0, ratio));
+  const auto channel = [ratio](int first, int last) {
+    return static_cast<int>(std::floor(
+      first + (last - first) * ratio + 0.5));
+  };
+  return RGB(
+    channel(GetRValue(start), GetRValue(end)),
+    channel(GetGValue(start), GetGValue(end)),
+    channel(GetBValue(start), GetBValue(end)));
+}
+
+static void nativeAppActiveFillVerticalGradient(
+  HDC dc,
+  const RECT& rect,
+  COLORREF baseColor)
+{
+  if (!dc || rect.right <= rect.left ||
+      rect.bottom <= rect.top) return;
+  const COLORREF topColor = nativeUiGradientColor(
+    baseColor, RGB(255, 255, 255), 0.15);
+  const COLORREF bottomColor = nativeUiGradientColor(
+    baseColor, RGB(0, 0, 0), 0.24);
+  const int height = std::max(1,
+    static_cast<int>(rect.bottom - rect.top));
+  const int bands = std::max(1, std::min(8, height));
+  for (int band = 0; band < bands; ++band) {
+    const int top = rect.top + (height * band) / bands;
+    const int bottom = rect.top +
+      (height * (band + 1)) / bands;
+    if (bottom <= top) continue;
+    const double ratio = bands <= 1
+      ? 0.0
+      : static_cast<double>(band) /
+          static_cast<double>(bands - 1);
+    nativeAppActiveFillRect(dc,
+      RECT{rect.left, top, rect.right, bottom},
+      nativeUiGradientColor(topColor, bottomColor, ratio));
+  }
+}
+
+static void nativeAppActiveFillHorizontalGradient(
+  HDC dc,
+  const RECT& rect,
+  COLORREF baseColor)
+{
+  if (!dc || rect.right <= rect.left ||
+      rect.bottom <= rect.top) return;
+  const COLORREF startColor = nativeUiGradientColor(
+    baseColor, RGB(255, 255, 255), 0.24);
+  const COLORREF endColor = nativeUiGradientColor(
+    baseColor, RGB(0, 0, 0), 0.24);
+  const int width = std::max(1,
+    static_cast<int>(rect.right - rect.left));
+  const int bands = std::max(1, std::min(12, width));
+  for (int band = 0; band < bands; ++band) {
+    const int left = rect.left + (width * band) / bands;
+    const int right = rect.left +
+      (width * (band + 1)) / bands;
+    if (right <= left) continue;
+    const double ratio = bands <= 1
+      ? 0.0
+      : static_cast<double>(band) /
+          static_cast<double>(bands - 1);
+    nativeAppActiveFillRect(dc,
+      RECT{left, rect.top, right, rect.bottom},
+      nativeUiGradientColor(startColor, endColor, ratio));
+  }
+}
+
+static void nativeAppActiveFillVerticalGradientRounded(
+  HDC dc,
+  const RECT& rect,
+  COLORREF baseColor,
+  COLORREF edgeColor,
+  int radius)
+{
+  if (!dc || rect.right <= rect.left ||
+      rect.bottom <= rect.top) return;
+  radius = std::max(1, radius);
+  nativeAppActiveFillRoundRect(
+    dc, rect, baseColor, edgeColor, radius);
+
+  RECT inner{rect.left + 1, rect.top + 1,
+    rect.right - 1, rect.bottom - 1};
+  if (inner.right > inner.left && inner.bottom > inner.top) {
+    const COLORREF topColor = nativeUiGradientColor(
+      baseColor, RGB(255, 255, 255), 0.16);
+    const COLORREF bottomColor = nativeUiGradientColor(
+      baseColor, RGB(0, 0, 0), 0.22);
+    const int height = std::max(1,
+      static_cast<int>(inner.bottom - inner.top));
+    const int bands = std::max(1, std::min(8, height));
+    for (int band = 0; band < bands; ++band) {
+      const int top = inner.top + (height * band) / bands;
+      const int bottom = inner.top +
+        (height * (band + 1)) / bands;
+      if (bottom <= top) continue;
+      const double ratio = bands <= 1
+        ? 0.0
+        : static_cast<double>(band) /
+            static_cast<double>(bands - 1);
+      const int centerY = (top + bottom) / 2;
+      const int distanceToEdge = std::min(
+        centerY - static_cast<int>(rect.top),
+        static_cast<int>(rect.bottom) - centerY - 1);
+      const int inset = std::max(0,
+        radius - distanceToEdge - 1);
+      RECT bandRect{inner.left + inset, top,
+        inner.right - inset, bottom};
+      if (bandRect.right > bandRect.left) {
+        nativeAppActiveFillRect(dc, bandRect,
+          nativeUiGradientColor(
+            topColor, bottomColor, ratio));
+      }
+    }
+  }
+  nativeAppActiveStrokeRoundRect(
+    dc, rect, edgeColor, radius);
 }
 
 struct NativeUiClipState {
@@ -17181,8 +17327,25 @@ static void nativePaintPartsColumn(
     headerEdge = headerFocused ? RGB(77, 179, 255) : RGB(50, 105, 165);
     headerTextColor = RGB(255, 255, 255);
   }
-  nativeAppActiveFillRoundRect(dc, headerHitRect,
-    headerFill, headerEdge, 0);
+  if (headerSelected && !headerArmed) {
+    nativeAppActiveFillVerticalGradient(
+      dc, headerHitRect, headerFill);
+    nativeAppActiveFillRect(dc,
+      RECT{headerHitRect.left, headerHitRect.top,
+        headerHitRect.right, headerHitRect.top + 1}, headerEdge);
+    nativeAppActiveFillRect(dc,
+      RECT{headerHitRect.left, headerHitRect.bottom - 1,
+        headerHitRect.right, headerHitRect.bottom}, headerEdge);
+    nativeAppActiveFillRect(dc,
+      RECT{headerHitRect.left, headerHitRect.top,
+        headerHitRect.left + 1, headerHitRect.bottom}, headerEdge);
+    nativeAppActiveFillRect(dc,
+      RECT{headerHitRect.right - 1, headerHitRect.top,
+        headerHitRect.right, headerHitRect.bottom}, headerEdge);
+  } else {
+    nativeAppActiveFillRoundRect(dc, headerHitRect,
+      headerFill, headerEdge, 0);
+  }
   const std::string sourceText = column.hasSource
     ? nativeUpperNamePtBrKeepParentheses(
         column.sourceName) + " - INÍCIO"
@@ -17315,7 +17478,11 @@ static void nativePaintPartsColumn(
         : RGB(51, 122, 209);
       drawEdge = true;
     }
-    nativeAppActiveFillRect(dc, rowRect, fill);
+    if (selected && !armed) {
+      nativeAppActiveFillVerticalGradient(dc, rowRect, fill);
+    } else {
+      nativeAppActiveFillRect(dc, rowRect, fill);
+    }
     if (drawEdge) {
       nativeAppActiveFillRect(dc,
         RECT{rowRect.left, rowRect.top,
@@ -18677,7 +18844,7 @@ static void nativeUiDrawButton(
     const int buttonH = std::max(1,
       static_cast<int>(rect.bottom - rect.top));
     const int radius = std::max(3,
-      std::min(7, buttonH / 3));
+      std::min(5, buttonH / 4));
     RECT shadow{rect.left, rect.top + 2,
       rect.right, rect.bottom};
     const COLORREF shadowColor = nativeUiBlendColor(
@@ -18706,7 +18873,7 @@ static void nativeUiDrawButton(
           RGB(255, 255, 255), 0.25)
       : nativeUiBlendColor(colors.edge,
           RGB(148, 163, 184), 0.12);
-    nativeAppActiveFillRoundRect(dc, face,
+    nativeAppActiveFillVerticalGradientRounded(dc, face,
       faceFill, faceEdge, radius);
 
     if (enabled && normalizedStyle == "rgb") {
@@ -18774,45 +18941,45 @@ static void nativeUiDrawButton(
     return;
   }
 
+  constexpr int squareCornerRadius = 2;
   if (enabled && normalizedStyle == "rgb") {
+    nativeAppActiveFillRoundRect(dc, rect,
+      colors.edge, colors.edge, squareCornerRadius);
     const COLORREF stripes[] = {
       RGB(242, 56, 56), RGB(245, 209, 61), RGB(46, 209, 87),
       RGB(61, 133, 235), RGB(158, 82, 214)
     };
     constexpr int stripeCount =
       static_cast<int>(sizeof(stripes) / sizeof(stripes[0]));
+    const RECT stripeArea{rect.left + 1, rect.top + 1,
+      rect.right - 1, rect.bottom - 1};
     const int buttonWidth = std::max(
-      1, static_cast<int>(rect.right - rect.left));
+      1, static_cast<int>(stripeArea.right - stripeArea.left));
     for (int i = 0; i < stripeCount; ++i) {
-      const int stripeLeft = rect.left +
+      const int stripeLeft = stripeArea.left +
         (buttonWidth * i) / stripeCount;
-      const int stripeRight = rect.left +
+      const int stripeRight = stripeArea.left +
         (buttonWidth * (i + 1)) / stripeCount;
       nativeAppActiveFillRect(dc,
-        RECT{stripeLeft, rect.top, stripeRight, rect.bottom},
+        RECT{stripeLeft, stripeArea.top,
+          stripeRight, stripeArea.bottom},
         stripes[i]);
     }
+    nativeAppActiveStrokeRoundRect(dc, rect,
+      colors.edge, squareCornerRadius);
   } else {
-    nativeAppActiveFillRect(dc, rect, fill);
+    nativeAppActiveFillVerticalGradientRounded(dc, rect,
+      fill, colors.edge, squareCornerRadius);
   }
-  nativeAppActiveFillRect(dc,
-    RECT{rect.left, rect.top, rect.right,
-      rect.top + 1}, colors.edge);
-  nativeAppActiveFillRect(dc,
-    RECT{rect.left, rect.bottom - 1, rect.right,
-      rect.bottom}, colors.edge);
-  nativeAppActiveFillRect(dc,
-    RECT{rect.left, rect.top, rect.left + 1,
-      rect.bottom}, colors.edge);
-  nativeAppActiveFillRect(dc,
-    RECT{rect.right - 1, rect.top, rect.right,
-      rect.bottom}, colors.edge);
   const std::string shown = nativeUiFitButtonLabel(dc, label,
     static_cast<int>(rect.right - rect.left), font, padding);
   nativeAppActiveDrawText(dc, shown, rect,
     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     colors.text, font);
 }
+
+static const std::map<std::string, std::string>&
+nativeUiVisualFixedDefaultPreset();
 
 static std::map<std::string, std::string> nativeUiReadVisualPrefs()
 {
@@ -18840,6 +19007,32 @@ static std::map<std::string, std::string> nativeUiReadVisualPrefs()
     }
     if (end >= raw.size()) break;
     start = end + 1;
+  }
+  const auto presetFound = values.find("visual_preset_index");
+  const int activePreset = presetFound == values.end()
+    ? 0 : std::atoi(presetFound->second.c_str());
+  if (activePreset == 0) {
+    std::string chosenLiveMark;
+    bool preserveChosenLiveMark = false;
+    const auto liveMarkFound = values.find("live_mark_color_mode");
+    if (liveMarkFound != values.end() && GetExtState_ptr) {
+      const char* chosen = GetExtState_ptr(
+        kLuaWindowExtStateSection,
+        "LIVE_MARK_DEFAULT_COLOR_CHOSEN_V1");
+      preserveChosenLiveMark = chosen &&
+        std::string(chosen) == "1";
+      if (preserveChosenLiveMark) {
+        chosenLiveMark = liveMarkFound->second;
+      }
+    }
+    for (const auto& entry :
+         nativeUiVisualFixedDefaultPreset()) {
+      values[entry.first] = entry.second;
+    }
+    values["visual_preset_index"] = "0";
+    if (preserveChosenLiveMark) {
+      values["live_mark_color_mode"] = chosenLiveMark;
+    }
   }
   return values;
 }
@@ -19008,12 +19201,21 @@ nativeUiVisualFixedDefaultPreset()
     std::map<std::string, std::string> result =
       nativeUiVisualDefaults();
     result["top_fields_rgb_border"] = "0";
-    result["list_scale_mode"] = "small";
+    result["list_scale_mode"] = "normal";
+    result["interface_bg_mode"] = "black";
+    result["list_panel_bg_mode"] = "default";
     result["transport_panel_bg_mode"] = "gray";
-    result["number_bar_bg_mode"] = "gray";
+    result["number_bar_bg_mode"] = "black";
     result["scrollbar_color_mode"] = "orange";
     result["live_mark_color_mode"] = "red";
     result["no_block_text_color_mode"] = "yellow";
+    result["playlist_selection_arrow_color_mode"] = "red";
+    result["regions_selection_arrow_color_mode"] = "red";
+    result["parts_selection_arrow_color_mode"] = "yellow";
+    result["block_symbol_mode"] = "angle";
+    result["playlist_font_mode"] = "bold";
+    result["regions_font_mode"] = "bold";
+    result["button_font_mode"] = "georgia";
     result["status_current_top"] = "0";
     result["status_current_bottom"] = "1";
     result["status_queue_top"] = "0";
@@ -32425,8 +32627,6 @@ struct NativeMixerPaintTrack {
   int folderDepth = 0;
   int folderDelta = 0;
   double volume = 1.0;
-  double peakLeft = 0.0;
-  double peakRight = 0.0;
   bool mute = false;
   bool solo = false;
   bool selected = false;
@@ -32492,8 +32692,7 @@ static COLORREF nativeUiTrackTint(
 static NativeMixerPaintTrack nativeUiMixerTrackItem(
   MediaTrack* track,
   int index,
-  bool master,
-  bool readPeaks = true)
+  bool master)
 {
   NativeMixerPaintTrack item;
   item.index = index;
@@ -32505,10 +32704,6 @@ static NativeMixerPaintTrack nativeUiMixerTrackItem(
     : nativeTrackName(track, std::max(0, index - 1));
   item.volume = GetMediaTrackInfo_Value_ptr
     ? GetMediaTrackInfo_Value_ptr(track, "D_VOL") : 1.0;
-  if (readPeaks) {
-    item.peakLeft = nativeSafeTrackPeak(track, 0);
-    item.peakRight = nativeSafeTrackPeak(track, 1);
-  }
   item.mute = GetMediaTrackInfo_Value_ptr &&
     GetMediaTrackInfo_Value_ptr(track, "B_MUTE") > 0.5;
   item.solo = GetMediaTrackInfo_Value_ptr &&
@@ -34292,11 +34487,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
     bottomFill.right =
       std::min(bottomTrack.right, bottomFill.left + fillW);
     if (showTop) {
-      nativeAppActiveFillRect(dc, topFill, color);
+      nativeAppActiveFillHorizontalGradient(dc, topFill, color);
     }
     if (showBottom) {
-      nativeAppActiveFillRect(dc, bottomFill,
-        color);
+      nativeAppActiveFillHorizontalGradient(
+        dc, bottomFill, color);
     }
   };
 
@@ -35325,10 +35520,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       }
 
       bool stateBackgroundApplied = false;
-      const COLORREF queuedBaseColor =
-        g_nativeAppActivePanelModel.autoplay2Enabled
-          ? RGB(38, 176, 92)
-          : RGB(230, 122, 41);
+      const COLORREF queuedBaseColor = RGB(230, 122, 41);
       // Fila + selecao conserva a base do modo e recebe a mesma camada azul
       // de 30% do Lua. Outros fundos fortes (bloco/Live/selecao) nao sao
       // substituidos pelo estado de transporte.
@@ -35367,7 +35559,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
       RECT rowBodyRect = rowRect;
       rowBodyRect.left = std::min(rowBodyRect.right,
         rowBodyRect.left + indexColumnW);
-      nativeAppActiveFillRect(dc, rowBodyRect, rowFill);
+      const bool useStateGradient =
+        !isDraggingSource &&
+        (stateBackgroundApplied ||
+         (isSelected && !isPlaying && !isLiveExecuted) ||
+         (row.block && hasBlockPaletteColor));
+      if (useStateGradient) {
+        nativeAppActiveFillVerticalGradient(
+          dc, rowBodyRect, rowFill);
+      } else {
+        nativeAppActiveFillRect(dc, rowBodyRect, rowFill);
+      }
 
       if (isPlaying || isQueued) {
         double ratio = isPlaying
@@ -35419,12 +35621,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
           bottomBar.right = std::min(rowRect.right,
             bottomBar.left + fillWidth);
           if (showTop) {
-            nativeAppActiveFillRect(dc, topBar,
-              barColor);
+            nativeAppActiveFillHorizontalGradient(
+              dc, topBar, barColor);
           }
           if (showBottom) {
-            nativeAppActiveFillRect(dc, bottomBar,
-              barColor);
+            nativeAppActiveFillHorizontalGradient(
+              dc, bottomBar, barColor);
           }
         }
       }
@@ -39634,7 +39836,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           nativeAppActiveFillRect(dc,
             RECT{rect.left, rect.top + 2, rect.right, rect.top + 4},
             track);
-          nativeAppActiveFillRect(dc,
+          nativeAppActiveFillHorizontalGradient(dc,
             RECT{rect.left, rect.top + 2,
               rect.left + fillWidth, rect.top + 4}, color);
         }
@@ -39642,7 +39844,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           nativeAppActiveFillRect(dc,
             RECT{rect.left, rect.bottom - 4,
               rect.right, rect.bottom - 2}, track);
-          nativeAppActiveFillRect(dc,
+          nativeAppActiveFillHorizontalGradient(dc,
             RECT{rect.left, rect.bottom - 4,
               rect.left + fillWidth, rect.bottom - 2}, color);
         }
@@ -39666,10 +39868,18 @@ static void nativePaintAppActivePanel(HWND hwnd)
           visual, "list_current_bg", true);
         const bool queuedBg = nativeUiVisualPrefBool(
           visual, "list_queue_bg", true);
-        nativeAppActiveFillRect(dc, current,
-          currentBg ? RGB(184, 61, 61) : panelFill);
-        nativeAppActiveFillRect(dc, queued,
-          queuedBg ? RGB(230, 122, 41) : panelFill);
+        if (currentBg) {
+          nativeAppActiveFillVerticalGradient(
+            dc, current, RGB(205, 20, 20));
+        } else {
+          nativeAppActiveFillRect(dc, current, panelFill);
+        }
+        if (queuedBg) {
+          nativeAppActiveFillVerticalGradient(
+            dc, queued, RGB(230, 122, 41));
+        } else {
+          nativeAppActiveFillRect(dc, queued, panelFill);
+        }
         RECT currentText{current.left + 6, current.top,
           current.right - 6, current.bottom};
         RECT queuedText{queued.left + 6, queued.top,
@@ -40800,8 +41010,21 @@ static void nativePaintAppActivePanel(HWND hwnd)
             groupRect.top + 23,
             groupRect.right - 6,
             groupRect.top + 45};
-          nativeAppActiveFillOutlinedRect(dc, preview,
-            RGB(26, 128, 242), RGB(77, 179, 255));
+          nativeAppActiveFillVerticalGradient(dc, preview,
+            RGB(26, 128, 242));
+          const COLORREF previewEdge = RGB(77, 179, 255);
+          nativeAppActiveFillRect(dc,
+            RECT{preview.left, preview.top,
+              preview.right, preview.top + 1}, previewEdge);
+          nativeAppActiveFillRect(dc,
+            RECT{preview.left, preview.bottom - 1,
+              preview.right, preview.bottom}, previewEdge);
+          nativeAppActiveFillRect(dc,
+            RECT{preview.left, preview.top,
+              preview.left + 1, preview.bottom}, previewEdge);
+          nativeAppActiveFillRect(dc,
+            RECT{preview.right - 1, preview.top,
+              preview.right, preview.bottom}, previewEdge);
           nativeUiDrawSelectionArrow(dc,
             preview.left + 7,
             (preview.top + preview.bottom) / 2,
@@ -41234,7 +41457,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       } else if (g_nativeMainModalKind ==
           NativeMainModalKind::CustomizeButtonDesign) {
         drawCustomHeader("Formato dos botões",
-          "Escolha entre o desenho quadrado original e o novo arredondado.");
+          "Escolha entre quadrado com cantos leves ou redondo.");
         const std::vector<std::pair<std::string, std::string>> options = {
           {"square", "Quadrado"},
           {"round", "Redondo"}
@@ -48762,10 +48985,6 @@ static std::vector<NativeMainFamilyButtonHit>
   g_nativeHookControllerFamilyButtonHits;
 static std::vector<NativeMixerHit> g_nativeHookControllerMixerHits;
 static std::vector<NativeMixerRowHit> g_nativeHookControllerMixerRowHits;
-static std::map<std::string, std::pair<double, double>>
-  g_nativeHookControllerMeterPeaks;
-static std::chrono::steady_clock::time_point
-  g_nativeHookControllerMeterSampleAt{};
 static NativeMixerAreaLayout g_nativeHookControllerMixerGroupsLayout;
 static NativeMixerAreaLayout g_nativeHookControllerMixerTracksLayout;
 static RECT g_nativeHookControllerMixerGroupsRect{0, 0, 0, 0};
@@ -49646,14 +49865,16 @@ static void nativeHookControllerPaintSongs(
             g_nativeAppActivePanelModel.selectedId,
             g_nativeAppActivePanelModel.selectedStart,
             g_nativeAppActivePanelModel.selectedEnd));
+    COLORREF inheritedPaletteColor = RGB(0, 0, 0);
+    const bool hasInheritedPaletteColor =
+      nativeAppActiveColorFromHex(
+        row.inheritedColorHex, inheritedPaletteColor);
     COLORREF rowFill = listFill;
     if (playing) rowFill = RGB(205, 20, 20);
     else if (liveExecuted && liveMarkColorMode != "none") {
       rowFill = nativeUiLiveMarkBackgroundColor(visualPrefs);
     }
-    else if (!liveExecuted && queued) rowFill =
-      g_nativeAppActivePanelModel.autoplay2Enabled
-        ? RGB(38, 176, 92) : RGB(230, 122, 41);
+    else if (!liveExecuted && queued) rowFill = RGB(230, 122, 41);
     else if (!liveExecuted && selected) rowFill = RGB(26, 128, 242);
     const bool draggingSource = g_nativeMainListDrag.active &&
       g_nativeMainListDrag.regionsPage &&
@@ -49663,7 +49884,12 @@ static void nativeHookControllerPaintSongs(
        (g_nativeMainListDrag.sourceIdentity.empty() &&
         g_nativeMainListDrag.sourceIndex == rowIndex));
     if (draggingSource) rowFill = RGB(122, 51, 219);
-    nativeAppActiveFillRect(dc, rowRect, rowFill);
+    if (!draggingSource && !liveExecuted &&
+        (playing || queued || selected)) {
+      nativeAppActiveFillVerticalGradient(dc, rowRect, rowFill);
+    } else {
+      nativeAppActiveFillRect(dc, rowRect, rowFill);
+    }
     constexpr int indexW = 28;
     nativeAppActiveFillRect(dc,
       RECT{rowRect.left, rowRect.top,
@@ -49693,12 +49919,12 @@ static void nativeHookControllerPaintSongs(
         const int barRight = std::min(
           static_cast<int>(rowRect.right), barLeft + barWidth);
         if (showTop) {
-          nativeAppActiveFillRect(dc,
+          nativeAppActiveFillHorizontalGradient(dc,
             RECT{barLeft, rowRect.top + 1,
               barRight, rowRect.top + 3}, barColor);
         }
         if (showBottom) {
-          nativeAppActiveFillRect(dc,
+          nativeAppActiveFillHorizontalGradient(dc,
             RECT{barLeft, rowRect.bottom - 3,
               barRight, rowRect.bottom - 1}, barColor);
         }
@@ -49766,11 +49992,9 @@ static void nativeHookControllerPaintSongs(
       ? RGB(255, 255, 255)
       : ((playing || queued || selected)
           ? RGB(13, 13, 13) : RGB(235, 238, 242));
-    COLORREF inherited{};
     if (!playing && !queued && !selected && !liveExecuted &&
-        nativeAppActiveColorFromHex(
-          row.inheritedColorHex, inherited)) {
-      textColor = inherited;
+        hasInheritedPaletteColor) {
+      textColor = inheritedPaletteColor;
     }
     nativeUiDrawWrappedText(dc, metrics.lines,
       textRect.left, rowRect.top + listLayout.paddingY,
@@ -50158,8 +50382,9 @@ static void nativeHookControllerPaintTcpTrack(HDC dc,
   g_nativeMixerHits.push_back(
     {dbRect, NativeMixerHitKind::ResetVolume, item.id});
 
-  const int meterW = nested ? 44 : (compact ? 50 : 72);
-  const int meterLeft = row.right - pad - meterW;
+  // Sem peak meters: o fader aproveita toda a largura restante, tanto no TCP
+  // da Hook Controller quanto na aba Mixer da interface principal.
+  const int meterLeft = row.right - pad;
   RECT faderRect{dbRect.right + (nested ? 4 : (compact ? 6 : 8)),
     bottomTop + (compact ? 2 : 4),
     meterLeft - (nested ? 5 : 7),
@@ -50196,35 +50421,6 @@ static void nativeHookControllerPaintTcpTrack(HDC dc,
     g_nativeMixerHits.push_back(
       {faderHit, NativeMixerHitKind::Volume, item.id});
   }
-  const auto meterRatio = [](double peak) {
-    if (!std::isfinite(peak) || peak <= 0.000001) return 0.0;
-    const double db = 20.0 * std::log10(peak);
-    return std::max(0.0, std::min(1.0,
-      (db + 60.0) / 60.0));
-  };
-  const int meterHeight = compact ? 4 : 5;
-  const auto paintMeter = [&](int top, double peak) {
-    RECT meter{meterLeft, top, row.right - pad,
-      top + meterHeight};
-    nativeAppActiveFillRoundRect(dc, meter,
-      RGB(7, 10, 13), RGB(45, 55, 65), 2);
-    const double ratio = meterRatio(peak);
-    RECT fill{meter.left + 1, meter.top + 1,
-      meter.left + 1 + std::max(0,
-        static_cast<int>((meter.right - meter.left - 2) * ratio)),
-      meter.bottom - 1};
-    if (fill.right > fill.left) {
-      const COLORREF meterColor = peak >= 1.0
-        ? RGB(239, 68, 68)
-        : (ratio >= 0.82 ? RGB(250, 204, 21)
-                         : RGB(34, 197, 94));
-      nativeAppActiveFillRoundRect(dc, fill,
-        meterColor, meterColor, 1);
-    }
-  };
-  const int meterTop = bottomTop + (compact ? 1 : 2);
-  paintMeter(meterTop, item.peakLeft);
-  paintMeter(meterTop + (compact ? 5 : 7), item.peakRight);
   g_nativeMixerRowHits.push_back(
     {row, areaId, item.id, displayIndex});
 }
@@ -50251,40 +50447,11 @@ static void nativeHookControllerPaintTcp(HDC dc,
   char projectPath[2048] = "";
   ReaProject* project = getCurrentProject(
     projectPath, static_cast<int>(sizeof(projectPath)));
-  const auto meterNow = std::chrono::steady_clock::now();
-  const UINT meterIntervalMs = nativeUiDesiredFrameInterval();
-  const bool refreshMeterSamples =
-    g_nativeHookControllerMeterSampleAt.time_since_epoch().count() == 0 ||
-    std::chrono::duration_cast<std::chrono::milliseconds>(
-      meterNow - g_nativeHookControllerMeterSampleAt).count() >=
-        static_cast<long long>(meterIntervalMs);
-  if (refreshMeterSamples) {
-    // Usa literalmente a mesma cadencia adaptativa da aba Mixer: rapida
-    // durante playback/manipulacao e economica quando a interface esta ociosa.
-    g_nativeHookControllerMeterSampleAt = meterNow;
-  }
-  const auto applyMeterSample = [&](NativeMixerPaintTrack& item,
-      MediaTrack* track) {
-    if (refreshMeterSamples) {
-      item.peakLeft = nativeSafeTrackPeak(track, 0);
-      item.peakRight = nativeSafeTrackPeak(track, 1);
-      g_nativeHookControllerMeterPeaks[item.id] =
-        {item.peakLeft, item.peakRight};
-      return;
-    }
-    const auto cached =
-      g_nativeHookControllerMeterPeaks.find(item.id);
-    if (cached != g_nativeHookControllerMeterPeaks.end()) {
-      item.peakLeft = cached->second.first;
-      item.peakRight = cached->second.second;
-    }
-  };
   std::vector<NativeMixerPaintTrack> tracks;
   if (project && GetMasterTrack_ptr) {
     if (MediaTrack* master = GetMasterTrack_ptr(project)) {
       NativeMixerPaintTrack item =
-        nativeUiMixerTrackItem(master, 0, true, false);
-      applyMeterSample(item, master);
+        nativeUiMixerTrackItem(master, 0, true);
       tracks.push_back(std::move(item));
     }
   }
@@ -50297,7 +50464,7 @@ static void nativeHookControllerPaintTcp(HDC dc,
       MediaTrack* track = GetTrack_ptr(project, index);
       if (!track) continue;
       NativeMixerPaintTrack item = nativeUiMixerTrackItem(
-        track, index + 1, false, false);
+        track, index + 1, false);
       item.folderDepth = std::max(0, folderDepth);
       item.insideGroup = item.folderDepth > 0;
       item.folderDelta = GetMediaTrackInfo_Value_ptr
@@ -50305,7 +50472,6 @@ static void nativeHookControllerPaintTcp(HDC dc,
             GetMediaTrackInfo_Value_ptr(track, "I_FOLDERDEPTH")))
         : 0;
       item.group = item.folderDelta > 0;
-      applyMeterSample(item, track);
       tracks.push_back(std::move(item));
       folderDepth = std::max(0, folderDepth +
         tracks.back().folderDelta);
@@ -57331,6 +57497,10 @@ struct NativeTelepromptWindowState {
   bool dragging = false;
   bool resizing = false;
   bool fullscreen = false;
+  // 1 alterna fullscreen no proximo LBUTTONUP; 2 fecha no proximo
+  // RBUTTONUP. Adiar a acao consome o ultimo evento do duplo clique antes de
+  // mover/destruir a janela e impede que ele atravesse para o grid do REAPER.
+  int pendingDoubleClickAction = 0;
   int resizeHitTest = HTNOWHERE;
   POINT dragStartCursor{0, 0};
   RECT dragStartWindow{0, 0, 0, 0};
@@ -57675,6 +57845,9 @@ struct NativeTelepromptRenderState {
   double progressStart = 0.0;
   double progressEnd = 0.0;
   double progress = 0.0;
+  double previewProgressStart = 0.0;
+  double previewProgressEnd = 0.0;
+  double previewProgress = 0.0;
   bool playing = false;
   bool timerExpired = false;
   NativeTelepromptPreviewState preview;
@@ -58917,6 +59090,17 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
   state.queuedName = nativeAppActiveSongNameForState(
     playlistItems, songs, queuedId, queuedStart, queuedEnd);
 
+  // O Preview acompanha a duração da música/região em reprodução, não a
+  // duração do item de letra/imagem atualmente exibido pelo Teleprompt.
+  state.previewProgressStart = playingStart;
+  state.previewProgressEnd = playingEnd;
+  state.previewProgress = playingEnd > playingStart + 0.000001
+    ? nativeTelepromptClamp(
+        (state.projectPosition - playingStart) /
+          (playingEnd - playingStart),
+        0.0, 1.0)
+    : state.progress;
+
   state.preview = nativeTelepromptBuildPreviewState(
     playlistItems,
     previewMode,
@@ -59009,6 +59193,15 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
             (state.progressEnd - state.progressStart),
           0.0, 1.0)
       : 0.0;
+  state.previewProgress =
+    state.previewProgressEnd >
+        state.previewProgressStart + 0.000001
+      ? nativeTelepromptClamp(
+          (livePosition - state.previewProgressStart) /
+            (state.previewProgressEnd -
+              state.previewProgressStart),
+          0.0, 1.0)
+      : state.progress;
   if (state.mediaType == "image" ||
       state.mediaType == "video") {
     const double linearSourceTime =
@@ -59031,6 +59224,7 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
   cache.state.projectPosition = state.projectPosition;
   cache.state.playing = state.playing;
   cache.state.progress = state.progress;
+  cache.state.previewProgress = state.previewProgress;
   cache.state.mediaCurrentTime = state.mediaCurrentTime;
   cache.lastObservedPosition = livePosition;
   return state;
@@ -59356,19 +59550,21 @@ static void nativeTelepromptDrawPreview(
       RECT songRect{card.left + padX, songTop,
         card.right - padX, songTop + songHeight};
       if (song.playing || song.queued) {
-        nativeAppActiveFillRect(dc, songRect,
+        nativeAppActiveFillVerticalGradient(dc, songRect,
           song.playing ? playingBackground : queuedBackground);
         const double ratio = std::max(0.0, std::min(1.0,
-          song.playing ? state.progress : 1.0 - state.progress));
+          song.playing
+            ? state.previewProgress
+            : 1.0 - state.previewProgress));
         const int fillWidth = std::max(0,
           static_cast<int>(std::floor(
             (songRect.right - songRect.left) * ratio +
             (song.queued ? 0.5 : 0.0))));
         if (fillWidth > 0) {
-          nativeAppActiveFillRect(dc,
-            RECT{songRect.left, songRect.bottom - 3,
+          nativeAppActiveFillHorizontalGradient(dc,
+            RECT{songRect.left, songRect.bottom - 4,
               std::min<LONG>(songRect.right,
-                songRect.left + fillWidth), songRect.bottom},
+                songRect.left + fillWidth), songRect.bottom - 1},
             song.playing ? playingProgress : queuedRegress);
         }
       }
@@ -61904,10 +62100,18 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_LBUTTONDBLCLK:
-      nativeTelepromptToggleFullscreen(slot);
+      window.dragging = false;
+      window.pendingDoubleClickAction = 1;
+      SetCapture(hwnd);
       return 0;
     case WM_RBUTTONDBLCLK:
-      nativeCloseTelepromptWindow(slot);
+      window.dragging = false;
+      window.pendingDoubleClickAction = 2;
+      SetCapture(hwnd);
+      return 0;
+    case WM_CONTEXTMENU:
+      // O Teleprompt nao possui menu de contexto. Consumir explicitamente
+      // evita que o clique direito seja encaminhado ao grid que esta atras.
       return 0;
     case WM_LBUTTONDOWN: {
       if (!window.fullscreen) {
@@ -61939,6 +62143,12 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       }
       break;
     case WM_LBUTTONUP:
+      if (window.pendingDoubleClickAction == 1) {
+        window.pendingDoubleClickAction = 0;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        nativeTelepromptToggleFullscreen(slot);
+        return 0;
+      }
 #ifndef _WIN32
       if (window.resizing) {
         nativeTelepromptEndManualResize(window, slot);
@@ -61951,6 +62161,14 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
         return 0;
       }
       break;
+    case WM_RBUTTONUP:
+      if (window.pendingDoubleClickAction == 2) {
+        window.pendingDoubleClickAction = 0;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        nativeCloseTelepromptWindow(slot);
+        return 0;
+      }
+      return 0;
 #ifdef _WIN32
     case WM_EXITSIZEMOVE:
       if (!window.fullscreen) {
@@ -61987,6 +62205,7 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       window.hwnd = nullptr;
       window.dragging = false;
       window.resizing = false;
+      window.pendingDoubleClickAction = 0;
       window.resizeHitTest = HTNOWHERE;
       window.fullscreen = false;
       if (RefreshToolbar2_ptr) {
@@ -69419,6 +69638,24 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
      g_nativeApplyingExternalHttpCommand) &&
     (type == "select_playlist_song" || type == "select_region");
   if (externalMusicSelection) {
+    const bool selectionCameFromApp =
+      g_nativeApplyingExternalHttpCommand &&
+      !g_nativeApplyingTimecodeLanRemoteCommand;
+    if (selectionCameFromApp && nativeAppActivePanelIsOpen()) {
+      // Um gesto do Diretor devolve o foco para a interface nativa. Assim o
+      // modo de edicao do grid (que limpa selecoes fora de foco) nao apaga a
+      // selecao azul que acabou de chegar do aplicativo.
+#ifdef _WIN32
+      HWND foregroundTarget = GetMainHwnd_ptr
+        ? GetMainHwnd_ptr() : g_nativeAppActivePanelHwnd;
+      if (foregroundTarget) SetForegroundWindow(foregroundTarget);
+#endif
+      if (DockWindowActivate_ptr) {
+        DockWindowActivate_ptr(g_nativeAppActivePanelHwnd);
+      }
+      ShowWindow(g_nativeAppActivePanelHwnd, SW_SHOW);
+      SetFocus(g_nativeAppActivePanelHwnd);
+    }
     // A selecao local da janela tinha prioridade sobre g_nativeSelected* na
     // pintura. Por isso o cursor remoto mudava no grid, mas o azul permanecia
     // preso na musica clicada neste computador. A origem remota passa a ser a
@@ -69430,7 +69667,7 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
     g_nativeMainNavigationFocus =
       type == "select_region" ? "regions" : "playlist";
     g_nativeUiMusicSelectionVisualActive =
-      keepVisibleDuringPlayback;
+      selectionCameFromApp || keepVisibleDuringPlayback;
   }
 
   if (type == "set_page") {
