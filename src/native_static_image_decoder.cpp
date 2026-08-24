@@ -784,12 +784,10 @@ std::shared_ptr<const CachedImage> decodeNative(
   }
   CGContextSetBlendMode(context, kCGBlendModeCopy);
   CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
-  // Quartz usa o eixo Y crescente para cima. Sem esta CTM a primeira linha
-  // do CGBitmapContext corresponde ao rodape visual. A API publica sempre a
-  // primeira linha da memoria como o topo (igual ao WIC/CopyPixels).
-  CGContextTranslateCTM(
-    context, 0.0, static_cast<CGFloat>(height));
-  CGContextScaleCTM(context, 1.0, -1.0);
+  // O CGImage criado pelo ImageIO ja chega com a orientacao aplicada pelo
+  // kCGImageSourceCreateThumbnailWithTransform. Repetir a inversao vertical
+  // aqui faz somente as imagens estaticas aparecerem de cabeca para baixo no
+  // desenho final do Teleprompt. O decoder de video segue a mesma regra.
   CGContextDrawImage(
     context,
     CGRectMake(

@@ -62361,7 +62361,10 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       }
       break;
     case WM_CLOSE:
-      DestroyWindow(hwnd);
+      // Fechar diretamente pela propria janela deve persistir exatamente o
+      // mesmo estado fechado usado pelo comando do menu. Caso contrario o
+      // ExtState permanece em "1" e o Teleprompt reaparece ao abrir o projeto.
+      nativeCloseTelepromptWindow(slot);
       return 0;
     case WM_DESTROY:
       KillTimer(hwnd,
