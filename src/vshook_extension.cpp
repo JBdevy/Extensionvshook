@@ -58137,7 +58137,7 @@ static void nativeTelepromptApplySettingsJson(
     0.35, 1.0);
   next.clockScale = nativeTelepromptClamp(
     nativeTelepromptJsonNumber(json, "clockScale", next.clockScale),
-    0.35, 1.0);
+    0.35, 1.5);
   next.songNameScale = nativeTelepromptClamp(
     nativeTelepromptJsonNumber(
       json, "songNameScale", next.songNameScale),
@@ -61306,11 +61306,11 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       return rect;
     };
 
-  // Em retrato, os dois relógios continuam exatamente na mesma faixa e nas
-  // mesmas posições horizontais do modo paisagem. Somente o limite efetivo
-  // de escala é menor para eles caberem lado a lado.
+  // Os dois relogios continuam na mesma faixa e nas mesmas posicoes
+  // horizontais em paisagem e retrato. O cronometro respeita integralmente
+  // a escala escolhida pelo usuario, agora limitada a 150%.
   const double effectiveClockScale = std::min(
-    settings.clockScale, portraitMode ? 0.75 : 1.0);
+    settings.clockScale, 1.5);
   int clockFontSize = std::max(24,
     static_cast<int>(std::min(width / 11.0, height / 8.0) *
       effectiveClockScale));
