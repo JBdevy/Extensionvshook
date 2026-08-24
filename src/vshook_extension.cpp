@@ -22026,19 +22026,77 @@ static bool nativeUiPlaylistContainsSong(
   const NativeUiPlaylistRecord& playlist,
   const NativeSongWindow& song)
 {
+  const bool songIsStoredMarker =
+    song.isHashChild && !song.isRegionChild;
   for (const std::string& itemLine : playlist.itemLines) {
     const auto fields = nativeSplit(itemLine, '\t');
     if (fields.size() < 5 || fields[0] != "ITEM") continue;
     const int sourceNumber = std::atoi(fields[2].c_str());
+    const bool isBlock = fields[1] == "block" || sourceNumber < 0;
+    if (isBlock) continue;
     const double start = std::atof(fields[3].c_str());
     const double end = std::atof(fields[4].c_str());
-    if (sourceNumber == song.sourceNumber &&
-        std::fabs(start - song.start) <= 0.000001 &&
-        std::fabs(end - song.end) <= 0.000001) {
+    const bool storedMarker =
+      fields.size() > 7 && fields[7] == "marker";
+    const bool sameKind = storedMarker == songIsStoredMarker;
+
+    // O numero da regiao/marcador e a identidade persistida usada para
+    // reconstruir o repertorio. A posicao pode sofrer pequenas variacoes de
+    // ponto flutuante ou ser alterada no grid sem transformar a musica em uma
+    // nova entrada. A comparacao por limites fica como fallback para projetos
+    // antigos ou regioes renumeradas.
+    const bool sameSource =
+      sourceNumber != 0 && song.sourceNumber != 0 &&
+      sourceNumber == song.sourceNumber;
+    const bool sameBounds =
+      std::fabs(start - song.start) <= 0.005 &&
+      std::fabs(end - song.end) <= 0.005;
+    if (sameKind && (sameSource || sameBounds)) {
       return true;
     }
   }
   return false;
+}
+
+static bool nativeUiRemoveDuplicatePlaylistSongs(
+  NativeUiPlaylistRecord& playlist)
+{
+  std::vector<std::string> uniqueLines;
+  uniqueLines.reserve(playlist.itemLines.size());
+  std::set<std::string> identities;
+  bool changed = false;
+  for (const std::string& itemLine : playlist.itemLines) {
+    const auto fields = nativeSplit(itemLine, '\t');
+    if (fields.size() < 5 || fields[0] != "ITEM") {
+      uniqueLines.push_back(itemLine);
+      continue;
+    }
+    const int sourceNumber = std::atoi(fields[2].c_str());
+    const bool isBlock = fields[1] == "block" || sourceNumber < 0;
+    if (isBlock) {
+      uniqueLines.push_back(itemLine);
+      continue;
+    }
+    const std::string kind =
+      fields.size() > 7 && fields[7] == "marker"
+        ? "marker" : "region";
+    std::string identity;
+    if (sourceNumber != 0) {
+      identity = kind + ":source:" + std::to_string(sourceNumber);
+    } else {
+      const double start = std::atof(fields[3].c_str());
+      const double end = std::atof(fields[4].c_str());
+      identity = kind + ":bounds:" +
+        nativeNumber(start, 3) + ":" + nativeNumber(end, 3);
+    }
+    if (!identities.insert(identity).second) {
+      changed = true;
+      continue;
+    }
+    uniqueLines.push_back(itemLine);
+  }
+  if (changed) playlist.itemLines.swap(uniqueLines);
+  return changed;
 }
 
 static void nativeUiSmartSearchApplyPendingLayout()
@@ -22352,8 +22410,26 @@ static bool nativeUiAddSelectionToPlaylist()
     getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
   if (!project) return false;
 
+  const std::string targetName = nativeTrim(
+    g_nativeUiPlaylists[
+      static_cast<size_t>(g_nativeUiTargetPlaylistIndex)].name);
+
+  // Rele a fonte oficial imediatamente antes de gravar. Assim uma revisao da
+  // interface, do app ou do Project Sync ocorrida enquanto a janela estava
+  // aberta nao permite salvar por cima de uma lista antiga.
+  std::vector<NativeUiPlaylistRecord> livePlaylists =
+    nativeUiReadPlaylistRecords(project);
+  int liveTargetIndex = -1;
+  for (size_t index = 0; index < livePlaylists.size(); ++index) {
+    if (nativeTrim(livePlaylists[index].name) == targetName) {
+      liveTargetIndex = static_cast<int>(index);
+      break;
+    }
+  }
+  if (liveTargetIndex < 0) return false;
   auto& target =
-    g_nativeUiPlaylists[static_cast<size_t>(g_nativeUiTargetPlaylistIndex)];
+    livePlaylists[static_cast<size_t>(liveTargetIndex)];
+  nativeUiRemoveDuplicatePlaylistSongs(target);
   std::vector<NativeSongWindow> songs;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -22369,7 +22445,7 @@ static bool nativeUiAddSelectionToPlaylist()
       target.itemLines.push_back(nativeUiPlaylistItemLineForSong(song));
     }
   }
-  if (!nativeUiSavePlaylistRecords(project, g_nativeUiPlaylists)) {
+  if (!nativeUiSavePlaylistRecords(project, livePlaylists)) {
     return false;
   }
   if (SetProjExtState_ptr) {
@@ -22379,6 +22455,7 @@ static bool nativeUiAddSelectionToPlaylist()
   nativeUiClearMainRowSelection();
   nativeApplySelectionCommand(
     "{\"type\":\"set_page\",\"page\":\"playlist\"}");
+  g_nativeUiPlaylists = std::move(livePlaylists);
   nativeUiCloseMainModal();
   return true;
 }
@@ -32179,7 +32256,7 @@ nativeUiHelpTopicContent(const std::string& topic)
       "F9: abre/fecha Parts 1.",
       playlistStepShortcut,
       "Tab: abre a busca inteligente no repertorio e em Musicas.",
-      "Esc: cancela loop ou janela aberta.",
+      "Esc: cancela primeiro Parts engatilhado, depois Loop e depois Fila de Espera.",
       "$ no inicio do nome do marker tambem entra em Parts, mas o simbolo nao aparece na lista.",
       "*1 no inicio do nome do marker entra em Parts 1, mas o simbolo nao aparece na lista.",
       "*2 no inicio do nome do marker entra em Parts 2, mas o simbolo nao aparece na lista.",
@@ -56680,6 +56757,11 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               "Esc", "Parts cancelado");
             g_nativePartsPreparedSelectionId.clear();
             nativeApplyMarkerCommand("{\"type\":\"marker_cancel\"}");
+          } else if (g_nativeAppActivePanelModel.loopActive) {
+            nativeUiShowShortcutPopup(
+              "Esc", "Loop desativado");
+            nativeApplyLoopCommand(
+              "{\"type\":\"loop_set\",\"desiredState\":false}");
           } else if (g_nativeAppActivePanelModel.queueActive) {
             nativeUiShowShortcutPopup(
               "Esc", "Fila de espera cancelada");
@@ -56691,11 +56773,6 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               "Esc", "Parts cancelado");
             g_nativePartsPreparedSelectionId.clear();
             nativeApplyMarkerCommand("{\"type\":\"marker_cancel\"}");
-          } else if (g_nativeAppActivePanelModel.loopActive) {
-            nativeUiShowShortcutPopup(
-              "Esc", "Loop desativado");
-            nativeApplyLoopCommand(
-              "{\"type\":\"loop_set\",\"desiredState\":false}");
           } else if (nativeUiMainSelectionCount(
                        g_nativeAppActivePanelModel.regionsPage) > 0) {
             nativeUiShowShortcutPopup(
@@ -62596,6 +62673,22 @@ static void nativeOpenTelepromptElectronApp(bool recados)
     base + L"\\VSHookTelepromptSettings\\electron.cmd";
   const std::wstring appDir =
     base + L"\\VSHookTelepromptSettings";
+  const std::wstring recadosRequestPath =
+    appDir + L"\\open-recados.request";
+  if (recados) {
+    HANDLE requestFile = CreateFileW(
+      recadosRequestPath.c_str(), GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (requestFile != INVALID_HANDLE_VALUE) {
+      const char requestValue = '1';
+      DWORD written = 0;
+      WriteFile(requestFile, &requestValue, 1, &written, nullptr);
+      CloseHandle(requestFile);
+    }
+  } else {
+    DeleteFileW(recadosRequestPath.c_str());
+  }
   DWORD attrs = GetFileAttributesW(packagedExe.c_str());
   std::wstring command;
   const std::wstring argument =
@@ -62698,15 +62791,28 @@ static void nativeOpenTelepromptElectronApp(bool recados)
       "a reaper_VSHookExt.dylib dentro de UserPlugins.");
     return;
   }
+  const size_t appSlash = appPath.find_last_of('/');
+  const std::string companionDirectory =
+    appSlash == std::string::npos
+      ? std::string(resourcePath) : appPath.substr(0, appSlash);
+  const std::string recadosRequestPath =
+    companionDirectory + "/open-recados.request";
+  if (recados) {
+    std::ofstream request(recadosRequestPath,
+      std::ios::out | std::ios::trunc);
+    request << '1';
+  } else {
+    unlink(recadosRequestPath.c_str());
+  }
   const pid_t pid = fork();
   if (pid == 0) {
     unsetenv("ELECTRON_RUN_AS_NODE");
     if (recados) {
-      execl("/usr/bin/open", "open",
+      execl("/usr/bin/open", "open", "-n",
         appPath.c_str(),
         "--args", "--recados", nullptr);
     } else {
-      execl("/usr/bin/open", "open",
+      execl("/usr/bin/open", "open", "-n",
         appPath.c_str(), nullptr);
     }
     _exit(127);
