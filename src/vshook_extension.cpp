@@ -34790,7 +34790,6 @@ static void nativePaintAppActivePanel(HWND hwnd)
     // Mantem os rotulos "TOCANDO AGORA" e "FILA DE ESPERA" com o peso
     // normal. Somente o nome da musica recebe destaque em negrito.
     HFONT panelSongFont = nativeUiConfiguredFont("bold");
-    HFONT panelBracketFont = nativeUiBlockTimeEmphasisFont();
     const int panelTextTop = 2;
     const int panelTextBottom = 2;
     RECT card{pad, panelY, width - pad, panelY + panelHeight};
@@ -34912,45 +34911,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
               : (g_nativeAppActivePanelModel.selectedOrPlayingMultiLoopActive
                   ? "ESSA MÚSICA TEM MULTILOOP ATIVO" : "-")))
       : (panelSongAvailable ? panelSongName : std::string()));
-    if (!multiLoop && panelSongAvailable) {
-      const COLORREF bracketColor = RGB(255, 48, 48);
-      const int bracketW = std::max(1,
-        nativeUiTextWidth(dc, "[", panelBracketFont));
-      RECT openBracket{panelName.left, panelName.top,
-        std::min(static_cast<int>(panelName.right),
-          static_cast<int>(panelName.left) + bracketW),
-        panelName.bottom};
-      const int nameLeft = openBracket.right;
-      const int maxNameRight = std::max(nameLeft,
-        static_cast<int>(panelName.right) - bracketW);
-      const int measuredNameW = nativeUiTextWidth(
-        dc, panelValue, panelSongFont);
-      const int closeLeft = measuredNameW <= maxNameRight - nameLeft
-        ? nameLeft + measuredNameW
-        : maxNameRight;
-      RECT songNameRect{nameLeft, panelName.top,
-        closeLeft, panelName.bottom};
-      RECT closeBracket{closeLeft, panelName.top,
-        std::min(static_cast<int>(panelName.right),
-          closeLeft + bracketW), panelName.bottom};
-      nativeAppActiveDrawText(dc, "[", openBracket,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        bracketColor, panelBracketFont);
-      nativeAppActiveDrawText(dc, panelValue, songNameRect,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE |
-          DT_END_ELLIPSIS | DT_NOPREFIX,
-        textColor, panelSongFont);
-      nativeAppActiveDrawText(dc, "]", closeBracket,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        bracketColor, panelBracketFont);
-    } else {
-      nativeAppActiveDrawText(dc,
-        panelValue,
-        panelName,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE |
-          DT_END_ELLIPSIS | DT_NOPREFIX,
-        textColor, panelNameFont);
-    }
+    nativeAppActiveDrawText(dc,
+      panelValue,
+      panelName,
+      DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+        DT_END_ELLIPSIS | DT_NOPREFIX,
+      textColor,
+      !multiLoop && panelSongAvailable ? panelSongFont : panelNameFont);
     if (!panelTimeText.empty()) {
       nativeAppActiveDrawText(dc,
         panelTimeText, panelTime,
