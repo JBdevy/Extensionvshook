@@ -749,6 +749,7 @@ struct NativeAppActivePanelModel {
     int enumIndex = -1;
     int tunerValue = 0;
     bool block = false;
+    bool blockCustomCentered = false;
     bool child = false;
     bool markerChild = false;
     bool familyParent = false;
@@ -1533,6 +1534,7 @@ static NativeUiSelectPlaylistMode g_nativeUiSelectPlaylistMode =
 static bool g_nativeUiRenameRegionsPage = false;
 static bool g_nativeUiRenameBlock = false;
 static bool g_nativeUiRenameBlockCustomName = false;
+static bool g_nativeUiRenameBlockCentered = false;
 static bool g_nativeUiRenameMarkerChild = false;
 static bool g_nativeUiRenameFamilyParent = false;
 static int g_nativeUiRenameSourceNumber = 0;
@@ -5646,6 +5648,7 @@ struct NativeTechnicalNoticeSettings {
   std::string backgroundColor = "#000000";
   std::string flashColor = "#ff0000";
   std::string fontFamily = "Arial";
+  double textScale = 1.0;
   bool window1Enabled = true;
   bool window2Enabled = true;
   bool emojiEnabled = true;
@@ -7633,6 +7636,8 @@ nativeTechnicalNoticeSettingsJsonLocked()
        << nativeJsonString(settings.flashColor) << ",";
   json << "\"fontFamily\":"
        << nativeJsonString(settings.fontFamily) << ",";
+  json << "\"textScale\":"
+       << nativeNumber(settings.textScale, 3) << ",";
   json << "\"window1Enabled\":"
        << (settings.window1Enabled ? "true" : "false") << ",";
   json << "\"window2Enabled\":"
@@ -7770,6 +7775,11 @@ static void nativeTechnicalNoticeApplySettingsJsonLocked(
   if (!fontFamily.empty()) {
     settings.fontFamily =
       nativeTechnicalNoticeFont(fontFamily);
+  }
+  double textScale = settings.textScale;
+  if (nativeParseDouble(
+        nativeJsonExtractString(json, "textScale"), textScale)) {
+    settings.textScale = std::max(0.5, std::min(1.0, textScale));
   }
   if (!emoji.empty()) {
     settings.emoji = emoji.size() > 32
@@ -8300,6 +8310,7 @@ struct NativeSongWindow {
   double blockDurationSec = 0.0;
   int sourceNumber = 0;
   bool isBlock = false;
+  bool blockCustomCentered = false;
   bool isHashParent = false;
   bool isHashChild = false;
   bool isRegionChild = false;
@@ -9276,6 +9287,8 @@ static std::string nativeSongToJson(const NativeSongWindow& item, int index)
   oss << "\"type\":" << nativeJsonString(item.type.empty() ? (item.isBlock ? "block" : "song") : item.type) << ",";
   oss << "\"itemType\":" << nativeJsonString(item.type.empty() ? (item.isBlock ? "block" : "song") : item.type) << ",";
   oss << "\"isBlock\":" << (item.isBlock ? "true" : "false") << ",";
+  oss << "\"blockCustomCentered\":"
+      << (item.blockCustomCentered ? "true" : "false") << ",";
   oss << "\"isPlayable\":" << (!item.isBlock ? "true" : "false") << ",";
   oss << "\"source_number\":" << item.sourceNumber << ",";
   oss << "\"sourceNumber\":" << item.sourceNumber << ",";
@@ -12567,6 +12580,8 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
         item.name = name.empty() ? (std::string("BLOCO ") + std::to_string(std::abs(sourceNumber))) : name;
         item.type = "block";
         item.isBlock = true;
+        item.blockCustomCentered =
+          fields.size() > 13 && fields[13] == "1";
         item.sourceNumber = sourceNumber;
         int blockNumber = std::abs(sourceNumber);
         if (blockNumber <= 0) {
@@ -16088,6 +16103,35 @@ static void nativeAppActiveFillVerticalGradient(
   }
 }
 
+static void nativeAppActiveFillSubtleVerticalGradient(
+  HDC dc,
+  const RECT& rect,
+  COLORREF baseColor)
+{
+  if (!dc || rect.right <= rect.left ||
+      rect.bottom <= rect.top) return;
+  const COLORREF topColor = nativeUiGradientColor(
+    baseColor, RGB(255, 255, 255), 0.02);
+  const COLORREF bottomColor = nativeUiGradientColor(
+    baseColor, RGB(0, 0, 0), 0.04);
+  const int height = std::max(1,
+    static_cast<int>(rect.bottom - rect.top));
+  const int bands = std::max(1, std::min(4, height));
+  for (int band = 0; band < bands; ++band) {
+    const int top = rect.top + (height * band) / bands;
+    const int bottom = rect.top +
+      (height * (band + 1)) / bands;
+    if (bottom <= top) continue;
+    const double ratio = bands <= 1
+      ? 0.0
+      : static_cast<double>(band) /
+          static_cast<double>(bands - 1);
+    nativeAppActiveFillRect(dc,
+      RECT{rect.left, top, rect.right, bottom},
+      nativeUiGradientColor(topColor, bottomColor, ratio));
+  }
+}
+
 static void nativeAppActiveFillHorizontalGradient(
   HDC dc,
   const RECT& rect,
@@ -16134,9 +16178,9 @@ static void nativeAppActiveFillVerticalGradientRounded(
     rect.right - 1, rect.bottom - 1};
   if (inner.right > inner.left && inner.bottom > inner.top) {
     const COLORREF topColor = nativeUiGradientColor(
-      baseColor, RGB(255, 255, 255), 0.16);
+      baseColor, RGB(255, 255, 255), 0.20);
     const COLORREF bottomColor = nativeUiGradientColor(
-      baseColor, RGB(0, 0, 0), 0.22);
+      baseColor, RGB(0, 0, 0), 0.26);
     const int height = std::max(1,
       static_cast<int>(inner.bottom - inner.top));
     const int bands = std::max(1, std::min(8, height));
@@ -16288,12 +16332,27 @@ static HFONT nativeUiConfiguredFont(const std::string& rawMode)
   const auto found = g_nativeUiConfiguredFonts.find(mode);
   if (found != g_nativeUiConfiguredFonts.end()) return found->second;
 
-  const bool bold = mode == "bold";
+  const bool italic = mode == "bold_italic";
+  const bool bold = mode == "bold" || italic;
+  const bool modern = mode == "bahnschrift_avenir";
   const char* fontName = "Arial";
   if (mode == "verdana") fontName = "Verdana";
   else if (mode == "trebuchet") fontName = "Trebuchet MS";
   else if (mode == "georgia") fontName = "Georgia";
   else if (mode == "courier") fontName = "Courier New";
+#ifdef _WIN32
+  else if (modern) fontName = "Bahnschrift";
+  else if (mode == "arial_black") fontName = "Arial Black";
+  else if (mode == "impact") fontName = "Impact";
+#elif defined(__APPLE__)
+  else if (modern) fontName = "Avenir Next";
+  else if (mode == "arial_black") fontName = "Arial Black";
+  else if (mode == "impact") fontName = "Impact";
+#else
+  else if (modern) fontName = "DejaVu Sans";
+  else if (mode == "arial_black") fontName = "DejaVu Sans";
+  else if (mode == "impact") fontName = "DejaVu Sans Condensed";
+#endif
 #ifdef _WIN32
   else if (mode == "system" || bold) fontName = "Segoe UI";
 #else
@@ -16305,7 +16364,10 @@ static HFONT nativeUiConfiguredFont(const std::string& rawMode)
   constexpr int fontSize = 14;
 #endif
   HFONT font = CreateFont(fontSize, 0, 0, 0,
-    bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    (bold || modern || mode == "arial_black" || mode == "impact")
+      ? FW_BOLD : FW_NORMAL,
+    italic ? TRUE : FALSE,
+    FALSE, FALSE, DEFAULT_CHARSET,
     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
     DEFAULT_QUALITY, DEFAULT_PITCH, fontName);
   if (!font) return nativeUiSharedFont();
@@ -16335,7 +16397,9 @@ static HFONT nativeUiCompactBlockFont(const std::string& rawMode)
 {
   std::string mode = nativeLower(nativeTrim(rawMode));
   if (mode.empty()) mode = "default";
-  const bool bold = mode == "bold";
+  const bool italic = mode == "bold_italic";
+  const bool bold = mode == "bold" || italic;
+  const bool modern = mode == "bahnschrift_avenir";
   const auto found = g_nativeUiCompactBlockFonts.find(mode);
   if (found != g_nativeUiCompactBlockFonts.end()) return found->second;
 
@@ -16349,6 +16413,19 @@ static HFONT nativeUiCompactBlockFont(const std::string& rawMode)
   else if (mode == "georgia") fontName = "Georgia";
   else if (mode == "courier") fontName = "Courier New";
 #ifdef _WIN32
+  else if (mode == "bahnschrift_avenir") fontName = "Bahnschrift";
+  else if (mode == "arial_black") fontName = "Arial Black";
+  else if (mode == "impact") fontName = "Impact";
+#elif defined(__APPLE__)
+  else if (mode == "bahnschrift_avenir") fontName = "Avenir Next";
+  else if (mode == "arial_black") fontName = "Arial Black";
+  else if (mode == "impact") fontName = "Impact";
+#else
+  else if (mode == "bahnschrift_avenir") fontName = "DejaVu Sans";
+  else if (mode == "arial_black") fontName = "DejaVu Sans";
+  else if (mode == "impact") fontName = "DejaVu Sans Condensed";
+#endif
+#ifdef _WIN32
   else if (mode == "system") fontName = "Segoe UI";
 #else
   else if (mode == "system") fontName = "Arial";
@@ -16356,7 +16433,10 @@ static HFONT nativeUiCompactBlockFont(const std::string& rawMode)
 
   constexpr int fontSize = 11;
   HFONT font = CreateFont(fontSize, 0, 0, 0,
-    bold ? FW_BOLD : FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    (bold || modern || mode == "arial_black" || mode == "impact")
+      ? FW_BOLD : FW_NORMAL,
+    italic ? TRUE : FALSE,
+    FALSE, FALSE, DEFAULT_CHARSET,
     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
     DEFAULT_QUALITY, DEFAULT_PITCH, fontName);
   if (!font) return nativeUiConfiguredFont(mode);
@@ -16382,6 +16462,15 @@ static HFONT nativeUiTimerFont()
 static HFONT nativeUiInfoStripFont()
 {
   if (g_nativeUiInfoStripFont) return g_nativeUiInfoStripFont;
+#ifdef _WIN32
+  // Bahnschrift deixa o cronometro, horario e percentual mais limpos sem
+  // perder a leitura rapida dos algarismos no palco.
+  const char* fontName = "Bahnschrift";
+#elif defined(__APPLE__)
+  const char* fontName = "Avenir Next";
+#else
+  const char* fontName = "DejaVu Sans";
+#endif
   g_nativeUiInfoStripFont = CreateFont(
 #ifdef __APPLE__
     -14,
@@ -16390,7 +16479,7 @@ static HFONT nativeUiInfoStripFont()
 #endif
     0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-    DEFAULT_QUALITY, DEFAULT_PITCH, "Verdana");
+    DEFAULT_QUALITY, DEFAULT_PITCH, fontName);
   return g_nativeUiInfoStripFont
     ? g_nativeUiInfoStripFont : nativeUiSharedFont();
 }
@@ -17130,6 +17219,7 @@ static uint64_t nativeUiRowsSourceSignature(
     nativeUiHashValue(hash, item.bpmOriginal);
     nativeUiHashValue(hash, item.bpmGeneric);
     nativeUiHashValue(hash, item.isBlock);
+    nativeUiHashValue(hash, item.blockCustomCentered);
     nativeUiHashValue(hash, item.isHashChild);
     nativeUiHashValue(hash, item.isRegionChild);
     nativeUiHashValue(hash, item.isHashParent);
@@ -17292,8 +17382,10 @@ static void nativePaintPartsColumn(
       "yellow");
   const int titleH = 18;
   const int sourceH = 22;
-  nativeAppActiveFillRoundRect(dc, columnRect,
-    listPanelFill, RGB(74, 82, 89), 0);
+  nativeAppActiveFillSubtleVerticalGradient(dc, columnRect,
+    listPanelFill);
+  nativeAppActiveStrokeRoundRect(dc, columnRect,
+    RGB(74, 82, 89), 0);
 
   RECT titleRect{columnRect.left, columnRect.top, columnRect.right,
     std::min(columnRect.bottom, columnRect.top + titleH)};
@@ -17477,11 +17569,7 @@ static void nativePaintPartsColumn(
         : RGB(51, 122, 209);
       drawEdge = true;
     }
-    if (selected && !armed) {
-      nativeAppActiveFillVerticalGradient(dc, rowRect, fill);
-    } else {
-      nativeAppActiveFillRect(dc, rowRect, fill);
-    }
+    nativeAppActiveFillSubtleVerticalGradient(dc, rowRect, fill);
     if (drawEdge) {
       nativeAppActiveFillRect(dc,
         RECT{rowRect.left, rowRect.top,
@@ -18702,8 +18790,9 @@ static NativeUiButtonColors nativeUiButtonColors(
     colors = {RGB(28, 168, 92), RGB(15, 102, 56),
       RGB(235, 240, 242), RGB(36, 189, 102)};
   } else if (style == "stop") {
-    colors = {RGB(184, 51, 51), RGB(112, 26, 26),
-      RGB(235, 240, 242), RGB(204, 66, 66)};
+    // Vermelho fica reservado exclusivamente ao Stop realmente ativo.
+    colors = {RGB(209, 31, 26), RGB(115, 10, 10),
+      RGB(255, 255, 255), RGB(240, 46, 36)};
   } else if (style == "up") {
     colors = {RGB(92, 92, 214), RGB(51, 51, 138),
       RGB(235, 240, 242), RGB(112, 112, 230)};
@@ -18755,8 +18844,8 @@ static NativeUiButtonColors nativeUiButtonColors(
     colors = {RGB(54, 59, 68), RGB(34, 38, 43),
       RGB(20, 20, 20), RGB(69, 74, 84)};
   } else if (style == "danger") {
-    colors = {RGB(209, 31, 26), RGB(115, 10, 10),
-      RGB(255, 255, 255), RGB(240, 46, 36)};
+    colors = {RGB(54, 59, 68), RGB(34, 38, 43),
+      RGB(235, 240, 242), RGB(69, 74, 84)};
   } else if (style == "chrono") {
     colors = {RGB(245, 148, 46), RGB(158, 82, 20),
       RGB(20, 20, 20), RGB(250, 163, 61)};
@@ -18788,6 +18877,13 @@ static void nativeUiDrawButton(
   }
   const std::string normalizedStyle =
     nativeLower(nativeTrim(style));
+  if (enabled && !active &&
+      (normalizedStyle == "stop" ||
+       normalizedStyle == "danger")) {
+    // Estados desligados permanecem neutros. O vermelho fica reservado ao Stop
+    // realmente ativo e a alertas que estejam em execucao.
+    colors = nativeUiButtonColors("page", true);
+  }
   const auto nowMs =
     std::chrono::duration_cast<
       std::chrono::milliseconds>(
@@ -19214,7 +19310,7 @@ nativeUiVisualFixedDefaultPreset()
     result["block_symbol_mode"] = "angle";
     result["playlist_font_mode"] = "bold";
     result["regions_font_mode"] = "bold";
-    result["button_font_mode"] = "verdana";
+    result["button_font_mode"] = "bold";
     result["status_current_top"] = "0";
     result["status_current_bottom"] = "1";
     result["status_queue_top"] = "0";
@@ -31470,6 +31566,7 @@ static void nativeUiCloseMainModal()
   g_nativeUiRenameInput.clear();
   g_nativeUiRenameInputCursor = 0;
   g_nativeUiRenameBlockCustomName = false;
+  g_nativeUiRenameBlockCentered = false;
   g_nativeUiRenameFamilyParent = false;
   g_nativeUiHelpTopic.clear();
   g_nativeUiHelpScroll = 0;
@@ -31923,6 +32020,8 @@ static void nativeUiOpenRowRename(
   g_nativeUiRenameBlock = row.block;
   g_nativeUiRenameBlockCustomName =
     row.block && !nativeUiBlockNameIsFormatted(row.name);
+  g_nativeUiRenameBlockCentered =
+    row.block && row.blockCustomCentered;
   g_nativeUiRenameMarkerChild = row.markerChild;
   g_nativeUiRenameFamilyParent = row.familyParent;
   g_nativeUiRenameSourceNumber = row.sourceNumber;
@@ -31934,7 +32033,7 @@ static void nativeUiOpenRowRename(
   g_nativeUiRenameOriginalName = row.name;
   if (row.block) {
     g_nativeUiRenameInput = g_nativeUiRenameBlockCustomName
-      ? nativeTrim(row.name)
+      ? row.name
       : nativeUiBlockEditValue(row.name);
     int blockNumber = std::abs(row.sourceNumber);
     if (blockNumber <= 0) blockNumber = std::max(1, row.order);
@@ -31970,12 +32069,11 @@ static std::string nativeUiJoinFields(
 
 static bool nativeUiApplyRowRename()
 {
-  std::string nextName = g_nativeUiRenameBlock
-    ? nativeUpperNamePtBrKeepParentheses(
-        nativeTrim(g_nativeUiRenameInput))
-    : nativeUpperNamePtBrKeepParentheses(
-        nativeTrim(g_nativeUiRenameInput));
-  if (nextName.empty() && !g_nativeUiRenameBlock) return false;
+  // Mantem exatamente os espacos internos digitados. O trim e usado apenas
+  // para impedir que um item receba um nome composto somente por espacos.
+  std::string nextName = nativeUpperNamePtBrKeepParentheses(
+    g_nativeUiRenameInput);
+  if (nativeTrim(nextName).empty() && !g_nativeUiRenameBlock) return false;
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
   if (!project) return false;
@@ -31994,6 +32092,7 @@ static bool nativeUiApplyRowRename()
     }
     auto fields = nativeSplit(itemLines[static_cast<size_t>(itemIndex)], '\t');
     if (fields.size() < 6) return false;
+    while (fields.size() <= 13) fields.push_back("");
     int blockNumber = std::abs(std::atoi(fields[2].c_str()));
     if (blockNumber <= 0) blockNumber = g_nativeUiRenamePlaylistOrder;
     std::string fullName;
@@ -32019,6 +32118,7 @@ static bool nativeUiApplyRowRename()
       fullName = nativeUiFormatBlockNameForCurrentSymbol(numberText);
     }
     fields[5] = nativeEscapeExtField(fullName);
+    fields[13] = g_nativeUiRenameBlockCentered ? "1" : "0";
     itemLines[static_cast<size_t>(itemIndex)] = nativeUiJoinFields(fields);
     if (!nativeUiSavePlaylistRecords(project, playlists)) return false;
     nativeUiCloseMainModal();
@@ -33778,10 +33878,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
   const COLORREF interfaceBackground =
     nativeUiInterfaceBackgroundColor(paintVisualPrefs);
   // Mesmo acabamento do Lua: fundo neutro nos quatro cantos e superficie
-  // principal com raio visual de 5 px (RoundRect recebe o diametro).
+  // principal com arredondamento discreto (RoundRect recebe o diametro).
   nativeAppActiveFillRect(dc, client, RGB(5, 5, 6));
   nativeAppActiveFillRoundRect(dc, client,
-    interfaceBackground, interfaceBackground, 10);
+    interfaceBackground, interfaceBackground, 8);
 
   // Geometria-base literal do Lua publico em cada plataforma.
   const int pad = 5;
@@ -33842,7 +33942,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     : listFont;
   const RECT versionStrip{pad, versionStripY, width - pad,
     versionStripY + versionStripH};
-  nativeAppActiveFillRect(dc, versionStrip,
+  nativeAppActiveFillVerticalGradient(dc, versionStrip,
     nativeUiBlendColor(interfaceBackground, RGB(22, 27, 34), 0.78));
   nativeAppActiveFillRect(dc,
     RECT{versionStrip.left, versionStrip.bottom - 1,
@@ -33854,7 +33954,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
   const int stripRight = width - pad;
   const RECT topStripRect{stripLeft, topStripY,
     stripRight, topStripY + topStripH};
-  nativeAppActiveFillRect(dc, topStripRect,
+  nativeAppActiveFillVerticalGradient(dc, topStripRect,
     nativeUiBlendColor(
       nativeUiInterfaceBackgroundColor(
         paintVisualPrefs),
@@ -33879,9 +33979,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
     RGB(82, 89, 97));
   auto drawTopField = [&](const RECT& rect, bool focused) {
     if (rect.right <= rect.left || rect.bottom <= rect.top) return;
-    nativeAppActiveFillRect(dc, rect,
+    nativeAppActiveFillVerticalGradient(dc, rect,
       focused ? RGB(54, 54, 45)
-              : RGB(36, 38, 43));
+              : nativeUiBlendColor(
+                  interfaceBackground, RGB(36, 38, 43), 0.72));
     const COLORREF edge = focused
       ? RGB(255, 224, 46)
       : RGB(77, 84, 92);
@@ -34686,6 +34787,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
       multiLoop ? nativeUiMultiLoopFont() : labelFont;
     HFONT panelNameFont =
       multiLoop ? nativeUiMultiLoopFont() : nameFont;
+    // Mantem os rotulos "TOCANDO AGORA" e "FILA DE ESPERA" com o peso
+    // normal. Somente o nome da musica recebe destaque em negrito.
+    HFONT panelSongFont = nativeUiConfiguredFont("bold");
+    HFONT panelBracketFont = nativeUiBlockTimeEmphasisFont();
     const int panelTextTop = 2;
     const int panelTextBottom = 2;
     RECT card{pad, panelY, width - pad, panelY + panelHeight};
@@ -34717,19 +34822,21 @@ static void nativePaintAppActivePanel(HWND hwnd)
           ? (g_nativeAppActivePanelModel.multiLoopBypassActive
               ? RGB(255, 224, 46) : RGB(187, 105, 255))
           : (current ? RGB(26, 255, 87) : RGB(255, 224, 46)));
+    const COLORREF labelTextColor = lightTransport || multiLoop
+      ? textColor
+      : (current ? RGB(14, 145, 52) : RGB(178, 145, 12));
     const std::string panelLabelText = multiLoop
       ? "MULTILOOPS"
-      : (current ? "TOCANDO AGORA" : "FILA DE ESPERA");
+      : (current ? "TOCANDO AGORA - " : "FILA DE ESPERA - ");
     const int panelInnerX = card.left + 7;
-    int panelLabelW = labelW;
-    int panelNameGap = 8;
-#ifdef __APPLE__
-    // O gfx do Lua mede o titulo no macOS antes de posicionar a musica. Faz a
-    // mesma coisa aqui para o texto nunca cortar nem encostar no nome.
-    panelLabelW = nativeUiTextWidth(
-      dc, panelLabelText, panelLabelFont);
-    panelNameGap = multiLoop ? 12 : 18;
-#endif
+    // Mede o rotulo completo em ambas as plataformas. Assim o separador fica
+    // sempre visivel e o nome da musica comeca logo depois dele.
+    const int panelLabelW = std::min(
+      std::max(1, static_cast<int>(card.right - panelInnerX - 8)),
+      multiLoop
+        ? labelW
+        : nativeUiTextWidth(dc, panelLabelText, panelLabelFont));
+    const int panelNameGap = multiLoop ? 8 : 0;
     RECT panelLabel{panelInnerX, card.top + panelTextTop,
       panelInnerX + panelLabelW,
       card.bottom - panelTextBottom};
@@ -34737,7 +34844,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       panelLabelText,
       panelLabel,
       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-      textColor, panelLabelFont);
+      labelTextColor, panelLabelFont);
     const double panelDurationSec = multiLoop
       ? 0.0
       : current
@@ -34783,6 +34890,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
       multiLoop &&
       nativeUiMainSelectionCount(
         g_nativeAppActivePanelModel.regionsPage) > 1;
+    const std::string panelSongName = current
+      ? g_nativeAppActivePanelModel.playingName
+      : g_nativeAppActivePanelModel.queuedName;
+    const bool panelSongAvailable =
+      !multiLoop &&
+      (current
+        ? g_nativeAppActivePanelModel.playing
+        : g_nativeAppActivePanelModel.queueActive) &&
+      !panelSongName.empty() && panelSongName != "-";
     const std::string panelValue = suppressMultiLoopValue
       ? std::string()
       : (multiLoop
@@ -34795,14 +34911,46 @@ static void nativePaintAppActivePanel(HWND hwnd)
                     " - EM LOOP")
               : (g_nativeAppActivePanelModel.selectedOrPlayingMultiLoopActive
                   ? "ESSA MÚSICA TEM MULTILOOP ATIVO" : "-")))
-      : (current ? g_nativeAppActivePanelModel.playingName
-                 : g_nativeAppActivePanelModel.queuedName));
-    nativeAppActiveDrawText(dc,
-      panelValue,
-      panelName,
-      DT_LEFT | DT_VCENTER | DT_SINGLELINE |
-        DT_END_ELLIPSIS | DT_NOPREFIX,
-      textColor, panelNameFont);
+      : (panelSongAvailable ? panelSongName : std::string()));
+    if (!multiLoop && panelSongAvailable) {
+      const COLORREF bracketColor = RGB(255, 48, 48);
+      const int bracketW = std::max(1,
+        nativeUiTextWidth(dc, "[", panelBracketFont));
+      RECT openBracket{panelName.left, panelName.top,
+        std::min(static_cast<int>(panelName.right),
+          static_cast<int>(panelName.left) + bracketW),
+        panelName.bottom};
+      const int nameLeft = openBracket.right;
+      const int maxNameRight = std::max(nameLeft,
+        static_cast<int>(panelName.right) - bracketW);
+      const int measuredNameW = nativeUiTextWidth(
+        dc, panelValue, panelSongFont);
+      const int closeLeft = measuredNameW <= maxNameRight - nameLeft
+        ? nameLeft + measuredNameW
+        : maxNameRight;
+      RECT songNameRect{nameLeft, panelName.top,
+        closeLeft, panelName.bottom};
+      RECT closeBracket{closeLeft, panelName.top,
+        std::min(static_cast<int>(panelName.right),
+          closeLeft + bracketW), panelName.bottom};
+      nativeAppActiveDrawText(dc, "[", openBracket,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        bracketColor, panelBracketFont);
+      nativeAppActiveDrawText(dc, panelValue, songNameRect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+          DT_END_ELLIPSIS | DT_NOPREFIX,
+        textColor, panelSongFont);
+      nativeAppActiveDrawText(dc, "]", closeBracket,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        bracketColor, panelBracketFont);
+    } else {
+      nativeAppActiveDrawText(dc,
+        panelValue,
+        panelName,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+          DT_END_ELLIPSIS | DT_NOPREFIX,
+        textColor, panelNameFont);
+    }
     if (!panelTimeText.empty()) {
       nativeAppActiveDrawText(dc,
         panelTimeText, panelTime,
@@ -35049,8 +35197,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
   g_nativeMainListRect = listRect;
   const COLORREF listPanelFill =
     nativeUiListPanelBackgroundColor(visualPrefs);
-  nativeAppActiveFillRoundRect(dc, listRect,
-    listPanelFill, RGB(74, 82, 89), 0);
+  nativeAppActiveFillSubtleVerticalGradient(dc, listRect,
+    listPanelFill);
+  nativeAppActiveStrokeRoundRect(dc, listRect,
+    RGB(74, 82, 89), 0);
 
   // Cabeçalho literal da lista.
   // O fill do Lua e 0.32 de RGB(20,23,26) sobre o painel RGB(41,46,51).
@@ -35413,7 +35563,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     // parcial e recém-reordenada recomporem pedaços em quadros diferentes no
     // mouse-up, produzindo o lampejo observado depois do drag/drop.
     constexpr int indexColumnW = 28;
-    nativeAppActiveFillRect(dc,
+    nativeAppActiveFillVerticalGradient(dc,
       RECT{listRect.left + 1, listInnerTop,
         listRect.left + 1 + indexColumnW, listInnerBottom},
       nativeUiNumberBarColor(visualPrefs));
@@ -35674,16 +35824,14 @@ static void nativePaintAppActivePanel(HWND hwnd)
       RECT rowBodyRect = rowRect;
       rowBodyRect.left = std::min(rowBodyRect.right,
         rowBodyRect.left + indexColumnW);
-      const bool useStateGradient =
-        !isDraggingSource &&
-        (stateBackgroundApplied ||
-         (isSelected && !isPlaying && !isLiveExecuted) ||
-         (row.block && hasBlockPaletteColor));
-      if (useStateGradient) {
+      // A intensidade maior fica reservada aos estados do transporte:
+      // musica tocando ou musica na fila. Os demais fundos sao discretos.
+      if (stateBackgroundApplied) {
         nativeAppActiveFillVerticalGradient(
           dc, rowBodyRect, rowFill);
       } else {
-        nativeAppActiveFillRect(dc, rowBodyRect, rowFill);
+        nativeAppActiveFillSubtleVerticalGradient(
+          dc, rowBodyRect, rowFill);
       }
 
       if (isPlaying || isQueued) {
@@ -35864,12 +36012,18 @@ static void nativePaintAppActivePanel(HWND hwnd)
               rowRect.bottom - rowRect.top)) / 2,
           selectionArrowColor);
       }
+      const std::string blockSymbolMode = row.block
+        ? nativeLower(nativeUiVisualPref(visualPrefs,
+            "block_symbol_mode", "none"))
+        : std::string("none");
+      // Nomes padrao continuam centralizados. O nome personalizado respeita
+      // Center somente em "Nenhum"; qualquer ornamento sempre o coloca entre
+      // os dois simbolos, centralizado.
       const bool designerBlockName = row.block &&
-        nativeUiBlockNameIsFormatted(row.name);
+        (nativeUiBlockNameIsFormatted(row.name) ||
+         blockSymbolMode != "none" ||
+         row.blockCustomCentered);
       if (designerBlockName) {
-        const std::string blockSymbolMode = nativeLower(
-          nativeUiVisualPref(visualPrefs,
-            "block_symbol_mode", "none"));
         const COLORREF ornamentColor = nativeUiNamedVisualColor(
           nativeUiVisualPref(visualPrefs,
             "block_symbol_" + blockSymbolMode +
@@ -37799,21 +37953,21 @@ static void nativePaintAppActivePanel(HWND hwnd)
         DT_LEFT | DT_VCENTER | DT_SINGLELINE |
           DT_END_ELLIPSIS | DT_NOPREFIX);
       if (g_nativeUiRenameBlock) {
+        const int toggleGap = 6;
+        const int toggleWidth = std::max(82,
+          (static_cast<int>(modal.right - modal.left) - 20 - toggleGap) / 2);
         addModalButton("rename_block_custom_toggle",
           g_nativeUiRenameBlockCustomName
             ? "Personalizado ON" : "Personalizado OFF",
           RECT{modal.left + 10, modal.top + 80,
-            modal.left + 142, modal.top + 98},
+            modal.left + 10 + toggleWidth, modal.top + 98},
           g_nativeUiRenameBlockCustomName ? "play" : "page", true);
-        RECT customHint{modal.left + 150, modal.top + 80,
-          modal.right - 10, modal.top + 99};
-        nativeAppActiveDrawText(dc,
-          g_nativeUiRenameBlockCustomName
-            ? "Nome livre" : "Formato BLOCO",
-          customHint,
-          DT_LEFT | DT_VCENTER | DT_SINGLELINE |
-            DT_END_ELLIPSIS | DT_NOPREFIX,
-          RGB(148, 163, 184), statusFont);
+        addModalButton("rename_block_center_toggle",
+          g_nativeUiRenameBlockCentered
+            ? "Center ON" : "Center OFF",
+          RECT{modal.left + 10 + toggleWidth + toggleGap,
+            modal.top + 80, modal.right - 10, modal.top + 98},
+          g_nativeUiRenameBlockCentered ? "play" : "page", true);
       }
       const int footerLeft = modal.left + 10;
       const int footerRight = modal.right - 10;
@@ -39926,7 +40080,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       auto drawPreviewFrame = [&](const RECT& rect,
                                   COLORREF fill,
                                   COLORREF edge) {
-        nativeAppActiveFillRect(dc, rect, fill);
+        nativeAppActiveFillSubtleVerticalGradient(dc, rect, fill);
         nativeAppActiveFillRect(dc,
           RECT{rect.left, rect.top, rect.right, rect.top + 1}, edge);
         nativeAppActiveFillRect(dc,
@@ -41527,7 +41681,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
           {"default", "Padrão"}, {"arial", "Arial"},
           {"verdana", "Verdana"}, {"trebuchet", "Trebuchet"},
           {"georgia", "Georgia"}, {"courier", "Courier"},
-          {"bold", "Negrito"}
+          {"bold", "Negrito"},
+          {"bold_italic", "Negrito Itálico"},
+          {"bahnschrift_avenir", "Bahnschrift / Avenir"},
+          {"arial_black", "Arial Black"},
+          {"impact", "Impact"}
         };
         struct FontGroup {
           const char* title;
@@ -49875,8 +50033,10 @@ static void nativeHookControllerPaintSongs(
   const int footerSpace = footerControls.empty() ? 0 : rowH + gap;
   RECT listRect{body.left, controlsTop, body.right,
     std::max<LONG>(controlsTop, body.bottom - footerSpace)};
-  nativeAppActiveFillOutlinedRect(dc, listRect,
-    nativeUiListPanelBackgroundColor(visualPrefs), RGB(74, 82, 89));
+  nativeAppActiveFillSubtleVerticalGradient(dc, listRect,
+    nativeUiListPanelBackgroundColor(visualPrefs));
+  nativeAppActiveStrokeRoundRect(dc, listRect,
+    RGB(74, 82, 89), 0);
   RECT header{listRect.left, listRect.top, listRect.right,
     std::min(listRect.bottom, listRect.top + rowH)};
   nativeAppActiveFillOutlinedRect(dc, header,
@@ -50028,14 +50188,14 @@ static void nativeHookControllerPaintSongs(
        (g_nativeMainListDrag.sourceIdentity.empty() &&
         g_nativeMainListDrag.sourceIndex == rowIndex));
     if (draggingSource) rowFill = RGB(122, 51, 219);
-    if (!draggingSource && !liveExecuted &&
-        (playing || queued || selected)) {
+    const bool strongRowGradient = playing || queued;
+    if (strongRowGradient) {
       nativeAppActiveFillVerticalGradient(dc, rowRect, rowFill);
     } else {
-      nativeAppActiveFillRect(dc, rowRect, rowFill);
+      nativeAppActiveFillSubtleVerticalGradient(dc, rowRect, rowFill);
     }
     constexpr int indexW = 28;
-    nativeAppActiveFillRect(dc,
+    nativeAppActiveFillVerticalGradient(dc,
       RECT{rowRect.left, rowRect.top,
         rowRect.left + indexW, rowRect.bottom},
       nativeUiNumberBarColor(visualPrefs));
@@ -50793,7 +50953,7 @@ static void nativeHookControllerPaint(HWND hwnd)
     nativeUiInterfaceBackgroundColor(visualPrefs);
   nativeAppActiveFillRect(dc, client, RGB(5, 5, 6));
   nativeAppActiveFillRoundRect(dc, client,
-    interfaceBackground, interfaceBackground, 10);
+    interfaceBackground, interfaceBackground, 8);
   g_nativeHookControllerAdjustHits.clear();
   const int padding = 5;
 #ifdef __APPLE__
@@ -50894,8 +51054,10 @@ static void nativeHookControllerPaint(HWND hwnd)
     client.right - padding, client.bottom - padding};
   const COLORREF listPanelFill =
     nativeUiListPanelBackgroundColor(visualPrefs);
-  nativeAppActiveFillRoundRect(dc, body,
-    listPanelFill, RGB(74, 82, 89), 0);
+  nativeAppActiveFillSubtleVerticalGradient(dc, body,
+    listPanelFill);
+  nativeAppActiveStrokeRoundRect(dc, body,
+    RGB(74, 82, 89), 0);
   RECT contentBody{body.left + 1, body.top + 1,
     body.right - 1, body.bottom - 1};
   if (g_nativeHookControllerMode !=
@@ -52431,9 +52593,12 @@ static bool nativeMainHandleModalClick(
     nativeUiOpenBlockMidiCapture();
   } else if (action == "rename_block_color") {
     nativeUiOpenBlockColor();
-  } else if (action == "rename_block_custom_toggle") {
-    g_nativeUiRenameBlockCustomName =
-      !g_nativeUiRenameBlockCustomName;
+  } else if (action == "rename_block_custom_toggle" ||
+             action == "rename_block_center_toggle") {
+    bool& toggle = action == "rename_block_custom_toggle"
+      ? g_nativeUiRenameBlockCustomName
+      : g_nativeUiRenameBlockCentered;
+    toggle = !toggle;
   } else if (nativeUiHandlePremixItemButtonAction(action)) {
   } else if (action == "premix_back") {
     nativeApplyPremixCommand("{\"type\":\"premix_close\"}");
@@ -52648,8 +52813,7 @@ static bool nativeMainHandleModalClick(
     g_nativeMainModalKind =
       NativeMainModalKind::MidiAssignList;
   } else if (action == "midi_back") {
-    g_nativeMainModalKind =
-      NativeMainModalKind::Config;
+    nativeUiCloseMainModal();
   } else if (action == "midi_cancel") {
     nativeUiOpenMidiAssign(
       g_nativeUiMidiSelectedAction);
@@ -55816,6 +55980,17 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             hwnd, wParam)) {
         return 0;
       }
+#ifdef _WIN32
+      // Enquanto um campo proprio estiver ativo, teclas imprimiveis pertencem
+      // ao texto. Em especial, Espaco nao pode cair no atalho de transporte
+      // antes de o WM_CHAR inseri-lo no nome do item ou do bloco.
+      if (!g_state.directorInterfaceBlocked &&
+          nativeUiFocusedTextInputKind() !=
+            NativeUiTextInputKind::None &&
+          wParam >= 0x20 && wParam <= 0x7e) {
+        return 0;
+      }
+#endif
       if (!g_state.directorInterfaceBlocked &&
           g_nativeMainBpmEditOpen &&
           g_nativeMainModalKind == NativeMainModalKind::None) {
@@ -57637,6 +57812,7 @@ struct NativeTelepromptSettings {
   double localClockDepth = 1.0;
   bool windowBorderEnabled = true;
   bool clockBorderEnabled = true;
+  bool localClockBorderEnabled = true;
   bool textBoxEnabled = true;
   bool clockEnabled = true;
   bool localClockEnabled = true;
@@ -58243,6 +58419,8 @@ static void nativeTelepromptApplySettingsJson(
       json, "borderEnabled", next.windowBorderEnabled));
   next.clockBorderEnabled = nativeTelepromptJsonBool(
     json, "clockBorderEnabled", next.clockBorderEnabled);
+  next.localClockBorderEnabled = nativeTelepromptJsonBool(
+    json, "localClockBorderEnabled", next.localClockBorderEnabled);
   next.textBoxEnabled = nativeTelepromptJsonBool(
     json, "textBoxEnabled", next.textBoxEnabled);
   next.clockEnabled = nativeTelepromptJsonBool(
@@ -58312,6 +58490,7 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"localClockDepth\":1,";
   json << "\"windowBorderEnabled\":true,";
   json << "\"clockBorderEnabled\":true,";
+  json << "\"localClockBorderEnabled\":true,";
   json << "\"textBoxEnabled\":true,";
   json << "\"clockEnabled\":true,";
   json << "\"localClockEnabled\":true,";
@@ -58399,6 +58578,8 @@ static std::string nativeTelepromptSettingsToJson(
        << boolean(settings.windowBorderEnabled) << ",";
   json << "\"clockBorderEnabled\":"
        << boolean(settings.clockBorderEnabled) << ",";
+  json << "\"localClockBorderEnabled\":"
+       << boolean(settings.localClockBorderEnabled) << ",";
   json << "\"textBoxEnabled\":"
        << boolean(settings.textBoxEnabled) << ",";
   json << "\"clockEnabled\":"
@@ -59476,7 +59657,7 @@ static void nativeTelepromptDrawPreviewLines(
           : lineRect.left;
         const int underlineY = std::min(
           static_cast<int>(lineRect.bottom) - 1,
-          top + lineHeight - 2);
+          top + lineHeight - 1);
         HPEN pen = CreatePen(PS_SOLID, 1, color);
         HGDIOBJ previousPen = SelectObject(dc, pen);
         MoveToEx(dc, lineLeft, underlineY, nullptr);
@@ -59583,22 +59764,55 @@ static void nativeTelepromptDrawPreview(
     1, static_cast<int>(area.bottom - area.top));
   const int cardW = std::max(
     1, (areaW - gap * (columns - 1)) / columns);
-  const int titleFontSize = std::max(
-    12, std::min(34, width / 50));
+  // Calcula o tamanho pela largura real de cada coluna e pela coluna que tem
+  // mais conteudo. O calculo antigo usava a largura total da janela e deixava
+  // muito espaco vazio, principalmente nos previews com uma ou duas colunas.
+  std::vector<int> columnSongCounts(
+    static_cast<size_t>(columns), 0);
+  std::vector<int> columnBlockCounts(
+    static_cast<size_t>(columns), 0);
+  for (int index = 0; index < blockCount; ++index) {
+    const int column = index % columns;
+    columnSongCounts[static_cast<size_t>(column)] +=
+      static_cast<int>(state.preview.blocks[
+        static_cast<size_t>(index)].songs.size());
+    ++columnBlockCounts[static_cast<size_t>(column)];
+  }
+  double busiestColumnUnits = 1.0;
+  int busiestColumnBlocks = 1;
+  for (int column = 0; column < columns; ++column) {
+    const int blocks = std::max(
+      1, columnBlockCounts[static_cast<size_t>(column)]);
+    busiestColumnBlocks = std::max(busiestColumnBlocks, blocks);
+    busiestColumnUnits = std::max(
+      busiestColumnUnits,
+      static_cast<double>(
+        columnSongCounts[static_cast<size_t>(column)]) +
+        static_cast<double>(blocks) * 1.35);
+  }
+  const int verticalFontLimit = std::max(10,
+    static_cast<int>(std::floor(
+      std::max(1, areaH - gap * (busiestColumnBlocks - 1) -
+        busiestColumnBlocks * 12) /
+      (busiestColumnUnits * 1.07))));
+  // Nomes compridos podem usar duas linhas; nao reduza toda a coluna para
+  // tentar manter cada musica obrigatoriamente em uma unica linha.
+  const int horizontalFontLimit = std::max(10, cardW / 13);
   const int songFontSize = std::max(
-    10, std::min(24, width / 74));
+    10, std::min(40,
+      std::min(horizontalFontLimit, verticalFontLimit)));
+  const int titleFontSize = std::max(
+    13, std::min(38,
+      static_cast<int>(std::lround(songFontSize * 1.08))));
   HFONT titleFont = nativeTelepromptFont(
     settings.fontFamily, titleFontSize, FW_BOLD);
   HFONT songFont = nativeTelepromptFont(
     settings.fontFamily, songFontSize, FW_BOLD);
   const int titleLineHeight = std::max(
-    titleFontSize + 4,
+    titleFontSize + 1,
     static_cast<int>(std::lround(
-      titleFontSize * 1.20)));
-  const int songLineHeight = std::max(
-    songFontSize + 3,
-    static_cast<int>(std::lround(
-      songFontSize * 1.18)));
+      titleFontSize * 1.04)));
+  const int songLineHeight = songFontSize + 2;
   std::vector<int> columnTops(
     static_cast<size_t>(columns), area.top);
 
@@ -59616,8 +59830,9 @@ static void nativeTelepromptDrawPreview(
       ? area.right : left + cardW;
     const COLORREF blockColor = nativeTelepromptColor(
       block.colorHex, fallbackColor);
-    const int padX = std::max(5, cardW / 28);
-    const int padY = std::max(4, std::min(12, areaH / 84));
+    const int padX = std::max(5, std::min(14, cardW / 45));
+    const int padY = block.songs.size() >= 12
+      ? 3 : std::max(4, std::min(12, areaH / 84));
     const int textWidth = std::max(
       1, right - left - padX * 2);
     // Preview respeita a mesma caixa configurada para a letra do TP.
@@ -59634,7 +59849,10 @@ static void nativeTelepromptDrawPreview(
       titleLineHeight,
       static_cast<int>(titleLines.size()) *
         titleLineHeight);
-    const int songGap = std::max(1, padY / 3);
+    // Em blocos longos as linhas ficam compactas para que a fonte possa
+    // crescer e ocupar visualmente a coluna sem esconder as ultimas musicas.
+    const int songGap = block.songs.size() >= 12
+      ? 0 : std::max(1, padY / 3);
     std::vector<std::vector<std::string>> wrappedSongs;
     wrappedSongs.reserve(block.songs.size());
     int songsHeight = 0;
@@ -59678,9 +59896,22 @@ static void nativeTelepromptDrawPreview(
       dc, titleLines, titleRect,
       titleLineHeight, true,
       blockColor, titleFont,
-      settings.previewUnderlineEnabled);
+      false);
 
-    int songTop = titleRect.bottom +
+    // Separa o cabecalho da lista com uma linha completa, em vez de
+    // sublinhar apenas o texto do nome do bloco.
+    const int titleSeparatorY = std::min(
+      static_cast<int>(card.bottom) - padY - 1,
+      static_cast<int>(titleRect.bottom));
+    if (titleSeparatorY >= card.top &&
+        titleSeparatorY < card.bottom) {
+      nativeAppActiveFillRect(dc,
+        RECT{card.left + 1, titleSeparatorY,
+          card.right - 1, titleSeparatorY + 1},
+        blockColor);
+    }
+
+    int songTop = titleSeparatorY +
       titleToSongsGap;
     const bool hasPlayingSong = std::any_of(
       block.songs.begin(), block.songs.end(),
@@ -59739,7 +59970,7 @@ static void nativeTelepromptDrawPreview(
           songRect.top,
           songRect.right - (song.playing || song.queued ? 3 : 0),
           songRect.bottom},
-        songLineHeight, false,
+        songLineHeight, true,
         songColor, songFont,
         settings.previewUnderlineEnabled && !song.playing);
       songTop += songHeight + songGap;
@@ -61588,8 +61819,10 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       localClockRect.bottom > localClockRect.top) {
     nativeAppActiveFillRect(
       dc, localClockRect, RGB(0, 0, 0));
-    nativeTelepromptDrawBorder(
-      dc, localClockRect, localClockColor, 2);
+    if (settings.localClockBorderEnabled) {
+      nativeTelepromptDrawBorder(
+        dc, localClockRect, localClockColor, 2);
+    }
     nativeAppActiveDrawText(
       dc, localTime, localClockRect,
       DT_CENTER | DT_VCENTER | DT_SINGLELINE,
@@ -61675,10 +61908,13 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       const int availableHeight = std::max(
         1, static_cast<int>(
           available.bottom - available.top));
-      const int maxFont = std::max(
+      const int baseMaxFont = std::max(
         24, static_cast<int>(
           std::min(width / 7.0, height / 3.8)));
-      const int minFont = 14;
+      const int maxFont = std::max(
+        8, static_cast<int>(std::lround(
+          baseMaxFont * technicalNoticeSettings.textScale)));
+      const int minFont = std::min(14, maxFont);
       NativeTelepromptTextLayoutCache& layoutCache =
         g_nativeTelepromptTextLayoutCache[index];
       const bool layoutChanged =
@@ -63074,6 +63310,7 @@ static void nativeRefreshAppActivePanelModel()
       }
       row.parentId = item.parentId;
       row.blockColorHex = item.blockColorHex;
+      row.blockCustomCentered = item.blockCustomCentered;
       row.inheritedColorHex = inheritedColorOverride.empty()
         ? item.inheritedBlockColorHex
         : inheritedColorOverride;
