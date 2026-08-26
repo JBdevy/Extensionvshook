@@ -23689,7 +23689,11 @@ static bool nativeUiBackupKeyAllowed(
   }
   if (section == kNativeTelepromptSettingsSection) {
     return key == "TP1_SETTINGS_V1" ||
-      key == "TP2_SETTINGS_V1";
+      key == "TP2_SETTINGS_V1" ||
+      key == "TP1_NIGHT_SETTINGS_V1" ||
+      key == "TP1_DAY_SETTINGS_V1" ||
+      key == "TP2_NIGHT_SETTINGS_V1" ||
+      key == "TP2_DAY_SETTINGS_V1";
   }
   if (section == "JBKEYS_VSLIVE_WINDOW") {
     return key == "PREMIX_V1" ||
@@ -24403,7 +24407,11 @@ static bool nativeProjectSyncConfigKeyAllowed(
   }
   if (section == kNativeTelepromptSettingsSection) {
     return key == "TP1_SETTINGS_V1" ||
-      key == "TP2_SETTINGS_V1";
+      key == "TP2_SETTINGS_V1" ||
+      key == "TP1_NIGHT_SETTINGS_V1" ||
+      key == "TP1_DAY_SETTINGS_V1" ||
+      key == "TP2_NIGHT_SETTINGS_V1" ||
+      key == "TP2_DAY_SETTINGS_V1";
   }
   return section == kManualStopFadeoutProjectSection &&
     key == kManualStopFadeoutTracksKey;
@@ -24426,6 +24434,10 @@ static std::string nativeProjectSyncBuildConfigSnapshot()
   }
   addGlobal(kNativeTelepromptSettingsSection, "TP1_SETTINGS_V1");
   addGlobal(kNativeTelepromptSettingsSection, "TP2_SETTINGS_V1");
+  addGlobal(kNativeTelepromptSettingsSection, "TP1_NIGHT_SETTINGS_V1");
+  addGlobal(kNativeTelepromptSettingsSection, "TP1_DAY_SETTINGS_V1");
+  addGlobal(kNativeTelepromptSettingsSection, "TP2_NIGHT_SETTINGS_V1");
+  addGlobal(kNativeTelepromptSettingsSection, "TP2_DAY_SETTINGS_V1");
   addGlobal("JBKEYS_VSLIVE_WINDOW", "PREMIX_V1");
   addGlobal("JBKEYS_VSLIVE_WINDOW", "PREMIX_ENABLED_V1");
   addGlobal("JBKEYS_VSLIVE_WINDOW", "PREMIX_GLOBAL_ENABLED_V1");
@@ -58700,6 +58712,60 @@ static std::string nativeTelepromptSettingsToJson(
   return json.str();
 }
 
+static std::string nativeTelepromptPresetSettingsKey(
+  int slot,
+  const std::string& preset)
+{
+  return std::string("TP") + (slot == 2 ? "2" : "1") +
+    (preset == "day" ? "_DAY_SETTINGS_V1"
+                     : "_NIGHT_SETTINGS_V1");
+}
+
+static std::string nativeTelepromptDefaultPresetSettingsJson(
+  int slot,
+  const std::string& preset)
+{
+  NativeTelepromptSettings settings{};
+  if (slot == 2) settings.previewEnabled = false;
+  settings.preset = preset == "day" ? "day" : "night";
+  if (settings.preset == "day") {
+    settings.textColor = "#ffffff";
+    settings.textBoxColor = "#ffffff";
+    settings.clockColor = "#ffffff";
+    settings.clockExpiredColor = "#d60000";
+    settings.clockBorderColor = "#ffffff";
+    settings.localClockColor = "#ffffff";
+    settings.borderColor = "#ffffff";
+    settings.songNameColor = "#ffffff";
+    settings.queueNameColor = "#ffffff";
+    settings.progressColor = "#ffffff";
+    settings.chordColor = "#d97706";
+  }
+  return nativeTelepromptSettingsToJson(slot, settings);
+}
+
+static std::string nativeTelepromptReadPresetSettingsJson(
+  int slot,
+  const std::string& preset)
+{
+  const std::string normalizedPreset =
+    preset == "day" ? "day" : "night";
+  if (GetExtState_ptr) {
+    const std::string key = nativeTelepromptPresetSettingsKey(
+      slot, normalizedPreset);
+    const char* stored = GetExtState_ptr(
+      kNativeTelepromptSettingsSection, key.c_str());
+    if (stored && *stored) return stored;
+  }
+  const int index = nativeTelepromptIndex(slot);
+  if (g_nativeTelepromptSettings[index].preset == normalizedPreset &&
+      !g_nativeTelepromptSettingsJson[index].empty()) {
+    return g_nativeTelepromptSettingsJson[index];
+  }
+  return nativeTelepromptDefaultPresetSettingsJson(
+    slot, normalizedPreset);
+}
+
 static void nativeTelepromptLoadSettings()
 {
   if (g_nativeTelepromptSettingsLoaded) return;
@@ -58719,6 +58785,31 @@ static void nativeTelepromptLoadSettings()
     if (slot == 2) g_nativeTelepromptSettings[index].previewEnabled = false;
     nativeTelepromptApplySettingsJson(
       g_nativeTelepromptSettings[index], raw);
+    const std::string activeJson = nativeTelepromptSettingsToJson(
+      slot, g_nativeTelepromptSettings[index]);
+    g_nativeTelepromptSettingsJson[index] = activeJson;
+    if (SetExtState_ptr) {
+      const std::string activeKey =
+        std::string("TP") + std::to_string(slot) + "_SETTINGS_V1";
+      SetExtState_ptr(kNativeTelepromptSettingsSection,
+        activeKey.c_str(), activeJson.c_str(), true);
+      for (const std::string preset : {"night", "day"}) {
+        const std::string presetKey =
+          nativeTelepromptPresetSettingsKey(slot, preset);
+        const char* storedPreset = GetExtState_ptr
+          ? GetExtState_ptr(
+              kNativeTelepromptSettingsSection, presetKey.c_str())
+          : nullptr;
+        if (!storedPreset || !*storedPreset) {
+          const std::string presetJson =
+            g_nativeTelepromptSettings[index].preset == preset
+              ? activeJson
+              : nativeTelepromptDefaultPresetSettingsJson(slot, preset);
+          SetExtState_ptr(kNativeTelepromptSettingsSection,
+            presetKey.c_str(), presetJson.c_str(), true);
+        }
+      }
+    }
   }
   g_nativeTelepromptSettingsLoaded = true;
 }
@@ -58730,6 +58821,14 @@ static std::string nativeTelepromptAllSettingsJson()
   return std::string("{\"ok\":true,\"tp1\":") +
     g_nativeTelepromptSettingsJson[0] +
     ",\"tp2\":" + g_nativeTelepromptSettingsJson[1] +
+    ",\"tp1Presets\":{\"night\":" +
+    nativeTelepromptReadPresetSettingsJson(1, "night") +
+    ",\"day\":" +
+    nativeTelepromptReadPresetSettingsJson(1, "day") + "}" +
+    ",\"tp2Presets\":{\"night\":" +
+    nativeTelepromptReadPresetSettingsJson(2, "night") +
+    ",\"day\":" +
+    nativeTelepromptReadPresetSettingsJson(2, "day") + "}" +
     ",\"technicalNoticeSettings\":" +
     nativeTechnicalNoticeSettingsJsonLocked() + "}";
 }
@@ -59014,16 +59113,22 @@ static bool nativeTelepromptSaveSettings(
   NativeTelepromptSettings next{};
   if (slot == 2) next.previewEnabled = false;
   nativeTelepromptApplySettingsJson(next, json);
+  const std::string normalizedJson =
+    nativeTelepromptSettingsToJson(slot, next);
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     g_nativeTelepromptSettings[index] = next;
-    g_nativeTelepromptSettingsJson[index] = json;
+    g_nativeTelepromptSettingsJson[index] = normalizedJson;
   }
   if (SetExtState_ptr) {
     const std::string key =
       std::string("TP") + std::to_string(slot) + "_SETTINGS_V1";
     SetExtState_ptr(kNativeTelepromptSettingsSection,
-      key.c_str(), json.c_str(), true);
+      key.c_str(), normalizedJson.c_str(), true);
+    const std::string presetKey =
+      nativeTelepromptPresetSettingsKey(slot, next.preset);
+    SetExtState_ptr(kNativeTelepromptSettingsSection,
+      presetKey.c_str(), normalizedJson.c_str(), true);
   }
   nativeTelepromptApplyTopmost(slot);
   HWND hwnd = g_nativeTelepromptWindows[index].hwnd;
