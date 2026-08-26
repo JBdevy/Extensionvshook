@@ -3,6 +3,7 @@
 #ifdef __APPLE__
 
 #import <AppKit/AppKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 #include "swell/swell.h"
 
@@ -24,6 +25,8 @@ struct SavedWindowState {
   bool movable = true;
   bool movableByWindowBackground = false;
   bool hasShadow = true;
+  bool canHide = true;
+  bool hidesOnDeactivate = false;
 };
 
 std::map<void*, SavedWindowState> g_fullscreenTeleprompts;
@@ -39,6 +42,33 @@ NSWindow* telepromptWindowFromSwellHandle(void* swellWindow)
     return [(NSView*)object window];
   }
   return nil;
+}
+
+NSInteger telepromptFullscreenLevel()
+{
+  // Esse nível permanece acima da barra de menus inclusive quando outro
+  // aplicativo assume o foco. Diferente das presentationOptions, ele afeta
+  // somente a janela do Teleprompt e não remove a barra da tela principal.
+  return static_cast<NSInteger>(
+    CGWindowLevelForKey(kCGScreenSaverWindowLevelKey));
+}
+
+void maintainFullscreenWindow(NSWindow* window)
+{
+  if (!window) return;
+  const NSInteger requiredLevel = telepromptFullscreenLevel();
+  if ([window level] != requiredLevel) {
+    [window setLevel:requiredLevel];
+  }
+  if ([window hidesOnDeactivate]) {
+    [window setHidesOnDeactivate:NO];
+  }
+  if ([window canHide]) {
+    [window setCanHide:NO];
+  }
+  if (![window isVisible]) {
+    [window orderFrontRegardless];
+  }
 }
 
 } // namespace
@@ -74,6 +104,8 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
     saved.movableByWindowBackground =
       [window isMovableByWindowBackground];
     saved.hasShadow = [window hasShadow];
+    saved.canHide = [window canHide];
+    saved.hidesOnDeactivate = [window hidesOnDeactivate];
     g_fullscreenTeleprompts.emplace(swellWindow, saved);
 
     // Dialogs SWELL normalmente nascem como child/owned windows do REAPER.
@@ -91,15 +123,20 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
     [window setMovable:NO];
     [window setMovableByWindowBackground:NO];
     [window setHasShadow:NO];
-    [window setLevel:NSMainMenuWindowLevel + 1];
+    [window setCanHide:NO];
+    [window setHidesOnDeactivate:NO];
+    [window setLevel:telepromptFullscreenLevel()];
     [window setCollectionBehavior:
       saved.collectionBehavior |
       NSWindowCollectionBehaviorCanJoinAllSpaces |
-      NSWindowCollectionBehaviorFullScreenAuxiliary];
+      NSWindowCollectionBehaviorFullScreenAuxiliary |
+      NSWindowCollectionBehaviorStationary |
+      NSWindowCollectionBehaviorIgnoresCycle];
     if (screen) {
       [window setFrame:[screen frame] display:YES animate:NO];
     }
-    [window makeKeyAndOrderFront:nil];
+    [window orderFrontRegardless];
+    maintainFullscreenWindow(window);
     return true;
   }
 
@@ -118,6 +155,8 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
   [window setMovableByWindowBackground:
     saved.movableByWindowBackground];
   [window setHasShadow:saved.hasShadow];
+  [window setCanHide:saved.canHide];
+  [window setHidesOnDeactivate:saved.hidesOnDeactivate];
   [window setLevel:saved.level];
   [window setCollectionBehavior:saved.collectionBehavior];
   [window setFrame:saved.frame display:YES animate:NO];
@@ -132,6 +171,23 @@ extern "C" void VSHookMacReleaseTelepromptFullscreen(
   void* swellWindow)
 {
   g_fullscreenTeleprompts.erase(swellWindow);
+}
+
+extern "C" void VSHookMacMaintainTelepromptFullscreen(
+  void* swellWindow)
+{
+  if (![NSThread isMainThread]) return;
+  if (g_fullscreenTeleprompts.find(swellWindow) ==
+      g_fullscreenTeleprompts.end()) {
+    return;
+  }
+  NSWindow* window =
+    telepromptWindowFromSwellHandle(swellWindow);
+  if (!window) {
+    g_fullscreenTeleprompts.erase(swellWindow);
+    return;
+  }
+  maintainFullscreenWindow(window);
 }
 
 extern "C" double VSHookMacTelepromptBackingScale(

@@ -8,6 +8,9 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
 extern "C" void VSHookMacReleaseTelepromptFullscreen(
   void* swellWindow);
 
+extern "C" void VSHookMacMaintainTelepromptFullscreen(
+  void* swellWindow);
+
 extern "C" double VSHookMacTelepromptBackingScale(
   void* swellWindow);
 

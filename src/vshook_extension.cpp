@@ -62731,6 +62731,11 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
     case WM_TIMER:
       if (wParam == kNativeTelepromptTimerBase +
           static_cast<UINT_PTR>(slot)) {
+#ifdef __APPLE__
+        if (window.fullscreen) {
+          VSHookMacMaintainTelepromptFullscreen(hwnd);
+        }
+#endif
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
