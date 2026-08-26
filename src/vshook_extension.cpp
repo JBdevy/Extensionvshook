@@ -1093,7 +1093,7 @@ static RECT g_nativeMainHeaderViewRect{0, 0, 0, 0};
 static RECT g_nativeMainHeaderAlphaRect{0, 0, 0, 0};
 static RECT g_nativeMainHeaderResetRect{0, 0, 0, 0};
 static RECT g_nativeMainPreviewPageRect{0, 0, 0, 0};
-static RECT g_nativeMainFooterRects[10]{};
+static RECT g_nativeMainFooterRects[11]{};
 static bool g_nativeMainPreviewSecondPage = false;
 static RECT g_nativePartsRenameInputRect{0, 0, 0, 0};
 static RECT g_nativePartsRenameOkRect{0, 0, 0, 0};
@@ -17799,7 +17799,7 @@ static std::string nativeUiMainTooltipAtPoint(const POINT& point)
       : "Mostrar os Previews 4, 5 e 6.";
   }
 
-  static const char* footerTooltips[10] = {
+  static const char* footerTooltips[11] = {
     "Preview dos blocos 01-08. Clique direito para mapear teclado ou MIDI.",
     "Preview dos blocos 09-16. Clique direito para mapear teclado ou MIDI.",
     "Preview dos blocos 17-24. Clique direito para mapear teclado ou MIDI.",
@@ -17807,11 +17807,12 @@ static std::string nativeUiMainTooltipAtPoint(const POINT& point)
     "Preview dos blocos 33-40. Clique direito para mapear teclado ou MIDI.",
     "Preview dos blocos 41-48. Clique direito para mapear teclado ou MIDI.",
     "Exportar musicas selecionadas.",
+    "Cria um Empty Item na pista CIFRAS.",
     "Cria TELEPROMPT1.",
     "Cria TELEPROMPT2.",
     "Liga/desliga Auto Stop."
   };
-  for (int i = 0; i < 10; ++i) {
+  for (int i = 0; i < 11; ++i) {
     if (PtInRect(&g_nativeMainFooterRects[i], point)) {
       return footerTooltips[i];
     }
@@ -19731,7 +19732,8 @@ nativeUiDefaultButtonLayout(const std::string& rawPage)
     "footer_preview_page",
     "footer_preview1", "footer_preview2", "footer_preview3",
     "footer_preview4", "footer_preview5", "footer_preview6",
-    "footer_export", "footer_tp1", "footer_tp2", "footer_stop"
+    "footer_export", "footer_cf", "footer_tp1", "footer_tp2",
+    "footer_stop"
   };
   return layout;
 }
@@ -19786,12 +19788,26 @@ nativeUiReadButtonLayout(const std::string& rawPage)
   for (const auto& zone : nativeUiButtonLayoutZones()) {
     if (!parsed.count(zone)) parsed[zone] = {};
   }
+  // Presets personalizados antigos não conhecem o CF. Migra o novo botão
+  // para a mesma linha e imediatamente antes do TP/1, sem desmontar a
+  // organização que o usuário já salvou.
+  if (!seen.count("footer_cf")) {
+    for (const auto& zone : nativeUiButtonLayoutZones()) {
+      auto tp1 = std::find(
+        parsed[zone].begin(), parsed[zone].end(), "footer_tp1");
+      if (tp1 == parsed[zone].end()) continue;
+      parsed[zone].insert(tp1, "footer_cf");
+      seen.insert("footer_cf");
+      break;
+    }
+  }
   const auto defaults = nativeUiDefaultButtonLayout(page);
   for (const auto& zone : nativeUiButtonLayoutZones()) {
     const auto found = defaults.find(zone);
     if (found == defaults.end()) continue;
     for (const auto& id : found->second) {
-      if (seen.insert(id).second) parsed[zone].push_back(id);
+      if (!seen.insert(id).second) continue;
+      parsed[zone].push_back(id);
     }
   }
   return parsed;
@@ -22960,6 +22976,60 @@ static bool nativeUiExecuteTp2()
     return false;
   }
   if (UpdateArrange_ptr) UpdateArrange_ptr();
+  return true;
+}
+
+static bool nativeUiExecuteCifras()
+{
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project) return false;
+  const double cursorPosition =
+    GetCursorPositionEx_ptr
+      ? GetCursorPositionEx_ptr(project)
+      : 0.0;
+  MediaTrack* track = nativeUiPrepareTelepromptTrack(
+    "CIFRAS", 2, 255, 128, 0);
+  if (!track) {
+    nativeUiOpenMessage(
+      "CF: nao foi possivel criar a pista CIFRAS");
+    return false;
+  }
+
+  if (SetEditCurPos2_ptr) {
+    SetEditCurPos2_ptr(
+      project, cursorPosition, false, false);
+  } else if (SetEditCurPos_ptr) {
+    SetEditCurPos_ptr(
+      cursorPosition, false, false);
+  }
+  if (SelectAllMediaItems_ptr) {
+    SelectAllMediaItems_ptr(project, false);
+  }
+  if (SetOnlyTrackSelected_ptr) {
+    SetOnlyTrackSelected_ptr(track);
+  }
+  if (Main_OnCommand_ptr) {
+    Main_OnCommand_ptr(40142, 0);
+  }
+  MediaItem* item = nullptr;
+  if (CountSelectedMediaItems_ptr &&
+      GetSelectedMediaItem_ptr &&
+      CountSelectedMediaItems_ptr(project) > 0) {
+    item = GetSelectedMediaItem_ptr(project, 0);
+  }
+  if (item && GetSetMediaItemInfo_String_ptr) {
+    char empty[1] = {'\0'};
+    GetSetMediaItemInfo_String_ptr(
+      item, "P_NOTES", empty, true);
+  }
+  if (Main_OnCommand_ptr) {
+    Main_OnCommand_ptr(40850, 0);
+  }
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+  g_nativeForceStateBuild.store(true);
+  g_nativeForceSnapshotBuild.store(true);
   return true;
 }
 
@@ -34540,14 +34610,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
     } else if (id == "footer_export") {
       spec = {&g_nativeMainFooterRects[6], "Export", "Exp",
         "copy", true, true, 62, 34, id};
+    } else if (id == "footer_cf") {
+      spec = {&g_nativeMainFooterRects[7], "CF", "CF",
+        "block", true, true, 38, 28, id};
     } else if (id == "footer_tp1") {
-      spec = {&g_nativeMainFooterRects[7], "TP/1", "TP1",
+      spec = {&g_nativeMainFooterRects[8], "TP/1", "TP1",
         "yellow_reset", true, true, 48, 32, id};
     } else if (id == "footer_tp2") {
-      spec = {&g_nativeMainFooterRects[8], "TP/2", "TP2",
+      spec = {&g_nativeMainFooterRects[9], "TP/2", "TP2",
         "play", true, true, 48, 32, id};
     } else if (id == "footer_stop") {
-      spec = {&g_nativeMainFooterRects[9], "Stop", "Stop",
+      spec = {&g_nativeMainFooterRects[10], "Stop", "Stop",
         g_nativeAppActivePanelModel.autoStopEnabled ? "play" : "stop",
         true, true, 50, 34, id};
     } else {
@@ -41888,6 +41961,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
                 ? "play" : "page", false};
           } else if (id == "footer_export") {
             item = {id, "Export", "copy", false};
+          } else if (id == "footer_cf") {
+            item = {id, "CF", "block", false};
           } else if (id == "footer_tp1") {
             item = {id, "TP/1", "yellow_reset", false};
           } else if (id == "footer_tp2") {
@@ -46603,7 +46678,7 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     return true;
   }
 
-  for (int i = 0; i < 10; ++i) {
+  for (int i = 0; i < 11; ++i) {
     if (!PtInRect(&g_nativeMainFooterRects[i], point)) continue;
     if (i < 6) {
       if (rightClick) {
@@ -46618,8 +46693,10 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     } else if (i == 6) {
       if (!rightClick) nativeUiOpenExportAudioFormat();
     } else if (i == 7) {
-      if (!rightClick) nativeUiExecuteTp1();
+      if (!rightClick) nativeUiExecuteCifras();
     } else if (i == 8) {
+      if (!rightClick) nativeUiExecuteTp1();
+    } else if (i == 9) {
       if (!rightClick) nativeUiExecuteTp2();
     } else {
       if (!rightClick) {
@@ -57761,21 +57838,26 @@ struct NativeTelepromptSettings {
   std::string songNameColor = "#00ff55";
   std::string queueNameColor = "#ffea00";
   std::string progressColor = "#ffea00";
+  std::string chordColor = "#fb923c";
   std::string fontFamily = "Arial";
   std::string songNameFontFamily = "Arial";
   std::string queueNameFontFamily = "Arial";
+  std::string chordFontFamily = "Arial";
   std::string textCase = "uppercase";
+  std::string textAlignment = "center";
   std::string clockPosition = "center-top";
   std::string localClockPosition = "right";
   std::string songNamePosition = "top";
   std::string queueNamePosition = "top";
   std::string progressPosition = "bottom";
+  std::string chordPosition = "top";
   double textScale = 1.0;
   double clockScale = 1.0;
   double songNameScale = 1.0;
   double queueNameScale = 1.0;
   double mediaScale = 1.0;
   double previewScale = 1.0;
+  double chordScale = 1.0;
   double localClockDepth = 1.0;
   bool windowBorderEnabled = true;
   bool clockBorderEnabled = true;
@@ -57790,6 +57872,7 @@ struct NativeTelepromptSettings {
   bool previewSongDurationEnabled = true;
   bool previewBlockDurationEnabled = true;
   bool previewUnderlineEnabled = true;
+  bool chordsEnabled = true;
   bool clearMode = false;
   bool rgbWindowBorderEnabled = false;
   bool rgbClockBorderEnabled = false;
@@ -58131,6 +58214,7 @@ static std::string nativeTelepromptPreviewStateJson(
 
 struct NativeTelepromptRenderState {
   std::string lyrics;
+  std::string chords;
   std::string songName;
   std::string queuedName;
   std::string timerText = "00 : 00 : 00";
@@ -58329,10 +58413,20 @@ static void nativeTelepromptApplySettingsJson(
   stringValue("songNameColor", next.songNameColor);
   stringValue("queueNameColor", next.queueNameColor);
   stringValue("progressColor", next.progressColor);
+  stringValue("chordColor", next.chordColor);
   stringValue("fontFamily", next.fontFamily);
   stringValue("songNameFontFamily", next.songNameFontFamily);
   stringValue("queueNameFontFamily", next.queueNameFontFamily);
+  stringValue("chordFontFamily", next.chordFontFamily);
   stringValue("textCase", next.textCase);
+  stringValue("textAlignment", next.textAlignment);
+  next.textAlignment = nativeLower(nativeTrim(next.textAlignment));
+  if (next.textAlignment != "left" &&
+      next.textAlignment != "center" &&
+      next.textAlignment != "right" &&
+      next.textAlignment != "justify") {
+    next.textAlignment = "center";
+  }
   stringValue("clockPosition", next.clockPosition);
   next.clockPosition = nativeLower(nativeTrim(next.clockPosition));
   if (next.clockPosition == "top") {
@@ -58352,6 +58446,9 @@ static void nativeTelepromptApplySettingsJson(
   stringValue("songNamePosition", next.songNamePosition);
   stringValue("queueNamePosition", next.queueNamePosition);
   stringValue("progressPosition", next.progressPosition);
+  stringValue("chordPosition", next.chordPosition);
+  next.chordPosition = nativeLower(nativeTrim(next.chordPosition));
+  if (next.chordPosition != "bottom") next.chordPosition = "top";
   next.textScale = nativeTelepromptClamp(
     nativeTelepromptJsonNumber(json, "textScale", next.textScale),
     0.35, 1.0);
@@ -58373,6 +58470,9 @@ static void nativeTelepromptApplySettingsJson(
     nativeTelepromptJsonNumber(
       json, "previewScale", next.previewScale),
     0.35, 3.0);
+  next.chordScale = nativeTelepromptClamp(
+    nativeTelepromptJsonNumber(json, "chordScale", next.chordScale),
+    0.1, 1.0);
   next.localClockDepth = nativeTelepromptJsonNumber(
     json, "localClockDepth", next.localClockDepth);
   // O primeiro protótipo tratava "profundidade" como deslocamento em pixels.
@@ -58410,6 +58510,9 @@ static void nativeTelepromptApplySettingsJson(
     json, "previewBlockDurationEnabled", legacyPreviewDurationEnabled);
   next.previewUnderlineEnabled = nativeTelepromptJsonBool(
     json, "previewUnderlineEnabled", next.previewUnderlineEnabled);
+  next.chordsEnabled = nativeTelepromptJsonBool(
+    json, "chordsEnabled",
+    nativeTelepromptJsonBool(json, "showChords", next.chordsEnabled));
   next.clearMode = nativeTelepromptJsonBool(
     json, "clearMode", next.clearMode);
   const bool legacyRgb = nativeTelepromptJsonBool(
@@ -58439,21 +58542,26 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"songNameColor\":\"#00ff55\",";
   json << "\"queueNameColor\":\"#ffea00\",";
   json << "\"progressColor\":\"#ffea00\",";
+  json << "\"chordColor\":\"#fb923c\",";
   json << "\"fontFamily\":\"Arial\",";
   json << "\"songNameFontFamily\":\"Arial\",";
   json << "\"queueNameFontFamily\":\"Arial\",";
+  json << "\"chordFontFamily\":\"Arial\",";
   json << "\"textCase\":\"uppercase\",";
+  json << "\"textAlignment\":\"center\",";
   json << "\"clockPosition\":\"center-top\",";
   json << "\"localClockPosition\":\"right\",";
   json << "\"songNamePosition\":\"top\",";
   json << "\"queueNamePosition\":\"top\",";
   json << "\"progressPosition\":\"bottom\",";
+  json << "\"chordPosition\":\"top\",";
   json << "\"textScale\":1,";
   json << "\"clockScale\":1,";
   json << "\"songNameScale\":1,";
   json << "\"queueNameScale\":1,";
   json << "\"mediaScale\":1,";
   json << "\"previewScale\":1,";
+  json << "\"chordScale\":1,";
   json << "\"localClockDepth\":1,";
   json << "\"windowBorderEnabled\":true,";
   json << "\"clockBorderEnabled\":true,";
@@ -58468,6 +58576,7 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"previewSongDurationEnabled\":true,";
   json << "\"previewBlockDurationEnabled\":true,";
   json << "\"previewUnderlineEnabled\":true,";
+  json << "\"chordsEnabled\":true,";
   json << "\"clearMode\":false,";
   json << "\"rgbWindowBorderEnabled\":false,";
   json << "\"rgbClockBorderEnabled\":false,";
@@ -58509,14 +58618,20 @@ static std::string nativeTelepromptSettingsToJson(
        << nativeJsonString(settings.queueNameColor) << ",";
   json << "\"progressColor\":"
        << nativeJsonString(settings.progressColor) << ",";
+  json << "\"chordColor\":"
+       << nativeJsonString(settings.chordColor) << ",";
   json << "\"fontFamily\":"
        << nativeJsonString(settings.fontFamily) << ",";
   json << "\"songNameFontFamily\":"
        << nativeJsonString(settings.songNameFontFamily) << ",";
   json << "\"queueNameFontFamily\":"
        << nativeJsonString(settings.queueNameFontFamily) << ",";
+  json << "\"chordFontFamily\":"
+       << nativeJsonString(settings.chordFontFamily) << ",";
   json << "\"textCase\":"
        << nativeJsonString(settings.textCase) << ",";
+  json << "\"textAlignment\":"
+       << nativeJsonString(settings.textAlignment) << ",";
   json << "\"clockPosition\":"
        << nativeJsonString(settings.clockPosition) << ",";
   json << "\"localClockPosition\":"
@@ -58527,6 +58642,8 @@ static std::string nativeTelepromptSettingsToJson(
        << nativeJsonString(settings.queueNamePosition) << ",";
   json << "\"progressPosition\":"
        << nativeJsonString(settings.progressPosition) << ",";
+  json << "\"chordPosition\":"
+       << nativeJsonString(settings.chordPosition) << ",";
   json << "\"textScale\":"
        << nativeNumber(settings.textScale, 3) << ",";
   json << "\"clockScale\":"
@@ -58539,6 +58656,8 @@ static std::string nativeTelepromptSettingsToJson(
        << nativeNumber(settings.mediaScale, 3) << ",";
   json << "\"previewScale\":"
        << nativeNumber(settings.previewScale, 3) << ",";
+  json << "\"chordScale\":"
+       << nativeNumber(settings.chordScale, 3) << ",";
   json << "\"localClockDepth\":"
        << nativeNumber(settings.localClockDepth, 3) << ",";
   json << "\"windowBorderEnabled\":"
@@ -58567,6 +58686,8 @@ static std::string nativeTelepromptSettingsToJson(
        << boolean(settings.previewBlockDurationEnabled) << ",";
   json << "\"previewUnderlineEnabled\":"
        << boolean(settings.previewUnderlineEnabled) << ",";
+  json << "\"chordsEnabled\":"
+       << boolean(settings.chordsEnabled) << ",";
   json << "\"clearMode\":"
        << boolean(settings.clearMode) << ",";
   json << "\"rgbWindowBorderEnabled\":"
@@ -58915,6 +59036,12 @@ static bool nativeApplyTelepromptSettingsCommand(
 {
   const std::string type = nativeLower(nativeTrim(
     nativeJsonExtractString(commandBody, "type")));
+  if (type == "teleprompt_create_chord_item" ||
+      type == "teleprompt_create_cifra_item" ||
+      type == "teleprompt_cf") {
+    nativeTimecodeLanRecordCommand(commandBody);
+    return nativeUiExecuteCifras();
+  }
   if (type == "teleprompt_window") {
     const std::string slotRaw =
       nativeJsonExtractString(commandBody, "slot");
@@ -59185,7 +59312,8 @@ static void nativeTelepromptDrawWrappedTextMac(
   const NativeTelepromptWrappedTextLayout& layout,
   const RECT& available,
   COLORREF color,
-  HFONT font)
+  HFONT font,
+  const std::string& alignment = "center")
 {
   if (!dc || layout.lines.empty()) return;
   const int availableHeight = std::max(
@@ -59193,17 +59321,58 @@ static void nativeTelepromptDrawWrappedTextMac(
       available.bottom - available.top));
   int y = available.top +
     std::max(0, (availableHeight - layout.totalHeight) / 2);
-  for (const std::string& line : layout.lines) {
+  const std::string normalizedAlignment =
+    nativeLower(nativeTrim(alignment));
+  for (size_t lineIndex = 0;
+       lineIndex < layout.lines.size(); ++lineIndex) {
+    const std::string& line = layout.lines[lineIndex];
     if (!line.empty()) {
       RECT lineRect{
         available.left, y,
         available.right, y + layout.lineHeight
       };
-      nativeAppActiveDrawText(
-        dc, line, lineRect,
-        DT_CENTER | DT_VCENTER |
-          DT_SINGLELINE | DT_NOPREFIX,
-        color, font);
+      if (normalizedAlignment == "justify" &&
+          lineIndex + 1 < layout.lines.size()) {
+        const std::vector<std::string> words = nativeSplit(line, ' ');
+        if (words.size() > 1) {
+          int wordsWidth = 0;
+          for (const auto& word : words) {
+            wordsWidth += nativeUiTextWidth(dc, word, font);
+          }
+          const double gap = static_cast<double>(
+            std::max(0, static_cast<int>(lineRect.right - lineRect.left) -
+              wordsWidth)) / static_cast<double>(words.size() - 1);
+          double x = lineRect.left;
+          for (const auto& word : words) {
+            const int wordWidth = nativeUiTextWidth(dc, word, font);
+            RECT wordRect{
+              static_cast<int>(std::lround(x)), lineRect.top,
+              static_cast<int>(std::lround(x)) + wordWidth,
+              lineRect.bottom
+            };
+            nativeAppActiveDrawText(
+              dc, word, wordRect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+              color, font);
+            x += wordWidth + gap;
+          }
+        } else {
+          nativeAppActiveDrawText(
+            dc, line, lineRect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            color, font);
+        }
+      } else {
+        const UINT horizontalFlag = normalizedAlignment == "left" ||
+            normalizedAlignment == "justify"
+          ? DT_LEFT
+          : (normalizedAlignment == "right" ? DT_RIGHT : DT_CENTER);
+        nativeAppActiveDrawText(
+          dc, line, lineRect,
+          horizontalFlag | DT_VCENTER |
+            DT_SINGLELINE | DT_NOPREFIX,
+          color, font);
+      }
     }
     y += layout.lineHeight + layout.lineGap;
   }
@@ -59270,6 +59439,10 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
   // existem somente no nível principal e não entram em conflito.
   state.lyrics = nativeJsonExtractString(
     snapshot, telepromptPrefix + "Text");
+  state.chords = nativeJsonExtractString(snapshot, "cifrasText");
+  if (state.chords.empty()) {
+    state.chords = nativeJsonExtractString(snapshot, "chordText");
+  }
   state.songName = nativeJsonExtractString(
     snapshot, telepromptPrefix + "SongName");
   state.mediaType = nativeJsonExtractString(
@@ -59344,9 +59517,16 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
           slot == 2 ? "TELEPROMPT2" : "TELEPROMPT1",
           transportPositionActive, livePosition,
           state.songName);
+      const std::string liveChordState =
+        nativeBuildTelepromptStateJson(
+          project, songs, 3, "CIFRAS",
+          transportPositionActive, livePosition,
+          state.songName);
 
       state.lyrics =
         nativeJsonExtractString(liveState, "lyricsText");
+      state.chords =
+        nativeJsonExtractString(liveChordState, "lyricsText");
       state.songName =
         nativeJsonExtractString(liveState, "songName");
       state.mediaType =
@@ -59382,6 +59562,14 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
       state.nextChangePosition =
         nativeTelepromptJsonNumber(
           liveState, "nextChangePosition", -1.0);
+      const double nextChordChangePosition =
+        nativeTelepromptJsonNumber(
+          liveChordState, "nextChangePosition", -1.0);
+      if (nextChordChangePosition >= 0.0 &&
+          (state.nextChangePosition < 0.0 ||
+           nextChordChangePosition < state.nextChangePosition)) {
+        state.nextChangePosition = nextChordChangePosition;
+      }
       const double liveItemPosition =
         nativeTelepromptJsonNumber(
           liveState, "position", livePosition);
@@ -61971,18 +62159,6 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     return;
   }
 
-  int topReserve = std::max(
-    24, topCursor - static_cast<int>(client.top));
-  int bottomReserve = std::max(
-    24, static_cast<int>(client.bottom) - bottomCursor);
-  if (previewActive) {
-    nativeTelepromptDrawPreview(
-      dc, state, settings, client,
-      topReserve, bottomReserve);
-    finishPaint();
-    return;
-  }
-
   const int nameFont = std::max(16,
     static_cast<int>(std::min(width / 34.0, height / 20.0) *
       settings.songNameScale));
@@ -62025,6 +62201,91 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
           settings.queueNameColor, RGB(255, 234, 0)),
         settings.queueNameFontFamily, queueFont);
     }
+  }
+
+  if (settings.chordsEnabled && !state.chords.empty()) {
+    const bool chordTop =
+      nativeLower(settings.chordPosition) != "bottom";
+    const int maxChordWidth = std::max(
+      80, static_cast<int>(std::lround(width * 0.82)));
+    int chordFontSize = std::max(
+      10, static_cast<int>(std::lround(
+        std::min(width / 22.0, height / 14.0) *
+          settings.chordScale)));
+    const int maxChordHeight = std::max(34, height / 4);
+    HFONT chordFont = nativeTelepromptFont(
+      settings.chordFontFamily, chordFontSize, FW_BOLD);
+    int chordContentWidth = 80;
+    for (const auto& chordLine : nativeSplit(state.chords, '\n')) {
+      chordContentWidth = std::max(
+        chordContentWidth,
+        nativeUiTextWidth(dc, chordLine, chordFont));
+    }
+    chordContentWidth = std::min(maxChordWidth, chordContentWidth);
+    RECT measured{0, 0, chordContentWidth, 1};
+    while (chordFontSize > 8) {
+      measured = RECT{0, 0, chordContentWidth, 1};
+      measured = nativeTelepromptMeasureText(
+        dc, state.chords, measured,
+        DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
+        chordFont);
+      if (measured.bottom - measured.top <= maxChordHeight) break;
+      --chordFontSize;
+      chordFont = nativeTelepromptFont(
+        settings.chordFontFamily, chordFontSize, FW_BOLD);
+      chordContentWidth = 80;
+      for (const auto& chordLine : nativeSplit(state.chords, '\n')) {
+        chordContentWidth = std::max(
+          chordContentWidth,
+          nativeUiTextWidth(dc, chordLine, chordFont));
+      }
+      chordContentWidth = std::min(maxChordWidth, chordContentWidth);
+    }
+    const int chordPaddingX = std::max(12, width / 90);
+    const int chordPaddingY = std::max(6, height / 180);
+    const int chordBoxWidth = std::min(
+      std::max(120,
+        chordContentWidth +
+          chordPaddingX * 2),
+      std::max(1, width - edge * 2));
+    const int chordBoxHeight = std::min(
+      maxChordHeight + chordPaddingY * 2,
+      std::max(28,
+        static_cast<int>(measured.bottom - measured.top) +
+          chordPaddingY * 2));
+    const int chordLeft =
+      client.left + (width - chordBoxWidth) / 2;
+    const RECT chordRect = allocateBand(
+      chordTop, chordBoxHeight,
+      chordLeft, chordLeft + chordBoxWidth);
+    if (chordRect.right > chordRect.left &&
+        chordRect.bottom > chordRect.top) {
+      nativeAppActiveFillRect(dc, chordRect, RGB(0, 0, 0));
+      const COLORREF chordColor = nativeTelepromptColor(
+        settings.chordColor, RGB(251, 146, 60));
+      nativeTelepromptDrawBorder(dc, chordRect, chordColor, 2);
+      RECT chordTextRect = chordRect;
+      chordTextRect.left += chordPaddingX;
+      chordTextRect.right -= chordPaddingX;
+      chordTextRect.top += chordPaddingY;
+      chordTextRect.bottom -= chordPaddingY;
+      nativeAppActiveDrawText(
+        dc, state.chords, chordTextRect,
+        DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX,
+        chordColor, chordFont);
+    }
+  }
+
+  const int topReserve = std::max(
+    24, topCursor - static_cast<int>(client.top));
+  const int bottomReserve = std::max(
+    24, static_cast<int>(client.bottom) - bottomCursor);
+  if (previewActive) {
+    nativeTelepromptDrawPreview(
+      dc, state, settings, client,
+      topReserve, bottomReserve);
+    finishPaint();
+    return;
   }
 
   RECT textRect{
@@ -62139,10 +62400,17 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         settings.textColor, RGB(255, 234, 0)),
       nativeTelepromptFont(
         settings.fontFamily,
-        layoutCache.chosenFont, FW_BOLD));
+        layoutCache.chosenFont, FW_BOLD),
+      settings.textAlignment);
 #else
+    const std::string alignment =
+      nativeLower(settings.textAlignment);
+    const UINT textAlignmentFlag = alignment == "left" ||
+        alignment == "justify"
+      ? DT_LEFT
+      : (alignment == "right" ? DT_RIGHT : DT_CENTER);
     nativeAppActiveDrawText(dc, lyrics, available,
-      DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX,
+      textAlignmentFlag | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX,
       nativeTelepromptColor(
         settings.textColor, RGB(255, 234, 0)),
       nativeTelepromptFont(
@@ -65556,6 +65824,8 @@ static void nativeRebuildState(bool forceSnapshot)
   const bool stopPauseModeEnabled = g_stopPauseModeEnabled.load();
   const std::string tp1Json = nativeBuildTelepromptStateJson(activeProject, songs, 1, "TELEPROMPT1", playing, playPos, playingName);
   const std::string tp2Json = nativeBuildTelepromptStateJson(activeProject, songs, 2, "TELEPROMPT2", playing, playPos, playingName);
+  const std::string cifrasJson = nativeBuildTelepromptStateJson(activeProject, songs, 3, "CIFRAS", playing, playPos, playingName);
+  const std::string cifrasText = nativeJsonExtractString(cifrasJson, "lyricsText");
   const std::string tp1LyricsText = nativeJsonExtractString(tp1Json, "lyricsText");
   const std::string tp1SongName = nativeJsonExtractString(tp1Json, "songName");
   const std::string tp1MediaType = nativeJsonExtractString(tp1Json, "mediaType");
@@ -65802,6 +66072,7 @@ static void nativeRebuildState(bool forceSnapshot)
   bool tpPreviewSongDurationEnabled[2]{true, true};
   bool tpPreviewBlockDurationEnabled[2]{true, true};
   bool tpPreviewUnderlineEnabled[2]{true, true};
+  bool tpClearMode[2]{false, false};
   std::string tpPreviewTextCase[2]{"uppercase", "uppercase"};
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -65812,6 +66083,8 @@ static void nativeRebuildState(bool forceSnapshot)
         g_nativeTelepromptSettings[index].previewBlockDurationEnabled;
       tpPreviewUnderlineEnabled[index] =
         g_nativeTelepromptSettings[index].previewUnderlineEnabled;
+      tpClearMode[index] =
+        g_nativeTelepromptSettings[index].clearMode;
       tpPreviewTextCase[index] =
         g_nativeTelepromptSettings[index].textCase;
     }
@@ -66165,6 +66438,10 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"telepromptPreview\":"
        << telepromptPreviewJson << ",";
   json << "\"telepromptPreviewSettings\":{";
+  json << "\"tp1ClearMode\":"
+       << (tpClearMode[0] ? "true" : "false") << ",";
+  json << "\"tp2ClearMode\":"
+       << (tpClearMode[1] ? "true" : "false") << ",";
   json << "\"tp1\":{\"songDurationEnabled\":"
        << (tpPreviewSongDurationEnabled[0] ? "true" : "false")
        << ",\"blockDurationEnabled\":"
@@ -66229,6 +66506,10 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"autoBlocoTargetPlaylistIndex\":" << autoBlocoTargetPlaylistIndex << ",";
   json << "\"tp1\":" << tp1Json << ",";
   json << "\"tp2\":" << tp2Json << ",";
+  json << "\"cifras\":" << cifrasJson << ",";
+  json << "\"chords\":" << cifrasJson << ",";
+  json << "\"cifrasText\":" << nativeJsonString(cifrasText) << ",";
+  json << "\"chordText\":" << nativeJsonString(cifrasText) << ",";
   json << "\"tp1LyricsText\":" << nativeJsonString(tp1LyricsText) << ",";
   json << "\"tp1Lyrics\":" << nativeJsonString(tp1LyricsText) << ",";
   json << "\"telepromptTp1Lyrics\":" << nativeJsonString(tp1LyricsText) << ",";
