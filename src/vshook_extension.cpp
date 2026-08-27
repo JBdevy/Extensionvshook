@@ -58121,6 +58121,7 @@ struct NativeTelepromptSettings {
   std::string progressColor = "#ffea00";
   std::string chordColor = "#fb923c";
   std::string fontFamily = "Arial";
+  std::string previewFontFamily = "Arial";
   std::string songNameFontFamily = "Arial";
   std::string queueNameFontFamily = "Arial";
   std::string chordFontFamily = "Arial";
@@ -58700,6 +58701,7 @@ static void nativeTelepromptApplySettingsJson(
   stringValue("progressColor", next.progressColor);
   stringValue("chordColor", next.chordColor);
   stringValue("fontFamily", next.fontFamily);
+  stringValue("previewFontFamily", next.previewFontFamily);
   stringValue("songNameFontFamily", next.songNameFontFamily);
   stringValue("queueNameFontFamily", next.queueNameFontFamily);
   stringValue("chordFontFamily", next.chordFontFamily);
@@ -58831,6 +58833,7 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"progressColor\":\"#ffea00\",";
   json << "\"chordColor\":\"#fb923c\",";
   json << "\"fontFamily\":\"Arial\",";
+  json << "\"previewFontFamily\":\"Arial\",";
   json << "\"songNameFontFamily\":\"Arial\",";
   json << "\"queueNameFontFamily\":\"Arial\",";
   json << "\"chordFontFamily\":\"Arial\",";
@@ -58910,6 +58913,8 @@ static std::string nativeTelepromptSettingsToJson(
        << nativeJsonString(settings.chordColor) << ",";
   json << "\"fontFamily\":"
        << nativeJsonString(settings.fontFamily) << ",";
+  json << "\"previewFontFamily\":"
+       << nativeJsonString(settings.previewFontFamily) << ",";
   json << "\"songNameFontFamily\":"
        << nativeJsonString(settings.songNameFontFamily) << ",";
   json << "\"queueNameFontFamily\":"
@@ -60299,7 +60304,7 @@ static void nativeTelepromptDrawPreview(
         DT_NOPREFIX,
       fallbackColor,
       nativeTelepromptFont(
-        settings.fontFamily, emptyFontSize, FW_BOLD));
+        settings.previewFontFamily, emptyFontSize, FW_BOLD));
     return;
   }
 
@@ -60355,9 +60360,9 @@ static void nativeTelepromptDrawPreview(
     13, std::min(38,
       static_cast<int>(std::lround(songFontSize * 1.08))));
   HFONT titleFont = nativeTelepromptFont(
-    settings.fontFamily, titleFontSize, FW_BOLD);
+    settings.previewFontFamily, titleFontSize, FW_BOLD);
   HFONT songFont = nativeTelepromptFont(
-    settings.fontFamily, songFontSize, FW_BOLD);
+    settings.previewFontFamily, songFontSize, FW_BOLD);
   const int titleLineHeight = std::max(
     titleFontSize + 1,
     static_cast<int>(std::lround(
@@ -60425,13 +60430,9 @@ static void nativeTelepromptDrawPreview(
     const int desiredHeight = std::max(
       titleLineHeight + padY * 2,
       padY + titleHeight + titleToSongsGap + songsHeight + padY);
-    const bool lastBlockInColumn =
-      static_cast<int>(index) + columns >= blockCount;
     RECT card{
       left, top, right,
-      lastBlockInColumn
-        ? area.bottom
-        : std::min(static_cast<int>(area.bottom), top + desiredHeight)
+      std::min(static_cast<int>(area.bottom), top + desiredHeight)
     };
     nativeAppActiveFillOutlinedRect(
       dc, card, RGB(0, 0, 0), blockColor);
