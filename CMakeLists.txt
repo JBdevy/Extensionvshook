@@ -53,6 +53,22 @@ if(VSHOOK_BUILD_TESTS)
       "-framework Security"
     )
   endif()
+
+  if(WIN32 OR APPLE)
+    add_executable(vshook_video_decoder_smoke_test
+      src/native_video_decoder_vlc.cpp
+      tests/native_video_decoder_smoke_test.cpp
+    )
+    target_include_directories(vshook_video_decoder_smoke_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    if(WIN32)
+      target_compile_definitions(vshook_video_decoder_smoke_test PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+      )
+    endif()
+  endif()
 endif()
 
 add_library(reaper_vshook SHARED
@@ -64,13 +80,13 @@ add_library(reaper_vshook SHARED
 
 if(WIN32)
   target_sources(reaper_vshook PRIVATE
-    src/native_video_decoder_win.cpp
+    src/native_video_decoder_vlc.cpp
   )
 elseif(APPLE)
   target_sources(reaper_vshook PRIVATE
     src/native_keyboard_mac.mm
     src/native_teleprompt_mac.mm
-    src/native_video_decoder_mac.mm
+    src/native_video_decoder_vlc.cpp
   )
 endif()
 

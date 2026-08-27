@@ -208,17 +208,20 @@ struct Decoder::Impl {
       std::max(2, requestedHeight);
     const bool portraitSource =
       sourceDisplayHeight > sourceDisplayWidth;
-    const int fullHdWidth =
-      portraitSource ? 1080 : 1920;
-    const int fullHdHeight =
-      portraitSource ? 1920 : 1080;
+    // A janela nativa do REAPER acompanha a resolucao fisica do monitor. O
+    // Teleprompt tambem pode preservar essa nitidez em telas Retina/4K, sem
+    // ficar preso ao antigo teto Full HD.
+    const int maximumDecodeWidth =
+      portraitSource ? 2160 : 3840;
+    const int maximumDecodeHeight =
+      portraitSource ? 3840 : 2160;
     const int quantizedWidth = std::min(
-      fullHdWidth,
-      ((std::min(wantedWidth, fullHdWidth) + 63) /
+      maximumDecodeWidth,
+      ((std::min(wantedWidth, maximumDecodeWidth) + 63) /
         64) * 64);
     const int quantizedHeight = std::min(
-      fullHdHeight,
-      ((std::min(wantedHeight, fullHdHeight) + 63) /
+      maximumDecodeHeight,
+      ((std::min(wantedHeight, maximumDecodeHeight) + 63) /
         64) * 64);
     const double sourceWidth =
       static_cast<double>(std::max(
@@ -240,9 +243,9 @@ struct Decoder::Impl {
       2, static_cast<int>(std::lround(
         sourceHeight * scale)));
     boundedWidth =
-      std::min(fullHdWidth, boundedWidth);
+      std::min(maximumDecodeWidth, boundedWidth);
     boundedHeight =
-      std::min(fullHdHeight, boundedHeight);
+      std::min(maximumDecodeHeight, boundedHeight);
     // O limite solicitado é quantizado, mas o render final conserva a
     // proporção da mídia. Isso evita recriar o reader por oscilações de 1 px
     // sem introduzir uma tela 16:9 em volta de conteúdo 4:3 ou ultrawide.

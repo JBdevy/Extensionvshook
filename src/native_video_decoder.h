@@ -18,7 +18,7 @@ struct DecodedFrame {
   double timestamp = 0.0;
 };
 
-// Reprodutor/decoder nativo por plataforma. O vídeo roda pelo relógio local
+// Reprodutor/decoder baseado exclusivamente no libVLC. O vídeo roda pelo relógio local
 // depois de carregado; frameAt() envia somente mudanças de transporte e
 // correções de sincronismo, e devolve imediatamente o último quadro pronto.
 // Todo carregamento, seek e decode acontece fora da thread da interface.

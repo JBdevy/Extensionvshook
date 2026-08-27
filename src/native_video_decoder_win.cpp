@@ -17,6 +17,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -239,7 +240,11 @@ struct Decoder::Impl {
   bool readerUsesD3D = false;
   std::string forceSoftwarePath;
   std::string path;
-  std::vector<std::uint8_t> pixels;
+  std::shared_ptr<std::vector<std::uint8_t>> pixels;
+  std::array<
+    std::shared_ptr<std::vector<std::uint8_t>>, 3>
+    pixelPool;
+  std::size_t nextPixelPoolIndex = 0;
   int sourceWidth = 0;
   int sourceHeight = 0;
   int outputWidth = 0;
@@ -404,7 +409,9 @@ struct Decoder::Impl {
     clearGpuProcessor();
     readerUsesD3D = false;
     path.clear();
-    pixels.clear();
+    pixels.reset();
+    pixelPool = {};
+    nextPixelPoolIndex = 0;
     sourceWidth = 0;
     sourceHeight = 0;
     outputWidth = 0;
@@ -421,16 +428,52 @@ struct Decoder::Impl {
     endOfStream = false;
   }
 
+  std::shared_ptr<std::vector<std::uint8_t>>
+  acquirePixelBuffer(std::size_t byteCount)
+  {
+    for (std::size_t attempt = 0;
+         attempt < pixelPool.size();
+         ++attempt) {
+      const std::size_t index =
+        (nextPixelPoolIndex + attempt) % pixelPool.size();
+      auto& candidate = pixelPool[index];
+      // O pool e o unico dono somente quando nem a janela nem o ultimo
+      // quadro publicado ainda usam este buffer.
+      if (!candidate || candidate.use_count() == 1) {
+        if (!candidate) {
+          candidate =
+            std::make_shared<std::vector<std::uint8_t>>();
+        }
+        candidate->resize(byteCount);
+        nextPixelPoolIndex =
+          (index + 1) % pixelPool.size();
+        return candidate;
+      }
+    }
+
+    const std::size_t index =
+      nextPixelPoolIndex % pixelPool.size();
+    auto replacement =
+      std::make_shared<std::vector<std::uint8_t>>(byteCount);
+    pixelPool[index] = replacement;
+    nextPixelPoolIndex =
+      (index + 1) % pixelPool.size();
+    return replacement;
+  }
+
   bool configureOutputSize(
     int requestedWidth,
     int requestedHeight)
   {
     if (sourceWidth <= 0 || sourceHeight <= 0) return false;
     const bool portraitSource = sourceHeight > sourceWidth;
+    // Conserva a resolucao fisica solicitada pela tela, inclusive 4K. O teto
+    // antigo em Full HD deixava o Teleprompt visivelmente mais macio que a
+    // janela de video do REAPER em monitores de alta resolucao.
     const int maximumOutputWidth =
-      portraitSource ? 1080 : 1920;
+      portraitSource ? 2160 : 3840;
     const int maximumOutputHeight =
-      portraitSource ? 1920 : 1080;
+      portraitSource ? 3840 : 2160;
     const int safeRequestedWidth = std::min(
       maximumOutputWidth,
       std::max(1, requestedWidth));
@@ -469,18 +512,23 @@ struct Decoder::Impl {
           static_cast<double>(sourceLongEdge));
     }
 
-    const int wantedWidth = std::max(
+    int wantedWidth = std::max(
       1,
       std::min(
         std::min(sourceWidth, safeRequestedWidth),
         static_cast<int>(
           std::lround(sourceWidth * outputScale))));
-    const int wantedHeight = std::max(
+    int wantedHeight = std::max(
       1,
       std::min(
         std::min(sourceHeight, safeRequestedHeight),
         static_cast<int>(
           std::lround(sourceHeight * outputScale))));
+    // NV12 trabalha em pares de luma/croma. Dimensoes impares podiam deixar
+    // uma fileira sem escrita em alguns processadores de video, aparecendo
+    // depois como uma linha verde na borda do quadro.
+    if (wantedWidth > 2) wantedWidth -= wantedWidth & 1;
+    if (wantedHeight > 2) wantedHeight -= wantedHeight & 1;
     if (wantedWidth == outputWidth &&
         wantedHeight == outputHeight) {
       return true;
@@ -497,10 +545,11 @@ struct Decoder::Impl {
       return false;
     }
 
-    std::vector<std::uint8_t> resizedPixels;
+    std::shared_ptr<std::vector<std::uint8_t>> resizedPixels;
     std::vector<BilinearAxisSample> resizedX;
     std::vector<BilinearAxisSample> resizedY;
-    if (destinationBytes > resizedPixels.max_size() ||
+    if (destinationBytes >
+          std::vector<std::uint8_t>().max_size() ||
         static_cast<std::size_t>(wantedWidth) >
           resizedX.max_size() ||
         static_cast<std::size_t>(wantedHeight) >
@@ -509,7 +558,9 @@ struct Decoder::Impl {
       return false;
     }
     try {
-      resizedPixels.assign(destinationBytes, 0);
+      resizedPixels = acquirePixelBuffer(destinationBytes);
+      std::fill(
+        resizedPixels->begin(), resizedPixels->end(), 0);
       buildBilinearAxis(
         sourceWidth, wantedWidth, resizedX);
       buildBilinearAxis(
@@ -525,7 +576,7 @@ struct Decoder::Impl {
     clearGpuProcessor();
     outputWidth = wantedWidth;
     outputHeight = wantedHeight;
-    pixels.swap(resizedPixels);
+    pixels = std::move(resizedPixels);
     sourceXForOutput.swap(resizedX);
     sourceYForOutput.swap(resizedY);
     // O quadro em cache possui a dimensão anterior; solicita novamente quando
@@ -876,7 +927,8 @@ struct Decoder::Impl {
 
   bool copyGpuSample(
     IMFSample* sample,
-    LONGLONG timestamp)
+    LONGLONG timestamp,
+    std::vector<std::uint8_t>& destinationPixels)
   {
     if (!sample || !readerUsesD3D || !outputIsNv12 ||
         !configureGpuProcessor()) {
@@ -956,6 +1008,16 @@ struct Decoder::Impl {
       videoProcessor.Get(),
       TRUE,
       &destinationRectangle);
+    D3D11_VIDEO_COLOR blackBackground{};
+    blackBackground.RGBA.A = 1.0f;
+    videoContext->VideoProcessorSetOutputBackgroundColor(
+      videoProcessor.Get(),
+      FALSE,
+      &blackBackground);
+    videoContext->VideoProcessorSetStreamAutoProcessingMode(
+      videoProcessor.Get(),
+      0,
+      TRUE);
 
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
@@ -982,7 +1044,7 @@ struct Decoder::Impl {
           outputHeight,
           destinationStride,
           destinationBytes) ||
-        destinationBytes != pixels.size()) {
+        destinationBytes != destinationPixels.size()) {
       statusCode = -106;
       return false;
     }
@@ -1007,7 +1069,7 @@ struct Decoder::Impl {
       static_cast<const std::uint8_t*>(mapped.pData);
     for (int row = 0; row < outputHeight; ++row) {
       std::memcpy(
-        pixels.data() +
+        destinationPixels.data() +
           static_cast<std::size_t>(row) *
             destinationStride,
         source +
@@ -1031,16 +1093,29 @@ struct Decoder::Impl {
     if (!sample ||
         sourceWidth <= 0 || sourceHeight <= 0 ||
         outputWidth <= 0 || outputHeight <= 0 ||
-        pixels.empty() ||
         !checkedBgraLayout(
           outputWidth,
           outputHeight,
           destinationStride,
-          destinationBytes) ||
-        destinationBytes != pixels.size()) {
+          destinationBytes)) {
       return false;
     }
-    if (copyGpuSample(sample, timestamp)) {
+    std::shared_ptr<std::vector<std::uint8_t>> nextPixels;
+    try {
+      nextPixels = acquirePixelBuffer(destinationBytes);
+    } catch (const std::bad_alloc&) {
+      statusCode = -107;
+      return false;
+    } catch (const std::length_error&) {
+      statusCode = -107;
+      return false;
+    }
+    if (!nextPixels || nextPixels->size() != destinationBytes) {
+      statusCode = -107;
+      return false;
+    }
+    if (copyGpuSample(sample, timestamp, *nextPixels)) {
+      pixels = std::move(nextPixels);
       return true;
     }
     ComPtr<IMFMediaBuffer> mediaBuffer;
@@ -1143,7 +1218,7 @@ struct Decoder::Impl {
           uvPlane +
           static_cast<std::size_t>(sourceY.second / 2) * stride;
         std::uint8_t* destinationRow =
-          pixels.data() +
+          nextPixels->data() +
           static_cast<std::size_t>(y) *
             destinationStride;
         for (int x = 0; x < outputWidth; ++x) {
@@ -1193,6 +1268,7 @@ struct Decoder::Impl {
       frameTimestamp = hnsToSeconds(timestamp);
       hasFrame = true;
       statusCode = 2;
+      pixels = std::move(nextPixels);
       return true;
     }
 
@@ -1283,7 +1359,7 @@ struct Decoder::Impl {
         scanline0 +
         static_cast<std::ptrdiff_t>(sourceY.second) * pitch;
       std::uint8_t* destinationRow =
-        pixels.data() +
+        nextPixels->data() +
         static_cast<std::size_t>(y) *
           destinationStride;
       for (int x = 0; x < outputWidth; ++x) {
@@ -1313,6 +1389,7 @@ struct Decoder::Impl {
     frameTimestamp = hnsToSeconds(timestamp);
     hasFrame = true;
     statusCode = 2;
+    pixels = std::move(nextPixels);
     return true;
   }
 
@@ -1389,31 +1466,21 @@ struct Decoder::Impl {
   void publishCurrentFrame(
     const PlaybackRequest& processed)
   {
-    if (!hasFrame || pixels.empty() ||
+    if (!hasFrame || !pixels || pixels->empty() ||
         outputWidth <= 0 || outputHeight <= 0) {
       return;
     }
 
-    // A cópia acontece na worker. A interface recebe um snapshot imutável e
-    // pode desenhá-lo sem bloquear o decoder ou correr risco de data race.
-    std::shared_ptr<std::vector<std::uint8_t>> snapshot;
-    try {
-      snapshot =
-        std::make_shared<std::vector<std::uint8_t>>(pixels);
-    } catch (const std::bad_alloc&) {
-      statusCode = -107;
-      return;
-    } catch (const std::length_error&) {
-      statusCode = -107;
-      return;
-    }
     std::lock_guard<std::mutex> lock(stateMutex);
     if (!hasRequest ||
         request.path != path ||
         request.playbackKey != processed.playbackKey) {
       return;
     }
-    publishedPixels = std::move(snapshot);
+    // O quadro foi decodificado diretamente em um buffer do pequeno pool.
+    // Compartilhar sua posse elimina a antiga cópia integral por frame (mais
+    // de 8 MB em Full HD) sem a worker alterar memoria ainda em desenho.
+    publishedPixels = pixels;
     publishedPath = path;
     publishedPlaybackKey = processed.playbackKey;
     publishedWidth = outputWidth;

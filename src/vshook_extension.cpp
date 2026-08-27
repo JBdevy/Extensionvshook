@@ -463,6 +463,9 @@ static StuffMIDIMessage_t StuffMIDIMessage_ptr = nullptr;
 static ReaProject* getCurrentProject(char* pathOut, int pathOutSize);
 static std::string nativeTrim(std::string value);
 static std::string nativeLower(std::string value);
+static std::string nativeMediaItemGuid(
+  MediaItem* item, const std::string& fallback);
+static std::string nativeReadTakeSourcePath(MediaItem_Take* take);
 static bool nativeUiSetProjectString(
   ReaProject* project, const char* key, const std::string& value);
 
@@ -659,6 +662,9 @@ static custom_action_register_t g_projectSyncAction = {
 static custom_action_register_t g_exportProjectAction = {
   0, "VSHOOKEXPORTPROJECT", "VS Hook: Export Project", nullptr
 };
+static custom_action_register_t g_convertMp3Action = {
+  0, "VSHOOKCONVERTMP3", "VS Hook: Converter MP3", nullptr
+};
 static custom_action_register_t g_telepromptOneAction = {
   0, "VSHOOKNEWTELEPROMPT1", "VS Hook: Abrir Teleprompt 1", nullptr
 };
@@ -690,6 +696,7 @@ static int g_timecodeTransmitterCommandId = 0;
 static int g_addTimecodeCommandId = 0;
 static int g_projectSyncCommandId = 0;
 static int g_exportProjectCommandId = 0;
+static int g_convertMp3CommandId = 0;
 static int g_telepromptOneCommandId = 0;
 static int g_telepromptTwoCommandId = 0;
 static int g_telepromptSettingsCommandId = 0;
@@ -4013,6 +4020,12 @@ static void toggleProjectSync()
     return;
   }
 
+  if (ShowMessageBox_ptr) {
+    ShowMessageBox_ptr(
+      "Recurso ainda em fase de teste.",
+      "VS Hook - Project Sync", 0);
+  }
+
   const std::string previousTimecodeMode = getTimecodeMode();
   if (previousTimecodeMode == "receive" ||
       previousTimecodeMode == "transmitter") {
@@ -4287,6 +4300,248 @@ static void nativeExportProject()
   if (dialogConfigurator.joinable()) dialogConfigurator.join();
 }
 
+static bool nativeConvertMp3EligibleSourcePath(const std::string& rawPath)
+{
+  const std::string path = nativeLower(nativeTrim(rawPath));
+  const size_t slash = path.find_last_of("/\\");
+  const size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos ||
+      (slash != std::string::npos && dot < slash)) {
+    return false;
+  }
+  const std::string extension = path.substr(dot);
+  return extension == ".wav" || extension == ".aif" ||
+    extension == ".aiff";
+}
+
+static MediaItem* nativeConvertMp3FindItemByGuid(
+  ReaProject* project, const std::string& wantedGuid)
+{
+  if (!project || wantedGuid.empty() || !CountTracks_ptr ||
+      !GetTrack_ptr || !GetTrackNumMediaItems_ptr ||
+      !GetTrackMediaItem_ptr) {
+    return nullptr;
+  }
+  const int trackCount = CountTracks_ptr(project);
+  for (int trackIndex = 0; trackIndex < trackCount; ++trackIndex) {
+    MediaTrack* track = GetTrack_ptr(project, trackIndex);
+    const int itemCount = track
+      ? GetTrackNumMediaItems_ptr(track) : 0;
+    for (int itemIndex = 0; itemIndex < itemCount; ++itemIndex) {
+      MediaItem* item = GetTrackMediaItem_ptr(track, itemIndex);
+      if (nativeMediaItemGuid(item, std::string()) == wantedGuid) {
+        return item;
+      }
+    }
+  }
+  return nullptr;
+}
+
+static bool nativeConvertMp3ReadProjectString(
+  ReaProject* project, const char* key, std::string& valueOut)
+{
+  valueOut.clear();
+  if (!project || !key || !GetSetProjectInfo_String_ptr) return false;
+  std::vector<char> buffer(16384, '\0');
+  if (!GetSetProjectInfo_String_ptr(
+        project, key, buffer.data(), false)) {
+    return false;
+  }
+  valueOut.assign(buffer.data());
+  return true;
+}
+
+static void nativeConvertProjectItemsToMp3()
+{
+  const int answer = ShowMessageBox_ptr
+    ? ShowMessageBox_ptr(
+        "Todos os itens de audio WAV e AIFF do grid serao convertidos "
+        "para MP3. Itens que ja sao MP3, videos e outros formatos nao "
+        "serao alterados. Deseja continuar?",
+        "VS Hook - Converter MP3", 1)
+    : 1;
+  if (answer != 1) return;
+
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project) {
+    showDiagnostic("Nenhum projeto esta aberto para converter.");
+    return;
+  }
+  if (!Main_OnCommand_ptr || !CountTracks_ptr || !GetTrack_ptr ||
+      !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr ||
+      !GetActiveTake_ptr || !GetMediaItemTake_Source_ptr ||
+      !GetMediaSourceFileName_ptr || !SelectAllMediaItems_ptr ||
+      !SetMediaItemInfo_Value_ptr || !CountSelectedMediaItems_ptr ||
+      !GetSelectedMediaItem_ptr || !Undo_DoUndo2_ptr ||
+      !GetSetProjectInfo_String_ptr) {
+    showDiagnostic(
+      "REAPER nao entregou as funcoes necessarias para converter os itens.");
+    return;
+  }
+
+  std::vector<std::string> eligibleGuids;
+  std::set<std::string> originallySelectedGuids;
+  const int selectedCount = CountSelectedMediaItems_ptr(project);
+  for (int index = 0; index < selectedCount; ++index) {
+    MediaItem* item = GetSelectedMediaItem_ptr(project, index);
+    const std::string guid = nativeMediaItemGuid(item, std::string());
+    if (!guid.empty()) originallySelectedGuids.insert(guid);
+  }
+
+  const int trackCount = CountTracks_ptr(project);
+  for (int trackIndex = 0; trackIndex < trackCount; ++trackIndex) {
+    MediaTrack* track = GetTrack_ptr(project, trackIndex);
+    const int itemCount = track
+      ? GetTrackNumMediaItems_ptr(track) : 0;
+    for (int itemIndex = 0; itemIndex < itemCount; ++itemIndex) {
+      MediaItem* item = GetTrackMediaItem_ptr(track, itemIndex);
+      MediaItem_Take* take = item ? GetActiveTake_ptr(item) : nullptr;
+      if (!take || (TakeIsMIDI_ptr && TakeIsMIDI_ptr(take)) ||
+          !nativeConvertMp3EligibleSourcePath(
+            nativeReadTakeSourcePath(take))) {
+        continue;
+      }
+      const std::string guid = nativeMediaItemGuid(item, std::string());
+      if (!guid.empty()) eligibleGuids.push_back(guid);
+    }
+  }
+
+  if (eligibleGuids.empty()) {
+    ShowMessageBox_ptr(
+      "Nenhum item WAV ou AIFF foi encontrado no grid.",
+      "VS Hook - Converter MP3", 0);
+    return;
+  }
+
+  std::string originalApplyFxFormat;
+  if (!nativeConvertMp3ReadProjectString(
+        project, "APPLYFX_FORMAT", originalApplyFxFormat)) {
+    showDiagnostic(
+      "Nao foi possivel guardar o formato atual de Apply FX/Glue.");
+    return;
+  }
+  std::string originalOpenCopyCfgIndex;
+  if (!nativeConvertMp3ReadProjectString(
+        project, "OPENCOPY_CFGIDX", originalOpenCopyCfgIndex)) {
+    showDiagnostic(
+      "Nao foi possivel guardar o formato atual de Apply FX/Glue.");
+    return;
+  }
+
+  // Configuracao MP3 a 320 kbps em qualidade maxima, igual a usada pelo
+  // Export Project. OPENCOPY_CFGIDX pertence a API de strings do REAPER;
+  // usar GetSetProjectInfo (numerico) faz o comando Glue ignorar o valor e
+  // continuar em Wave (auto-depth).
+  const bool formatSet =
+    nativeUiSetProjectString(project, "APPLYFX_FORMAT",
+      "bDNwbUABAAAAAAAACgAAAP////8EAAAAQAEAAAAAAAAI") &&
+    nativeUiSetProjectString(project, "OPENCOPY_CFGIDX", "1");
+  std::string activeOpenCopyCfgIndex;
+  const bool formatConfirmed = formatSet &&
+    nativeConvertMp3ReadProjectString(
+      project, "OPENCOPY_CFGIDX", activeOpenCopyCfgIndex) &&
+    nativeTrim(activeOpenCopyCfgIndex) == "1";
+  if (!formatConfirmed) {
+    nativeUiSetProjectString(
+      project, "APPLYFX_FORMAT", originalApplyFxFormat);
+    nativeUiSetProjectString(
+      project, "OPENCOPY_CFGIDX", originalOpenCopyCfgIndex);
+    showDiagnostic(
+      "O REAPER nao aceitou MP3 como formato de Apply FX/Glue. "
+      "Nenhum item foi alterado.");
+    return;
+  }
+
+  std::map<std::string, std::string> convertedSelectionGuids;
+  int convertedCount = 0;
+  bool glueRejectedMp3Format = false;
+  if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
+  if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
+
+  for (const std::string& originalGuid : eligibleGuids) {
+    MediaItem* item = nativeConvertMp3FindItemByGuid(
+      project, originalGuid);
+    if (!item) continue;
+
+    SelectAllMediaItems_ptr(project, false);
+    SetMediaItemInfo_Value_ptr(item, "B_UISEL", 1.0);
+    // Action nativa do REAPER: Item: Glue items.
+    Main_OnCommand_ptr(40362, 0);
+
+    MediaItem* result = CountSelectedMediaItems_ptr(project) == 1
+      ? GetSelectedMediaItem_ptr(project, 0) : nullptr;
+    MediaItem_Take* resultTake = result
+      ? GetActiveTake_ptr(result) : nullptr;
+    if (!resultTake ||
+        nativeConvertMp3EligibleSourcePath(
+          nativeReadTakeSourcePath(resultTake))) {
+      continue;
+    }
+    const std::string resultPath = nativeLower(
+      nativeReadTakeSourcePath(resultTake));
+    const size_t dot = resultPath.find_last_of('.');
+    if (dot == std::string::npos || resultPath.substr(dot) != ".mp3") {
+      // Nunca percorre o restante do projeto se o Glue ignorar MP3. O bloco
+      // inteiro sera desfeito automaticamente logo abaixo.
+      glueRejectedMp3Format = true;
+      break;
+    }
+    ++convertedCount;
+    if (originallySelectedGuids.count(originalGuid) != 0) {
+      const std::string resultGuid = nativeMediaItemGuid(
+        result, std::string());
+      if (!resultGuid.empty()) {
+        convertedSelectionGuids[originalGuid] = resultGuid;
+      }
+    }
+  }
+
+  // A preferencia do projeto nunca fica alterada pela ferramenta.
+  nativeUiSetProjectString(
+    project, "APPLYFX_FORMAT", originalApplyFxFormat);
+  nativeUiSetProjectString(
+    project, "OPENCOPY_CFGIDX", originalOpenCopyCfgIndex);
+
+  SelectAllMediaItems_ptr(project, false);
+  for (const std::string& originalGuid : originallySelectedGuids) {
+    std::string guidToRestore = originalGuid;
+    const auto converted = convertedSelectionGuids.find(originalGuid);
+    if (converted != convertedSelectionGuids.end()) {
+      guidToRestore = converted->second;
+    }
+    MediaItem* item = nativeConvertMp3FindItemByGuid(
+      project, guidToRestore);
+    if (item) SetMediaItemInfo_Value_ptr(item, "B_UISEL", 1.0);
+  }
+
+  if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(-1);
+  if (Undo_EndBlock2_ptr) {
+    Undo_EndBlock2_ptr(project,
+      "VS Hook: Converter itens WAV/AIFF para MP3", -1);
+  }
+  if (UpdateArrange_ptr) UpdateArrange_ptr();
+
+  if (glueRejectedMp3Format) {
+    Undo_DoUndo2_ptr(project);
+    if (UpdateArrange_ptr) UpdateArrange_ptr();
+    ShowMessageBox_ptr(
+      "O Glue do REAPER nao gerou MP3. A conversao foi interrompida e "
+      "todas as alteracoes desta tentativa foram desfeitas.",
+      "VS Hook - Converter MP3", 0);
+    return;
+  }
+
+  std::ostringstream message;
+  message << convertedCount << " item(ns) convertido(s) para MP3.";
+  if (convertedCount != static_cast<int>(eligibleGuids.size())) {
+    message << "\n" <<
+      (static_cast<int>(eligibleGuids.size()) - convertedCount) <<
+      " item(ns) nao puderam ser convertidos.";
+  }
+  ShowMessageBox_ptr(
+    message.str().c_str(), "VS Hook - Converter MP3", 0);
+}
+
 static std::string getCurrentProjectSignature()
 {
   char path[2048] = "";
@@ -4507,6 +4762,11 @@ static bool hookCommand(int command, int flag)
     nativeExportProject();
     return true;
   }
+  if (g_convertMp3CommandId != 0 &&
+      command == g_convertMp3CommandId) {
+    nativeConvertProjectItemsToMp3();
+    return true;
+  }
   if (g_telepromptOneCommandId != 0 &&
       command == g_telepromptOneCommandId) {
     nativeToggleTelepromptWindow(1);
@@ -4638,6 +4898,11 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   if (g_exportProjectCommandId != 0 &&
       command == g_exportProjectCommandId) {
     nativeExportProject();
+    return true;
+  }
+  if (g_convertMp3CommandId != 0 &&
+      command == g_convertMp3CommandId) {
+    nativeConvertProjectItemsToMp3();
     return true;
   }
   if (g_telepromptOneCommandId != 0 &&
@@ -4975,6 +5240,8 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
     MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
   appendMenuString(vsHookMenu, "Export Project",
     g_exportProjectCommandId, false);
+  appendMenuString(vsHookMenu, "Converter MP3",
+    g_convertMp3CommandId, false);
   InsertMenu(vsHookMenu, GetMenuItemCount(vsHookMenu),
     MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
   appendMenuString(vsHookMenu, "Bypass",
@@ -20279,7 +20546,7 @@ static bool nativePlayProtectionShouldAllow(
   const bool insideWindow = sameAction &&
     g_nativePlayProtectionLastTapAt.time_since_epoch().count() != 0 &&
     now - g_nativePlayProtectionLastTapAt <=
-      std::chrono::milliseconds(550);
+      std::chrono::milliseconds(300);
   if (insideWindow) {
     g_nativePlayProtectionLastTapAt =
       std::chrono::steady_clock::time_point();
@@ -59263,7 +59530,6 @@ static RECT nativeTelepromptMeasureText(
   return rect;
 }
 
-#ifdef __APPLE__
 struct NativeTelepromptWrappedTextLayout {
   std::vector<std::string> lines;
   int lineHeight = 1;
@@ -59485,7 +59751,6 @@ static void nativeTelepromptDrawWrappedTextMac(
 
 static NativeTelepromptWrappedTextLayout
   g_nativeTelepromptWrappedTextLayout[2];
-#endif
 
 static std::string nativeTelepromptDisplayText(
   const std::string& raw,
@@ -60858,12 +61123,12 @@ static void nativeTelepromptClampDecodeRequest(
   int& outputHeight)
 {
   // A orientação da mídia só é conhecida pelo decoder. Um limite quadrado
-  // de 1920 permite que ele escolha 1920x1080 (paisagem) ou 1080x1920
-  // (retrato), sem que a orientação da janela reduza o eixo errado.
+  // de 3840 permite acompanhar a resolução física de monitores 4K/Retina;
+  // o decoder ainda conserva a proporção e nunca ultrapassa a fonte.
   outputWidth = std::max(
-    1, std::min(1920, requestedWidth));
+    1, std::min(3840, requestedWidth));
   outputHeight = std::max(
-    1, std::min(1920, requestedHeight));
+    1, std::min(3840, requestedHeight));
 }
 
 static bool nativeTelepromptHoldImageFrame(
@@ -62193,26 +62458,12 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
           HFONT font = nativeTelepromptFont(
             technicalNoticeSettings.fontFamily,
             size, FW_BOLD);
-#ifdef __APPLE__
           const NativeTelepromptWrappedTextLayout measured =
             nativeTelepromptLayoutWrappedTextMac(
               dc, noticeText, font, availableWidth);
           const bool fits =
             measured.totalHeight <= availableHeight &&
             measured.maxLineWidth <= availableWidth;
-#else
-          RECT measured{
-            available.left, available.top,
-            available.right, available.top + 1
-          };
-          measured = nativeTelepromptMeasureText(
-            dc, noticeText, measured,
-            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
-            font);
-          const bool fits =
-            measured.bottom - measured.top <=
-              availableHeight;
-#endif
           if (fits) {
             chosen = size;
             low = size + 1;
@@ -62227,7 +62478,6 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         layoutCache.availableHeight = availableHeight;
         layoutCache.maxFont = maxFont;
         layoutCache.chosenFont = chosen;
-#ifdef __APPLE__
         g_nativeTelepromptWrappedTextLayout[index] =
           nativeTelepromptLayoutWrappedTextMac(
             dc, noticeText,
@@ -62235,9 +62485,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
               technicalNoticeSettings.fontFamily,
               chosen, FW_BOLD),
             availableWidth);
-#endif
       }
-#ifdef __APPLE__
       nativeTelepromptDrawWrappedTextMac(
         dc, g_nativeTelepromptWrappedTextLayout[index],
         available,
@@ -62247,18 +62495,6 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         nativeTelepromptFont(
           technicalNoticeSettings.fontFamily,
           layoutCache.chosenFont, FW_BOLD));
-#else
-      nativeAppActiveDrawText(
-        dc, noticeText, available,
-        DT_CENTER | DT_VCENTER |
-          DT_WORDBREAK | DT_NOPREFIX,
-        nativeTelepromptColor(
-          technicalNoticeSettings.textColor,
-          RGB(255, 234, 0)),
-        nativeTelepromptFont(
-          technicalNoticeSettings.fontFamily,
-          layoutCache.chosenFont, FW_BOLD));
-#endif
     }
     finishPaint();
     return;
@@ -62456,25 +62692,12 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         const int size = low + (high - low) / 2;
         HFONT font = nativeTelepromptFont(
           settings.fontFamily, size, FW_BOLD);
-#ifdef __APPLE__
         const NativeTelepromptWrappedTextLayout measured =
           nativeTelepromptLayoutWrappedTextMac(
             dc, lyrics, font, availableWidth);
         const bool fits =
           measured.totalHeight <= availableHeight &&
           measured.maxLineWidth <= availableWidth;
-#else
-        RECT measured{
-          available.left, available.top,
-          available.right, available.top + 1
-        };
-        measured = nativeTelepromptMeasureText(
-          dc, lyrics, measured,
-          DT_CENTER | DT_WORDBREAK | DT_NOPREFIX, font);
-        const bool fits =
-          measured.bottom - measured.top <=
-            availableHeight;
-#endif
         if (fits) {
           chosen = size;
           low = size + 1;
@@ -62488,16 +62711,13 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       layoutCache.availableHeight = availableHeight;
       layoutCache.maxFont = maxFont;
       layoutCache.chosenFont = chosen;
-#ifdef __APPLE__
       g_nativeTelepromptWrappedTextLayout[index] =
         nativeTelepromptLayoutWrappedTextMac(
           dc, lyrics,
           nativeTelepromptFont(
             settings.fontFamily, chosen, FW_BOLD),
           availableWidth);
-#endif
     }
-#ifdef __APPLE__
     nativeTelepromptDrawWrappedTextMac(
       dc, g_nativeTelepromptWrappedTextLayout[index],
       available,
@@ -62507,21 +62727,6 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         settings.fontFamily,
         layoutCache.chosenFont, FW_BOLD),
       settings.textAlignment);
-#else
-    const std::string alignment =
-      nativeLower(settings.textAlignment);
-    const UINT textAlignmentFlag = alignment == "left" ||
-        alignment == "justify"
-      ? DT_LEFT
-      : (alignment == "right" ? DT_RIGHT : DT_CENTER);
-    nativeAppActiveDrawText(dc, lyrics, available,
-      textAlignmentFlag | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX,
-      nativeTelepromptColor(
-        settings.textColor, RGB(255, 234, 0)),
-      nativeTelepromptFont(
-        settings.fontFamily,
-        layoutCache.chosenFont, FW_BOLD));
-#endif
   }
 
   finishPaint();
@@ -74175,6 +74380,11 @@ static bool initialize()
   if (g_exportProjectCommandId != 0) {
     hasRegisteredAction = true;
   }
+  g_convertMp3CommandId =
+    plugin_register_ptr("custom_action", (void*)&g_convertMp3Action);
+  if (g_convertMp3CommandId != 0) {
+    hasRegisteredAction = true;
+  }
   g_telepromptOneCommandId =
     plugin_register_ptr("custom_action", (void*)&g_telepromptOneAction);
   if (g_telepromptOneCommandId != 0) hasRegisteredAction = true;
@@ -74414,6 +74624,10 @@ static void shutdown()
   if (g_exportProjectCommandId != 0) {
     plugin_register_ptr("-custom_action", (void*)&g_exportProjectAction);
     g_exportProjectCommandId = 0;
+  }
+  if (g_convertMp3CommandId != 0) {
+    plugin_register_ptr("-custom_action", (void*)&g_convertMp3Action);
+    g_convertMp3CommandId = 0;
   }
   if (g_telepromptOneCommandId != 0) {
     plugin_register_ptr("-custom_action", (void*)&g_telepromptOneAction);
