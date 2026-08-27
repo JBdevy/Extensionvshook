@@ -60310,24 +60310,77 @@ static void nativeTelepromptDrawPreview(
 
   const int blockCount = std::min(
     8, static_cast<int>(state.preview.blocks.size()));
-  const int columns = std::max(1, std::min(4, blockCount));
   const int gap = std::max(
     4, std::min(16, width / 80));
   const int areaW = std::max(
     1, static_cast<int>(area.right - area.left));
   const int areaH = std::max(
     1, static_cast<int>(area.bottom - area.top));
-  const int cardW = std::max(
-    1, (areaW - gap * (columns - 1)) / columns);
-  // Calcula o tamanho pela largura real de cada coluna e pela coluna que tem
-  // mais conteudo. O calculo antigo usava a largura total da janela e deixava
-  // muito espaco vazio, principalmente nos previews com uma ou duas colunas.
+  // Testa todas as quantidades de colunas possíveis e escolhe a que permite
+  // a maior fonte. Os blocos são colocados na coluna menos ocupada, portanto
+  // o Preview não fica preso ao antigo arranjo 4 em cima + 4 embaixo.
+  int columns = 1;
+  int cardW = areaW;
+  int bestEstimatedFont = 0;
+  std::vector<int> blockColumns(static_cast<size_t>(blockCount), 0);
+  for (int candidateColumns = 1;
+       candidateColumns <= std::min(4, blockCount);
+       ++candidateColumns) {
+    const int candidateCardW = std::max(
+      1, (areaW - gap * (candidateColumns - 1)) /
+        candidateColumns);
+    std::vector<double> columnUnits(
+      static_cast<size_t>(candidateColumns), 0.0);
+    std::vector<int> columnBlocks(
+      static_cast<size_t>(candidateColumns), 0);
+    std::vector<int> candidateBlockColumns(
+      static_cast<size_t>(blockCount), 0);
+    for (int index = 0; index < blockCount; ++index) {
+      int targetColumn = 0;
+      for (int column = 1; column < candidateColumns; ++column) {
+        if (columnUnits[static_cast<size_t>(column)] <
+            columnUnits[static_cast<size_t>(targetColumn)]) {
+          targetColumn = column;
+        }
+      }
+      candidateBlockColumns[static_cast<size_t>(index)] = targetColumn;
+      const auto& candidateBlock =
+        state.preview.blocks[static_cast<size_t>(index)];
+      columnUnits[static_cast<size_t>(targetColumn)] +=
+        std::max<size_t>(1, candidateBlock.songs.size()) + 1.35;
+      ++columnBlocks[static_cast<size_t>(targetColumn)];
+    }
+    double busiestUnits = 1.0;
+    int busiestBlocks = 1;
+    for (int column = 0; column < candidateColumns; ++column) {
+      busiestUnits = std::max(
+        busiestUnits, columnUnits[static_cast<size_t>(column)]);
+      busiestBlocks = std::max(
+        busiestBlocks, columnBlocks[static_cast<size_t>(column)]);
+    }
+    const int verticalLimit = std::max(10,
+      static_cast<int>(std::floor(
+        std::max(1, areaH - gap * (busiestBlocks - 1) -
+          busiestBlocks * 12) / (busiestUnits * 1.07))));
+    const int horizontalLimit = std::max(10, candidateCardW / 13);
+    const int estimatedFont = std::max(
+      10, std::min(40, std::min(horizontalLimit, verticalLimit)));
+    if (estimatedFont > bestEstimatedFont ||
+        (estimatedFont == bestEstimatedFont &&
+         candidateCardW > cardW)) {
+      columns = candidateColumns;
+      cardW = candidateCardW;
+      bestEstimatedFont = estimatedFont;
+      blockColumns = std::move(candidateBlockColumns);
+    }
+  }
+
   std::vector<int> columnSongCounts(
     static_cast<size_t>(columns), 0);
   std::vector<int> columnBlockCounts(
     static_cast<size_t>(columns), 0);
   for (int index = 0; index < blockCount; ++index) {
-    const int column = index % columns;
+    const int column = blockColumns[static_cast<size_t>(index)];
     columnSongCounts[static_cast<size_t>(column)] +=
       static_cast<int>(state.preview.blocks[
         static_cast<size_t>(index)].songs.size());
@@ -60376,7 +60429,7 @@ static void nativeTelepromptDrawPreview(
        index < 8; ++index) {
     const NativeTelepromptPreviewBlock& block =
       state.preview.blocks[index];
-    const int column = static_cast<int>(index) % columns;
+    const int column = blockColumns[index];
     const int left = area.left +
       column * (cardW + gap);
     const int top = columnTops[static_cast<size_t>(column)];
