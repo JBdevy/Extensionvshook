@@ -4278,14 +4278,16 @@ static void nativeExportProject()
   if (GetSetProjectInfo_ptr) {
     GetSetProjectInfo_ptr(
       project, "RECFMT_OPENCOPY", convertToMp3 ? 1.0 : 0.0, true);
-    GetSetProjectInfo_ptr(
-      project, "OPENCOPY_CFGIDX", convertToMp3 ? 1.0 : 0.0, true);
   }
   if (convertToMp3) {
     // MP3 a 320 kbps no modo de qualidade maxima. APPLYFX_FORMAT e a
     // configuracao usada pelo proprio REAPER ao converter midia no Save As.
+    // OPENCOPY_CFGIDX pertence a API de strings (0=Wave, 1=Apply FX,
+    // 2=Recording). A chamada numerica anterior era ignorada e deixava Wave
+    // selecionado, embora a caixa "Converter midia" estivesse marcada.
     nativeUiSetProjectString(project, "APPLYFX_FORMAT",
       "bDNwbUABAAAAAAAACgAAAP////8EAAAAQAEAAAAAAAAI");
+    nativeUiSetProjectString(project, "OPENCOPY_CFGIDX", "1");
   }
 
   std::atomic<bool> dialogClosed{false};
@@ -59886,10 +59888,16 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
         (playState & 1) == 1 || (playState & 4) == 4;
       const bool transportPositionActive =
         livePlaying || (playState & 2) == 2;
-      const double livePosition =
-        GetPlayPositionEx_ptr
-          ? GetPlayPositionEx_ptr(project)
-          : 0.0;
+      // Em Play/Pause, a janela acompanha o cursor de reproducao. Depois de
+      // um Stop, GetPlayPositionEx conserva a ultima posicao reproduzida e nao
+      // representa o quadro que a janela de video do REAPER exibe. Nesse
+      // estado, a referencia correta e o cursor de edicao.
+      double livePosition = 0.0;
+      if (transportPositionActive && GetPlayPositionEx_ptr) {
+        livePosition = GetPlayPositionEx_ptr(project);
+      } else if (GetCursorPositionEx_ptr) {
+        livePosition = GetCursorPositionEx_ptr(project);
+      }
       const std::string liveState =
         nativeBuildTelepromptStateJson(
           project, songs, slot,
@@ -62529,6 +62537,21 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     return;
   }
 
+  // Com o Preview ativo, somente o próprio Preview, o cronômetro e o horário
+  // local podem permanecer visíveis. Encerra o desenho antes de reservar ou
+  // renderizar nome da música, fila, cifras, letras, imagens ou vídeos.
+  if (previewActive) {
+    const int previewTopReserve = std::max(
+      24, topCursor - static_cast<int>(client.top));
+    const int previewBottomReserve = std::max(
+      24, static_cast<int>(client.bottom) - bottomCursor);
+    nativeTelepromptDrawPreview(
+      dc, state, settings, client,
+      previewTopReserve, previewBottomReserve);
+    finishPaint();
+    return;
+  }
+
   const int nameFont = std::max(16,
     static_cast<int>(std::min(width / 34.0, height / 20.0) *
       settings.songNameScale));
@@ -62644,18 +62667,6 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
         DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX,
         chordColor, chordFont);
     }
-  }
-
-  const int topReserve = std::max(
-    24, topCursor - static_cast<int>(client.top));
-  const int bottomReserve = std::max(
-    24, static_cast<int>(client.bottom) - bottomCursor);
-  if (previewActive) {
-    nativeTelepromptDrawPreview(
-      dc, state, settings, client,
-      topReserve, bottomReserve);
-    finishPaint();
-    return;
   }
 
   RECT textRect{
