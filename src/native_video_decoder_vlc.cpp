@@ -437,8 +437,9 @@ struct Decoder::Impl {
   bool activePlaying = false;
   double activeRate = 1.0;
   bool playerStarted = false;
-  std::chrono::steady_clock::time_point lastCorrection =
-    std::chrono::steady_clock::time_point::min();
+  bool previousRequestValid = false;
+  double previousRequestSourceTime = 0.0;
+  std::chrono::steady_clock::time_point previousRequestWall{};
 
   Impl()
   {
@@ -481,17 +482,21 @@ struct Decoder::Impl {
     unsigned outputHeight = std::max(
       2u, static_cast<unsigned>(
         std::lround(static_cast<double>(*height) * boundedScale)));
-    // RV32 trabalha melhor com dimensoes pares e evita a faixa verde que
-    // alguns decoders produzem em alturas impares.
+    // Mantem dimensoes pares para evitar a faixa verde que alguns decoders
+    // produzem ao converter videos com altura impar.
     outputWidth &= ~1u;
     outputHeight &= ~1u;
-    std::memcpy(chroma, "RV32", 4);
+    // Os renderizadores Win32 e CoreGraphics consomem BGRA top-down. Usar o
+    // formato explicito evita que a ordem dos canais de RV32 varie conforme
+    // a plataforma ou o conversor escolhido pelo VLC.
+    std::memcpy(chroma, "BGRA", 4);
     *width = outputWidth;
     *height = outputHeight;
-    const unsigned outputPitch =
-      ((outputWidth * 4u) + 31u) & ~31u;
-    const unsigned outputLines =
-      (outputHeight + 31u) & ~31u;
+    // Uma linha BGRA ja e naturalmente alinhada para GDI/CoreGraphics. Nao
+    // anuncia linhas extras ao vmem: alguns conversores preenchem esse espaco
+    // como imagem valida e o resultado aparece corrompido no Windows.
+    const unsigned outputPitch = outputWidth * 4u;
+    const unsigned outputLines = outputHeight;
     pitches[0] = outputPitch;
     lines[0] = outputLines;
     {
@@ -636,6 +641,7 @@ struct Decoder::Impl {
       media = nullptr;
     }
     playerStarted = false;
+    previousRequestValid = false;
     {
       std::lock_guard<std::mutex> lock(frameMutex);
       activePath.clear();
@@ -657,8 +663,7 @@ struct Decoder::Impl {
       "--no-video-title-show",
       "--no-osd",
       "--no-stats",
-      "--quiet",
-      "--avcodec-hw=any"
+      "--quiet"
     };
     std::vector<const char*> arguments;
     arguments.reserve(ownedArguments.size());
@@ -714,7 +719,9 @@ struct Decoder::Impl {
     api.setPause(player, current.playing ? 0 : 1);
     activePlaying = current.playing;
     activeRate = current.playbackRate;
-    lastCorrection = std::chrono::steady_clock::now();
+    previousRequestValid = true;
+    previousRequestSourceTime = current.sourceTime;
+    previousRequestWall = std::chrono::steady_clock::now();
     return true;
   }
 
@@ -730,9 +737,15 @@ struct Decoder::Impl {
     const bool identityChanged =
       !player || current.path != activePath ||
       current.playbackKey != activePlaybackKey;
-    const bool dimensionsChanged = player &&
-      (std::abs(current.requestedWidth - maximumWidth) > 64 ||
-       std::abs(current.requestedHeight - maximumHeight) > 64);
+    // Durante o play o tamanho disponivel pode oscilar alguns pixels a cada
+    // pintura. Recriar o media player por causa disso interrompe a decodificacao
+    // (principalmente no macOS). Uma nova resolucao so e negociada em pausa e
+    // quando a mudanca e realmente grande; o desenho final continua escalavel.
+    const int widthTolerance = std::max(256, maximumWidth / 2);
+    const int heightTolerance = std::max(144, maximumHeight / 2);
+    const bool dimensionsChanged = player && !current.playing &&
+      (std::abs(current.requestedWidth - maximumWidth) > widthTolerance ||
+       std::abs(current.requestedHeight - maximumHeight) > heightTolerance);
     if (identityChanged || dimensionsChanged) {
       createPlayer(current);
       return;
@@ -745,27 +758,56 @@ struct Decoder::Impl {
       api.setRate(player, static_cast<float>(safeRate));
       activeRate = safeRate;
     }
+    const auto now = std::chrono::steady_clock::now();
+    const bool wasPlaying = activePlaying;
+    bool playbackJump = false;
+    if (previousRequestValid && wasPlaying && current.playing) {
+      const double elapsed = std::chrono::duration<double>(
+        now - previousRequestWall).count();
+      const double expectedAdvance = elapsed * safeRate;
+      const double actualAdvance =
+        current.sourceTime - previousRequestSourceTime;
+      // Corrige apenas um salto real do transporte (seek, loop ou troca de
+      // posicao). Pequenos desvios entre os relogios do REAPER e do VLC nao
+      // podem gerar set_time, pois cada chamada interrompe o fluxo de frames.
+      playbackJump = std::abs(actualAdvance - expectedAdvance) > 0.30;
+    }
+
     if (current.playing != activePlaying) {
-      api.setPause(player, current.playing ? 0 : 1);
+      if (current.playing) {
+        const libvlc_time_t playerTime = api.getTime(player);
+        const double drift = playerTime >= 0
+          ? std::abs(
+              static_cast<double>(playerTime) / 1000.0 -
+              current.sourceTime)
+          : std::numeric_limits<double>::infinity();
+        if (drift > 0.075) {
+          api.setTime(player, secondsToMilliseconds(current.sourceTime));
+        }
+        api.setPause(player, 0);
+      } else {
+        api.setPause(player, 1);
+      }
       activePlaying = current.playing;
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    const bool correctionDue =
-      now - lastCorrection >= std::chrono::milliseconds(300);
-    const libvlc_time_t playerTime = api.getTime(player);
-    const double drift = playerTime >= 0
-      ? std::abs(
-          static_cast<double>(playerTime) / 1000.0 -
-          current.sourceTime)
-      : std::numeric_limits<double>::infinity();
-    // Nao reescreve o tempo continuamente. Isso evita o aspecto de seek e
-    // deixa o VLC reproduzir pelo proprio relogio entre correcoes reais.
-    if ((!current.playing && drift > 0.018) ||
-        (current.playing && correctionDue && drift > 0.12)) {
+    if (!current.playing) {
+      const libvlc_time_t playerTime = api.getTime(player);
+      const double drift = playerTime >= 0
+        ? std::abs(
+            static_cast<double>(playerTime) / 1000.0 -
+            current.sourceTime)
+        : std::numeric_limits<double>::infinity();
+      if (drift > 0.018) {
+        api.setTime(player, secondsToMilliseconds(current.sourceTime));
+      }
+    } else if (wasPlaying && playbackJump) {
       api.setTime(player, secondsToMilliseconds(current.sourceTime));
-      lastCorrection = now;
     }
+
+    previousRequestValid = true;
+    previousRequestSourceTime = current.sourceTime;
+    previousRequestWall = now;
   }
 
   void workerLoop()
