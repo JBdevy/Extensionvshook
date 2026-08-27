@@ -58129,6 +58129,7 @@ struct NativeTelepromptSettings {
   std::string songNamePosition = "top";
   std::string queueNamePosition = "top";
   std::string progressPosition = "bottom";
+  std::string progressMode = "lyrics";
   std::string chordPosition = "top";
   double textScale = 1.0;
   double clockScale = 1.0;
@@ -58164,6 +58165,7 @@ struct NativeTelepromptWindowState {
   bool dragging = false;
   bool resizing = false;
   bool fullscreen = false;
+  bool spaceKeyDown = false;
   // 1 alterna fullscreen no proximo LBUTTONUP; 2 fecha no proximo
   // RBUTTONUP. Adiar a acao consome o ultimo evento do duplo clique antes de
   // mover/destruir a janela e impede que ele atravesse para o grid do REAPER.
@@ -58512,6 +58514,8 @@ struct NativeTelepromptRenderState {
   double itemEnd = 0.0;
   double progressStart = 0.0;
   double progressEnd = 0.0;
+  double chordProgressStart = 0.0;
+  double chordProgressEnd = 0.0;
   double progress = 0.0;
   double previewProgressStart = 0.0;
   double previewProgressEnd = 0.0;
@@ -58702,8 +58706,7 @@ static void nativeTelepromptApplySettingsJson(
   next.textAlignment = nativeLower(nativeTrim(next.textAlignment));
   if (next.textAlignment != "left" &&
       next.textAlignment != "center" &&
-      next.textAlignment != "right" &&
-      next.textAlignment != "justify") {
+      next.textAlignment != "right") {
     next.textAlignment = "center";
   }
   stringValue("clockPosition", next.clockPosition);
@@ -58725,6 +58728,9 @@ static void nativeTelepromptApplySettingsJson(
   stringValue("songNamePosition", next.songNamePosition);
   stringValue("queueNamePosition", next.queueNamePosition);
   stringValue("progressPosition", next.progressPosition);
+  stringValue("progressMode", next.progressMode);
+  next.progressMode = nativeLower(nativeTrim(next.progressMode));
+  if (next.progressMode != "chords") next.progressMode = "lyrics";
   stringValue("chordPosition", next.chordPosition);
   next.chordPosition = nativeLower(nativeTrim(next.chordPosition));
   if (next.chordPosition != "bottom") next.chordPosition = "top";
@@ -58833,6 +58839,7 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"songNamePosition\":\"top\",";
   json << "\"queueNamePosition\":\"top\",";
   json << "\"progressPosition\":\"bottom\",";
+  json << "\"progressMode\":\"lyrics\",";
   json << "\"chordPosition\":\"top\",";
   json << "\"textScale\":1,";
   json << "\"clockScale\":1,";
@@ -58921,6 +58928,8 @@ static std::string nativeTelepromptSettingsToJson(
        << nativeJsonString(settings.queueNamePosition) << ",";
   json << "\"progressPosition\":"
        << nativeJsonString(settings.progressPosition) << ",";
+  json << "\"progressMode\":"
+       << nativeJsonString(settings.progressMode) << ",";
   json << "\"chordPosition\":"
        << nativeJsonString(settings.chordPosition) << ",";
   json << "\"textScale\":"
@@ -59929,6 +59938,14 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
         liveState, "progressStart", state.itemStart);
       state.progressEnd = nativeTelepromptJsonNumber(
         liveState, "progressEnd", state.itemEnd);
+      const double chordItemStart = nativeTelepromptJsonNumber(
+        liveChordState, "itemStart", 0.0);
+      const double chordItemEnd = nativeTelepromptJsonNumber(
+        liveChordState, "itemEnd", 0.0);
+      state.chordProgressStart = nativeTelepromptJsonNumber(
+        liveChordState, "progressStart", chordItemStart);
+      state.chordProgressEnd = nativeTelepromptJsonNumber(
+        liveChordState, "progressEnd", chordItemEnd);
       state.nextChangePosition =
         nativeTelepromptJsonNumber(
           liveState, "nextChangePosition", -1.0);
@@ -62309,19 +62326,31 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     }
   }
 
-  double smoothProgress = state.progress;
+  const bool progressUsesChords =
+    nativeLower(settings.progressMode) == "chords";
+  const double selectedProgressStart = progressUsesChords
+    ? state.chordProgressStart : state.progressStart;
+  const double selectedProgressEnd = progressUsesChords
+    ? state.chordProgressEnd : state.progressEnd;
+  double smoothProgress =
+    selectedProgressEnd > selectedProgressStart + 0.000001
+      ? nativeTelepromptClamp(
+          (state.projectPosition - selectedProgressStart) /
+            (selectedProgressEnd - selectedProgressStart),
+          0.0, 1.0)
+      : 0.0;
   if (settings.progressEnabled && !previewActive &&
       !technicalNoticeActive &&
       state.playing &&
-      state.progressEnd > state.progressStart + 0.000001 &&
+      selectedProgressEnd > selectedProgressStart + 0.000001 &&
       EnumProjects_ptr &&
       GetPlayPositionEx_ptr) {
     ReaProject* project = EnumProjects_ptr(-1, nullptr, 0);
     if (project) {
       const double livePosition = GetPlayPositionEx_ptr(project);
       smoothProgress = nativeTelepromptClamp(
-        (livePosition - state.progressStart) /
-          (state.progressEnd - state.progressStart),
+        (livePosition - selectedProgressStart) /
+          (selectedProgressEnd - selectedProgressStart),
         0.0, 1.0);
     }
   }
@@ -63139,7 +63168,39 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       }
       window.dragging = false;
       break;
+    case WM_KILLFOCUS:
+      window.spaceKeyDown = false;
+      break;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+      if (wParam == VK_SPACE) {
+        window.spaceKeyDown = false;
+        return 0;
+      }
+      break;
     case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+      if (wParam == VK_SPACE) {
+        // A janela do Teleprompt recebe o foco em tela cheia. Encaminhar o
+        // Espaco explicitamente preserva o mesmo transporte usado quando o
+        // foco esta no REAPER, sem deixar o autorepeat alternar varias vezes.
+        if (window.spaceKeyDown) return 0;
+        window.spaceKeyDown = true;
+        if (nativeTimecodeReceiveBlocksLocalSpace()) return 0;
+        if (nativeStopBreakModifierDown()) {
+          g_globalStopBreakRequested.store(true);
+          return 0;
+        }
+        if (g_stopPauseModeEnabled.load()) {
+          g_globalStopPauseRequested.store(true);
+          return 0;
+        }
+        if (Main_OnCommand_ptr) {
+          Main_OnCommand_ptr(kReaperTransportPlayStopCommandId, 0);
+          g_nativeForceStateBuild.store(true);
+        }
+        return 0;
+      }
       if (wParam == VK_ESCAPE) {
         if (window.fullscreen) nativeTelepromptToggleFullscreen(slot);
         else nativeCloseTelepromptWindow(slot);
@@ -63165,6 +63226,7 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       window.pendingDoubleClickAction = 0;
       window.resizeHitTest = HTNOWHERE;
       window.fullscreen = false;
+      window.spaceKeyDown = false;
       if (RefreshToolbar2_ptr) {
         RefreshToolbar2_ptr(0,
           slot == 1 ? g_telepromptOneCommandId

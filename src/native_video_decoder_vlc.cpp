@@ -739,14 +739,19 @@ struct Decoder::Impl {
       current.playbackKey != activePlaybackKey;
     // Durante o play o tamanho disponivel pode oscilar alguns pixels a cada
     // pintura. Recriar o media player por causa disso interrompe a decodificacao
-    // (principalmente no macOS). Uma nova resolucao so e negociada em pausa e
-    // quando a mudanca e realmente grande; o desenho final continua escalavel.
+    // (principalmente no macOS). Porem, quando a janela cresce muito (por
+    // exemplo, ao entrar em tela cheia/Retina), manter a resolucao negociada na
+    // janela pequena deixa o video visivelmente borrado. Nesse crescimento
+    // grande renegocia uma vez, conservando o ultimo frame durante o aquecimento.
     const int widthTolerance = std::max(256, maximumWidth / 2);
     const int heightTolerance = std::max(144, maximumHeight / 2);
     const bool dimensionsChanged = player && !current.playing &&
       (std::abs(current.requestedWidth - maximumWidth) > widthTolerance ||
        std::abs(current.requestedHeight - maximumHeight) > heightTolerance);
-    if (identityChanged || dimensionsChanged) {
+    const bool qualityUpgradeNeeded = player && current.playing &&
+      (current.requestedWidth > maximumWidth + widthTolerance ||
+       current.requestedHeight > maximumHeight + heightTolerance);
+    if (identityChanged || dimensionsChanged || qualityUpgradeNeeded) {
       createPlayer(current);
       return;
     }
@@ -761,6 +766,7 @@ struct Decoder::Impl {
     const auto now = std::chrono::steady_clock::now();
     const bool wasPlaying = activePlaying;
     bool playbackJump = false;
+    bool playbackRestart = false;
     if (previousRequestValid && wasPlaying && current.playing) {
       const double elapsed = std::chrono::duration<double>(
         now - previousRequestWall).count();
@@ -771,10 +777,20 @@ struct Decoder::Impl {
       // posicao). Pequenos desvios entre os relogios do REAPER e do VLC nao
       // podem gerar set_time, pois cada chamada interrompe o fluxo de frames.
       playbackJump = std::abs(actualAdvance - expectedAdvance) > 0.30;
+      // Se o mesmo item voltar ao inicio antes de o worker observar o Stop,
+      // o player do VLC pode continuar no estado Ended. set_time sozinho nao
+      // retira esse estado; um novo play e necessario antes do seek.
+      playbackRestart = actualAdvance < -0.15;
     }
 
     if (current.playing != activePlaying) {
       if (current.playing) {
+        // libVLC nao sai do estado Ended apenas com set_pause(0). Chamar play
+        // tambem funciona como resume quando o player estava pausado.
+        if (api.play(player) != 0) {
+          createPlayer(current);
+          return;
+        }
         const libvlc_time_t playerTime = api.getTime(player);
         const double drift = playerTime >= 0
           ? std::abs(
@@ -802,6 +818,10 @@ struct Decoder::Impl {
         api.setTime(player, secondsToMilliseconds(current.sourceTime));
       }
     } else if (wasPlaying && playbackJump) {
+      if (playbackRestart && api.play(player) != 0) {
+        createPlayer(current);
+        return;
+      }
       api.setTime(player, secondsToMilliseconds(current.sourceTime));
     }
 
