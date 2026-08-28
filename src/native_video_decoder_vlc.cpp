@@ -281,6 +281,7 @@ struct VlcApi {
   void (*setPause)(libvlc_media_player_t*, int) = nullptr;
   void (*stop)(libvlc_media_player_t*) = nullptr;
   void (*setTime)(libvlc_media_player_t*, libvlc_time_t) = nullptr;
+  void (*nextFrame)(libvlc_media_player_t*) = nullptr;
   libvlc_time_t (*getTime)(libvlc_media_player_t*) = nullptr;
   int (*setRate)(libvlc_media_player_t*, float) = nullptr;
   int (*setMute)(libvlc_media_player_t*, int) = nullptr;
@@ -372,9 +373,44 @@ struct VlcApi {
       unload();
       return false;
     }
+    // Disponivel no VLC 3 e usado para publicar imediatamente o quadro de
+    // um seek enquanto o player esta pausado. Continua opcional para manter
+    // compatibilidade com runtimes que nao exportem essa funcao.
+    bind(nextFrame, "libvlc_media_player_next_frame");
     return true;
   }
 };
+
+std::mutex g_sharedVlcInstanceMutex;
+libvlc_instance_t* g_sharedVlcInstance = nullptr;
+int g_sharedVlcInstanceUsers = 0;
+
+libvlc_instance_t* acquireSharedVlcInstance(
+  VlcApi& api,
+  const std::vector<const char*>& arguments)
+{
+  std::lock_guard<std::mutex> lock(g_sharedVlcInstanceMutex);
+  if (!g_sharedVlcInstance) {
+    g_sharedVlcInstance = api.newInstance(
+      static_cast<int>(arguments.size()), arguments.data());
+  }
+  if (g_sharedVlcInstance) ++g_sharedVlcInstanceUsers;
+  return g_sharedVlcInstance;
+}
+
+void releaseSharedVlcInstance(
+  VlcApi& api,
+  libvlc_instance_t*& instance)
+{
+  if (!instance) return;
+  std::lock_guard<std::mutex> lock(g_sharedVlcInstanceMutex);
+  instance = nullptr;
+  if (g_sharedVlcInstanceUsers > 0) --g_sharedVlcInstanceUsers;
+  if (g_sharedVlcInstanceUsers == 0 && g_sharedVlcInstance) {
+    api.releaseInstance(g_sharedVlcInstance);
+    g_sharedVlcInstance = nullptr;
+  }
+}
 
 std::int64_t secondsToMilliseconds(double seconds)
 {
@@ -670,8 +706,10 @@ struct Decoder::Impl {
     for (const std::string& argument : ownedArguments) {
       arguments.push_back(argument.c_str());
     }
-    instance = api.newInstance(
-      static_cast<int>(arguments.size()), arguments.data());
+    // TP1 e TP2 usam a mesma instancia do VLC. Cada janela conserva seu
+    // media player independente, mas deixa de inicializar um segundo motor
+    // completo de decodificacao, evitando que a TP2 perca fluidez.
+    instance = acquireSharedVlcInstance(api, arguments);
     if (!instance) {
       statusCode.store(-201, std::memory_order_release);
       return false;
@@ -717,6 +755,9 @@ struct Decoder::Impl {
     playerStarted = true;
     api.setTime(player, secondsToMilliseconds(current.sourceTime));
     api.setPause(player, current.playing ? 0 : 1);
+    if (!current.playing && api.nextFrame) {
+      api.nextFrame(player);
+    }
     activePlaying = current.playing;
     activeRate = current.playbackRate;
     previousRequestValid = true;
@@ -814,8 +855,12 @@ struct Decoder::Impl {
             static_cast<double>(playerTime) / 1000.0 -
             current.sourceTime)
         : std::numeric_limits<double>::infinity();
-      if (drift > 0.018) {
+      // A transicao Play -> Stop sempre força o quadro do cursor de edicao.
+      // Sem isso, o VLC mantinha visualmente o ultimo quadro reproduzido,
+      // parecendo Pause mesmo com o REAPER ja parado em outra posicao.
+      if (wasPlaying || drift > 0.018) {
         api.setTime(player, secondsToMilliseconds(current.sourceTime));
+        if (api.nextFrame) api.nextFrame(player);
       }
     } else if (wasPlaying && playbackJump) {
       if (playbackRestart && api.play(player) != 0) {
@@ -851,10 +896,7 @@ struct Decoder::Impl {
       applyRequest(current);
     }
     destroyPlayer();
-    if (instance) {
-      api.releaseInstance(instance);
-      instance = nullptr;
-    }
+    releaseSharedVlcInstance(api, instance);
   }
 
   bool frameAt(

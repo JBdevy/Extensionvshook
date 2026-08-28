@@ -37545,19 +37545,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
           ? "Falha ao aplicar. Confira a Hook Center e tente novamente."
           : applyState.error;
         footerColor = RGB(248, 113, 113);
-      } else if (g_nativeProjectSyncDiffModalTruncated ||
-          g_nativeProjectSyncDiffModalDifferenceCount >
-            static_cast<int>(
-              g_nativeProjectSyncDiffModalDifferences.size())) {
-        footerNotice = "Exibindo as " +
-          std::to_string(
-            g_nativeProjectSyncDiffModalDifferences.size()) +
-          " diferencas guardadas (limite seguro: 200).";
       }
       const int applyButtonWidth = canOfferApply ? 164 : 0;
       if (!footerNotice.empty()) {
         nativeAppActiveDrawText(dc, footerNotice,
-          RECT{modal.left + 12, modal.bottom - 36,
+          RECT{modal.left + (canShowRoleHandover ? 176 : 12),
+            modal.bottom - 36,
             modal.right - 104 - applyButtonWidth, modal.bottom - 10},
           DT_LEFT | DT_VCENTER | DT_SINGLELINE |
             DT_END_ELLIPSIS | DT_NOPREFIX,
@@ -43743,11 +43736,67 @@ static void nativePaintAppActivePanel(HWND hwnd)
             previewBlockLabels.end()
           ? customLabel->second
           : "Bloco " + std::to_string(block);
+        const std::string visibleLabel =
+          std::string(selected ? "[x] " : "[ ] ") + buttonLabel;
+        const RECT buttonRect{
+          left, top, left + buttonW, top + buttonH};
+        // O nome real do bloco deve permanecer legivel mesmo nas grades mais
+        // estreitas. O fundo/hit-test continua sendo o botao normal, mas o
+        // texto e desenhado separadamente para poder reduzir e quebrar linha
+        // sem usar reticencias.
         addModalButton(
           "preview_block_toggle|" + std::to_string(block),
-          std::string(selected ? "[x] " : "[ ] ") + buttonLabel,
-          RECT{left, top, left + buttonW, top + buttonH},
+          "", buttonRect,
           selected ? "play" : (enabled ? "page" : "locked"), enabled);
+        int previewButtonFontSize = std::max(
+          7, std::min(13, buttonH - 4));
+        const auto estimatedLineCount = [&](int fontSize) {
+          const int charactersPerLine = std::max(
+            1, static_cast<int>(std::floor(
+              std::max(1, buttonW - 8) /
+              std::max(1.0, fontSize * 0.58))));
+          return std::max(1,
+            (static_cast<int>(visibleLabel.size()) +
+              charactersPerLine - 1) / charactersPerLine);
+        };
+        while (previewButtonFontSize > 7 &&
+               estimatedLineCount(previewButtonFontSize) *
+                   (previewButtonFontSize + 1) > buttonH - 3) {
+          --previewButtonFontSize;
+        }
+        static std::map<int, HFONT> previewButtonFonts;
+        HFONT previewButtonFont = nullptr;
+        const auto cachedFont = previewButtonFonts.find(
+          previewButtonFontSize);
+        if (cachedFont != previewButtonFonts.end()) {
+          previewButtonFont = cachedFont->second;
+        } else {
+#ifdef _WIN32
+          const char* previewButtonFontName = "Segoe UI";
+#else
+          const char* previewButtonFontName = "Arial";
+#endif
+          previewButtonFont = CreateFont(
+            previewButtonFontSize, 0, 0, 0, FW_BOLD,
+            FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY, DEFAULT_PITCH,
+            previewButtonFontName);
+          if (!previewButtonFont) previewButtonFont = statusFont;
+          previewButtonFonts.emplace(
+            previewButtonFontSize, previewButtonFont);
+        }
+        RECT previewButtonTextRect{
+          buttonRect.left + 3, buttonRect.top + 1,
+          buttonRect.right - 3, buttonRect.bottom - 1};
+        nativeAppActiveDrawText(
+          dc, visibleLabel, previewButtonTextRect,
+          DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX,
+          !enabled
+            ? RGB(107, 114, 128)
+            : (selected ? RGB(220, 255, 220)
+                        : RGB(248, 250, 252)),
+          previewButtonFont);
       }
       const int menuY = modal.bottom - 28;
       const int footerButtonGap = gap;
@@ -58214,6 +58263,7 @@ struct NativeTelepromptSettings {
   bool rgbWindowBorderEnabled = false;
   bool rgbClockBorderEnabled = false;
   bool rgbTextBoxBorderEnabled = false;
+  bool rgbChordBorderEnabled = false;
 };
 
 struct NativeTelepromptWindowState {
@@ -58868,6 +58918,8 @@ static void nativeTelepromptApplySettingsJson(
     json, "rgbClockBorderEnabled", next.rgbClockBorderEnabled);
   next.rgbTextBoxBorderEnabled = nativeTelepromptJsonBool(
     json, "rgbTextBoxBorderEnabled", next.rgbTextBoxBorderEnabled);
+  next.rgbChordBorderEnabled = nativeTelepromptJsonBool(
+    json, "rgbChordBorderEnabled", next.rgbChordBorderEnabled);
 }
 
 static std::string nativeTelepromptDefaultSettingsJson(int slot)
@@ -58927,7 +58979,8 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"clearMode\":false,";
   json << "\"rgbWindowBorderEnabled\":false,";
   json << "\"rgbClockBorderEnabled\":false,";
-  json << "\"rgbTextBoxBorderEnabled\":false";
+  json << "\"rgbTextBoxBorderEnabled\":false,";
+  json << "\"rgbChordBorderEnabled\":false";
   json << "}";
   return json.str();
 }
@@ -59048,7 +59101,9 @@ static std::string nativeTelepromptSettingsToJson(
   json << "\"rgbClockBorderEnabled\":"
        << boolean(settings.rgbClockBorderEnabled) << ",";
   json << "\"rgbTextBoxBorderEnabled\":"
-       << boolean(settings.rgbTextBoxBorderEnabled);
+       << boolean(settings.rgbTextBoxBorderEnabled) << ",";
+  json << "\"rgbChordBorderEnabled\":"
+       << boolean(settings.rgbChordBorderEnabled);
   json << "}";
   return json.str();
 }
@@ -62283,6 +62338,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
           settings.textBoxColor, RGB(255, 234, 0));
   const bool previewActive =
     !technicalNoticeActive &&
+    !settings.clearMode &&
     settings.previewEnabled &&
     state.preview.active &&
     state.preview.mode >= 1 &&
@@ -62430,8 +62486,11 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   std::string localTime;
   COLORREF localClockColor = nativeTelepromptColor(
     settings.localClockColor, RGB(0, 255, 85));
-  const COLORREF localClockBorderColor = nativeTelepromptColor(
-    settings.localClockBorderColor, RGB(0, 255, 85));
+  const COLORREF localClockBorderColor =
+    settings.rgbClockBorderEnabled
+      ? rgbColor
+      : nativeTelepromptColor(
+          settings.localClockBorderColor, RGB(0, 255, 85));
 
   // Nas posições laterais, cronômetro e horário local formam uma única
   // faixa. As duas caixas têm exatamente a mesma largura e altura. À
@@ -62454,11 +62513,11 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     const int pairWidth =
       equalBoxWidth * visibleClockBoxes +
       (visibleClockBoxes > 1 ? stackGap : 0);
+    // Se apenas um dos dois estiver visivel, ele deixa de ficar preso na
+    // lateral escolhida e ocupa o centro da faixa.
     const int pairLeft = visibleClockBoxes > 1
       ? client.left + edge
-      : (clockAtRight
-          ? client.right - edge - pairWidth
-          : client.left + edge);
+      : client.left + (width - pairWidth) / 2;
     const RECT pairBand = allocateBand(
       clockTop, clockHeight,
       pairLeft, pairLeft + pairWidth);
@@ -62888,7 +62947,10 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       nativeAppActiveFillRect(dc, chordRect, RGB(0, 0, 0));
       const COLORREF chordColor = nativeTelepromptColor(
         settings.chordColor, RGB(251, 146, 60));
-      nativeTelepromptDrawBorder(dc, chordRect, chordColor, 2);
+      const COLORREF chordBorderColor =
+        settings.rgbChordBorderEnabled ? rgbColor : chordColor;
+      nativeTelepromptDrawBorder(
+        dc, chordRect, chordBorderColor, 2);
       RECT chordTextRect = chordRect;
       chordTextRect.left += chordPaddingX;
       chordTextRect.right -= chordPaddingX;
