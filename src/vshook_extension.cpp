@@ -1329,6 +1329,7 @@ enum class NativeMainModalKind {
   ConfirmRetry,
   ConfirmNumber,
   Confirm09,
+  ConfirmResetVisualPreset,
   Help,
   HelpTopic,
   Config,
@@ -1338,12 +1339,15 @@ enum class NativeMainModalKind {
   CustomizeListBackground,
   CustomizeListPanelBackground,
   CustomizeNoBlockColor,
+  CustomizeBlockSongColor,
+  CustomizeBlockColorMode,
   CustomizeBlockBorder,
   CustomizeBlockHeight,
   CustomizeTooltips,
   CustomizeInterfaceBackground,
   CustomizeListScale,
   CustomizeTransportBackground,
+  CustomizeTransportPlaybackColor,
   CustomizeNumberBar,
   CustomizeScrollbar,
   CustomizeTimerColor,
@@ -17826,16 +17830,16 @@ static void nativePaintPartsColumn(
       drawEdge = true;
     } else if (selected) {
       fill = focused
-        ? RGB(26, 128, 242)
+        ? RGB(20, 98, 194)
         : nativeUiBlendColor(
             listPanelFill,
-            RGB(20, 77, 148), 0.58);
+            RGB(16, 65, 132), 0.58);
       textColor = focused
         ? RGB(13, 13, 13)
         : RGB(224, 240, 255);
       edge = focused
         ? RGB(255, 224, 61)
-        : RGB(51, 122, 209);
+        : RGB(39, 102, 181);
       drawEdge = true;
     }
     nativeAppActiveFillSubtleVerticalGradient(dc, rowRect, fill);
@@ -19438,7 +19442,8 @@ nativeUiVisualPreferenceKeys()
     "interface_bg_mode", "list_scale_mode",
     "block_height_mode",
     "tooltips_enabled",
-    "transport_panel_bg_mode", "number_bar_bg_mode",
+    "transport_panel_bg_mode", "transport_playback_color_mode",
+    "number_bar_bg_mode",
     "scrollbar_color_mode", "timer_color_mode", "live_mark_color_mode",
     "playlist_selection_arrow_color_mode",
     "regions_selection_arrow_color_mode",
@@ -19448,6 +19453,8 @@ nativeUiVisualPreferenceKeys()
     "list_progress_color_mode",
     "list_regress_color_mode",
     "no_block_text_color_mode",
+    "block_song_color_mode",
+    "block_color_mode",
     "block_symbol_mode",
     "block_symbol_colon_color_mode",
     "block_symbol_angle_color_mode",
@@ -19505,6 +19512,7 @@ nativeUiVisualDefaults()
     {"block_height_mode", "normal"},
     {"tooltips_enabled", "1"},
     {"transport_panel_bg_mode", "black"},
+    {"transport_playback_color_mode", "none"},
     {"number_bar_bg_mode", "black"},
     {"scrollbar_color_mode", "yellow"},
     {"timer_color_mode", "yellow"},
@@ -19517,6 +19525,8 @@ nativeUiVisualDefaults()
     {"list_progress_color_mode", "green"},
     {"list_regress_color_mode", "yellow"},
     {"no_block_text_color_mode", "none"},
+    {"block_song_color_mode", "block"},
+    {"block_color_mode", "auto"},
     {"block_symbol_mode", "none"},
     {"block_symbol_colon_color_mode", "yellow"},
     {"block_symbol_angle_color_mode", "yellow"},
@@ -19574,13 +19584,15 @@ nativeUiVisualFixedDefaultPreset()
     result["scrollbar_color_mode"] = "orange";
     result["live_mark_color_mode"] = "red";
     result["no_block_text_color_mode"] = "yellow";
+    result["block_song_color_mode"] = "block";
+    result["block_color_mode"] = "auto";
     result["playlist_selection_arrow_color_mode"] = "red";
     result["regions_selection_arrow_color_mode"] = "red";
     result["parts_selection_arrow_color_mode"] = "yellow";
     result["block_symbol_mode"] = "angle";
-    result["playlist_font_mode"] = "bold";
-    result["regions_font_mode"] = "bold";
-    result["button_font_mode"] = "bold";
+    result["playlist_font_mode"] = "bold_italic";
+    result["regions_font_mode"] = "bold_italic";
+    result["button_font_mode"] = "bold_italic";
     result["status_current_top"] = "0";
     result["status_current_bottom"] = "1";
     result["status_queue_top"] = "0";
@@ -20119,6 +20131,38 @@ static bool nativeUiWriteButtonLayout(
   return true;
 }
 
+// Restaura um preset visual personalizado ao mesmo conjunto do Preset Padrão.
+// A posição/visibilidade dos botões é persistida separadamente, portanto ela
+// também é apagada para que volte ao layout oficial.
+static bool nativeUiResetVisualPreset(int preset)
+{
+  preset = std::max(1, std::min(3, preset));
+  auto values = nativeUiReadVisualPrefs();
+  values["visual_preset_index"] = std::to_string(preset);
+  const auto& fixed = nativeUiVisualFixedDefaultPreset();
+  const auto& defaults = nativeUiVisualDefaults();
+  for (const auto& key : nativeUiVisualPreferenceKeys()) {
+    const auto fixedValue = fixed.find(key);
+    const auto defaultValue = defaults.find(key);
+    const std::string value = fixedValue != fixed.end()
+      ? fixedValue->second
+      : (defaultValue != defaults.end()
+          ? defaultValue->second : std::string());
+    values[key] = value;
+    values["preset" + std::to_string(preset) + "_" + key] = value;
+  }
+  if (SetExtState_ptr) {
+    for (const std::string& page : {"playlist", "regions"}) {
+      const std::string storageKey =
+        nativeUiButtonLayoutStorageKey(page, preset);
+      SetExtState_ptr(kLuaWindowExtStateSection,
+        storageKey.c_str(), "", true);
+    }
+  }
+  nativeUiWriteVisualPrefs(std::move(values));
+  return true;
+}
+
 static std::vector<std::string> nativeUiButtonIdsForZone(
   const std::string& page,
   const std::string& zone)
@@ -20260,12 +20304,15 @@ static bool nativeUiIsCustomizeModal(
     kind == NativeMainModalKind::CustomizeListBackground ||
     kind == NativeMainModalKind::CustomizeListPanelBackground ||
     kind == NativeMainModalKind::CustomizeNoBlockColor ||
+    kind == NativeMainModalKind::CustomizeBlockSongColor ||
+    kind == NativeMainModalKind::CustomizeBlockColorMode ||
     kind == NativeMainModalKind::CustomizeBlockBorder ||
     kind == NativeMainModalKind::CustomizeBlockHeight ||
     kind == NativeMainModalKind::CustomizeTooltips ||
     kind == NativeMainModalKind::CustomizeInterfaceBackground ||
     kind == NativeMainModalKind::CustomizeListScale ||
     kind == NativeMainModalKind::CustomizeTransportBackground ||
+    kind == NativeMainModalKind::CustomizeTransportPlaybackColor ||
     kind == NativeMainModalKind::CustomizeNumberBar ||
     kind == NativeMainModalKind::CustomizeScrollbar ||
     kind == NativeMainModalKind::CustomizeTimerColor ||
@@ -20548,7 +20595,7 @@ static bool nativePlayProtectionShouldAllow(
   const bool insideWindow = sameAction &&
     g_nativePlayProtectionLastTapAt.time_since_epoch().count() != 0 &&
     now - g_nativePlayProtectionLastTapAt <=
-      std::chrono::milliseconds(300);
+      std::chrono::milliseconds(200);
   if (insideWindow) {
     g_nativePlayProtectionLastTapAt =
       std::chrono::steady_clock::time_point();
@@ -20935,7 +20982,9 @@ static std::string nativeUiBlockHeightMode(
   const std::string mode = nativeLower(
     nativeUiVisualPref(
       visualPrefs, "block_height_mode", "normal"));
-  return mode == "compact" ? "compact" : "normal";
+  if (mode == "compact") return "compact";
+  if (mode == "large") return "large";
+  return "normal";
 }
 
 static int nativeUiCompactBlockHeight()
@@ -20950,6 +20999,15 @@ static int nativeUiCompactBlockHeight()
 static int nativeUiCompactBlockLineHeight()
 {
   return std::max(1, nativeUiCompactBlockHeight() - 2);
+}
+
+static int nativeUiLargeBlockHeight(
+  const NativeUiListLayout& layout)
+{
+  // Large aumenta somente a faixa do bloco; a escala das músicas não muda.
+  return std::max(layout.singleRowHeight + 8,
+    static_cast<int>(std::floor(
+      layout.singleRowHeight * 1.42 + 0.5)));
 }
 
 static size_t nativeUiNextUtf8Byte(
@@ -33591,7 +33649,7 @@ static void nativeUiPaintMixerTrackRow(
     static_cast<int>(row.bottom - row.top));
   const int gap = 4;
   const int pad = 4;
-  const int indexW = 28;
+  const int indexW = 24;
   const int buttonW = 26;
   const int buttonH =
     std::max(20, std::min(26, rowH - 30));
@@ -34288,6 +34346,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
   const std::string blockHeightMode =
     nativeUiBlockHeightMode(paintVisualPrefs);
   const bool compactBlocks = blockHeightMode == "compact";
+  const bool largeBlocks = blockHeightMode == "large";
   HFONT compactBlockFont = compactBlocks
     ? nativeUiCompactBlockFont(listFontMode)
     : listFont;
@@ -35136,32 +35195,58 @@ static void nativePaintAppActivePanel(HWND hwnd)
                                    int panelY) {
     const bool current = mode == "current";
     const bool multiLoop = mode == "multiloop";
+    const bool currentActive = current &&
+      g_nativeAppActivePanelModel.playing;
+    const bool queueActive = !current && !multiLoop &&
+      g_nativeAppActivePanelModel.queueActive;
+    const bool auto2QueueActive = queueActive &&
+      g_nativeAppActivePanelModel.autoplay2Enabled;
+    const bool playbackPanelColors = nativeLower(
+      nativeUiVisualPref(paintVisualPrefs,
+        "transport_playback_color_mode", "none")) != "none";
     const int panelHeight = statusPanelHeight(mode);
     HFONT panelLabelFont =
       multiLoop ? nativeUiMultiLoopFont() : labelFont;
     HFONT panelNameFont =
       multiLoop ? nativeUiMultiLoopFont() : nameFont;
-    // Mantem os rotulos "TOCANDO AGORA" e "FILA DE ESPERA" com o peso
-    // normal. Somente o nome da musica recebe destaque em negrito.
-    HFONT panelSongFont = nativeUiConfiguredFont("bold");
+    // O nome das musicas no transporte acompanha exatamente a fonte
+    // escolhida para a lista de repertorio.
+    HFONT panelSongFont = nativeUiConfiguredFont(
+      nativeUiVisualPref(paintVisualPrefs,
+        "playlist_font_mode", "default"));
     const int panelTextTop = 2;
     const int panelTextBottom = 2;
     RECT card{pad, panelY, width - pad, panelY + panelHeight};
+    const COLORREF cardFill = playbackPanelColors && currentActive
+      ? RGB(205, 20, 20)
+      : playbackPanelColors && auto2QueueActive
+        ? RGB(34, 197, 94)
+        : playbackPanelColors && queueActive
+          ? RGB(230, 122, 41)
+          : nativeUiTransportFillColor(paintVisualPrefs);
+    const COLORREF cardEdge = playbackPanelColors && currentActive
+      ? RGB(128, 12, 12)
+      : playbackPanelColors && auto2QueueActive
+        ? RGB(22, 101, 52)
+        : playbackPanelColors && queueActive
+          ? RGB(154, 75, 18)
+          : nativeUiTransportEdgeColor(paintVisualPrefs);
     nativeAppActiveFillRoundRect(dc, card,
-      nativeUiTransportFillColor(paintVisualPrefs),
-      nativeUiTransportEdgeColor(paintVisualPrefs), 3);
+      cardFill, cardEdge, 3);
     if (!multiLoop) {
       drawProgressBars(card,
         current
           ? g_nativeAppActivePanelModel.progress
           : (g_nativeAppActivePanelModel.queueActive
               ? (1.0 - g_nativeAppActivePanelModel.progress) : 0.0),
-        nativeUiNamedVisualColor(
-          nativeUiVisualPref(paintVisualPrefs,
-            current ? "status_progress_color_mode"
-                    : "status_regress_color_mode",
-            current ? "green" : "yellow"),
-          current ? "green" : "yellow"),
+        auto2QueueActive
+          ? RGB(22, 163, 74)
+          : nativeUiNamedVisualColor(
+              nativeUiVisualPref(paintVisualPrefs,
+                current ? "status_progress_color_mode"
+                        : "status_regress_color_mode",
+                current ? "green" : "yellow"),
+              current ? "green" : "yellow"),
         nativeUiVisualPrefBool(paintVisualPrefs,
           current ? "status_current_top" : "status_queue_top", false),
         nativeUiVisualPrefBool(paintVisualPrefs,
@@ -35169,18 +35254,24 @@ static void nativePaintAppActivePanel(HWND hwnd)
     }
     // O antigo light_gray é migrado visualmente para o mesmo cinza escuro.
     const bool lightTransport = false;
-    const COLORREF textColor = lightTransport
+    const bool strongTransportState = playbackPanelColors &&
+      (currentActive || queueActive);
+    const COLORREF textColor = strongTransportState
+      ? RGB(13, 13, 13)
+      : lightTransport
       ? RGB(20, 18, 10)
       : (multiLoop
           ? (g_nativeAppActivePanelModel.multiLoopBypassActive
               ? RGB(255, 224, 46) : RGB(187, 105, 255))
           : (current ? RGB(26, 255, 87) : RGB(255, 224, 46)));
-    const COLORREF labelTextColor = lightTransport || multiLoop
+    const COLORREF labelTextColor = strongTransportState
+      ? RGB(13, 13, 13)
+      : lightTransport || multiLoop
       ? textColor
       : (current ? RGB(14, 145, 52) : RGB(178, 145, 12));
     const std::string panelLabelText = multiLoop
       ? "MULTILOOPS"
-      : (current ? "TOCANDO AGORA - " : "FILA DE ESPERA - ");
+      : (current ? "REPRODUZINDO" : "PRÓXIMA");
     const int panelInnerX = card.left + 7;
     // Mede o rotulo completo em ambas as plataformas. Assim o separador fica
     // sempre visivel e o nome da musica comeca logo depois dele.
@@ -35188,7 +35279,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       std::max(1, static_cast<int>(card.right - panelInnerX - 8)),
       multiLoop
         ? labelW
-        : nativeUiTextWidth(dc, panelLabelText, panelLabelFont));
+        : nativeUiTextWidth(dc, panelLabelText, panelLabelFont) + 15);
     const int panelNameGap = multiLoop ? 8 : 0;
     RECT panelLabel{panelInnerX, card.top + panelTextTop,
       panelInnerX + panelLabelW,
@@ -35198,6 +35289,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
       panelLabel,
       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
       labelTextColor, panelLabelFont);
+    if (!multiLoop) {
+      nativeUiDrawSelectionArrow(dc,
+        panelInnerX + nativeUiTextWidth(
+          dc, panelLabelText, panelLabelFont) + 4,
+        (panelLabel.top + panelLabel.bottom) / 2,
+        current ? RGB(26, 255, 87) : RGB(255, 224, 46));
+    }
     const double panelDurationSec = multiLoop
       ? 0.0
       : current
@@ -35264,13 +35362,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
                     " - EM LOOP")
               : (g_nativeAppActivePanelModel.selectedOrPlayingMultiLoopActive
                   ? "ESSA MÚSICA TEM MULTILOOP ATIVO" : "-")))
-      : (panelSongAvailable ? panelSongName : std::string()));
+               : (panelSongAvailable ? panelSongName : std::string()));
+    const COLORREF panelSongColor =
+      !multiLoop && panelSongAvailable && strongTransportState &&
+      !auto2QueueActive
+        ? RGB(255, 255, 255) : textColor;
     nativeAppActiveDrawText(dc,
       panelValue,
       panelName,
       DT_LEFT | DT_VCENTER | DT_SINGLELINE |
         DT_END_ELLIPSIS | DT_NOPREFIX,
-      textColor,
+      panelSongColor,
       !multiLoop && panelSongAvailable ? panelSongFont : panelNameFont);
     if (!panelTimeText.empty()) {
       nativeAppActiveDrawText(dc,
@@ -35347,7 +35449,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         "PARTS2_WIDTH_RATIO_X10000_V1", 2200) / 10000.0));
     g_nativeMainPartsWidthRatiosLoaded = true;
   }
-  const int defaultPartsColumnW = std::max(120,
+  const int defaultPartsColumnW = std::max(96,
     static_cast<int>(std::floor(bodyW * 0.22)));
   int parts1ColumnW = std::max(defaultPartsColumnW,
     static_cast<int>(std::floor(
@@ -35381,17 +35483,40 @@ static void nativePaintAppActivePanel(HWND hwnd)
     (showBpm ? bpmColumnW : 0) +
     std::max(0, visibleSideColumns) * bodyGap;
   const int flexibleW = std::max(0, bodyW - fixedColumnsW);
-  if (showParts1) {
-    const int other = showParts2 ? parts2ColumnW : 0;
-    const int cap = std::max(defaultPartsColumnW,
-      (flexibleW - other) / 2);
-    parts1ColumnW = std::min(parts1ColumnW, cap);
-  }
-  if (showParts2) {
-    const int other = showParts1 ? parts1ColumnW : 0;
-    const int cap = std::max(defaultPartsColumnW,
-      (flexibleW - other) / 2);
-    parts2ColumnW = std::min(parts2ColumnW, cap);
+  if (visiblePartColumns > 0) {
+    // Quando a janela estreita, Parts 1/2 cedem largura primeiro. A lista
+    // principal conserva sua area util ate as Parts atingirem o minimo.
+    constexpr int partsMinimumW = 72;
+    constexpr int preferredMainListW = 260;
+    const int desiredPartsTotal =
+      (showParts1 ? parts1ColumnW : 0) +
+      (showParts2 ? parts2ColumnW : 0);
+    const int minimumPartsTotal =
+      visiblePartColumns * partsMinimumW;
+    const int roomBeforeMainMustShrink = std::max(
+      0, flexibleW - preferredMainListW);
+    const int targetPartsTotal = std::max(
+      minimumPartsTotal,
+      std::min(desiredPartsTotal, roomBeforeMainMustShrink));
+    if (showParts1 && showParts2) {
+      const int desiredTotal = std::max(
+        1, parts1ColumnW + parts2ColumnW);
+      parts1ColumnW = std::max(partsMinimumW,
+        static_cast<int>(std::floor(
+          targetPartsTotal *
+          (static_cast<double>(parts1ColumnW) /
+           desiredTotal) + 0.5)));
+      parts1ColumnW = std::min(
+        targetPartsTotal - partsMinimumW,
+        parts1ColumnW);
+      parts2ColumnW = std::max(
+        partsMinimumW,
+        targetPartsTotal - parts1ColumnW);
+    } else if (showParts1) {
+      parts1ColumnW = targetPartsTotal;
+    } else if (showParts2) {
+      parts2ColumnW = targetPartsTotal;
+    }
   }
 
   int mainLeft = bodyRect.left;
@@ -35660,7 +35785,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
           measuredRow.start - 0.0005 &&
         g_nativeCurrentPlayPosition <
           measuredRow.end - 0.0005;
-      const NativeUiMainRowMetrics metrics =
+      NativeUiMainRowMetrics metrics =
         nativeUiMeasureMainRow(dc, measuredRow,
           listBaseWidth,
           measuredPlaying ||
@@ -35676,6 +35801,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
           compactBlocks && measuredRow.block
             ? compactBlockFont : listFont,
           listLayout);
+      if (largeBlocks && measuredRow.block) {
+        metrics.height = std::max(metrics.height,
+          nativeUiLargeBlockHeight(listLayout));
+      }
       g_nativeMainRowHeights.push_back(metrics.height);
       measuredRowsHeight += metrics.height;
     }
@@ -35857,11 +35986,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
     }
     const bool useLocalMainSelection =
       g_nativeUiMainSelectionAuthoritative;
-    // O destaque azul pertence exclusivamente a navegacao da interface.
-    // Enquanto o usuario trabalha no arrange/grid, o alvo funcional pode
-    // continuar existindo no motor, mas nao volta a ser pintado por fallback.
-    const bool mainPanelHasKeyboardFocus =
-      GetFocus() == hwnd;
+    // A seleção azul é um estado visual persistente. Perder o foco libera
+    // somente o alvo funcional usado pelo transporte; não apaga o destaque.
     // Igual a vshook_navigation_selection_color_20260716 do Lua: quando uma
     // coluna Parts esta aberta, as selecoes das tres listas continuam
     // visiveis, mas somente a coluna navegada usa o azul forte.
@@ -35883,7 +36009,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     // A barra numérica é uma faixa única. Pintá-la por linha fazia as linhas
     // parcial e recém-reordenada recomporem pedaços em quadros diferentes no
     // mouse-up, produzindo o lampejo observado depois do drag/drop.
-    constexpr int indexColumnW = 28;
+    constexpr int indexColumnW = 24;
     nativeAppActiveFillVerticalGradient(dc,
       RECT{listRect.left + 1, listInnerTop,
         listRect.left + 1 + indexColumnW, listInnerBottom},
@@ -35992,7 +36118,6 @@ static void nativePaintAppActivePanel(HWND hwnd)
       // navegacao por setas/MIDI e a busca continuam azuis para o usuario poder
       // confirmar a fila com Enter. A propria musica tocando nunca recebe azul.
       const bool selectionVisualAllowed =
-        mainPanelHasKeyboardFocus &&
         (!g_nativeAppActivePanelModel.playing ||
          g_nativeUiMusicSelectionVisualActive ||
          g_nativeMainSearchFocused);
@@ -36043,7 +36168,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       const bool compactBlock = compactBlocks && row.block;
       HFONT rowFont = compactBlock
         ? compactBlockFont : listFont;
-      const NativeUiMainRowMetrics rowMetrics =
+      NativeUiMainRowMetrics rowMetrics =
         nativeUiMeasureMainRow(dc, row,
           listBaseWidth,
           isPlaying || familyContainsPlayback,
@@ -36052,6 +36177,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
           compactBlock,
           rowFont,
           listLayout);
+      if (largeBlocks && row.block) {
+        rowMetrics.height = std::max(rowMetrics.height,
+          nativeUiLargeBlockHeight(listLayout));
+      }
 
       const COLORREF panelFill = listPanelFill;
       // Repertório e Músicas usam um fundo único. Estados funcionais como
@@ -36072,7 +36201,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
       COLORREF parsedColor = RGB(0, 0, 0);
       COLORREF blockPaletteColor = RGB(0, 0, 0);
       bool hasBlockPaletteColor = false;
-      if (row.block && nativeAppActiveColorFromHex(row.blockColorHex, parsedColor)) {
+      const bool showBlockColors = nativeLower(
+        nativeUiVisualPref(visualPrefs,
+          "block_color_mode", "auto")) != "none";
+      if (row.block && showBlockColors &&
+          nativeAppActiveColorFromHex(row.blockColorHex, parsedColor)) {
         // O Lua desenha a paleta do bloco com alpha 0.36 sobre o fundo da
         // linha; usar a cor pura deixava todos os blocos muito saturados.
         blockPaletteColor = parsedColor;
@@ -36081,8 +36214,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
         rowFill = nativeUiBlendColor(panelFill,
           blockPaletteColor, 0.36);
         textColor = RGB(255, 224, 46);
+      } else if (row.block && !showBlockColors) {
+        // Sem cores remove o preenchimento próprio do bloco, mas preserva
+        // uma leitura uniforme: todos os títulos ficam amarelos.
+        textColor = RGB(255, 224, 46);
       } else if (!row.block && nativeAppActiveColorFromHex(row.inheritedColorHex, parsedColor)) {
-        textColor = parsedColor;
+        const bool useBlockSongColor = nativeLower(
+          nativeUiVisualPref(visualPrefs,
+            "block_song_color_mode", "block")) != "white";
+        textColor = useBlockSongColor ? parsedColor : RGB(255, 255, 255);
       }
 
       // "Nenhum" conserva o fundo normal; as demais opcoes continuam usando
@@ -36101,21 +36241,26 @@ static void nativePaintAppActivePanel(HWND hwnd)
           ? RGB(245, 51, 148)
           : (mainSelectionUsesInactiveVisual
               ? nativeUiBlendColor(
-                  panelFill, RGB(20, 77, 148), 0.58)
-              : RGB(26, 128, 242));
+                  panelFill, RGB(16, 65, 132), 0.58)
+              : RGB(20, 98, 194));
       }
 
       bool stateBackgroundApplied = false;
-      const COLORREF queuedBaseColor = RGB(230, 122, 41);
+      const COLORREF queuedBaseColor =
+        g_nativeAppActivePanelModel.autoplay2Enabled
+          ? RGB(34, 197, 94)
+          : RGB(230, 122, 41);
       // Fila + selecao conserva a base do modo e recebe a mesma camada azul
       // de 30% do Lua. Outros fundos fortes (bloco/Live/selecao) nao sao
       // substituidos pelo estado de transporte.
       if (isQueued && isSelected && !isDraggingSource && !row.block &&
           nativeUiVisualPrefBool(visualPrefs,
             "list_queue_bg", true)) {
-        rowFill = nativeUiBlendColor(
-          queuedBaseColor, RGB(20, 87, 219),
-          mainSelectionUsesInactiveVisual ? 0.16 : 0.30);
+        rowFill = g_nativeAppActivePanelModel.autoplay2Enabled
+          ? queuedBaseColor
+          : nativeUiBlendColor(
+              queuedBaseColor, RGB(18, 76, 184),
+              mainSelectionUsesInactiveVisual ? 0.16 : 0.30);
         stateBackgroundApplied = true;
       } else if (!isDraggingSource && !row.block &&
           !isLiveExecuted && !isSelected &&
@@ -36132,10 +36277,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
         rowFill = queuedBaseColor;
         stateBackgroundApplied = true;
       }
-      if (stateBackgroundApplied ||
-          (isSelected && !isDraggingSource &&
+      if (stateBackgroundApplied) {
+        // Na lista principal o texto permanece escuro; branco é exclusivo
+        // dos nomes dentro do painel de transporte.
+        textColor = RGB(13, 13, 13);
+      } else if (isSelected && !isDraggingSource &&
            !isLiveExecuted &&
-           (!mainSelectionUsesInactiveVisual || row.block))) {
+           (!mainSelectionUsesInactiveVisual || row.block)) {
         textColor = RGB(13, 13, 13);
       } else if (isSelected && !isDraggingSource &&
                  !isLiveExecuted &&
@@ -36170,10 +36318,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
               nativeUiVisualPref(visualPrefs,
                 "list_progress_color_mode",
                 "green"), "green")
-          : nativeUiNamedVisualColor(
-              nativeUiVisualPref(visualPrefs,
-                "list_regress_color_mode",
-                "yellow"), "yellow");
+          : g_nativeAppActivePanelModel.autoplay2Enabled
+            ? RGB(22, 163, 74)
+            : nativeUiNamedVisualColor(
+                nativeUiVisualPref(visualPrefs,
+                  "list_regress_color_mode",
+                  "yellow"), "yellow");
         const bool showTop = nativeUiVisualPrefBool(
           visualPrefs,
           isPlaying ? "list_current_top"
@@ -36398,10 +36548,6 @@ static void nativePaintAppActivePanel(HWND hwnd)
         // igual nos aplicativos do Diretor e dos Músicos.
         if (row.block) {
           timeColor = RGB(34, 197, 94);
-          nativeUiDrawSelectionArrow(dc,
-            durationRect.left - 12,
-            (durationRect.top + durationRect.bottom) / 2,
-            RGB(255, 224, 46));
         }
         nativeAppActiveDrawText(dc,
           rowMetrics.timeText, durationRect,
@@ -36781,11 +36927,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
 #else
       const COLORREF scrollEdge = RGB(74, 82, 89);
 #endif
-      nativeAppActiveFillOutlinedRect(dc, scrollTrack,
-        RGB(87, 69, 10), scrollEdge);
+      nativeAppActiveFillRoundRect(dc, scrollTrack,
+        RGB(87, 69, 10), scrollEdge, 3);
       const int trackH = std::max(1, trackBottom - trackTop);
       const double visibleContentRatio =
-        compactBlocks && hasBlock
+        blockHeightMode != "normal" && hasBlock
           ? static_cast<double>(viewportPixels) /
               std::max(1, totalContentPixels)
           : static_cast<double>(visibleRows) /
@@ -36803,11 +36949,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
         scrollHitTrack.right, thumbY + thumbH};
       const RECT thumbVisual{scrollTrack.left,
         thumbY, scrollTrack.right, thumbY + thumbH};
-      nativeAppActiveFillOutlinedRect(dc, thumbVisual,
+      nativeAppActiveFillRoundRect(dc, thumbVisual,
         nativeUiNamedVisualColor(
           nativeUiVisualPref(visualPrefs,
             "scrollbar_color_mode",
-            "yellow"), "yellow"), scrollEdge);
+            "yellow"), "yellow"), scrollEdge, 3);
     }
   }
 
@@ -40200,6 +40346,31 @@ static void nativePaintAppActivePanel(HWND hwnd)
         RECT{modal.right - 90, modal.bottom - 28,
           modal.right - 10, modal.bottom - 10},
         "clear_playlist", true);
+    } else if (g_nativeMainModalKind ==
+                 NativeMainModalKind::ConfirmResetVisualPreset) {
+      const int preset = nativeUiVisualPresetIndex(
+        nativeUiReadVisualPrefs());
+      RECT title{modal.left + 14, modal.top + 14,
+        modal.right - 14, modal.top + 40};
+      nativeAppActiveDrawText(dc, "Resetar Preset", title,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(248, 250, 252), nameFont);
+      RECT question{modal.left + 14, modal.top + 48,
+        modal.right - 14, modal.bottom - 44};
+      nativeAppActiveDrawText(dc,
+        "Deseja resetar o Preset " + std::to_string(preset) +
+          " para as configurações padrão?",
+        question, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
+        RGB(203, 213, 225), statusFont);
+      const int actionY = modal.bottom - 29;
+      addModalButton("custom_reset_preset_confirm", "Sim",
+        RECT{modal.left + 14, actionY,
+          modal.left + 92, actionY + 20},
+        "yellow_reset", true);
+      addModalButton("close", "Cancelar",
+        RECT{modal.right - 94, actionY,
+          modal.right - 14, actionY + 20},
+        "page", true);
     } else if (nativeUiIsCustomizeModal(
                  g_nativeMainModalKind)) {
       const auto& visual = paintVisualPrefs;
@@ -40900,6 +41071,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
           NativeMainModalKind::CustomizeMain) {
         drawCustomHeader("Personalizar",
           "Escolha uma categoria para configurar.");
+        // O Padrão já é a referência oficial. Somente presets próprios
+        // podem ser restaurados, por isso o botão fica apagado nele.
+        addModalButton("custom_reset_preset", "Reset",
+          RECT{modal.right - 84, modal.top + 8,
+            modal.right - 12, modal.top + 29},
+          locked ? "page" : "yellow_reset", true, !locked);
         const int presetY = modal.top + 58;
         const int presetGap = 6;
         const int presetHeight =
@@ -41109,8 +41286,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
             return 15 +
               rows * (buttonHeight + gap) - gap + 9;
           };
+        // Deve acompanhar exatamente as categorias desenhadas abaixo.
+        // Quando novas opções foram adicionadas em Lista, Interface e Blocos,
+        // a conta antiga encurtou o scroll e escondeu a categoria Gavetas.
         const size_t categoryEntryCounts[] = {
-          3, 10, 10, 3, 2, 1
+          4, 11, 11, 3, 3, 1
         };
         int contentHeight = 0;
         for (const size_t count : categoryEntryCounts) {
@@ -41178,12 +41358,14 @@ static void nativePaintAppActivePanel(HWND hwnd)
         addCategory("Painel Transporte", {
           {"Posição do Painel Transporte", "status_panel", "access"},
           {"Barras do Painel Transporte", "status_bar", "add_existing"},
-          {"Cor do fundo do Painel Transporte", "transport_bg", "block"}
+          {"Cor do fundo do Painel Transporte", "transport_bg", "block"},
+          {"Cor reprodução painel", "transport_playback_color", "play"}
         });
         addCategory("Lista", {
           {"Barras da lista", "list_bar", "add_existing"},
           {"Fundo da tira da lista", "list_bg", "access"},
           {"Cor de fundo da lista", "list_panel_bg", "clear_sel"},
+          {"Cor da lista", "block_song_color", "copy"},
           {"Cor da lista sem bloco", "no_block", "yellow_reset"},
           {"Cor da seta da lista", "selection_arrow_color", "yellow_reset"},
           {"Cor das barras de progresso", "bar_color", "play"},
@@ -41212,6 +41394,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         });
         addCategory("Blocos", {
           {"Simbolo/Bloco", "block_symbol", "block"},
+          {"Cor dos blocos", "block_colors", "copy"},
           {"Altura do bloco", "block_height", "up"}
         });
         addCategory("Gavetas", {
@@ -41310,6 +41493,35 @@ static void nativePaintAppActivePanel(HWND hwnd)
           modal.top + 66, panelWidth >= 420 ? 2 : 1,
           customButtonH, customGap, true);
         drawSimplePreview(optionsBottom + 10, 46, "no_block");
+        addCustomNav("custom_back_main");
+      } else if (g_nativeMainModalKind ==
+          NativeMainModalKind::CustomizeBlockSongColor) {
+        drawCustomHeader("Cor da lista",
+          "Escolha se as musicas dentro dos blocos acompanham a cor do bloco ou ficam brancas.");
+        const std::vector<std::pair<std::string, std::string>> options = {
+          {"block", "Acompanhar bloco"},
+          {"white", "Branco"}
+        };
+        addChoiceGrid(options,
+          nativeUiVisualRawValue(visual,
+            "block_song_color_mode"),
+          "custom_set|block_song_color_mode|",
+          modal.top + 66, panelWidth >= 420 ? 2 : 1,
+          customButtonH, customGap, false);
+        addCustomNav("custom_back_main");
+      } else if (g_nativeMainModalKind ==
+          NativeMainModalKind::CustomizeBlockColorMode) {
+        drawCustomHeader("Cor dos blocos",
+          "Defina se os blocos usam cores automáticas ou ficam sem cor.");
+        const std::vector<std::pair<std::string, std::string>> options = {
+          {"auto", "Cores automáticas"},
+          {"none", "Sem cores"}
+        };
+        addChoiceGrid(options,
+          nativeUiVisualRawValue(visual, "block_color_mode"),
+          "custom_set|block_color_mode|",
+          modal.top + 66, panelWidth >= 420 ? 2 : 1,
+          customButtonH, customGap, false);
         addCustomNav("custom_back_main");
       } else if (g_nativeMainModalKind ==
           NativeMainModalKind::CustomizeBlockBorder ||
@@ -41456,6 +41668,20 @@ static void nativePaintAppActivePanel(HWND hwnd)
             RGB(248, 250, 252), statusFont);
           rowTop += sampleHeight;
         }
+        addCustomNav("custom_back_main");
+      } else if (g_nativeMainModalKind ==
+          NativeMainModalKind::CustomizeTransportPlaybackColor) {
+        drawCustomHeader("Cor reprodução painel",
+          "Escolha se os estados de reprodução mudam o fundo do painel.");
+        const std::vector<std::pair<std::string, std::string>> options = {
+          {"colors", "Com cores"}, {"none", "Sem cores"}
+        };
+        const int optionsBottom = addChoiceGrid(options,
+          nativeUiVisualRawValue(visual,
+            "transport_playback_color_mode"),
+          "custom_set|transport_playback_color_mode|", modal.top + 66,
+          panelWidth >= 420 ? 2 : 1, 32, 8, false);
+        drawSimplePreview(optionsBottom + 10, 62, "transport");
         addCustomNav("custom_back_main");
       } else if (g_nativeMainModalKind ==
           NativeMainModalKind::CustomizeTransportBackground ||
@@ -41854,14 +42080,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
       } else if (g_nativeMainModalKind ==
           NativeMainModalKind::CustomizeBlockHeight) {
         drawCustomHeader("Altura do bloco",
-          "Escolha a altura dos itens de bloco. Compacto usa uma linha mais fina e uma fonte menor.");
+          "Escolha entre bloco compacto, normal ou com altura ampliada.");
         const std::vector<std::pair<std::string, std::string>> options = {
-          {"normal", "Normal"}, {"compact", "Compacto"}
+          {"compact", "Compacto"}, {"normal", "Normal"},
+          {"large", "Large"}
         };
         const int optionsBottom = addChoiceGrid(options,
           nativeUiVisualRawValue(visual, "block_height_mode"),
           "custom_set|block_height_mode|", modal.top + 66,
-          panelWidth >= 420 ? 2 : 1, 24, 8, false);
+          panelWidth >= 500 ? 3 : 1, 24, 8, false);
 
         RECT preview{panelLeft, optionsBottom + 10,
           panelLeft + panelWidth, optionsBottom + 106};
@@ -41877,13 +42104,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
           nativeUiConfiguredFont(previewFontMode);
         const bool previewCompact =
           nativeUiBlockHeightMode(visual) == "compact";
+        const bool previewLarge =
+          nativeUiBlockHeightMode(visual) == "large";
         HFONT previewBlockFont = previewCompact
           ? nativeUiCompactBlockFont(previewFontMode)
           : previewListFont;
         const int musicHeight = sampleLayout.singleRowHeight;
         const int blockHeight = previewCompact
           ? nativeUiCompactBlockHeight()
-          : sampleLayout.singleRowHeight;
+          : (previewLarge
+              ? nativeUiLargeBlockHeight(sampleLayout)
+              : sampleLayout.singleRowHeight);
         int rowTop = preview.top + 9;
         const RECT firstMusic{preview.left + 9, rowTop,
           preview.right - 9, rowTop + musicHeight};
@@ -49746,11 +49977,10 @@ static bool nativeHookControllerWindowIsOpen()
     IsWindow(g_nativeHookControllerHwnd);
 }
 
-// Quando o usuario sai das janelas de musica do VS Hook para editar o arrange,
-// a selecao funcional precisa desaparecer junto com o azul. Sem isso o Stop
-// ainda enxergava a ultima musica como destino deliberado e puxava o cursor de
-// volta ao inicio dela. O poll cobre dockers/SWELL que nem sempre entregam
-// WM_KILLFOCUS para a janela filha correta.
+// Quando o usuário sai das janelas do VS Hook para editar o arrange, somente
+// a seleção funcional é liberada. O mapa visual azul permanece intacto.
+// Assim Stop/Pause não puxa o cursor para o início da última música, mas o
+// usuário ainda enxerga na interface qual linha havia selecionado.
 static bool nativeUiReleaseMusicSelectionForArrangeEditing()
 {
   const auto belongsToWindow = [](HWND target, HWND owner) {
@@ -49800,8 +50030,8 @@ static bool nativeUiReleaseMusicSelectionForArrangeEditing()
   if (!releaseFunctionalSelection) return false;
 
   nativeUiCancelPendingMusicNavigation();
-  nativeUiClearMainRowSelection();
-  // Mantem o mapa vazio como autoridade ate o snapshot sem selecao chegar.
+  // Mantém o mapa visual como autoridade para o snapshot funcional vazio não
+  // apagar a seleção azul ao perder o foco.
   g_nativeUiMainSelectionAuthoritative = true;
   return true;
 }
@@ -50605,8 +50835,12 @@ static void nativeHookControllerPaintSongs(
     else if (liveExecuted && liveMarkColorMode != "none") {
       rowFill = nativeUiLiveMarkBackgroundColor(visualPrefs);
     }
-    else if (!liveExecuted && queued) rowFill = RGB(230, 122, 41);
-    else if (!liveExecuted && selected) rowFill = RGB(26, 128, 242);
+    else if (!liveExecuted && queued) {
+      rowFill = g_nativeAppActivePanelModel.autoplay2Enabled
+        ? RGB(34, 197, 94)
+        : RGB(230, 122, 41);
+    }
+    else if (!liveExecuted && selected) rowFill = RGB(20, 98, 194);
     const bool draggingSource = g_nativeMainListDrag.active &&
       g_nativeMainListDrag.regionsPage &&
       ((!g_nativeMainListDrag.sourceIdentity.empty() &&
@@ -50621,7 +50855,7 @@ static void nativeHookControllerPaintSongs(
     } else {
       nativeAppActiveFillSubtleVerticalGradient(dc, rowRect, rowFill);
     }
-    constexpr int indexW = 28;
+    constexpr int indexW = 24;
     nativeAppActiveFillVerticalGradient(dc,
       RECT{rowRect.left, rowRect.top,
         rowRect.left + indexW, rowRect.bottom},
@@ -50634,9 +50868,11 @@ static void nativeHookControllerPaintSongs(
         ? nativeUiNamedVisualColor(
             nativeUiVisualPref(visualPrefs,
               "list_progress_color_mode", "green"), "green")
-        : nativeUiNamedVisualColor(
-            nativeUiVisualPref(visualPrefs,
-              "list_regress_color_mode", "yellow"), "yellow");
+        : g_nativeAppActivePanelModel.autoplay2Enabled
+          ? RGB(22, 163, 74)
+          : nativeUiNamedVisualColor(
+              nativeUiVisualPref(visualPrefs,
+                "list_regress_color_mode", "yellow"), "yellow");
       const bool showTop = nativeUiVisualPrefBool(visualPrefs,
         playing ? "list_current_top" : "list_queue_top", false);
       const bool showBottom = nativeUiVisualPrefBool(visualPrefs,
@@ -50725,7 +50961,11 @@ static void nativeHookControllerPaintSongs(
           ? RGB(13, 13, 13) : RGB(235, 238, 242));
     if (!playing && !queued && !selected && !liveExecuted &&
         hasInheritedPaletteColor) {
-      textColor = inheritedPaletteColor;
+      const bool useBlockSongColor = nativeLower(
+        nativeUiVisualPref(visualPrefs,
+          "block_song_color_mode", "block")) != "white";
+      textColor = useBlockSongColor
+        ? inheritedPaletteColor : RGB(255, 255, 255);
     }
     nativeUiDrawWrappedText(dc, metrics.lines,
       textRect.left, rowRect.top + listLayout.paddingY,
@@ -52843,6 +53083,40 @@ static bool nativeMainHandleModalClick(
 
   if (action == "config_project_sync") {
     nativeProjectSyncOpenConferenceFromConfig();
+    return true;
+  }
+
+  // Mantido fora da longa cadeia de ações de Personalizar para não aumentar
+  // o aninhamento dessa rotina, que já fica no limite do compilador MSVC.
+  if (action == "custom_open|block_song_color") {
+    g_nativeMainModalKind =
+      NativeMainModalKind::CustomizeBlockSongColor;
+    return true;
+  }
+  if (action == "custom_open|block_colors") {
+    g_nativeMainModalKind =
+      NativeMainModalKind::CustomizeBlockColorMode;
+    return true;
+  }
+  if (action == "custom_open|transport_playback_color") {
+    g_nativeMainModalKind =
+      NativeMainModalKind::CustomizeTransportPlaybackColor;
+    return true;
+  }
+  if (action == "custom_reset_preset") {
+    const int preset = nativeUiVisualPresetIndex(
+      nativeUiReadVisualPrefs());
+    if (preset > 0) {
+      g_nativeMainModalKind =
+        NativeMainModalKind::ConfirmResetVisualPreset;
+    }
+    return true;
+  }
+  if (action == "custom_reset_preset_confirm") {
+    const int preset = nativeUiVisualPresetIndex(
+      nativeUiReadVisualPrefs());
+    if (preset > 0) nativeUiResetVisualPreset(preset);
+    g_nativeMainModalKind = NativeMainModalKind::CustomizeMain;
     return true;
   }
 
@@ -66829,6 +67103,18 @@ static void nativeRebuildState(bool forceSnapshot)
   const auto bridgeVisualPrefs = nativeUiReadVisualPrefs();
   const std::string blockHeightMode =
     nativeUiBlockHeightMode(bridgeVisualPrefs);
+  const std::string transportPlaybackColorMode = nativeLower(
+    nativeUiVisualPref(bridgeVisualPrefs,
+      "transport_playback_color_mode", "none"));
+  const std::string statusCurrentPosition = nativeLower(
+    nativeUiVisualPref(bridgeVisualPrefs,
+      "status_current_position", "top"));
+  const std::string statusQueuePosition = nativeLower(
+    nativeUiVisualPref(bridgeVisualPrefs,
+      "status_queue_position", "top"));
+  const std::string statusMultiLoopPosition = nativeLower(
+    nativeUiVisualPref(bridgeVisualPrefs,
+      "status_multiloop_position", "top"));
   const std::string blockSymbolMode = nativeLower(
     nativeUiVisualPref(
       bridgeVisualPrefs, "block_symbol_mode", "none"));
@@ -66839,6 +67125,12 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string noBlockTextColorMode = nativeLower(
     nativeUiVisualPref(
       bridgeVisualPrefs, "no_block_text_color_mode", "none"));
+  const std::string blockSongColorMode = nativeLower(
+    nativeUiVisualPref(
+      bridgeVisualPrefs, "block_song_color_mode", "block"));
+  const std::string blockColorMode = nativeLower(
+    nativeUiVisualPref(
+      bridgeVisualPrefs, "block_color_mode", "auto"));
   const std::string liveMarkColorMode =
     nativeUiLiveMarkColorMode(bridgeVisualPrefs);
   const bool batteryWarningEnabled = nativeUiVisualPrefBool(
@@ -66878,6 +67170,22 @@ static void nativeRebuildState(bool forceSnapshot)
        << nativeJsonString(blockHeightMode) << ",";
   json << "\"block_height_mode\":"
        << nativeJsonString(blockHeightMode) << ",";
+  json << "\"transportPlaybackColorMode\":"
+       << nativeJsonString(transportPlaybackColorMode) << ",";
+  json << "\"transport_playback_color_mode\":"
+       << nativeJsonString(transportPlaybackColorMode) << ",";
+  json << "\"statusCurrentPosition\":"
+       << nativeJsonString(statusCurrentPosition) << ",";
+  json << "\"statusQueuePosition\":"
+       << nativeJsonString(statusQueuePosition) << ",";
+  json << "\"statusMultiLoopPosition\":"
+       << nativeJsonString(statusMultiLoopPosition) << ",";
+  json << "\"status_current_position\":"
+       << nativeJsonString(statusCurrentPosition) << ",";
+  json << "\"status_queue_position\":"
+       << nativeJsonString(statusQueuePosition) << ",";
+  json << "\"status_multiloop_position\":"
+       << nativeJsonString(statusMultiLoopPosition) << ",";
   json << "\"blockSymbolMode\":"
        << nativeJsonString(blockSymbolMode) << ",";
   json << "\"blockSymbolColor\":"
@@ -66892,6 +67200,14 @@ static void nativeRebuildState(bool forceSnapshot)
        << nativeJsonString(noBlockTextColorMode) << ",";
   json << "\"no_block_text_color_mode\":"
        << nativeJsonString(noBlockTextColorMode) << ",";
+  json << "\"blockSongColorMode\":"
+       << nativeJsonString(blockSongColorMode) << ",";
+  json << "\"block_song_color_mode\":"
+       << nativeJsonString(blockSongColorMode) << ",";
+  json << "\"blockColorMode\":"
+       << nativeJsonString(blockColorMode) << ",";
+  json << "\"block_color_mode\":"
+       << nativeJsonString(blockColorMode) << ",";
   json << "\"liveMarkColorMode\":"
        << nativeJsonString(liveMarkColorMode) << ",";
   json << "\"liveMarkColor\":"
