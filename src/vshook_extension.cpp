@@ -37003,6 +37003,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
       g_nativeMainModalKind == NativeMainModalKind::MidiAssignList;
     const bool previewConfigModal =
       g_nativeMainModalKind == NativeMainModalKind::PreviewConfig;
+    const bool previewBindingModal =
+      g_nativeMainModalKind == NativeMainModalKind::PreviewBinding;
+    const bool previewModal =
+      previewConfigModal || previewBindingModal;
     const bool compactCaptureModal =
       g_nativeMainModalKind == NativeMainModalKind::MidiAssignCapture ||
       g_nativeMainModalKind == NativeMainModalKind::MidiAssignConfirm ||
@@ -37053,8 +37057,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
         static_cast<int>(std::floor(height * 0.72))),
         std::max(260, height - 20));
     } else if (previewConfigModal) {
-      modalW = std::max(300, width - 8);
-      requestedH = std::max(300, height - 8);
+      // Acompanha a janela sem impor uma largura minima maior que ela.
+      modalW = std::max(120, width - 8);
+      requestedH = std::max(100, height - 8);
+    } else if (previewBindingModal) {
+      modalW = std::min(520, std::max(120, width - 12));
+      requestedH = std::min(210, std::max(110, height - 12));
     } else if (compactCaptureModal) {
       requestedH = std::max(190,
         static_cast<int>(std::floor(height * 0.56)));
@@ -37151,11 +37159,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
           static_cast<int>(std::floor(height * 0.56)));
       }
     }
-    const int modalH = (customizeModal || projectSyncDiffModal)
-      ? std::max(220, height - 8)
-      : std::max(140, std::min(
-          playlistModal ? height - 8 : height - 20,
-          requestedH));
+    const int modalH = previewModal
+      ? std::max(80, std::min(std::max(80, height - 8), requestedH))
+      : ((customizeModal || projectSyncDiffModal)
+          ? std::max(220, height - 8)
+          : std::max(140, std::min(
+              playlistModal ? height - 8 : height - 20,
+              requestedH)));
     const int modalLeft = (width - modalW) / 2;
     const int modalTop = (height - modalH) / 2;
     RECT modal{modalLeft, modalTop, modalLeft + modalW, modalTop + modalH};
@@ -43628,21 +43638,28 @@ static void nativePaintAppActivePanel(HWND hwnd)
           : RGB(179, 255, 179),
         statusFont);
       const int menuY = modal.bottom - 28;
+      const int footerGap = std::max(2,
+        std::min(4, static_cast<int>(modal.right - modal.left) / 90));
+      const int footerAvailableW = std::max(4,
+        static_cast<int>(modal.right - modal.left) - 20 - footerGap * 3);
+      const int footerButtonW = std::max(1, footerAvailableW / 4);
+      int footerLeft = modal.left + 10;
+      const auto takePreviewFooterButton = [&]() {
+        RECT result{footerLeft, menuY,
+          footerLeft + footerButtonW, menuY + 18};
+        footerLeft = result.right + footerGap;
+        return result;
+      };
       addModalButton("preview_keyboard", "Teclado",
-        RECT{modal.left + 10, menuY,
-          modal.left + 102, menuY + 18},
+        takePreviewFooterButton(),
         "add_existing", true);
       addModalButton("preview_config", "Config",
-        RECT{modal.left + 106, menuY,
-          modal.left + 178, menuY + 18},
+        takePreviewFooterButton(),
         "page", true);
       addModalButton("preview_clear", "Clean",
-        RECT{modal.left + 182, menuY,
-          modal.left + 254, menuY + 18},
+        takePreviewFooterButton(),
         "clear_playlist", true);
-      g_nativeMainModalCloseRect =
-        RECT{modal.right - 84, menuY,
-          modal.right - 10, menuY + 18};
+      g_nativeMainModalCloseRect = takePreviewFooterButton();
       addModalButton("close", "OK",
         g_nativeMainModalCloseRect,
         "play", true);
@@ -43650,6 +43667,29 @@ static void nativePaintAppActivePanel(HWND hwnd)
                NativeMainModalKind::PreviewConfig) {
       const std::vector<int> selectedBlocks =
         nativeUiReadPreviewBlocks(g_nativeMainModalPreviewSlot);
+      std::map<int, std::string> previewBlockLabels;
+      {
+        std::lock_guard<std::mutex> lock(g_nativeMutex);
+        for (const auto& item : g_nativeActivePlaylistItems) {
+          if (!item.isBlock) continue;
+          const int blockNumber = std::abs(item.sourceNumber);
+          if (blockNumber <= 0 || blockNumber > 48) continue;
+          const std::string displayName = nativeTrim(
+            nativeUiPlainBlockDisplayName(item.name));
+          const std::string suffix = nativeTrim(
+            nativeUiBlockEditValue(item.name));
+          const bool numericSuffix = !suffix.empty() &&
+            std::all_of(suffix.begin(), suffix.end(),
+              [](unsigned char character) {
+                return character >= '0' && character <= '9';
+              });
+          const bool defaultName = numericSuffix &&
+            std::atoi(suffix.c_str()) == blockNumber;
+          if (!displayName.empty() && !defaultName) {
+            previewBlockLabels[blockNumber] = displayName;
+          }
+        }
+      }
       RECT title{modal.left + 10, modal.top + 8,
         modal.right - 10, modal.top + 32};
       nativeAppActiveDrawText(dc,
@@ -43667,20 +43707,26 @@ static void nativePaintAppActivePanel(HWND hwnd)
           DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(168, 179, 189), statusFont);
 
-      const int gap = 4;
+      const int gap = std::max(1,
+        std::min(4, static_cast<int>(modal.right - modal.left) / 120));
       const int availableW = std::max(1,
         static_cast<int>(modal.right - modal.left) - 20);
-      const int columns = availableW >= 620 ? 8
-        : (availableW >= 440 ? 6 : 4);
-      const int rows = (48 + columns - 1) / columns;
       const int gridTop = modal.top + 66;
       const int gridBottom = modal.bottom - 38;
-      const int buttonW = std::max(24,
+      const int gridHeight = std::max(1, gridBottom - gridTop);
+      const int preferredColumns = availableW >= 620 ? 8
+        : (availableW >= 440 ? 6 : 4);
+      const int maximumRows = std::max(1,
+        (gridHeight + gap) / (14 + gap));
+      const int minimumColumnsToFit =
+        (48 + maximumRows - 1) / maximumRows;
+      const int columns = std::max(1, std::min(16,
+        std::max(preferredColumns, minimumColumnsToFit)));
+      const int rows = (48 + columns - 1) / columns;
+      const int buttonW = std::max(1,
         (availableW - gap * (columns - 1)) / columns);
-      const int buttonH = std::max(14,
-        std::min(28,
-          (std::max(1, gridBottom - gridTop) -
-           gap * (rows - 1)) / rows));
+      const int buttonH = std::max(1, std::min(28,
+        (gridHeight - gap * (rows - 1)) / rows));
       for (int block = 1; block <= 48; ++block) {
         const int index = block - 1;
         const int row = index / columns;
@@ -43692,20 +43738,27 @@ static void nativePaintAppActivePanel(HWND hwnd)
           std::find(selectedBlocks.begin(), selectedBlocks.end(), block) !=
             selectedBlocks.end();
         const bool enabled = selected || selectedBlocks.size() < 8;
+        const auto customLabel = previewBlockLabels.find(block);
+        const std::string buttonLabel = customLabel !=
+            previewBlockLabels.end()
+          ? customLabel->second
+          : "Bloco " + std::to_string(block);
         addModalButton(
           "preview_block_toggle|" + std::to_string(block),
-          std::string(selected ? "[x] " : "[ ] ") +
-            std::to_string(block),
+          std::string(selected ? "[x] " : "[ ] ") + buttonLabel,
           RECT{left, top, left + buttonW, top + buttonH},
           selected ? "play" : (enabled ? "page" : "locked"), enabled);
       }
       const int menuY = modal.bottom - 28;
+      const int footerButtonGap = gap;
+      const int footerButtonW = std::max(1,
+        (availableW - footerButtonGap) / 2);
       addModalButton("preview_config_reset", "Reset",
         RECT{modal.left + 10, menuY,
-          modal.left + 92, menuY + 18},
+          modal.left + 10 + footerButtonW, menuY + 18},
         "clear_playlist", true);
       addModalButton("preview_config_back", "Voltar",
-        RECT{modal.right - 92, menuY,
+        RECT{modal.left + 10 + footerButtonW + footerButtonGap, menuY,
           modal.right - 10, menuY + 18},
         "page", true);
     } else if (g_nativeMainModalKind ==
@@ -58115,6 +58168,7 @@ struct NativeTelepromptSettings {
   std::string clockExpiredColor = "#ff3131";
   std::string clockBorderColor = "#00ff55";
   std::string localClockColor = "#00ff55";
+  std::string localClockBorderColor = "#00ff55";
   std::string borderColor = "#00ff55";
   std::string songNameColor = "#00ff55";
   std::string queueNameColor = "#ffea00";
@@ -58695,6 +58749,7 @@ static void nativeTelepromptApplySettingsJson(
   stringValue("clockExpiredColor", next.clockExpiredColor);
   stringValue("clockBorderColor", next.clockBorderColor);
   stringValue("localClockColor", next.localClockColor);
+  stringValue("localClockBorderColor", next.localClockBorderColor);
   stringValue("borderColor", next.borderColor);
   stringValue("songNameColor", next.songNameColor);
   stringValue("queueNameColor", next.queueNameColor);
@@ -58827,6 +58882,7 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"clockExpiredColor\":\"#ff3131\",";
   json << "\"clockBorderColor\":\"#00ff55\",";
   json << "\"localClockColor\":\"#00ff55\",";
+  json << "\"localClockBorderColor\":\"#00ff55\",";
   json << "\"borderColor\":\"#00ff55\",";
   json << "\"songNameColor\":\"#00ff55\",";
   json << "\"queueNameColor\":\"#ffea00\",";
@@ -58901,6 +58957,8 @@ static std::string nativeTelepromptSettingsToJson(
        << nativeJsonString(settings.clockBorderColor) << ",";
   json << "\"localClockColor\":"
        << nativeJsonString(settings.localClockColor) << ",";
+  json << "\"localClockBorderColor\":"
+       << nativeJsonString(settings.localClockBorderColor) << ",";
   json << "\"borderColor\":"
        << nativeJsonString(settings.borderColor) << ",";
   json << "\"songNameColor\":"
@@ -59018,6 +59076,7 @@ static std::string nativeTelepromptDefaultPresetSettingsJson(
     settings.clockExpiredColor = "#d60000";
     settings.clockBorderColor = "#ffffff";
     settings.localClockColor = "#ffffff";
+    settings.localClockBorderColor = "#ffffff";
     settings.borderColor = "#ffffff";
     settings.songNameColor = "#ffffff";
     settings.queueNameColor = "#ffffff";
@@ -60258,30 +60317,8 @@ static void nativeTelepromptDrawPreview(
   const double previewScale = nativeTelepromptClamp(
     settings.previewScale, 0.35, 3.0);
   const int baseW = area.right - area.left;
-  const int baseH = area.bottom - area.top;
-  // A escala nunca pode devolver o preview para dentro das faixas reservadas
-  // ao cronômetro, relógio local ou demais elementos. Valores acima de 100%
-  // ocupam todo o retângulo seguro, sem ultrapassá-lo.
-  const int scaledW = std::max(1, std::min(
-    baseW,
-    static_cast<int>(std::lround(baseW * previewScale))));
-  const int scaledH = std::max(1, std::min(
-    baseH,
-    static_cast<int>(std::lround(baseH * previewScale))));
-  const int centerX = (area.left + area.right) / 2;
-  const int centerY = (area.top + area.bottom) / 2;
-  area = RECT{
-    std::max<LONG>(area.left,
-      static_cast<LONG>(centerX - scaledW / 2)),
-    std::max<LONG>(area.top,
-      static_cast<LONG>(centerY - scaledH / 2)),
-    std::min<LONG>(area.right,
-      static_cast<LONG>(
-        centerX + (scaledW + 1) / 2)),
-    std::min<LONG>(area.bottom,
-      static_cast<LONG>(
-        centerY + (scaledH + 1) / 2))
-  };
+  // Profundidade controla somente a tipografia. O retângulo seguro e os
+  // contornos dos blocos continuam aproveitando toda a área disponível.
 
   const COLORREF fallbackColor = nativeTelepromptColor(
     settings.queueNameColor, RGB(255, 234, 0));
@@ -60310,8 +60347,8 @@ static void nativeTelepromptDrawPreview(
 
   const int blockCount = std::min(
     8, static_cast<int>(state.preview.blocks.size()));
-  const int gap = std::max(
-    4, std::min(16, width / 80));
+  // Mesma folga usada entre cronometro e horario local.
+  const int gap = std::max(4, height / 160);
   const int areaW = std::max(
     1, static_cast<int>(area.right - area.left));
   const int areaH = std::max(
@@ -60323,6 +60360,37 @@ static void nativeTelepromptDrawPreview(
   int cardW = areaW;
   int bestEstimatedFont = 0;
   std::vector<int> blockColumns(static_cast<size_t>(blockCount), 0);
+  const auto estimatedBlockUnits = [&settings](
+      const NativeTelepromptPreviewBlock& block,
+      int availableCardWidth) {
+    // Estima tambem as quebras de linha. Contar apenas a quantidade de
+    // musicas fazia blocos com nomes longos parecerem menores do que eram.
+    const int charactersPerLine = std::max(10, availableCardWidth / 15);
+    const auto lineUnits = [charactersPerLine](
+        const std::string& value) {
+      const int characters = std::max(1,
+        static_cast<int>(value.size()));
+      return std::max(1,
+        (characters + charactersPerLine - 1) / charactersPerLine);
+    };
+    std::string title = nativeTelepromptDisplayText(
+      block.name, settings.textCase);
+    if (settings.previewBlockDurationEnabled && block.durationSec > 0.0) {
+      title += "  •  " +
+        nativeAppActiveFormatDuration(block.durationSec);
+    }
+    double units = lineUnits(title) * 1.35;
+    for (const auto& song : block.songs) {
+      std::string label = nativeTelepromptDisplayText(
+        song.name, settings.textCase);
+      if (settings.previewSongDurationEnabled && song.durationSec > 0.0) {
+        label += "  •  " +
+          nativeAppActiveFormatDuration(song.durationSec);
+      }
+      units += lineUnits(label);
+    }
+    return std::max(1.35, units);
+  };
   for (int candidateColumns = 1;
        candidateColumns <= std::min(4, blockCount);
        ++candidateColumns) {
@@ -60335,7 +60403,21 @@ static void nativeTelepromptDrawPreview(
       static_cast<size_t>(candidateColumns), 0);
     std::vector<int> candidateBlockColumns(
       static_cast<size_t>(blockCount), 0);
+    std::vector<std::pair<double, int>> weightedBlocks;
+    weightedBlocks.reserve(static_cast<size_t>(blockCount));
     for (int index = 0; index < blockCount; ++index) {
+      weightedBlocks.push_back({
+        estimatedBlockUnits(
+          state.preview.blocks[static_cast<size_t>(index)],
+          candidateCardW),
+        index});
+    }
+    std::stable_sort(weightedBlocks.begin(), weightedBlocks.end(),
+      [](const auto& left, const auto& right) {
+        return left.first > right.first;
+      });
+    for (const auto& weightedBlock : weightedBlocks) {
+      const int index = weightedBlock.second;
       int targetColumn = 0;
       for (int column = 1; column < candidateColumns; ++column) {
         if (columnUnits[static_cast<size_t>(column)] <
@@ -60344,10 +60426,8 @@ static void nativeTelepromptDrawPreview(
         }
       }
       candidateBlockColumns[static_cast<size_t>(index)] = targetColumn;
-      const auto& candidateBlock =
-        state.preview.blocks[static_cast<size_t>(index)];
       columnUnits[static_cast<size_t>(targetColumn)] +=
-        std::max<size_t>(1, candidateBlock.songs.size()) + 1.35;
+        weightedBlock.first;
       ++columnBlocks[static_cast<size_t>(targetColumn)];
     }
     double busiestUnits = 1.0;
@@ -60375,52 +60455,138 @@ static void nativeTelepromptDrawPreview(
     }
   }
 
-  std::vector<int> columnSongCounts(
-    static_cast<size_t>(columns), 0);
-  std::vector<int> columnBlockCounts(
-    static_cast<size_t>(columns), 0);
-  for (int index = 0; index < blockCount; ++index) {
-    const int column = blockColumns[static_cast<size_t>(index)];
-    columnSongCounts[static_cast<size_t>(column)] +=
-      static_cast<int>(state.preview.blocks[
-        static_cast<size_t>(index)].songs.size());
-    ++columnBlockCounts[static_cast<size_t>(column)];
-  }
-  double busiestColumnUnits = 1.0;
-  int busiestColumnBlocks = 1;
-  for (int column = 0; column < columns; ++column) {
-    const int blocks = std::max(
-      1, columnBlockCounts[static_cast<size_t>(column)]);
-    busiestColumnBlocks = std::max(busiestColumnBlocks, blocks);
-    busiestColumnUnits = std::max(
-      busiestColumnUnits,
-      static_cast<double>(
-        columnSongCounts[static_cast<size_t>(column)]) +
-        static_cast<double>(blocks) * 1.35);
-  }
-  const int verticalFontLimit = std::max(10,
-    static_cast<int>(std::floor(
-      std::max(1, areaH - gap * (busiestColumnBlocks - 1) -
-        busiestColumnBlocks * 12) /
-      (busiestColumnUnits * 1.07))));
-  // Nomes compridos podem usar duas linhas; nao reduza toda a coluna para
-  // tentar manter cada musica obrigatoriamente em uma unica linha.
-  const int horizontalFontLimit = std::max(10, cardW / 13);
-  const int songFontSize = std::max(
-    10, std::min(40,
-      std::min(horizontalFontLimit, verticalFontLimit)));
-  const int titleFontSize = std::max(
-    13, std::min(38,
-      static_cast<int>(std::lround(songFontSize * 1.08))));
-  HFONT titleFont = nativeTelepromptFont(
-    settings.previewFontFamily, titleFontSize, FW_BOLD);
-  HFONT songFont = nativeTelepromptFont(
-    settings.previewFontFamily, songFontSize, FW_BOLD);
-  const int titleLineHeight = std::max(
-    titleFontSize + 1,
+  // Cada bloco recebe sua propria escala. Um bloco muito cheio diminui sem
+  // obrigar os demais blocos da tela a usarem a mesma fonte pequena.
+  const int unscaledCardW = std::max(1,
+    (baseW - gap * (columns - 1)) / columns);
+  const int maximumSongFont = std::max(4,
     static_cast<int>(std::lround(
-      titleFontSize * 1.04)));
-  const int songLineHeight = songFontSize + 2;
+      // Permite que a tipografia cresca verticalmente para consumir a area
+      // livre da coluna. O limite anterior (largura / 13) mantinha letras
+      // pequenas e deixava metade inferior do Preview vazia.
+      std::max(8, std::min(72, unscaledCardW / 7)) *
+      std::min(1.0, previewScale))));
+  const int minimumSongFont = std::max(4,
+    static_cast<int>(std::lround(6.0 *
+      std::min(1.0, previewScale))));
+  const int minimumTitleFont = std::max(5,
+    static_cast<int>(std::lround(8.0 *
+      std::min(1.0, previewScale))));
+  const auto measureBlockHeight = [&](int blockIndex, int songSize) {
+    const NativeTelepromptPreviewBlock& block =
+      state.preview.blocks[static_cast<size_t>(blockIndex)];
+    const int titleSize = std::max(minimumTitleFont, std::min(68,
+      static_cast<int>(std::lround(songSize * 1.08))));
+    HFONT measuredTitleFont = nativeTelepromptFont(
+      settings.previewFontFamily, titleSize, FW_BOLD);
+    HFONT measuredSongFont = nativeTelepromptFont(
+      settings.previewFontFamily, songSize, FW_BOLD);
+    const int titleLineH = std::max(titleSize + 1,
+      static_cast<int>(std::lround(titleSize * 1.04)));
+    const int songLineH = songSize + 2;
+    const int padX = std::max(5, std::min(14, cardW / 45));
+    const int padY = block.songs.size() >= 12
+      ? 3 : std::max(4, std::min(12, areaH / 84));
+    const int textWidth = std::max(1, cardW - padX * 2);
+    std::string title = nativeTelepromptDisplayText(
+      block.name, settings.textCase);
+    if (settings.previewBlockDurationEnabled && block.durationSec > 0.0) {
+      title += "  •  " +
+        nativeAppActiveFormatDuration(block.durationSec);
+    }
+    const auto titleLines = nativeTelepromptPreviewWrapLines(
+      dc, title, textWidth, measuredTitleFont, 128);
+    const int titleHeight = std::max(titleLineH,
+      static_cast<int>(titleLines.size()) * titleLineH);
+    const int songGap = block.songs.size() >= 12
+      ? 0 : std::max(1, padY / 3);
+    int songsHeight = 0;
+    for (size_t songIndex = 0;
+         songIndex < block.songs.size(); ++songIndex) {
+      const auto& song = block.songs[songIndex];
+      std::string label = nativeTelepromptDisplayText(
+        song.name, settings.textCase);
+      if (settings.previewSongDurationEnabled && song.durationSec > 0.0) {
+        label += "  •  " +
+          nativeAppActiveFormatDuration(song.durationSec);
+      }
+      const auto lines = nativeTelepromptPreviewWrapLines(
+        dc, label, textWidth, measuredSongFont, 128);
+      songsHeight += std::max(songLineH,
+        static_cast<int>(lines.size()) * songLineH);
+      if (songIndex + 1 < block.songs.size()) songsHeight += songGap;
+    }
+    const int titleToSongsGap = block.songs.empty()
+      ? 0 : std::max(2, padY / 2);
+    return std::max(titleLineH + padY * 2,
+      padY + titleHeight + titleToSongsGap + songsHeight + padY);
+  };
+
+  std::vector<std::vector<int>> blocksByColumn(
+    static_cast<size_t>(columns));
+  for (int index = 0; index < blockCount; ++index) {
+    blocksByColumn[static_cast<size_t>(
+      blockColumns[static_cast<size_t>(index)])].push_back(index);
+  }
+  std::vector<int> blockFontSizes(
+    static_cast<size_t>(blockCount), maximumSongFont);
+  for (int column = 0; column < columns; ++column) {
+    const auto& indices = blocksByColumn[static_cast<size_t>(column)];
+    if (indices.empty()) continue;
+    const int availableForCards = std::max(1,
+      areaH - gap * (static_cast<int>(indices.size()) - 1));
+    std::vector<int> minimumHeights;
+    std::vector<int> naturalHeights;
+    int totalMinimum = 0;
+    int totalNatural = 0;
+    int totalGrowth = 0;
+    for (const int index : indices) {
+      const int minimumHeight =
+        measureBlockHeight(index, minimumSongFont);
+      const int naturalHeight =
+        measureBlockHeight(index, maximumSongFont);
+      minimumHeights.push_back(minimumHeight);
+      naturalHeights.push_back(naturalHeight);
+      totalMinimum += minimumHeight;
+      totalNatural += naturalHeight;
+      totalGrowth += std::max(0, naturalHeight - minimumHeight);
+    }
+    int remainingAllocation = availableForCards;
+    int remainingMinimum = totalMinimum;
+    int remainingGrowth = totalGrowth;
+    for (size_t position = 0; position < indices.size(); ++position) {
+      const int index = indices[position];
+      const int minimumHeight = minimumHeights[position];
+      const int naturalHeight = naturalHeights[position];
+      int allocatedHeight = naturalHeight;
+      if (totalNatural > availableForCards) {
+        const int availableGrowth = std::max(0,
+          remainingAllocation - remainingMinimum);
+        const int ownGrowth = std::max(0,
+          naturalHeight - minimumHeight);
+        const int extra = remainingGrowth > 0
+          ? static_cast<int>(std::lround(
+              static_cast<double>(availableGrowth) * ownGrowth /
+              remainingGrowth))
+          : 0;
+        allocatedHeight = std::min(remainingAllocation,
+          minimumHeight + std::max(0, extra));
+      }
+      int selectedFont = maximumSongFont;
+      while (selectedFont > minimumSongFont &&
+             measureBlockHeight(index, selectedFont) > allocatedHeight) {
+        --selectedFont;
+      }
+      blockFontSizes[static_cast<size_t>(index)] = selectedFont;
+      const int usedHeight = measureBlockHeight(index, selectedFont);
+      remainingAllocation = std::max(0,
+        remainingAllocation - usedHeight);
+      remainingMinimum = std::max(0,
+        remainingMinimum - minimumHeight);
+      remainingGrowth = std::max(0,
+        remainingGrowth - std::max(0, naturalHeight - minimumHeight));
+    }
+  }
   std::vector<int> columnTops(
     static_cast<size_t>(columns), area.top);
 
@@ -60438,6 +60604,16 @@ static void nativeTelepromptDrawPreview(
       ? area.right : left + cardW;
     const COLORREF blockColor = nativeTelepromptColor(
       block.colorHex, fallbackColor);
+    const int songFontSize = blockFontSizes[index];
+    const int titleFontSize = std::max(minimumTitleFont, std::min(68,
+      static_cast<int>(std::lround(songFontSize * 1.08))));
+    HFONT titleFont = nativeTelepromptFont(
+      settings.previewFontFamily, titleFontSize, FW_BOLD);
+    HFONT songFont = nativeTelepromptFont(
+      settings.previewFontFamily, songFontSize, FW_BOLD);
+    const int titleLineHeight = std::max(titleFontSize + 1,
+      static_cast<int>(std::lround(titleFontSize * 1.04)));
+    const int songLineHeight = songFontSize + 2;
     const int padX = std::max(5, std::min(14, cardW / 45));
     const int padY = block.songs.size() >= 12
       ? 3 : std::max(4, std::min(12, areaH / 84));
@@ -60452,7 +60628,7 @@ static void nativeTelepromptDrawPreview(
     }
     const std::vector<std::string> titleLines =
       nativeTelepromptPreviewWrapLines(
-        dc, titleLabel, textWidth, titleFont, 3);
+        dc, titleLabel, textWidth, titleFont, 128);
     const int titleHeight = std::max(
       titleLineHeight,
       static_cast<int>(titleLines.size()) *
@@ -60472,7 +60648,7 @@ static void nativeTelepromptDrawPreview(
           nativeAppActiveFormatDuration(song.durationSec);
       }
       wrappedSongs.push_back(nativeTelepromptPreviewWrapLines(
-        dc, label, textWidth, songFont, 2));
+        dc, label, textWidth, songFont, 128));
       songsHeight += std::max(
         songLineHeight,
         static_cast<int>(wrappedSongs.back().size()) * songLineHeight);
@@ -62254,6 +62430,8 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   std::string localTime;
   COLORREF localClockColor = nativeTelepromptColor(
     settings.localClockColor, RGB(0, 255, 85));
+  const COLORREF localClockBorderColor = nativeTelepromptColor(
+    settings.localClockBorderColor, RGB(0, 255, 85));
 
   // Nas posições laterais, cronômetro e horário local formam uma única
   // faixa. As duas caixas têm exatamente a mesma largura e altura. À
@@ -62437,7 +62615,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       dc, localClockRect, RGB(0, 0, 0));
     if (settings.localClockBorderEnabled) {
       nativeTelepromptDrawBorder(
-        dc, localClockRect, localClockColor, 2);
+        dc, localClockRect, localClockBorderColor, 2);
     }
     nativeAppActiveDrawText(
       dc, localTime, localClockRect,
