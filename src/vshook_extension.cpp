@@ -1136,6 +1136,13 @@ static NativeUiSmoothScrollState g_nativeParts1SmoothScroll;
 static NativeUiSmoothScrollState g_nativeParts2SmoothScroll;
 static std::chrono::steady_clock::time_point
   g_nativeUiLastSmoothScrollAdvanceAt{};
+struct NativeUiPendingBlockReveal {
+  bool pending = false;
+  int blockNumber = 0;
+  std::string playlistName;
+  std::chrono::steady_clock::time_point expiresAt{};
+};
+static NativeUiPendingBlockReveal g_nativeUiPendingBlockReveal;
 struct NativePartsRowHit {
   RECT rect{0, 0, 0, 0};
   int rowIndex = -1;
@@ -23016,66 +23023,6 @@ static std::string nativeUiFormatDefaultBlockName(int blockNumber)
   return nativeUiFormatBlockNameForCurrentSymbol(suffix.str());
 }
 
-static size_t nativeUiPlaylistBlockInsertIndexFromCurrentScroll(
-  const std::vector<std::string>& itemLines)
-{
-  if (itemLines.empty()) return 0;
-
-  // O botão Blocos pertence ao repertório. Usa a geometria do último paint
-  // para que alturas normais/compactas e uma primeira linha parcialmente
-  // visível sejam consideradas exatamente como aparecem na tela.
-  size_t insertIndex = std::min<size_t>(4, itemLines.size());
-  if (!g_nativeAppActivePanelModel.regionsPage &&
-      !g_nativeMainVisibleRowIndices.empty()) {
-    const size_t layoutCount = std::min(
-      g_nativeMainVisibleRowIndices.size(),
-      std::min(g_nativeMainRowHeights.size(),
-        g_nativeMainRowOffsets.empty()
-          ? size_t{0}
-          : g_nativeMainRowOffsets.size() - 1));
-    size_t firstVisible = 0;
-    while (firstVisible < layoutCount &&
-           g_nativeMainRowOffsets[firstVisible] +
-             g_nativeMainRowHeights[firstVisible] <=
-               g_nativeAppActiveListScrollPixels) {
-      ++firstVisible;
-    }
-
-    // Índice 4 = quinta linha a partir do ponto atual do scroll. Inserir antes
-    // dela faz o bloco novo ocupar visualmente essa quinta posição.
-    const size_t targetVisible = firstVisible + 4;
-    if (targetVisible < layoutCount) {
-      const size_t modelIndex =
-        g_nativeMainVisibleRowIndices[targetVisible];
-      if (modelIndex < g_nativeAppActivePanelModel.rows.size()) {
-        const auto& targetRow =
-          g_nativeAppActivePanelModel.rows[modelIndex];
-        const int resolvedLine = nativeUiPlaylistLineIndexForRow(
-          itemLines, targetRow);
-        if (resolvedLine >= 0) {
-          insertIndex = static_cast<size_t>(resolvedLine);
-        } else {
-          insertIndex = static_cast<size_t>(std::max(0,
-            std::min(targetRow.order - 1,
-              static_cast<int>(itemLines.size()))));
-        }
-      }
-    } else {
-      insertIndex = itemLines.size();
-    }
-  }
-
-  // Um item bloco não pode separar uma região pai das músicas filhas. Quando
-  // a quinta linha cair dentro dessa família, usa o primeiro ponto seguro logo
-  // depois dela, igual ao drag/drop da própria lista.
-  std::vector<bool> noMovingRows(itemLines.size(), false);
-  const int safeIndex = nativeUiClampFamilyReorderTarget(
-    itemLines, noMovingRows, static_cast<int>(insertIndex),
-    nativeUiPlaylistLineFamilyInfo);
-  return static_cast<size_t>(std::max(0,
-    std::min(safeIndex, static_cast<int>(itemLines.size()))));
-}
-
 static bool nativeUiCreatePlaylistBlock()
 {
   char pathBuf[2048] = "";
@@ -23121,9 +23068,26 @@ static bool nativeUiCreatePlaylistBlock()
   }
   const int blockNumber = previousBlockNumber + 1;
 
-  const size_t insertIndex =
-    nativeUiPlaylistBlockInsertIndexFromCurrentScroll(
-      playlist.itemLines);
+  // O bloco novo nasce imediatamente abaixo do ultimo item de bloco ja
+  // existente — nunca no fim arbitrario da lista. Sem nenhum bloco, ele e o
+  // primeiro item do repertorio. Apos achar a posicao, protege tambem uma
+  // familia pai/filhos que eventualmente comece logo abaixo desse cabecalho.
+  size_t insertIndex = 0;
+  bool foundExistingBlock = false;
+  for (size_t index = 0; index < playlist.itemLines.size(); ++index) {
+    if (blockNumberFromLine(playlist.itemLines[index]) <= 0) continue;
+    insertIndex = index + 1;
+    foundExistingBlock = true;
+  }
+  if (foundExistingBlock) {
+    std::vector<bool> noMovingRows(playlist.itemLines.size(), false);
+    const int safeIndex = nativeUiClampFamilyReorderTarget(
+      playlist.itemLines, noMovingRows,
+      static_cast<int>(insertIndex), nativeUiPlaylistLineFamilyInfo);
+    insertIndex = static_cast<size_t>(std::max(0,
+      std::min(safeIndex,
+        static_cast<int>(playlist.itemLines.size()))));
+  }
 
   const std::vector<std::string> fields = {
     "ITEM", "block", std::to_string(-blockNumber),
@@ -23136,7 +23100,66 @@ static bool nativeUiCreatePlaylistBlock()
     playlist.itemLines.begin() + static_cast<std::ptrdiff_t>(insertIndex),
     blockLine);
   nativeUiRenumberPlaylistBlocks(playlist.itemLines);
-  return nativeUiSavePlaylistRecords(project, playlists);
+  if (!nativeUiSavePlaylistRecords(project, playlists)) return false;
+
+  // O snapshot/modelo da lista e reconstruido de forma assincrona. Guarda a
+  // identidade do bloco e revela a linha somente quando a geometria nova ja
+  // estiver disponivel; assim o salto nunca usa o limite de scroll antigo.
+  g_nativeUiPendingBlockReveal.pending = true;
+  g_nativeUiPendingBlockReveal.blockNumber = blockNumber;
+  g_nativeUiPendingBlockReveal.playlistName = playlist.name;
+  g_nativeUiPendingBlockReveal.expiresAt =
+    std::chrono::steady_clock::now() + std::chrono::seconds(4);
+  g_nativeUiRowsSourceSignatureValid = false;
+  if (nativeAppActivePanelIsOpen()) {
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
+  return true;
+}
+
+static void nativeUiRevealPendingCreatedBlock()
+{
+  if (!g_nativeUiPendingBlockReveal.pending) return;
+  const auto now = std::chrono::steady_clock::now();
+  if (g_nativeUiPendingBlockReveal.expiresAt.time_since_epoch().count() != 0 &&
+      now >= g_nativeUiPendingBlockReveal.expiresAt) {
+    g_nativeUiPendingBlockReveal = NativeUiPendingBlockReveal{};
+    return;
+  }
+  if (g_nativeAppActivePanelModel.mixerPage ||
+      g_nativeAppActivePanelModel.regionsPage ||
+      g_nativeAppActivePanelModel.playlistName !=
+        g_nativeUiPendingBlockReveal.playlistName) {
+    return;
+  }
+  const size_t layoutCount = std::min(
+    g_nativeMainVisibleRowIndices.size(),
+    std::min(g_nativeMainRowHeights.size(),
+      g_nativeMainRowOffsets.empty()
+        ? size_t{0} : g_nativeMainRowOffsets.size() - 1));
+  for (size_t visible = 0; visible < layoutCount; ++visible) {
+    const size_t modelIndex = g_nativeMainVisibleRowIndices[visible];
+    if (modelIndex >= g_nativeAppActivePanelModel.rows.size()) continue;
+    const auto& row = g_nativeAppActivePanelModel.rows[modelIndex];
+    if (!row.block ||
+        std::abs(row.sourceNumber) !=
+          g_nativeUiPendingBlockReveal.blockNumber) {
+      continue;
+    }
+    const int rowTop = g_nativeMainRowOffsets[visible];
+    const int viewport = std::max(1, g_nativeMainListViewportPixels);
+    // Posiciona o bloco aproximadamente a dois tercos da area visivel. O
+    // respiro virtual do fim da lista deixa claro que ele realmente foi criado.
+    const int desired = std::max(0,
+      std::min(g_nativeMainListMaxScrollPixels,
+        rowTop - (viewport * 2) / 3));
+    g_nativeAppActiveListScrollPixels = desired;
+    g_nativePlaylistListScrollPixels = desired;
+    g_nativeMainSmoothScroll = NativeUiSmoothScrollState{};
+    g_nativeUiLastSmoothScrollAdvanceAt = {};
+    g_nativeUiPendingBlockReveal = NativeUiPendingBlockReveal{};
+    return;
+  }
 }
 
 static void nativeUiOpenMessage(const std::string& message)
@@ -27056,6 +27079,10 @@ struct NativeProjectSyncPrepareInput {
   std::string projectFileName;
   std::string manifestRevision;
   std::string structuralRevision;
+  // Manifesto exato que originou o snapshot. Ele viaja assinado dentro do
+  // descriptor para o PC B nunca misturar o RPP de uma revisao com o
+  // diagnostico/configuracao de outra revisao recebida alguns ms depois.
+  std::string sourceManifest;
   std::string configSnapshot;
   std::string sourceSessionId;
   std::string resourcePath;
@@ -27394,6 +27421,8 @@ static void nativeProjectSyncPrepareBundleWorker(
     << nativeJsonString(input.manifestRevision)
     << ",\"sourceStructuralRevision\":"
     << nativeJsonString(input.structuralRevision)
+    << ",\"sourceManifest\":"
+    << nativeJsonString(input.sourceManifest)
     << ",\"projectFile\":{\"relativePath\":"
     << nativeJsonString(projectRelative)
     << ",\"size\":" << portableRpp.size()
@@ -27677,12 +27706,22 @@ static void nativeProjectSyncApplyBundleWorker(
     nativeJsonExtractString(descriptor, "sourceManifestRevision"));
   const std::string sourceStructuralRevision = nativeTrim(
     nativeJsonExtractString(descriptor, "sourceStructuralRevision"));
-  if (sourceManifestRevision.empty() || sourceStructuralRevision.empty()) {
+  const std::string descriptorSourceManifest =
+    nativeJsonExtractString(descriptor, "sourceManifest");
+  if (sourceManifestRevision.empty() || sourceStructuralRevision.empty() ||
+      descriptorSourceManifest.empty() ||
+      descriptorSourceManifest.size() > 640u * 1024u ||
+      nativeLower(nativeProjectSyncHashText(descriptorSourceManifest)) !=
+        nativeLower(sourceManifestRevision)) {
     nativeProjectSyncFinishApplyError(input.requestId,
-      "O descriptor nao informa a revisao do projeto mestre.");
+      "O descriptor nao corresponde ao manifesto exato do projeto mestre.");
     g_nativeProjectSyncBundleWorkerRunning.store(false);
     return;
   }
+  // A copia recebida no descriptor e a autoridade desta transacao. O
+  // preflight vivo pode continuar recebendo revisoes novas sem alterar o
+  // pacote que ja esta sendo validado/aplicado.
+  input.sourceManifest = descriptorSourceManifest;
 
   const std::string projectObject = nativeTrim(
     nativeJsonExtractRawValue(descriptor, "projectFile"));
@@ -28262,6 +28301,7 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
   std::string role;
   std::string manifestRevision;
   std::string structuralRevision;
+  std::string sourceManifest;
   std::string configSnapshot;
   std::string currentPreflightRequestId;
   {
@@ -28270,6 +28310,7 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
     manifestRevision = g_nativeProjectSyncPreflight.manifestRevision;
     structuralRevision =
       g_nativeProjectSyncPreflight.structuralManifestRevision;
+    sourceManifest = g_nativeProjectSyncPreflight.manifest;
     configSnapshot = g_nativeProjectSyncPreflight.configSnapshot;
     currentPreflightRequestId = g_nativeProjectSyncPreflight.requestId;
   }
@@ -28320,6 +28361,7 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
     manifestRevision = g_nativeProjectSyncPreflight.manifestRevision;
     structuralRevision =
       g_nativeProjectSyncPreflight.structuralManifestRevision;
+    sourceManifest = g_nativeProjectSyncPreflight.manifest;
     configSnapshot = g_nativeProjectSyncPreflight.configSnapshot;
   }
   if (!expectedRevision.empty() &&
@@ -28327,6 +28369,13 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
       !nativeProjectSyncPathEquals(expectedRevision, structuralRevision)) {
     nativeProjectSyncFinishBundleError(requestId,
       "O projeto do PC A mudou antes de preparar o bundle. Confira novamente.");
+    return true;
+  }
+  if (sourceManifest.empty() || manifestRevision.empty() ||
+      nativeLower(nativeProjectSyncHashText(sourceManifest)) !=
+        nativeLower(manifestRevision)) {
+    nativeProjectSyncFinishBundleError(requestId,
+      "O manifesto do PC A mudou durante a preparacao. Confira novamente.");
     return true;
   }
 
@@ -28394,7 +28443,7 @@ static bool nativeProjectSyncPrepareBundleFromCommand(
       requestId, bundleId, snapshotProjectPath, projectPath,
       projectDirectory,
       mediaDirectory, projectFileName, manifestRevision,
-      structuralRevision, configSnapshot,
+      structuralRevision, sourceManifest, configSnapshot,
       nativeTimecodeLanSessionId(),
       normalizeSlashes(
         GetResourcePath_ptr ? GetResourcePath_ptr() : ""),
@@ -28840,9 +28889,6 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
       std::string guid;
       std::string name;
       int folderDepth = 0;
-      double volume = 1.0;
-      bool mute = false;
-      int solo = 0;
       MediaTrack* track = nullptr;
     };
     ReaProject* project = getCurrentProject(nullptr, 0);
@@ -28875,9 +28921,6 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
         target.index = std::max(0, std::atoi(fields[2].c_str()) - 1);
         target.name = fields[3];
         target.folderDepth = std::atoi(fields[4].c_str());
-        target.volume = std::atof(fields[6].c_str());
-        target.mute = fields[7] == "1";
-        target.solo = std::atoi(fields[8].c_str());
         const auto found = localTracks.find(target.guid);
         if (found == localTracks.end()) {
           directReady = false;
@@ -28924,12 +28967,9 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
           }
           SetMediaTrackInfo_Value_ptr(track, "I_FOLDERDEPTH",
             targets[targetIndex].folderDepth);
-          SetMediaTrackInfo_Value_ptr(track, "D_VOL",
-            targets[targetIndex].volume);
-          SetMediaTrackInfo_Value_ptr(track, "B_MUTE",
-            targets[targetIndex].mute ? 1.0 : 0.0);
-          SetMediaTrackInfo_Value_ptr(track, "I_SOLO",
-            targets[targetIndex].solo);
+          // Volume, mute e solo nao pertencem ao manifesto estrutural. Eles
+          // chegam pelo snapshot absoluto do mixer; aplicar os placeholders
+          // 1/0/0 daqui podia desmutar ou zerar o estado real da pista.
         }
       }
       if (directApplied && timelineDiffers) {
@@ -29811,10 +29851,18 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
       g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
       applyConfigurations =
         g_nativeProjectSyncApply.applyConfigurations;
-      remoteConfigSnapshot =
-        g_nativeProjectSyncPreflight.remoteConfigSnapshot;
+    }
+  }
+  // Configuracoes pertencem ao mesmo manifesto imutavel que gerou o RPP do
+  // bundle. Nao usa o snapshot vivo do preflight aqui, pois ele pode ter sido
+  // atualizado enquanto os arquivos ainda estavam em transferencia.
+  if (applyConfigurations && !pending.sourceManifest.empty()) {
+    const NativeProjectSyncParsedManifest exactManifest =
+      nativeProjectSyncParseManifest(pending.sourceManifest);
+    if (exactManifest.valid) {
+      remoteConfigSnapshot = exactManifest.configSnapshot;
       remoteConfigRevision =
-        g_nativeProjectSyncPreflight.remoteConfigRevision;
+        nativeProjectSyncHashText(remoteConfigSnapshot);
     }
   }
   char currentPathBuffer[8192] = "";
@@ -35941,6 +35989,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
   // A busca aplica o alvo depois da sincronizacao normal da lista; assim a
   // selecao antiga ou a musica tocando nao conseguem puxar o scroll de volta.
   nativeUiSmartSearchApplyPendingLayout();
+  // A criacao do bloco tem prioridade sobre foco anterior/fila. So depois de
+  // medir e aplicar todos os outros alvos da lista sabemos o ponto final que
+  // o usuario vera, entao o novo bloco nao some novamente no mesmo frame.
+  nativeUiRevealPendingCreatedBlock();
   g_nativeAppActiveListScrollPixels = std::max(0, std::min(g_nativeAppActiveListScrollPixels, maxScrollPixels));
   if (g_nativeAppActivePanelModel.regionsPage) {
     g_nativeRegionsListScrollPixels =
@@ -72594,9 +72646,13 @@ static std::string nativeBuildTpMediaResponse(const std::string& req)
   return nativeHttpBinaryResponse(200, data, mime);
 }
 
-static void nativeQueueHttpCommand(const std::string& commandBody)
+static constexpr size_t kNativeHttpCommandQueueLimit = 4096;
+
+static bool nativeQueueHttpCommandLocked(
+  std::deque<std::string>& queue,
+  const std::string& commandBody)
 {
-  if (commandBody.empty()) return;
+  if (commandBody.empty()) return false;
   const std::string commandType = nativeLower(nativeTrim(
     nativeJsonExtractString(commandBody, "type")));
   const bool replacePendingTransportPulse =
@@ -72606,27 +72662,24 @@ static void nativeQueueHttpCommand(const std::string& commandBody)
     commandType == "select_region" ||
     commandType == "clear_selection" ||
     commandType == "clear_selected_song";
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
   if (replacePendingTransportPulse) {
-    g_nativeHttpCommandQueue.erase(
+    queue.erase(
       std::remove_if(
-        g_nativeHttpCommandQueue.begin(),
-        g_nativeHttpCommandQueue.end(),
+        queue.begin(), queue.end(),
         [](const std::string& queuedCommand) {
           return nativeLower(nativeTrim(nativeJsonExtractString(
             queuedCommand, "type"))) == "timecode_transport_sync";
         }),
-      g_nativeHttpCommandQueue.end());
+      queue.end());
   }
   if (prioritizeLatestMusicSelection) {
     // A selecao do Diretor e um estado absoluto. Descarta selecoes ainda nao
     // consumidas e entrega somente o toque mais recente antes de pulsos de
     // transporte/Project Sync que possam estar acumulados. As APIs do REAPER
     // continuam sendo chamadas exclusivamente pelo startupTimer.
-    g_nativeHttpCommandQueue.erase(
+    queue.erase(
       std::remove_if(
-        g_nativeHttpCommandQueue.begin(),
-        g_nativeHttpCommandQueue.end(),
+        queue.begin(), queue.end(),
         [](const std::string& queuedCommand) {
           const std::string queuedType = nativeLower(nativeTrim(
             nativeJsonExtractString(queuedCommand, "type")));
@@ -72635,18 +72688,41 @@ static void nativeQueueHttpCommand(const std::string& commandBody)
             queuedType == "clear_selection" ||
             queuedType == "clear_selected_song";
         }),
-      g_nativeHttpCommandQueue.end());
+      queue.end());
   }
-  // Limite defensivo: em uso normal o timer esvazia esta fila no ciclo
-  // seguinte. O teto impede um cliente abandonado de consumir memoria sem fim.
-  if (g_nativeHttpCommandQueue.size() >= 1024) {
-    g_nativeHttpCommandQueue.pop_front();
+  if (queue.size() >= kNativeHttpCommandQueueLimit) {
+    return false;
   }
   if (prioritizeLatestMusicSelection) {
-    g_nativeHttpCommandQueue.push_front(commandBody);
+    queue.push_front(commandBody);
   } else {
-    g_nativeHttpCommandQueue.push_back(commandBody);
+    queue.push_back(commandBody);
   }
+  return true;
+}
+
+static bool nativeQueueHttpCommand(const std::string& commandBody)
+{
+  if (commandBody.empty()) return false;
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  return nativeQueueHttpCommandLocked(
+    g_nativeHttpCommandQueue, commandBody);
+}
+
+static size_t nativeQueueHttpCommandBatchAtomic(
+  const std::vector<std::string>& commands)
+{
+  if (commands.empty()) return 0;
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  // Monta a fila em uma copia. Se ela nao comportar o lote inteiro, nada e
+  // confirmado nem parcialmente inserido; a Hook Center repetira o mesmo
+  // envelope sem perder toggles, Parts, exclusoes ou movimentos do grid.
+  std::deque<std::string> staged = g_nativeHttpCommandQueue;
+  for (const std::string& command : commands) {
+    if (!nativeQueueHttpCommandLocked(staged, command)) return 0;
+  }
+  g_nativeHttpCommandQueue.swap(staged);
+  return commands.size();
 }
 
 static int nativeMtcOutputPreference(const std::string& rawName,
@@ -73574,23 +73650,47 @@ static void nativeHandleClient(native_socket_t client)
     } else {
       const std::string requestBody = nativeRequestBody(req);
       size_t start = 0;
-      size_t queued = 0;
-      while (start < requestBody.size() && queued < 256) {
+      std::vector<std::string> commands;
+      commands.reserve(258);
+      bool tooManyCommands = false;
+      bool invalidCommand = false;
+      while (start < requestBody.size()) {
         size_t end = requestBody.find('\n', start);
         if (end == std::string::npos) end = requestBody.size();
         std::string command = nativeTrim(
           requestBody.substr(start, end - start));
-        if (!command.empty() && command.front() == '{') {
-          if (command.back() == '}') command.pop_back();
+        if (!command.empty()) {
+          if (command.size() > 1536 * 1024 || command.front() != '{' ||
+              command.back() != '}') {
+            invalidCommand = true;
+            break;
+          }
+          if (commands.size() >= 512) {
+            tooManyCommands = true;
+            break;
+          }
+          command.pop_back();
           command += ",\"channel\":\"parallel\"}";
-          nativeQueueHttpCommand(command);
-          ++queued;
+          commands.push_back(std::move(command));
         }
         start = end + 1;
       }
-      body = nativeHttpResponse(200,
-        std::string("{\"ok\":true,\"queued\":") +
-          std::to_string(queued) + "}");
+      const size_t queued = tooManyCommands || invalidCommand
+        ? 0 : nativeQueueHttpCommandBatchAtomic(commands);
+      if (invalidCommand) {
+        body = nativeHttpResponse(
+          400, "{\"ok\":false,\"error\":\"invalid_inbox_command\",\"queued\":0}");
+      } else if (tooManyCommands) {
+        body = nativeHttpResponse(
+          413, "{\"ok\":false,\"error\":\"inbox_batch_too_large\",\"queued\":0}");
+      } else if (!commands.empty() && queued != commands.size()) {
+        body = nativeHttpResponse(
+          503, "{\"ok\":false,\"error\":\"inbox_busy\",\"queued\":0}");
+      } else {
+        body = nativeHttpResponse(200,
+          std::string("{\"ok\":true,\"queued\":") +
+            std::to_string(queued) + "}");
+      }
     }
   } else if (path == "/timecode/outbox" &&
              nativeRequestIsPost(req)) {
@@ -73617,28 +73717,55 @@ static void nativeHandleClient(native_socket_t client)
     } else {
       const std::string requestBody = nativeRequestBody(req);
       size_t start = 0;
-      size_t queued = 0;
-      while (start < requestBody.size() && queued < 256) {
+      std::vector<std::string> commands;
+      commands.reserve(258);
+      bool tooManyCommands = false;
+      bool invalidCommand = false;
+      while (start < requestBody.size()) {
         size_t end = requestBody.find('\n', start);
         if (end == std::string::npos) end = requestBody.size();
         std::string command = nativeTrim(
           requestBody.substr(start, end - start));
-        if (!command.empty() && command.size() <= 1536 * 1024 &&
-            command.front() == '{') {
-          nativeQueueHttpCommand(command);
-          ++queued;
+        if (!command.empty()) {
+          if (command.size() > 1536 * 1024 || command.front() != '{' ||
+              command.back() != '}') {
+            invalidCommand = true;
+            break;
+          }
+          if (commands.size() >= 512) {
+            tooManyCommands = true;
+            break;
+          }
+          commands.push_back(std::move(command));
         }
         start = end + 1;
       }
-      std::ostringstream response;
-      response << "{\"ok\":true,\"queued\":"
-               << queued << '}';
-      body = nativeHttpResponse(200, response.str());
+      const size_t queued = tooManyCommands || invalidCommand
+        ? 0 : nativeQueueHttpCommandBatchAtomic(commands);
+      if (invalidCommand) {
+        body = nativeHttpResponse(
+          400, "{\"ok\":false,\"error\":\"invalid_inbox_command\",\"queued\":0}");
+      } else if (tooManyCommands) {
+        body = nativeHttpResponse(
+          413, "{\"ok\":false,\"error\":\"inbox_batch_too_large\",\"queued\":0}");
+      } else if (!commands.empty() && queued != commands.size()) {
+        body = nativeHttpResponse(
+          503, "{\"ok\":false,\"error\":\"inbox_busy\",\"queued\":0}");
+      } else {
+        std::ostringstream response;
+        response << "{\"ok\":true,\"queued\":"
+                 << queued << '}';
+        body = nativeHttpResponse(200, response.str());
+      }
     }
   } else if (path == "/command" && nativeRequestIsPost(req)) {
     const std::string commandBody = nativeTrim(nativeRequestBody(req));
-    if (!commandBody.empty()) nativeQueueHttpCommand(commandBody);
-    body = nativeHttpResponse(200, "{\"ok\":true,\"nativeBridge\":true,\"queued\":true}");
+    const bool queued = nativeQueueHttpCommand(commandBody);
+    body = queued
+      ? nativeHttpResponse(200,
+          "{\"ok\":true,\"nativeBridge\":true,\"queued\":true}")
+      : nativeHttpResponse(503,
+          "{\"ok\":false,\"error\":\"command_queue_busy\",\"queued\":false}");
   } else if (path == "/health" || path == "/ping") {
     bool stateReady = false;
     {
