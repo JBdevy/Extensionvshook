@@ -176,6 +176,7 @@ using SetRegionRenderMatrix_t =
   void (*)(ReaProject*, int, MediaTrack*, int);
 using GetProjectPathEx_t =
   void (*)(ReaProject*, char*, int);
+using DockGetPosition_t = int (*)(int);
 using DockIsChildOfDock_t = int (*)(HWND, bool*);
 using Dock_UpdateDockID_t = void (*)(const char*, int);
 using DockWindowActivate_t = void (*)(HWND);
@@ -354,6 +355,7 @@ static EnumRegionRenderMatrix_t
 static SetRegionRenderMatrix_t
   SetRegionRenderMatrix_ptr = nullptr;
 static GetProjectPathEx_t GetProjectPathEx_ptr = nullptr;
+static DockGetPosition_t DockGetPosition_ptr = nullptr;
 static DockIsChildOfDock_t DockIsChildOfDock_ptr = nullptr;
 static Dock_UpdateDockID_t Dock_UpdateDockID_ptr = nullptr;
 static DockWindowActivate_t DockWindowActivate_ptr = nullptr;
@@ -4029,12 +4031,6 @@ static void toggleProjectSync()
       nativeUiShowTemporaryPopup("", 0.01);
     }
     return;
-  }
-
-  if (ShowMessageBox_ptr) {
-    ShowMessageBox_ptr(
-      "Recurso ainda em fase de teste.",
-      "VS Hook - Project Sync", 0);
   }
 
   const std::string previousTimecodeMode = getTimecodeMode();
@@ -16123,6 +16119,17 @@ static void nativeRefreshInterfaceToggle()
 // janela ao docker escolhido pelas APIs modernas do REAPER 7.65+.
 static constexpr const char* kNativePanelDockTitle = "VS Hook";
 static constexpr const char* kNativePanelDockId = "VSHOOKEXT_MAIN_WINDOW_V1";
+// O indice do Docker nao e fixo: em alguns REAPERs o Docker direito e o 1,
+// em outros ele pode ser o 2. Na primeira abertura pedimos o primeiro Docker
+// disponivel e, depois, sempre preservamos o indice que o REAPER devolveu.
+static constexpr int kNativePanelFirstDockerIndex = 2;
+static constexpr int kNativePanelFirstDockState =
+  kNativePanelFirstDockerIndex * 256 + 1;
+static constexpr int kNativePanelDefaultRightDockWidth = 459;
+// O marcador so e gravado apos o REAPER confirmar que o docker realmente
+// ficou na direita. Assim uma tentativa que abriu embaixo e refeita.
+static constexpr const char* kNativePanelRightDockPlacementKey =
+  "MAIN_PANEL_RIGHT_DOCK_PLACED_V10";
 
 static bool nativeAppActiveAddToDocker(HWND hwnd, int dockerIndex,
                                        bool allowShow = true)
@@ -23070,23 +23077,12 @@ static bool nativeUiCreatePlaylistBlock()
 
   // O bloco novo nasce imediatamente abaixo do ultimo item de bloco ja
   // existente — nunca no fim arbitrario da lista. Sem nenhum bloco, ele e o
-  // primeiro item do repertorio. Apos achar a posicao, protege tambem uma
-  // familia pai/filhos que eventualmente comece logo abaixo desse cabecalho.
+  // primeiro item do repertorio. Esta e deliberadamente a posicao logo apos
+  // o cabecalho do bloco, sem empurra-lo para o fim do repertorio.
   size_t insertIndex = 0;
-  bool foundExistingBlock = false;
   for (size_t index = 0; index < playlist.itemLines.size(); ++index) {
     if (blockNumberFromLine(playlist.itemLines[index]) <= 0) continue;
     insertIndex = index + 1;
-    foundExistingBlock = true;
-  }
-  if (foundExistingBlock) {
-    std::vector<bool> noMovingRows(playlist.itemLines.size(), false);
-    const int safeIndex = nativeUiClampFamilyReorderTarget(
-      playlist.itemLines, noMovingRows,
-      static_cast<int>(insertIndex), nativeUiPlaylistLineFamilyInfo);
-    insertIndex = static_cast<size_t>(std::max(0,
-      std::min(safeIndex,
-        static_cast<int>(playlist.itemLines.size()))));
   }
 
   const std::vector<std::string> fields = {
@@ -47837,6 +47833,44 @@ static bool nativeBigClockWriteReaperConfigInt(
   return true;
 }
 
+static bool nativeBigClockReadReaperConfigInt(
+    const char* key, int& value)
+{
+  if (!get_config_var_ptr || !key) return false;
+  int size = 0;
+  void* address = get_config_var_ptr(key, &size);
+  if (!address || size < static_cast<int>(sizeof(int))) return false;
+  value = *static_cast<int*>(address);
+  return true;
+}
+
+static bool nativePrepareMainPanelRightDockerLayout()
+{
+  // Layout aprovado no primeiro uso:
+  // Docker 1 permanece inferior e a interface principal ocupa o Docker 2,
+  // na direita, com a largura gravada pelo proprio REAPER.
+  bool prepared = true;
+  prepared = nativeBigClockWriteReaperConfigInt(
+    "dockermode1", 0) && prepared;
+  prepared = nativeBigClockWriteReaperConfigInt(
+    "dockermode2", 3) && prepared;
+  prepared = nativeBigClockWriteReaperConfigInt(
+    "dockheight_r", kNativePanelDefaultRightDockWidth) && prepared;
+
+  const char* iniFile = get_ini_file_ptr ? get_ini_file_ptr() : nullptr;
+  if (iniFile && *iniFile) {
+    WritePrivateProfileString("REAPER", "dockermode1", "0", iniFile);
+    WritePrivateProfileString("REAPER", "dockermode2", "3", iniFile);
+    WritePrivateProfileString("REAPER", "dockheight_r", "459", iniFile);
+    WritePrivateProfileString("REAPERdockpref", kNativePanelDockId,
+      "0.50000000 2", iniFile);
+  }
+  if (Dock_UpdateDockID_ptr) {
+    Dock_UpdateDockID_ptr(kNativePanelDockId, kNativePanelFirstDockerIndex);
+  }
+  return prepared;
+}
+
 static bool nativePrepareBigClockDockerLayout()
 {
   // O estado da janela escolhe o indice; estas variaveis do REAPER escolhem o
@@ -58279,18 +58313,31 @@ static bool nativeOpenAppActivePanel()
     return true;
   }
 
-  // Primeira abertura: prepara e usa exatamente o Docker direito aprovado.
-  // Depois disso, o estado salvo pelo usuário sempre prevalece.
+  // O REAPER escolhe o numero do Docker dinamicamente. O que define a direita
+  // e dockermode<N>=3, usando o mesmo N que ficou gravado no dockpref.
   const bool firstOpen = !nativeAppActiveHasWindowValue("DOCKSTATE_V1");
-  if (firstOpen) {
-    // Reproduz inclusive a prioridade dos quatro cantos: a direita atravessa
-    // toda a altura; em cima/baixo atravessam a esquerda e enquadram o
-    // Hook Controller no meio.
-    nativePrepareFirstUseDockerLayout();
-    nativeAppActiveWriteWindowInt("DOCKSTATE_V1", 769);
-    nativeAppActiveWriteWindowInt("LAST_DOCKSTATE_V1", 769);
+  const int persistedDockState = nativeAppActiveReadWindowInt(
+    "DOCKSTATE_V1", nativeAppActiveReadWindowInt(
+      "LAST_DOCKSTATE_V1", kNativePanelFirstDockState));
+  const int persistedDockerIndex = persistedDockState > 0
+    ? std::max(0, persistedDockState >> 8)
+    : -1;
+  const bool needsRightDockPlacement = firstOpen ||
+    nativeAppActiveReadWindowInt(kNativePanelRightDockPlacementKey, 0) == 0;
+  const int requestedDockerIndex = needsRightDockPlacement
+    ? kNativePanelFirstDockerIndex
+    : (persistedDockerIndex >= 0
+      ? persistedDockerIndex : kNativePanelFirstDockerIndex);
+  if (needsRightDockPlacement) {
+    nativePrepareMainPanelRightDockerLayout();
+    const int requestedDockState = requestedDockerIndex * 256 + 1;
+    nativeAppActiveWriteWindowInt(
+      "DOCKSTATE_V1", requestedDockState);
+    nativeAppActiveWriteWindowInt(
+      "LAST_DOCKSTATE_V1", requestedDockState);
   }
-  const int savedDockState = nativeAppActiveReadWindowInt("DOCKSTATE_V1", 769);
+  const int savedDockState = nativeAppActiveReadWindowInt(
+    "DOCKSTATE_V1", kNativePanelFirstDockState);
   const int savedX = nativeAppActiveReadWindowInt("WINDOW_X_V1", 100);
   const int savedY = nativeAppActiveReadWindowInt("WINDOW_Y_V1", 100);
 #ifdef __APPLE__
@@ -58394,16 +58441,47 @@ static bool nativeOpenAppActivePanel()
     nativeAppActiveAddToDocker(hwnd, dockerIndex, true);
     if (DockWindowActivate_ptr) DockWindowActivate_ptr(hwnd);
     if (DockWindowRefreshForHWND_ptr) DockWindowRefreshForHWND_ptr(hwnd);
+    if (needsRightDockPlacement) {
+      // 41601 = mover o Docker ativo para a direita. Alterar apenas
+      // dockermode no REAPER ja aberto nao recalcula a geometria do Docker;
+      // por isso a acao e aplicada uma unica vez, com o VS Hook ativado.
+      SetFocus(hwnd);
+      if (Main_OnCommand_ptr) Main_OnCommand_ptr(41601, 0);
+      nativePrepareMainPanelRightDockerLayout();
+      if (DockWindowRefreshForHWND_ptr) {
+        DockWindowRefreshForHWND_ptr(hwnd);
+      }
+      bool floatingDocker = false;
+      const int actualDockerIndex = DockIsChildOfDock_ptr
+        ? DockIsChildOfDock_ptr(hwnd, &floatingDocker) : -1;
+      if (actualDockerIndex >= 0) {
+        Dock_UpdateDockID_ptr(kNativePanelDockId, actualDockerIndex);
+        const int actualDockState = actualDockerIndex * 256 + 1;
+        nativeAppActiveWriteWindowInt(
+          "DOCKSTATE_V1", actualDockState);
+        nativeAppActiveWriteWindowInt(
+          "LAST_DOCKSTATE_V1", actualDockState);
+        const int finalPosition = DockGetPosition_ptr
+          ? DockGetPosition_ptr(actualDockerIndex) : -1;
+        int finalMode = -1;
+        const std::string finalModeKey =
+          "dockermode" + std::to_string(actualDockerIndex);
+        nativeBigClockReadReaperConfigInt(
+          finalModeKey.c_str(), finalMode);
+        if (finalPosition == 3 || finalMode == 3) {
+          nativePrepareMainPanelRightDockerLayout();
+          nativeAppActiveWriteWindowInt(
+            kNativePanelRightDockPlacementKey, 1);
+        }
+      }
+    }
   } else {
     ShowWindow(hwnd, SW_SHOW);
   }
-  if (firstOpen) {
-    // A primeira abertura entrega o conjunto completo já no layout padrão.
-    // Cada janela passa a persistir sua própria posição a partir daqui.
-    nativeOpenBigClockWindow(0);
-    nativeOpenBigClockWindow(1);
-    nativeOpenHookControllerWindow();
-  }
+  // No primeiro uso abre somente a interface principal, no docker direito.
+  // Big Clock 1, Big Clock 2 e Hook Controller so podem abrir por comando
+  // direto do usuario ou se ele tiver ativado explicitamente suas opcoes de
+  // Startup; nunca como consequencia de abrir o VS Hook pela primeira vez.
   SetFocus(hwnd);
   InvalidateRect(hwnd, nullptr, FALSE);
   // Evita empilhar duas confirmacoes na mesma abertura. Se a preferencia de
@@ -74918,6 +74996,8 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetProjectPathEx_ptr =
     reinterpret_cast<GetProjectPathEx_t>(
       rec->GetFunc("GetProjectPathEx"));
+  DockGetPosition_ptr = reinterpret_cast<DockGetPosition_t>(
+    rec->GetFunc("DockGetPosition"));
   DockIsChildOfDock_ptr = reinterpret_cast<DockIsChildOfDock_t>(rec->GetFunc("DockIsChildOfDock"));
   Dock_UpdateDockID_ptr = reinterpret_cast<Dock_UpdateDockID_t>(rec->GetFunc("Dock_UpdateDockID"));
   DockWindowActivate_ptr = reinterpret_cast<DockWindowActivate_t>(rec->GetFunc("DockWindowActivate"));
