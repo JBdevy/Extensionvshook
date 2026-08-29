@@ -12765,16 +12765,23 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
   const std::vector<double> storedPlaylistTotals = nativeComputeStoredPlaylistTotals(data);
   if (activeStoredTotalOut && !storedPlaylistTotals.empty()) *activeStoredTotalOut = storedPlaylistTotals.front();
 
-  auto findActualSong = [&](int primary, int fallback, bool childWanted) -> const NativeSongWindow* {
-    if (primary != 0) {
+  auto findActualSong = [&](int primary, bool hasPrimary,
+                            int fallback, bool hasFallback,
+                            bool childWanted) -> const NativeSongWindow* {
+    // O ID 0 e um ID valido de regiao/marcador no REAPER. O que indica
+    // ausencia de identificador no formato persistido e o campo vazio, nao
+    // o valor numerico zero.
+    if (hasPrimary) {
       for (const auto& s : projectSongs) {
         if (s.sourceNumber == primary && (!childWanted || s.isHashChild)) return &s;
       }
-      for (const auto& s : projectSongs) {
-        if (s.sourceNumber == primary) return &s;
+      if (childWanted) {
+        for (const auto& s : projectSongs) {
+          if (s.sourceNumber == primary) return &s;
+        }
       }
     }
-    if (fallback != 0) {
+    if (hasFallback && (!hasPrimary || fallback != primary)) {
       for (const auto& s : projectSongs) {
         if (s.sourceNumber == fallback && !s.isHashChild) return &s;
       }
@@ -12824,6 +12831,8 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
         continue;
       }
 
+      const bool hasSongSourceNumber =
+        !nativeTrim(songFields[2]).empty();
       const int songSourceNumber =
         std::atoi(songFields[2].c_str());
       if (songFields[1] == "block" ||
@@ -12835,16 +12844,16 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
         songFields[9] == "1";
       if (storedHashChild) continue;
 
-      const int markerNumber =
-        songFields.size() > 10
-          ? std::atoi(songFields[10].c_str())
-          : 0;
+      const bool hasMarkerNumber =
+        songFields.size() > 10 &&
+        !nativeTrim(songFields[10]).empty();
+      const int markerNumber = hasMarkerNumber
+        ? std::atoi(songFields[10].c_str()) : 0;
       const NativeSongWindow* actual =
         findActualSong(
-          markerNumber != 0
-            ? markerNumber
-            : songSourceNumber,
-          songSourceNumber, false);
+          hasMarkerNumber ? markerNumber : songSourceNumber,
+          hasMarkerNumber || hasSongSourceNumber,
+          songSourceNumber, hasSongSourceNumber, false);
       if (actual && !actual->isHashChild) {
         blockDurationSec +=
           nativeRawDurationSec(*actual);
@@ -12903,6 +12912,8 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
           << ",\"songs\":[";
     } else if (tag == "ITEM" && inPlaylist) {
       const std::string itemType = fields.size() > 1 ? fields[1] : "";
+      const bool hasSourceNumber =
+        fields.size() > 2 && !nativeTrim(fields[2]).empty();
       const int sourceNumber = fields.size() > 2 ? std::atoi(fields[2].c_str()) : 0;
       const double startPos = fields.size() > 3 ? std::atof(fields[3].c_str()) : 0.0;
       const double endPos = fields.size() > 4 ? std::atof(fields[4].c_str()) : 0.0;
@@ -12910,7 +12921,10 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
       const std::string blockColorKey = fields.size() > 6 ? nativeUnescapeExtField(fields[6]) : "";
       const bool storedHashParent = fields.size() > 8 && fields[8] == "1";
       const bool storedHashChild = fields.size() > 9 && fields[9] == "1";
-      const int markerNumber = fields.size() > 10 ? std::atoi(fields[10].c_str()) : 0;
+      const bool hasMarkerNumber =
+        fields.size() > 10 && !nativeTrim(fields[10]).empty();
+      const int markerNumber = hasMarkerNumber
+        ? std::atoi(fields[10].c_str()) : 0;
       const bool isBlock = itemType == "block" || sourceNumber < 0;
 
       NativeSongWindow item;
@@ -12937,7 +12951,11 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
         }
         currentBlockColorHex = item.blockColorHex;
       } else {
-        const NativeSongWindow* actual = findActualSong(storedHashChild && markerNumber ? markerNumber : sourceNumber, sourceNumber, storedHashChild);
+        const bool useMarkerNumber = storedHashChild && hasMarkerNumber;
+        const NativeSongWindow* actual = findActualSong(
+          useMarkerNumber ? markerNumber : sourceNumber,
+          useMarkerNumber || hasSourceNumber,
+          sourceNumber, hasSourceNumber, storedHashChild);
         // Se era filho antigo e o marker nao existe mais, nao envia filho fantasma para o app.
         if (!actual) continue;
         item = *actual;
@@ -22550,6 +22568,7 @@ static bool nativeUiPlaylistContainsSong(
   for (const std::string& itemLine : playlist.itemLines) {
     const auto fields = nativeSplit(itemLine, '\t');
     if (fields.size() < 5 || fields[0] != "ITEM") continue;
+    const bool hasSourceNumber = !nativeTrim(fields[2]).empty();
     const int sourceNumber = std::atoi(fields[2].c_str());
     const bool isBlock = fields[1] == "block" || sourceNumber < 0;
     if (isBlock) continue;
@@ -22565,8 +22584,7 @@ static bool nativeUiPlaylistContainsSong(
     // nova entrada. A comparacao por limites fica como fallback para projetos
     // antigos ou regioes renumeradas.
     const bool sameSource =
-      sourceNumber != 0 && song.sourceNumber != 0 &&
-      sourceNumber == song.sourceNumber;
+      hasSourceNumber && sourceNumber == song.sourceNumber;
     const bool sameBounds =
       std::fabs(start - song.start) <= 0.005 &&
       std::fabs(end - song.end) <= 0.005;
@@ -22590,6 +22608,7 @@ static bool nativeUiRemoveDuplicatePlaylistSongs(
       uniqueLines.push_back(itemLine);
       continue;
     }
+    const bool hasSourceNumber = !nativeTrim(fields[2]).empty();
     const int sourceNumber = std::atoi(fields[2].c_str());
     const bool isBlock = fields[1] == "block" || sourceNumber < 0;
     if (isBlock) {
@@ -22600,7 +22619,7 @@ static bool nativeUiRemoveDuplicatePlaylistSongs(
       fields.size() > 7 && fields[7] == "marker"
         ? "marker" : "region";
     std::string identity;
-    if (sourceNumber != 0) {
+    if (hasSourceNumber) {
       identity = kind + ":source:" + std::to_string(sourceNumber);
     } else {
       const double start = std::atof(fields[3].c_str());
