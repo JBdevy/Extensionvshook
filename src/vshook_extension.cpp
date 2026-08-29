@@ -710,6 +710,7 @@ static int g_extensionBypassCommandId = 0;
 
 struct State {
   bool initialized = false;
+  bool legacyReaperMenuOnly = false;
   bool commandHookRegistered = false;
   bool commandHook2Registered = false;
   bool toggleActionRegistered = false;
@@ -2133,7 +2134,8 @@ static bool nativeEnsureSupportedReaperVersion()
     "Versao instalada: " + installed + "\n\n"
     "Atualize o REAPER para abrir o Hook."
   );
-  // A carga e recusada antes de registrar interface, servidor ou automacoes.
+  // A extensao permanece carregada para manter o menu disponivel. A versao
+  // minima e exigida somente quando o usuario tenta abrir a interface.
   return false;
 }
 
@@ -4664,6 +4666,9 @@ static void toggleProjectAutoOpenMode(const char* mode)
 static void runScriptByAutoOpenMode(const std::string& mode)
 {
   if (!isAutoOpenModeValue(mode)) return;
+  // Auto-inicio nunca exibe o aviso de versao por baixo da inicializacao do
+  // REAPER. Em versao antiga, aguarda o usuario clicar no menu do VS Hook.
+  if (!nativeReaperVersionIsSupported()) return;
   if (mode == "native") {
     nativeOpenAppActivePanel();
     return;
@@ -4707,10 +4712,62 @@ static bool nativeCommandStartsProjectTransition(int command)
   }
 }
 
+static bool nativeIsRegisteredExtensionCommand(int command)
+{
+  if (command <= 0) return false;
+  const std::array<int, 15> fixedCommands = {
+    g_nativeInterfaceCommandId,
+    g_hookControllerCommandId,
+    g_extensionBypassCommandId,
+    g_timecodeReceiveCommandId,
+    g_timecodeTransmitterCommandId,
+    g_addTimecodeCommandId,
+    g_projectSyncCommandId,
+    g_exportProjectCommandId,
+    g_convertMp3CommandId,
+    g_telepromptOneCommandId,
+    g_telepromptTwoCommandId,
+    g_telepromptSettingsCommandId,
+    g_recadosCommandId,
+    g_bigClockHookCommandId,
+    g_bigClockHookTwoCommandId
+  };
+  if (std::find(fixedCommands.begin(), fixedCommands.end(), command) !=
+      fixedCommands.end()) {
+    return true;
+  }
+  for (const AutoOpenEntry& entry : g_autoOpenEntries) {
+    if (entry.commandId == command) return true;
+  }
+  for (const AutoOpenEntry& entry : g_projectAutoOpenEntries) {
+    if (entry.commandId == command) return true;
+  }
+  for (const StartupWindowEntry& entry : g_startupWindowEntries) {
+    if (entry.commandId == command) return true;
+  }
+  for (const ProjectStartupWindowEntry& entry :
+       g_projectStartupWindowEntries) {
+    if (entry.commandId == command) return true;
+  }
+  return findScriptByCommand(command) != nullptr;
+}
+
+static bool nativeBlockLegacyReaperCommand(int command)
+{
+  if (!g_state.legacyReaperMenuOnly ||
+      !nativeIsRegisteredExtensionCommand(command)) {
+    return false;
+  }
+  nativeEnsureSupportedReaperVersion();
+  return true;
+}
+
 // Necessario para cliques vindos do menu Extensions e tambem chamadas normais da action list.
 static bool hookCommand(int command, int flag)
 {
   (void)flag;
+
+  if (nativeBlockLegacyReaperCommand(command)) return true;
 
   if (g_extensionBypassCommandId != 0 &&
       command == g_extensionBypassCommandId) {
@@ -4852,6 +4909,8 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   (void)relmode;
   (void)hwnd;
 
+  if (nativeBlockLegacyReaperCommand(command)) return true;
+
   if (g_extensionBypassCommandId != 0 &&
       command == g_extensionBypassCommandId) {
     nativeSetExtensionBypass(
@@ -4983,6 +5042,10 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
 
 static int toggleActionState(int commandId)
 {
+  if (g_state.legacyReaperMenuOnly &&
+      nativeIsRegisteredExtensionCommand(commandId)) {
+    return 0;
+  }
   if (g_extensionBypassCommandId != 0 &&
       commandId == g_extensionBypassCommandId) {
     return g_nativeExtensionBypassActive.load() ? 1 : 0;
@@ -16125,11 +16188,14 @@ static constexpr const char* kNativePanelDockId = "VSHOOKEXT_MAIN_WINDOW_V1";
 static constexpr int kNativePanelFirstDockerIndex = 2;
 static constexpr int kNativePanelFirstDockState =
   kNativePanelFirstDockerIndex * 256 + 1;
-static constexpr int kNativePanelDefaultRightDockWidth = 459;
+// Ao mover um Docker ativo para a direita, o REAPER acrescenta 16 px do
+// proprio conteiner. Pedir 443 resulta no dockheight_r final aprovado: 459.
+static constexpr int kNativePanelRequestedRightDockWidth = 443;
+static constexpr int kNativePanelFinalRightDockWidth = 459;
 // O marcador so e gravado apos o REAPER confirmar que o docker realmente
 // ficou na direita. Assim uma tentativa que abriu embaixo e refeita.
 static constexpr const char* kNativePanelRightDockPlacementKey =
-  "MAIN_PANEL_RIGHT_DOCK_PLACED_V10";
+  "MAIN_PANEL_RIGHT_DOCK_PLACED_V11";
 
 static bool nativeAppActiveAddToDocker(HWND hwnd, int dockerIndex,
                                        bool allowShow = true)
@@ -47855,13 +47921,13 @@ static bool nativePrepareMainPanelRightDockerLayout()
   prepared = nativeBigClockWriteReaperConfigInt(
     "dockermode2", 3) && prepared;
   prepared = nativeBigClockWriteReaperConfigInt(
-    "dockheight_r", kNativePanelDefaultRightDockWidth) && prepared;
+    "dockheight_r", kNativePanelRequestedRightDockWidth) && prepared;
 
   const char* iniFile = get_ini_file_ptr ? get_ini_file_ptr() : nullptr;
   if (iniFile && *iniFile) {
     WritePrivateProfileString("REAPER", "dockermode1", "0", iniFile);
     WritePrivateProfileString("REAPER", "dockermode2", "3", iniFile);
-    WritePrivateProfileString("REAPER", "dockheight_r", "459", iniFile);
+    WritePrivateProfileString("REAPER", "dockheight_r", "443", iniFile);
     WritePrivateProfileString("REAPERdockpref", kNativePanelDockId,
       "0.50000000 2", iniFile);
   }
@@ -58447,7 +58513,6 @@ static bool nativeOpenAppActivePanel()
       // por isso a acao e aplicada uma unica vez, com o VS Hook ativado.
       SetFocus(hwnd);
       if (Main_OnCommand_ptr) Main_OnCommand_ptr(41601, 0);
-      nativePrepareMainPanelRightDockerLayout();
       if (DockWindowRefreshForHWND_ptr) {
         DockWindowRefreshForHWND_ptr(hwnd);
       }
@@ -58455,23 +58520,40 @@ static bool nativeOpenAppActivePanel()
       const int actualDockerIndex = DockIsChildOfDock_ptr
         ? DockIsChildOfDock_ptr(hwnd, &floatingDocker) : -1;
       if (actualDockerIndex >= 0) {
-        Dock_UpdateDockID_ptr(kNativePanelDockId, actualDockerIndex);
-        const int actualDockState = actualDockerIndex * 256 + 1;
-        nativeAppActiveWriteWindowInt(
-          "DOCKSTATE_V1", actualDockState);
-        nativeAppActiveWriteWindowInt(
-          "LAST_DOCKSTATE_V1", actualDockState);
         const int finalPosition = DockGetPosition_ptr
           ? DockGetPosition_ptr(actualDockerIndex) : -1;
-        int finalMode = -1;
-        const std::string finalModeKey =
-          "dockermode" + std::to_string(actualDockerIndex);
+        int finalRightDockWidth = -1;
         nativeBigClockReadReaperConfigInt(
-          finalModeKey.c_str(), finalMode);
-        if (finalPosition == 3 || finalMode == 3) {
-          nativePrepareMainPanelRightDockerLayout();
+          "dockheight_r", finalRightDockWidth);
+        const bool rightLayoutConfirmed =
+          actualDockerIndex == kNativePanelFirstDockerIndex &&
+          !floatingDocker && finalPosition == 3 &&
+          finalRightDockWidth == kNativePanelFinalRightDockWidth;
+        if (rightLayoutConfirmed) {
+          Dock_UpdateDockID_ptr(
+            kNativePanelDockId, kNativePanelFirstDockerIndex);
+          nativeAppActiveWriteWindowInt(
+            "DOCKSTATE_V1", kNativePanelFirstDockState);
+          nativeAppActiveWriteWindowInt(
+            "LAST_DOCKSTATE_V1", kNativePanelFirstDockState);
+          const char* iniFile =
+            get_ini_file_ptr ? get_ini_file_ptr() : nullptr;
+          if (iniFile && *iniFile) {
+            WritePrivateProfileString(
+              "REAPERdockpref", kNativePanelDockId,
+              "0.50000000 2", iniFile);
+          }
           nativeAppActiveWriteWindowInt(
             kNativePanelRightDockPlacementKey, 1);
+        } else {
+          // Mantem o alvo aprovado para a proxima tentativa; nunca adota um
+          // Docker inferior apenas porque o REAPER devolveu outro indice.
+          Dock_UpdateDockID_ptr(
+            kNativePanelDockId, kNativePanelFirstDockerIndex);
+          nativeAppActiveWriteWindowInt(
+            "DOCKSTATE_V1", kNativePanelFirstDockState);
+          nativeAppActiveWriteWindowInt(
+            "LAST_DOCKSTATE_V1", kNativePanelFirstDockState);
         }
       }
     }
@@ -75195,6 +75277,11 @@ static bool initialize()
 {
   if (g_state.initialized) return true;
 
+  // Em hosts anteriores ao 7.65 a DLL continua carregada e registra o menu,
+  // mas nao inicia interfaces, automacoes, APIs ou servidores que dependem das
+  // APIs modernas. O aviso aparece somente quando o usuario clica numa action.
+  g_state.legacyReaperMenuOnly = !nativeReaperVersionIsSupported();
+
   bool startsBypassed = false;
   if (GetExtState_ptr) {
     const char* raw =
@@ -75313,53 +75400,55 @@ static bool initialize()
     }
   }
 
-  // Registra scripts auxiliares ocultos no Action List quando o arquivo existe.
-  for (ScriptEntry& script : g_scripts) {
-    if (!script.showInExtensionsMenu) {
-      registerScriptInActionListIfPresent(script);
+  if (!g_state.legacyReaperMenuOnly) {
+    // Registra scripts auxiliares ocultos no Action List quando o arquivo existe.
+    for (ScriptEntry& script : g_scripts) {
+      if (!script.showInExtensionsMenu) {
+        registerScriptInActionListIfPresent(script);
+      }
     }
-  }
 
-  registerClipboardApi();
-  vshook_jsapi::registerApi(plugin_register_ptr, plugin_getapi_ptr);
-  registerNativeBridgeApi();
-  nativeTelepromptLoadSettings();
-  nativeTimecodeLanRefreshConfigOnMainThread();
-  nativeTechnicalNoticeLoadState();
-  nativeTechnicalNoticeRefreshAuthCache(
-    nativeDirectorPasswordHash(nativeReadDirectorPassword()),
-    nativeDirectorPasswordHash(nativeReadRecadosPassword()));
-  if (startsBypassed) {
-    const char* bypassedState =
-      "{\"ok\":false,\"connected\":false,\"bypassed\":true}";
-    {
-      std::lock_guard<std::mutex> lock(g_nativeMutex);
-      g_nativeCommandQueue.clear();
-      g_nativeHttpCommandQueue.clear();
-      g_nativeTunerCommandQueue.clear();
-      g_nativeStateJson = bypassedState;
-      g_nativePublishedCommandsSignature.clear();
+    registerClipboardApi();
+    vshook_jsapi::registerApi(plugin_register_ptr, plugin_getapi_ptr);
+    registerNativeBridgeApi();
+    nativeTelepromptLoadSettings();
+    nativeTimecodeLanRefreshConfigOnMainThread();
+    nativeTechnicalNoticeLoadState();
+    nativeTechnicalNoticeRefreshAuthCache(
+      nativeDirectorPasswordHash(nativeReadDirectorPassword()),
+      nativeDirectorPasswordHash(nativeReadRecadosPassword()));
+    if (startsBypassed) {
+      const char* bypassedState =
+        "{\"ok\":false,\"connected\":false,\"bypassed\":true}";
+      {
+        std::lock_guard<std::mutex> lock(g_nativeMutex);
+        g_nativeCommandQueue.clear();
+        g_nativeHttpCommandQueue.clear();
+        g_nativeTunerCommandQueue.clear();
+        g_nativeStateJson = bypassedState;
+        g_nativePublishedCommandsSignature.clear();
+      }
+      if (SetExtState_ptr) {
+        SetExtState_ptr(kNativeExtStateSection,
+          "NATIVE_STATE_JSON_V1", bypassedState, false);
+        SetExtState_ptr(kNativeExtStateSection,
+          kNativeCommandsExtKey,
+          "{\"seq\":0,\"commands\":[]}", false);
+        SetExtState_ptr(kNativeExtStateSection,
+          kLuaControlHeartbeatKey, "", false);
+      }
     }
-    if (SetExtState_ptr) {
-      SetExtState_ptr(kNativeExtStateSection,
-        "NATIVE_STATE_JSON_V1", bypassedState, false);
-      SetExtState_ptr(kNativeExtStateSection,
-        kNativeCommandsExtKey,
-        "{\"seq\":0,\"commands\":[]}", false);
-      SetExtState_ptr(kNativeExtStateSection,
-        kLuaControlHeartbeatKey, "", false);
+    // Deixa a descoberta do projeto pronta antes da primeira consulta da Hook
+    // Center. O timer continuará atualizando normalmente, mas Macs antigos não
+    // dependem mais do primeiro ciclo do SWELL para aparecer no app.
+    if (!startsBypassed) {
+      nativePublishStandbyDiscoveryState();
+      startNativeBridgeServer();
     }
-  }
-  // Deixa a descoberta do projeto pronta antes da primeira consulta da Hook
-  // Center. O timer continuará atualizando normalmente, mas Macs antigos não
-  // dependem mais do primeiro ciclo do SWELL para aparecer no app.
-  if (!startsBypassed) {
-    nativePublishStandbyDiscoveryState();
-    startNativeBridgeServer();
-  }
 
-  if (plugin_register_ptr("accelerator", reinterpret_cast<void*>(&g_vshookGlobalHotkeyAccelerator))) {
-    g_state.acceleratorRegistered = true;
+    if (plugin_register_ptr("accelerator", reinterpret_cast<void*>(&g_vshookGlobalHotkeyAccelerator))) {
+      g_state.acceleratorRegistered = true;
+    }
   }
 
   if (hasRegisteredAction) {
@@ -75386,30 +75475,32 @@ static bool initialize()
     AddExtensionsMainMenu_ptr();
   }
 
-  if (plugin_register_ptr("projectconfig",
-        reinterpret_cast<void*>(
-          &g_nativeProjectConfigExtension))) {
-    g_state.projectConfigRegistered = true;
-  }
-
-  // O timer fica ativo de forma leve para suportar auto-inicio por projeto
-  // quando o usuario troca/abre projetos depois do REAPER ja estar rodando.
-  g_state.startupTimerTicks = 0;
-  g_state.projectStableTicks = 0;
-  g_state.didGlobalStartupAutoOpen = startsBypassed;
-  g_state.didAuxiliaryStartupAutoOpen = startsBypassed;
-  g_state.activeProjectSignature.clear();
-  g_state.autoOpenedProjectSignature.clear();
-  g_state.auxiliaryAutoOpenedProjectSignature.clear();
-  rememberActiveScriptMode("");
-  if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
-    g_state.timerRegistered = true;
-  } else if (!startsBypassed) {
-    if (!getAutoOpenMode().empty()) {
-      runScriptByAutoOpenMode(getAutoOpenMode());
+  if (!g_state.legacyReaperMenuOnly) {
+    if (plugin_register_ptr("projectconfig",
+          reinterpret_cast<void*>(
+            &g_nativeProjectConfigExtension))) {
+      g_state.projectConfigRegistered = true;
     }
-    nativeOpenConfiguredStartupWindows();
-    g_state.didAuxiliaryStartupAutoOpen = true;
+
+    // O timer fica ativo de forma leve para suportar auto-inicio por projeto
+    // quando o usuario troca/abre projetos depois do REAPER ja estar rodando.
+    g_state.startupTimerTicks = 0;
+    g_state.projectStableTicks = 0;
+    g_state.didGlobalStartupAutoOpen = startsBypassed;
+    g_state.didAuxiliaryStartupAutoOpen = startsBypassed;
+    g_state.activeProjectSignature.clear();
+    g_state.autoOpenedProjectSignature.clear();
+    g_state.auxiliaryAutoOpenedProjectSignature.clear();
+    rememberActiveScriptMode("");
+    if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
+      g_state.timerRegistered = true;
+    } else if (!startsBypassed) {
+      if (!getAutoOpenMode().empty()) {
+        runScriptByAutoOpenMode(getAutoOpenMode());
+      }
+      nativeOpenConfiguredStartupWindows();
+      g_state.didAuxiliaryStartupAutoOpen = true;
+    }
   }
 
   g_state.initialized = true;
@@ -75601,6 +75692,7 @@ static void shutdown()
   g_state.appActiveScreenOpen = false;
   g_state.directorInterfaceBlocked = false;
   g_state.pcAccessOverride = false;
+  g_state.legacyReaperMenuOnly = false;
   g_state.initialized = false;
 }
 
@@ -75620,13 +75712,6 @@ extern "C" REAPER_PLUGIN_DLL_EXPORT int REAPER_PLUGIN_ENTRYPOINT(
   // Nao bloqueia por caller_version: alguns REAPERs reportam versao diferente
   // e isso fazia a extensao retornar 0 silenciosamente, sem criar o menu Extensions.
   if (!vshook::loadApi(rec)) return 0;
-  if (!vshook::nativeEnsureSupportedReaperVersion()) return 0;
-  if (!vshook::Dock_UpdateDockID_ptr ||
-      !vshook::DockWindowAddEx_ptr) {
-    vshook::showDiagnostic(
-      "O VS Hook requer as APIs de docker do REAPER 7.65 ou superior.");
-    return 0;
-  }
   if (!vshook::nativeEnsurePluginLicense()) return 0;
 
   return vshook::initialize() ? 1 : 0;
