@@ -56023,11 +56023,15 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       nativeUiSetFrameTimerInterval(
         hwnd, kNativeUiFrameFastIntervalMs);
       return 0;
-    case WM_NCHITTEST:
-      // O SWELL consulta o hit-test antes de entregar qualquer evento de
-      // mouse. Sem HTCLIENT, o macOS converte o clique para WM_NC* e nenhum
-      // controle desenhado pela extensao recebe WM_LBUTTON*/WM_RBUTTON*.
-      return HTCLIENT;
+    case WM_NCHITTEST: {
+      bool floatingDocker = false;
+      const bool docked = DockIsChildOfDock_ptr &&
+        DockIsChildOfDock_ptr(hwnd, &floatingDocker) >= 0;
+      if (docked) return HTCLIENT;
+      // Janela solta usa o mesmo processamento nativo da Hook Controller,
+      // incluindo as bordas e os cantos redimensionáveis no Windows/macOS.
+      break;
+    }
 #ifdef _WIN32
     case WM_GETDLGCODE: {
       // Toda a interface e desenhada pela extensao e tambem implementa os
@@ -58058,7 +58062,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
   // bytes ("V\0S\0..."), deixando a janela solta com apenas "V".
   return DefWindowProcW(hwnd, message, wParam, lParam);
 #else
-  return 0;
+  return DefWindowProc(hwnd, message, wParam, lParam);
 #endif
 }
 
