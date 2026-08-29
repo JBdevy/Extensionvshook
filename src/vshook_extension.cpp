@@ -58407,8 +58407,12 @@ static bool nativeOpenAppActivePanel()
   const int persistedDockerIndex = persistedDockState > 0
     ? std::max(0, persistedDockState >> 8)
     : -1;
-  const bool needsRightDockPlacement = firstOpen ||
-    nativeAppActiveReadWindowInt(kNativePanelRightDockPlacementKey, 0) == 0;
+  // Estado 0 é uma escolha explícita do usuário para manter a janela solta.
+  // Não tente reconstruir o layout à direita nesse caso; caso contrário o
+  // botão “Docker” recria a janela e a encaixa de novo imediatamente.
+  const bool needsRightDockPlacement = persistedDockState != 0 &&
+    (firstOpen || nativeAppActiveReadWindowInt(
+      kNativePanelRightDockPlacementKey, 0) == 0);
   const int requestedDockerIndex = needsRightDockPlacement
     ? kNativePanelFirstDockerIndex
     : (persistedDockerIndex >= 0
