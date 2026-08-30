@@ -62957,6 +62957,11 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
 
   const bool hasMedia =
     state.mediaType == "image" || state.mediaType == "video";
+  // O modo Clear e uma saida exclusiva de midia: recados tecnicos nao podem
+  // substituir nem interromper a imagem ou o video dessa janela.
+  const bool mediaOverlayActive =
+    hasMedia && !previewActive &&
+    (settings.clearMode || !technicalNoticeActive);
   if (state.mediaType != "image") {
     g_nativeTelepromptStaticImageStatus[index].store(0);
   }
@@ -62966,8 +62971,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     g_nativeTelepromptHeldMediaKind[index] = 0;
     nativeTelepromptResetHeldMediaTransition(index);
   }
-  if (hasMedia && !previewActive &&
-      !technicalNoticeActive) {
+  if (mediaOverlayActive) {
     // A mídia usa toda a área da janela e mantém a proporção original.
     // Quando a proporção não coincide, o fundo preto completa as sobras.
     nativeTelepromptDrawMedia(
@@ -63281,8 +63285,10 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   if (showNoticeLocalClock &&
       localClockRect.right > localClockRect.left &&
       localClockRect.bottom > localClockRect.top) {
-    nativeAppActiveFillRect(
-      dc, localClockRect, RGB(0, 0, 0));
+    if (!mediaOverlayActive) {
+      nativeAppActiveFillRect(
+        dc, localClockRect, RGB(0, 0, 0));
+    }
     if (settings.localClockBorderEnabled) {
       nativeTelepromptDrawBorder(
         dc, localClockRect, localClockBorderColor, 2);
@@ -63316,7 +63322,9 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   if (showNoticeClock &&
       timerRect.right > timerRect.left &&
       timerRect.bottom > timerRect.top) {
-    nativeAppActiveFillRect(dc, timerRect, RGB(0, 0, 0));
+    if (!mediaOverlayActive) {
+      nativeAppActiveFillRect(dc, timerRect, RGB(0, 0, 0));
+    }
     if (settings.clockBorderEnabled) {
       nativeTelepromptDrawBorder(
         dc, timerRect, clockBorderColor, 3);
@@ -63555,7 +63563,9 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       chordLeft, chordLeft + chordBoxWidth);
     if (chordRect.right > chordRect.left &&
         chordRect.bottom > chordRect.top) {
-      nativeAppActiveFillRect(dc, chordRect, RGB(0, 0, 0));
+      if (!mediaOverlayActive) {
+        nativeAppActiveFillRect(dc, chordRect, RGB(0, 0, 0));
+      }
       const COLORREF chordColor = nativeTelepromptColor(
         settings.chordColor, RGB(251, 146, 60));
       const COLORREF chordBorderColor =
