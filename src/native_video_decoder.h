@@ -16,6 +16,7 @@ struct DecodedFrame {
   int height = 0;
   int stride = 0;
   double timestamp = 0.0;
+  std::uint64_t sequence = 0;
 };
 
 // Reprodutor/decoder baseado exclusivamente no libVLC. O vídeo roda pelo relógio local

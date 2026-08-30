@@ -1,11 +1,13 @@
 #include "native_video_decoder.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <thread>
 
@@ -22,6 +24,7 @@ struct FrameObservation {
   std::uint64_t checksum = 0;
   int width = 0;
   int height = 0;
+  bool hasNonzeroPixel = false;
 };
 
 bool setRuntimeDirectory(const std::string& directory)
@@ -67,7 +70,10 @@ bool observeFrame(
     65536u);
   std::uint64_t checksum = 0;
   for (std::size_t index = 0; index < bytes; index += 97) {
-    checksum = checksum * 131u + frame.pixels[index];
+    const std::uint8_t value = frame.pixels[index];
+    checksum = checksum * 131u + value;
+    observation.hasNonzeroPixel =
+      observation.hasNonzeroPixel || value != 0;
   }
   observation.checksum = checksum;
   return true;
@@ -76,6 +82,69 @@ bool observeFrame(
 void waitForDecoder()
 {
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
+
+bool waitForStoppedTarget(
+  vshook_video::Decoder& decoder,
+  const std::string& path,
+  const std::string& playbackKey,
+  double target,
+  FrameObservation& observation,
+  double timeoutSeconds = 3.0)
+{
+  const auto startedAt = SteadyClock::now();
+  while (std::chrono::duration<double>(
+           SteadyClock::now() - startedAt).count() <=
+         timeoutSeconds) {
+    FrameObservation candidate;
+    if (observeFrame(
+          decoder, path, playbackKey,
+          target, false, candidate) &&
+        std::abs(candidate.timestamp - target) <= 0.03) {
+      observation = candidate;
+      return true;
+    }
+    waitForDecoder();
+  }
+  return false;
+}
+
+bool settleAndHoldStoppedTarget(
+  vshook_video::Decoder& decoder,
+  const std::string& path,
+  const std::string& playbackKey,
+  double target,
+  FrameObservation& settledFrame)
+{
+  // Um callback que ja estava em voo pode chegar logo depois do seek. Deixa
+  // o decoder estabilizar e usa o ultimo quadro correto como referencia.
+  const auto settlingAt = SteadyClock::now();
+  while (std::chrono::duration<double>(
+           SteadyClock::now() - settlingAt).count() <= 0.25) {
+    FrameObservation observation;
+    if (observeFrame(
+          decoder, path, playbackKey,
+          target, false, observation) &&
+        std::abs(observation.timestamp - target) <= 0.03) {
+      settledFrame = observation;
+    }
+    waitForDecoder();
+  }
+
+  const auto holdAt = SteadyClock::now();
+  while (std::chrono::duration<double>(
+           SteadyClock::now() - holdAt).count() <= 0.35) {
+    FrameObservation observation;
+    if (observeFrame(
+          decoder, path, playbackKey,
+          target, false, observation) &&
+        (std::abs(observation.timestamp - target) > 0.03 ||
+         observation.checksum != settledFrame.checksum)) {
+      return false;
+    }
+    waitForDecoder();
+  }
+  return true;
 }
 
 } // namespace
@@ -107,6 +176,7 @@ int main(int argc, char** argv)
   std::uint64_t checksum = 0;
   int width = 0;
   int height = 0;
+  bool receivedNonzeroPixel = false;
   bool playAdvanced = false;
   while (std::chrono::duration<double>(
            SteadyClock::now() - playStartedAt).count() <= 8.0) {
@@ -118,6 +188,8 @@ int main(int argc, char** argv)
           elapsed, true, observation)) {
       width = observation.width;
       height = observation.height;
+      receivedNonzeroPixel =
+        receivedNonzeroPixel || observation.hasNonzeroPixel;
       checksum = checksum * 131u + observation.checksum;
       if (firstPlayTimestamp < 0.0) {
         firstPlayTimestamp = observation.timestamp;
@@ -137,7 +209,7 @@ int main(int argc, char** argv)
     waitForDecoder();
   }
   if (!playAdvanced) {
-    std::cerr << "video nao avancou durante o primeiro Play; status="
+    std::cerr << "nenhum fluxo de quadros durante o primeiro Play; status="
               << decoder.status() << " frames=" << distinctPlayFrames
               << " intervalo="
               << (firstPlayTimestamp >= 0.0
@@ -146,69 +218,68 @@ int main(int argc, char** argv)
               << '\n';
     return 4;
   }
+  if (!receivedNonzeroPixel) {
+    std::cerr <<
+      "decoder publicou somente buffers vazios; status="
+      << decoder.status() << " frame=" << width << 'x' << height
+      << '\n';
+    return 5;
+  }
 
   // 2. Com a mesma playbackKey, parar e buscar para tras deve substituir o
   // quadro do Play pelo quadro exato do cursor, sem herdar o snapshot antigo.
   constexpr double seekTarget = 0.10;
-  const auto seekStartedAt = SteadyClock::now();
   FrameObservation pausedFrame;
-  bool seekCompleted = false;
-  while (std::chrono::duration<double>(
-           SteadyClock::now() - seekStartedAt).count() <= 3.0) {
-    FrameObservation observation;
-    if (observeFrame(
-          decoder, videoPath, playbackKey,
-          seekTarget, false, observation) &&
-        std::abs(observation.timestamp - seekTarget) <= 0.03 &&
-        lastPlayTimestamp - observation.timestamp >= 0.10) {
-      pausedFrame = observation;
-      seekCompleted = true;
-      break;
-    }
-    waitForDecoder();
-  }
-  if (!seekCompleted) {
+  if (!waitForStoppedTarget(
+        decoder, videoPath, playbackKey,
+        seekTarget, pausedFrame) ||
+      lastPlayTimestamp - pausedFrame.timestamp < 0.10) {
     std::cerr << "pausa/seek nao publicou o quadro solicitado; status="
               << decoder.status() << " ultimoPlay="
               << lastPlayTimestamp << '\n';
-    return 5;
-  }
-
-  // Deixa qualquer callback que ja estava em voo terminar e confirma que o
-  // quadro nao continua mudando enquanto o transporte permanece parado.
-  const auto pauseSettlingAt = SteadyClock::now();
-  while (std::chrono::duration<double>(
-           SteadyClock::now() - pauseSettlingAt).count() <= 0.25) {
-    FrameObservation observation;
-    if (observeFrame(
-          decoder, videoPath, playbackKey,
-          seekTarget, false, observation)) {
-      pausedFrame = observation;
-    }
-    waitForDecoder();
-  }
-  const auto pauseHoldAt = SteadyClock::now();
-  bool pauseStable = true;
-  while (std::chrono::duration<double>(
-           SteadyClock::now() - pauseHoldAt).count() <= 0.35) {
-    FrameObservation observation;
-    if (observeFrame(
-          decoder, videoPath, playbackKey,
-          seekTarget, false, observation) &&
-        (std::abs(observation.timestamp - seekTarget) > 0.03 ||
-         observation.checksum != pausedFrame.checksum)) {
-      pauseStable = false;
-      break;
-    }
-    waitForDecoder();
-  }
-  if (!pauseStable) {
-    std::cerr << "quadro continuou avancando durante a pausa; status="
-              << decoder.status() << '\n';
     return 6;
   }
 
-  // 3. A retomada da mesma midia/chave precisa voltar a publicar quadros. E
+  if (!settleAndHoldStoppedTarget(
+        decoder, videoPath, playbackKey,
+        seekTarget, pausedFrame)) {
+    std::cerr << "quadro continuou avancando durante a pausa; status="
+              << decoder.status() << '\n';
+    return 7;
+  }
+
+  // 3. Com o transporte ainda parado, cada mudanca do cursor precisa
+  // publicar o quadro do novo alvo e estabilizar nele. Isso protege contra o
+  // ciclo set_time + next_frame que fazia a imagem iniciar e voltar sozinha.
+  constexpr std::array<double, 3> stoppedCursorTargets = {
+    0.35, 0.75, 0.20
+  };
+  int stoppedCursorChanges = 0;
+  for (const double target : stoppedCursorTargets) {
+    FrameObservation targetFrame;
+    if (!waitForStoppedTarget(
+          decoder, videoPath, playbackKey,
+          target, targetFrame)) {
+      std::cerr <<
+        "cursor parado nao publicou o novo alvo; status="
+        << decoder.status() << " alvo=" << target
+        << " alteracoes=" << stoppedCursorChanges << '\n';
+      return 8;
+    }
+    if (!settleAndHoldStoppedTarget(
+          decoder, videoPath, playbackKey,
+          target, targetFrame)) {
+      std::cerr <<
+        "quadro oscilou depois de mudar o cursor parado; status="
+        << decoder.status() << " alvo=" << target
+        << " alteracoes=" << stoppedCursorChanges << '\n';
+      return 9;
+    }
+    pausedFrame = targetFrame;
+    ++stoppedCursorChanges;
+  }
+
+  // 4. A retomada da mesma midia/chave precisa voltar a publicar quadros. E
   // este trecho que detecta o bug em que activePlaying ficava true, mas o VLC
   // permanecia parado no quadro obtido pelo seek.
   const auto resumeStartedAt = SteadyClock::now();
@@ -223,7 +294,7 @@ int main(int argc, char** argv)
     FrameObservation observation;
     if (observeFrame(
           decoder, videoPath, playbackKey,
-          seekTarget + elapsed, true, observation)) {
+          pausedFrame.timestamp + elapsed, true, observation)) {
       checksum = checksum * 131u + observation.checksum;
       if (observation.timestamp > lastResumeTimestamp + 0.005) {
         lastResumeTimestamp = observation.timestamp;
@@ -242,10 +313,10 @@ int main(int argc, char** argv)
               << decoder.status() << " frames=" << distinctResumeFrames
               << " intervalo="
               << lastResumeTimestamp - firstResumeTimestamp << '\n';
-    return 7;
+    return 10;
   }
 
-  // 4. Um item com B_LOOPSRC volta do fim da fonte para o inicio sem trocar a
+  // 5. Um item com B_LOOPSRC volta do fim da fonte para o inicio sem trocar a
   // playbackKey. Essa emenda precisa tirar o VLC de Ended e substituir o
   // ultimo quadro pelo primeiro quadro do novo ciclo.
   const auto beforeLoopStartedAt = SteadyClock::now();
@@ -267,7 +338,7 @@ int main(int argc, char** argv)
     std::cerr << "nao foi possivel preparar a emenda de loop; status="
               << decoder.status() << " timestamp="
               << beforeLoopTimestamp << '\n';
-    return 8;
+    return 11;
   }
 
   const auto loopStartedAt = SteadyClock::now();
@@ -312,91 +383,137 @@ int main(int argc, char** argv)
                     ? lastLoopTimestamp - firstLoopTimestamp
                     : 0.0)
               << '\n';
-    return 9;
+    return 12;
   }
 
-  // 5. Quando a duracao e fornecida, deixa o player chegar ao fim fisico da
-  // fonte (estado Ended do VLC) e volta ao inicio com a mesma chave. Isso
-  // reproduz o caso real de um item esticado/repetido no REAPER.
+  // 6. Quando a duracao e fornecida, deixa o player chegar repetidas vezes ao
+  // fim fisico da fonte (estado Ended do VLC) e volta ao inicio com a mesma
+  // chave. Isso reproduz B_LOOPSRC em um item esticado e tambem limita o tempo
+  // em que o ultimo quadro pode ficar preso antes do ciclo seguinte aparecer.
+  constexpr int requiredPhysicalLoops = 3;
+  constexpr double maximumLoopRecoverySeconds = 0.85;
+  int physicalLoopCycles = 0;
   int physicalLoopFrames = 0;
   double physicalLoopAdvance = 0.0;
+  double maximumPhysicalLoopRecovery = 0.0;
   if (std::isfinite(sourceDuration) && sourceDuration > 1.0) {
     const double nearEnd = std::max(0.05, sourceDuration - 0.25);
-    const auto endSeekStartedAt = SteadyClock::now();
-    bool reachedEndSection = false;
-    while (std::chrono::duration<double>(
-             SteadyClock::now() - endSeekStartedAt).count() <= 4.0) {
-      FrameObservation observation;
-      if (observeFrame(
-            decoder, videoPath, playbackKey,
-            nearEnd, true, observation) &&
-          observation.timestamp >= nearEnd - 0.10) {
-        reachedEndSection = true;
-        break;
-      }
-      waitForDecoder();
-    }
-    if (!reachedEndSection) {
-      std::cerr << "nao foi possivel buscar o fim fisico; status="
-                << decoder.status() << " alvo=" << nearEnd << '\n';
-      return 10;
-    }
-
-    // Mantem o relogio solicitado avançando alem do fim por tempo suficiente
-    // para o VLC publicar Ended, como acontece antes da emenda de B_LOOPSRC.
-    const auto endingAt = SteadyClock::now();
-    while (std::chrono::duration<double>(
-             SteadyClock::now() - endingAt).count() <= 1.10) {
-      const double elapsed = std::chrono::duration<double>(
-        SteadyClock::now() - endingAt).count();
-      FrameObservation ignored;
-      observeFrame(
-        decoder, videoPath, playbackKey,
-        nearEnd + elapsed, true, ignored);
-      waitForDecoder();
-    }
-
-    const auto physicalLoopAt = SteadyClock::now();
-    double firstPhysicalLoopTimestamp = -1.0;
-    double lastPhysicalLoopTimestamp = -1.0;
-    bool physicalLoopRecovered = false;
-    while (std::chrono::duration<double>(
-             SteadyClock::now() - physicalLoopAt).count() <= 6.0) {
-      const double elapsed = std::chrono::duration<double>(
-        SteadyClock::now() - physicalLoopAt).count();
-      FrameObservation observation;
-      if (observeFrame(
-            decoder, videoPath, playbackKey,
-            0.05 + elapsed, true, observation)) {
-        const bool returnedToStart =
-          observation.timestamp < sourceDuration - 0.50;
-        if (firstPhysicalLoopTimestamp < 0.0 && returnedToStart) {
-          firstPhysicalLoopTimestamp = observation.timestamp;
-          lastPhysicalLoopTimestamp = observation.timestamp;
-          physicalLoopFrames = 1;
-        } else if (firstPhysicalLoopTimestamp >= 0.0 &&
-                   observation.timestamp >
-                     lastPhysicalLoopTimestamp + 0.005) {
-          lastPhysicalLoopTimestamp = observation.timestamp;
-          ++physicalLoopFrames;
-        }
-        physicalLoopAdvance = firstPhysicalLoopTimestamp >= 0.0
-          ? lastPhysicalLoopTimestamp - firstPhysicalLoopTimestamp
-          : 0.0;
-        if (physicalLoopFrames >= 3 &&
-            physicalLoopAdvance >= 0.25) {
-          physicalLoopRecovered = true;
+    for (int cycle = 1; cycle <= requiredPhysicalLoops; ++cycle) {
+      const auto endSeekStartedAt = SteadyClock::now();
+      bool reachedEndSection = false;
+      while (std::chrono::duration<double>(
+               SteadyClock::now() - endSeekStartedAt).count() <= 4.0) {
+        FrameObservation observation;
+        if (observeFrame(
+              decoder, videoPath, playbackKey,
+              nearEnd, true, observation) &&
+            observation.timestamp >= nearEnd - 0.10) {
+          reachedEndSection = true;
           break;
         }
+        waitForDecoder();
       }
-      waitForDecoder();
-    }
-    if (!physicalLoopRecovered) {
-      std::cerr <<
-        "video nao saiu de Ended no loop fisico; status="
-        << decoder.status() << " frames=" << physicalLoopFrames
-        << " intervalo=" << physicalLoopAdvance << '\n';
-      return 11;
+      if (!reachedEndSection) {
+        std::cerr << "nao foi possivel buscar o fim fisico; status="
+                  << decoder.status() << " alvo=" << nearEnd
+                  << " ciclo=" << cycle << '\n';
+        return 13;
+      }
+
+      // Mantem o relogio alem do fim o bastante para o VLC realmente entrar
+      // em Ended. O cronometro da recuperacao so comeca quando B_LOOPSRC volta
+      // para o inicio, portanto essa preparacao nao mascara a latencia medida.
+      const auto endingAt = SteadyClock::now();
+      while (std::chrono::duration<double>(
+               SteadyClock::now() - endingAt).count() <= 0.80) {
+        const double elapsed = std::chrono::duration<double>(
+          SteadyClock::now() - endingAt).count();
+        FrameObservation ignored;
+        observeFrame(
+          decoder, videoPath, playbackKey,
+          nearEnd + elapsed, true, ignored);
+        waitForDecoder();
+      }
+
+      const auto physicalLoopAt = SteadyClock::now();
+      double firstPhysicalLoopTimestamp = -1.0;
+      double lastPhysicalLoopTimestamp = -1.0;
+      double recoverySeconds = -1.0;
+      int cycleFrames = 0;
+      int cycleObservations = 0;
+      double minimumObservedTimestamp =
+        std::numeric_limits<double>::infinity();
+      double maximumObservedTimestamp = -1.0;
+      bool physicalLoopRecovered = false;
+      while (std::chrono::duration<double>(
+               SteadyClock::now() - physicalLoopAt).count() <= 2.0) {
+        const double elapsed = std::chrono::duration<double>(
+          SteadyClock::now() - physicalLoopAt).count();
+        FrameObservation observation;
+        if (observeFrame(
+              decoder, videoPath, playbackKey,
+              0.05 + elapsed, true, observation)) {
+          ++cycleObservations;
+          minimumObservedTimestamp = std::min(
+            minimumObservedTimestamp, observation.timestamp);
+          maximumObservedTimestamp = std::max(
+            maximumObservedTimestamp, observation.timestamp);
+          const bool returnedToStart = observation.timestamp <
+            std::min(1.0, sourceDuration - 0.50);
+          if (firstPhysicalLoopTimestamp < 0.0 && returnedToStart) {
+            firstPhysicalLoopTimestamp = observation.timestamp;
+            lastPhysicalLoopTimestamp = observation.timestamp;
+            recoverySeconds = elapsed;
+            cycleFrames = 1;
+          } else if (firstPhysicalLoopTimestamp >= 0.0 &&
+                     observation.timestamp >
+                       lastPhysicalLoopTimestamp + 0.005) {
+            lastPhysicalLoopTimestamp = observation.timestamp;
+            ++cycleFrames;
+          }
+          const double cycleAdvance =
+            firstPhysicalLoopTimestamp >= 0.0
+              ? lastPhysicalLoopTimestamp -
+                  firstPhysicalLoopTimestamp
+              : 0.0;
+          if (cycleFrames >= 3 && cycleAdvance >= 0.25) {
+            physicalLoopRecovered = true;
+            physicalLoopFrames += cycleFrames;
+            physicalLoopAdvance += cycleAdvance;
+            break;
+          }
+        }
+        waitForDecoder();
+      }
+      if (!physicalLoopRecovered) {
+        std::cerr <<
+          "video nao saiu de Ended no loop fisico; status="
+          << decoder.status() << " ciclo=" << cycle
+          << " frames=" << cycleFrames << " intervalo="
+          << (firstPhysicalLoopTimestamp >= 0.0
+                ? lastPhysicalLoopTimestamp -
+                    firstPhysicalLoopTimestamp
+                : 0.0)
+          << " recuperacao=" << recoverySeconds << '\n';
+        std::cerr << "observacoes=" << cycleObservations
+                  << " menorTimestamp="
+                  << (std::isfinite(minimumObservedTimestamp)
+                        ? minimumObservedTimestamp : -1.0)
+                  << " maiorTimestamp="
+                  << maximumObservedTimestamp << '\n';
+        return 14;
+      }
+      if (recoverySeconds > maximumLoopRecoverySeconds) {
+        std::cerr <<
+          "ultimo quadro ficou preso na emenda de B_LOOPSRC; status="
+          << decoder.status() << " ciclo=" << cycle
+          << " recuperacao=" << recoverySeconds
+          << " limite=" << maximumLoopRecoverySeconds << '\n';
+        return 15;
+      }
+      maximumPhysicalLoopRecovery = std::max(
+        maximumPhysicalLoopRecovery, recoverySeconds);
+      ++physicalLoopCycles;
     }
   }
 
@@ -407,6 +524,7 @@ int main(int argc, char** argv)
             << " playAdvance="
             << lastPlayTimestamp - firstPlayTimestamp
             << " seek=" << pausedFrame.timestamp
+            << " stoppedCursorChanges=" << stoppedCursorChanges
             << " resumeFrames=" << distinctResumeFrames
             << " resumeAdvance="
             << lastResumeTimestamp - firstResumeTimestamp
@@ -415,6 +533,9 @@ int main(int argc, char** argv)
             << lastLoopTimestamp - firstLoopTimestamp
             << " physicalLoopFrames=" << physicalLoopFrames
             << " physicalLoopAdvance=" << physicalLoopAdvance
+            << " physicalLoopCycles=" << physicalLoopCycles
+            << " maxPhysicalLoopRecovery="
+            << maximumPhysicalLoopRecovery
             << '\n';
   return 0;
 }

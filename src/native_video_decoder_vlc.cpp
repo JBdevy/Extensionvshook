@@ -223,6 +223,14 @@ VlcLocation locateVlc()
   }
 
 #ifdef _WIN32
+  // A DLL da extensao normalmente esta em %APPDATA%\\REAPER\\UserPlugins.
+  // Este caminho explicito cobre hosts que carregam a DLL de um alias e nao
+  // deixam GetModuleFileName resolver a pasta esperada.
+  const std::string appData = environmentValue("APPDATA");
+  if (!appData.empty()) {
+    roots.push_back(joinPath(
+      appData, "REAPER/UserPlugins/VSHookRuntime/VLC"));
+  }
   const std::string programFiles =
     environmentValue("ProgramFiles");
   if (!programFiles.empty()) {
@@ -440,6 +448,20 @@ std::int64_t secondsToMilliseconds(double seconds)
   return static_cast<std::int64_t>(std::llround(value));
 }
 
+std::string mediaPathForVlc(const std::string& path)
+{
+#ifdef _WIN32
+  // O estado do Teleprompt usa barras de URL para permanecer portavel entre
+  // Windows e macOS. libvlc_media_new_path, porem, exige o caminho nativo no
+  // Windows e devolve nullptr para alguns caminhos absolutos com '/'.
+  std::string nativePath = path;
+  std::replace(nativePath.begin(), nativePath.end(), '/', '\\');
+  return nativePath;
+#else
+  return path;
+#endif
+}
+
 } // namespace
 
 struct Decoder::Impl {
@@ -486,6 +508,7 @@ struct Decoder::Impl {
   int publishedStride = 0;
   double publishedTimestamp = -1.0;
   std::uint64_t publishedFrameSequence = 0;
+  std::uint64_t publishedTimestampSequence = 0;
   std::chrono::steady_clock::time_point lastFramePublishedAt{};
   int formatWidth = 1;
   int formatHeight = 1;
@@ -504,6 +527,8 @@ struct Decoder::Impl {
   std::chrono::steady_clock::time_point previousRequestWall{};
   bool initialSyncPending = false;
   std::chrono::steady_clock::time_point initialSyncForceAt{};
+  std::uint64_t initialSyncFrameSequence = 0;
+  std::chrono::steady_clock::time_point lastInitialStoppedSeekAt{};
   std::chrono::steady_clock::time_point playerCreatedAt{};
   std::chrono::steady_clock::time_point watchdogGraceUntil{};
   std::chrono::steady_clock::time_point lastWatchdogCheckAt{};
@@ -513,6 +538,11 @@ struct Decoder::Impl {
   std::uint64_t lastWatchdogFrameSequence = 0;
   int watchdogClockStallChecks = 0;
   int watchdogRecoveryStage = 0;
+  bool loopRestartPending = false;
+  double loopRestartTarget = 0.0;
+  std::uint64_t loopRestartFrameSequence = 0;
+  std::chrono::steady_clock::time_point loopRestartRequestedAt{};
+  std::chrono::steady_clock::time_point loopRestartGuardUntil{};
 
   Impl()
   {
@@ -683,9 +713,11 @@ struct Decoder::Impl {
     self->publishedWidth = self->formatWidth;
     self->publishedHeight = self->formatHeight;
     self->publishedStride = self->formatStride;
-    self->publishedTimestamp =
-      self->latestRequestedTime.load(std::memory_order_relaxed);
     ++self->publishedFrameSequence;
+    // Nao chama nenhuma API do libVLC dentro do callback de video: no Windows
+    // isso pode reentrar no lock interno do vout e prender o decoder. A worker
+    // associa o relogio real do player a esta sequencia logo em seguida.
+    self->publishedTimestamp = -1.0;
     self->lastFramePublishedAt =
       std::chrono::steady_clock::now();
     self->statusCode.store(2, std::memory_order_release);
@@ -703,7 +735,43 @@ struct Decoder::Impl {
     publishedHeight = 0;
     publishedStride = 0;
     publishedTimestamp = -1.0;
+    publishedTimestampSequence = 0;
     lastFramePublishedAt = {};
+  }
+
+  void stampPublishedFrameFromPlayer()
+  {
+    if (!player || !api.getTime) return;
+    std::uint64_t sequence = 0;
+    {
+      std::lock_guard<std::mutex> lock(frameMutex);
+      if (!publishedFrame ||
+          publishedTimestampSequence == publishedFrameSequence) {
+        return;
+      }
+      sequence = publishedFrameSequence;
+    }
+    // Esta consulta roda exclusivamente na worker, fora do callback do vout.
+    const libvlc_time_t playerTime = api.getTime(player);
+    if (playerTime < 0) return;
+    const double playerTimeSeconds =
+      static_cast<double>(playerTime) / 1000.0;
+    const double requestedTime =
+      latestRequestedTime.load(std::memory_order_relaxed);
+    // Um callback que ja estava na fila pode chegar depois do seek para tras.
+    // Durante a emenda, descarta qualquer quadro cujo relogio ainda pertence
+    // ao ciclo anterior, como a janela de video do REAPER faz pela timeline.
+    if (loopRestartGuardUntil !=
+          std::chrono::steady_clock::time_point{} &&
+        std::chrono::steady_clock::now() < loopRestartGuardUntil &&
+        std::abs(playerTimeSeconds - requestedTime) > 0.75) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(frameMutex);
+    if (publishedFrame && publishedFrameSequence == sequence) {
+      publishedTimestamp = playerTimeSeconds;
+      publishedTimestampSequence = sequence;
+    }
   }
 
   FrameHeartbeat readFrameHeartbeat()
@@ -733,6 +801,8 @@ struct Decoder::Impl {
     activeStoppedSourceTime = -1.0;
     initialSyncPending = false;
     initialSyncForceAt = {};
+    initialSyncFrameSequence = 0;
+    lastInitialStoppedSeekAt = {};
     playerCreatedAt = {};
     watchdogGraceUntil = {};
     lastWatchdogCheckAt = {};
@@ -742,6 +812,11 @@ struct Decoder::Impl {
     lastWatchdogFrameSequence = 0;
     watchdogClockStallChecks = 0;
     watchdogRecoveryStage = 0;
+    loopRestartPending = false;
+    loopRestartTarget = 0.0;
+    loopRestartFrameSequence = 0;
+    loopRestartRequestedAt = {};
+    loopRestartGuardUntil = {};
     {
       std::lock_guard<std::mutex> lock(frameMutex);
       activePath.clear();
@@ -763,6 +838,9 @@ struct Decoder::Impl {
       "--no-video-title-show",
       "--no-osd",
       "--no-stats",
+      "--avcodec-hw=any",
+      "--drop-late-frames",
+      "--skip-frames",
       "--quiet"
     };
     std::vector<const char*> arguments;
@@ -795,7 +873,8 @@ struct Decoder::Impl {
       activePath = current.path;
       activePlaybackKey = current.playbackKey;
     }
-    media = api.newMediaPath(instance, current.path.c_str());
+    const std::string mediaPath = mediaPathForVlc(current.path);
+    media = api.newMediaPath(instance, mediaPath.c_str());
     if (!media) {
       statusCode.store(-202, std::memory_order_release);
       return false;
@@ -827,12 +906,12 @@ struct Decoder::Impl {
       api.setPause(player, 0);
       activeStoppedSourceTime = -1.0;
     } else {
-      // Pause antes do seek impede o player recém-criado de avançar alguns
-      // quadros por conta própria enquanto o transporte do REAPER está parado.
-      api.setPause(player, 1);
+      // Um player novo ainda nao possui quadro para uma pausa. Mantem o vout
+      // acordado somente durante a busca inicial; finishInitialSync pausa assim
+      // que o primeiro quadro correspondente ao cursor for realmente publicado.
       api.setTime(player, secondsToMilliseconds(current.sourceTime));
-      if (api.nextFrame) api.nextFrame(player);
-      activeStoppedSourceTime = current.sourceTime;
+      api.setPause(player, 0);
+      activeStoppedSourceTime = -1.0;
     }
     activePlaying = current.playing;
     activeRate = safeRate;
@@ -843,6 +922,8 @@ struct Decoder::Impl {
     // pronto, applyRequest reaplica uma unica vez o alvo mais recente.
     initialSyncPending = true;
     initialSyncForceAt = now + std::chrono::milliseconds(1500);
+    initialSyncFrameSequence = heartbeat.sequence;
+    lastInitialStoppedSeekAt = now;
     playerCreatedAt = now;
     watchdogGraceUntil = now + std::chrono::milliseconds(1500);
     lastWatchdogCheckAt = now;
@@ -871,6 +952,42 @@ struct Decoder::Impl {
     lastWatchdogPlayerTime = -1.0;
     lastWatchdogFrameSequence = heartbeat.sequence;
     watchdogClockStallChecks = 0;
+  }
+
+  bool finishLoopRestart(
+    const Request& current,
+    const std::chrono::steady_clock::time_point now)
+  {
+    if (!loopRestartPending || !player || !current.playing) {
+      return false;
+    }
+    const FrameHeartbeat heartbeat = readFrameHeartbeat();
+    const libvlc_time_t rawPlayerTime = api.getTime(player);
+    const double playerTime = rawPlayerTime >= 0
+      ? static_cast<double>(rawPlayerTime) / 1000.0 : -1.0;
+    const bool newFrameArrived =
+      heartbeat.sequence != loopRestartFrameSequence;
+    const bool clockReachedNewCycle = playerTime >= 0.0 &&
+      std::abs(playerTime - current.sourceTime) <= 0.35 &&
+      playerTime < loopRestartTarget + 1.0;
+    if (newFrameArrived && clockReachedNewCycle) {
+      loopRestartPending = false;
+      loopRestartRequestedAt = {};
+      watchdogRecoveryStage = 0;
+      return false;
+    }
+    if (loopRestartRequestedAt !=
+          std::chrono::steady_clock::time_point{} &&
+        now - loopRestartRequestedAt >=
+          std::chrono::milliseconds(90)) {
+      // Alguns demuxers aceitam play() em Ended, mas continuam entregando o
+      // ultimo quadro. A janela do REAPER nao espera esse estado indefinido;
+      // apos uma tolerancia de poucos frames, abre outro player VLC ja no
+      // tempo correto. A janela conserva o ultimo snapshot durante o aquecimento.
+      createPlayer(current, 1);
+      return true;
+    }
+    return false;
   }
 
   bool finishInitialSync(
@@ -922,15 +1039,45 @@ struct Decoder::Impl {
       api.setPause(player, 0);
       activeStoppedSourceTime = -1.0;
     } else {
+      const FrameHeartbeat heartbeat = readFrameHeartbeat();
+      const double playerTimeSeconds = playerTime >= 0
+        ? static_cast<double>(playerTime) / 1000.0 : -1.0;
+      const bool targetFramePublished =
+        heartbeat.sequence != initialSyncFrameSequence &&
+        playerTimeSeconds >= 0.0 &&
+        std::abs(playerTimeSeconds - current.sourceTime) <= 0.12;
+      if (!targetFramePublished) {
+        // O seek enviado durante Opening pode ser ignorado. Reaplica de forma
+        // espaçada quando o player estiver pronto, mantendo-o ativo apenas até
+        // o callback do quadro correto. Isso reproduz o frame parado do REAPER
+        // sem o ciclo visual causado por next_frame.
+        const bool canSeekNow = stateReady ||
+          stateUnavailableButClockReady || openingTimedOut;
+        if (canSeekNow &&
+            (lastInitialStoppedSeekAt ==
+               std::chrono::steady_clock::time_point{} ||
+             now - lastInitialStoppedSeekAt >=
+               std::chrono::milliseconds(75))) {
+          if (api.play(player) != 0) {
+            createPlayer(
+              current, std::max(1, watchdogRecoveryStage + 1));
+            return true;
+          }
+          api.setTime(
+            player, secondsToMilliseconds(current.sourceTime));
+          api.setPause(player, 0);
+          lastInitialStoppedSeekAt = now;
+        }
+        return true;
+      }
       api.setPause(player, 1);
-      api.setTime(
-        player, secondsToMilliseconds(current.sourceTime));
-      if (api.nextFrame) api.nextFrame(player);
       activeStoppedSourceTime = current.sourceTime;
     }
     activePlaying = current.playing;
     initialSyncPending = false;
     initialSyncForceAt = {};
+    initialSyncFrameSequence = 0;
+    lastInitialStoppedSeekAt = {};
     armWatchdogGrace(
       current, now, std::chrono::milliseconds(900));
     return true;
@@ -1089,6 +1236,7 @@ struct Decoder::Impl {
   {
     latestRequestedTime.store(
       current.sourceTime, std::memory_order_relaxed);
+    stampPublishedFrameFromPlayer();
     if (current.path.empty()) {
       destroyPlayer();
       statusCode.store(0, std::memory_order_release);
@@ -1124,6 +1272,21 @@ struct Decoder::Impl {
       activeRate = safeRate;
     }
     const auto now = std::chrono::steady_clock::now();
+    if (finishLoopRestart(current, now)) {
+      return;
+    }
+    // O watchdog pode estar reaquecendo o player exatamente quando B_LOOPSRC
+    // volta do fim ao inicio. Se a sincronizacao inicial consumir esse pedido,
+    // o salto para tras se perde e o VLC permanece preso em Ended. Reinicia o
+    // proprio player VLC imediatamente já no alvo correto do novo ciclo.
+    const bool restartDuringInitialSync = initialSyncPending &&
+      previousRequestValid && activePlaying && current.playing &&
+      current.sourceTime < previousRequestSourceTime - 0.01;
+    if (restartDuringInitialSync) {
+      createPlayer(
+        current, std::max(1, watchdogRecoveryStage));
+      return;
+    }
     if (finishInitialSync(current, now, safeRate)) {
       previousRequestValid = true;
       previousRequestSourceTime = current.sourceTime;
@@ -1193,31 +1356,54 @@ struct Decoder::Impl {
     if (!current.playing) {
       // A transicao Play -> Stop sempre força o quadro do cursor de edicao.
       // Depois disso, somente uma mudança real no cursor solicita outro
-      // quadro. Comparar com get_time() criava um ciclo: next_frame avançava,
-      // o avanço era tratado como drift, o código voltava e avançava de novo.
+      // quadro. next_frame nao pode ser usado aqui: ele avanca alem do seek e
+      // fazia a janela mostrar um ponto diferente do cursor, especialmente no
+      // inicio do video.
       const bool stoppedTargetChanged =
         activeStoppedSourceTime < 0.0 ||
         std::abs(
           activeStoppedSourceTime - current.sourceTime) > 0.008;
       if (wasPlaying || stoppedTargetChanged) {
         api.setTime(player, secondsToMilliseconds(current.sourceTime));
-        if (api.nextFrame) api.nextFrame(player);
         activeStoppedSourceTime = current.sourceTime;
       }
     } else if (wasPlaying && playbackJump) {
-      if (playbackRestart && api.play(player) != 0) {
-        createPlayer(current);
-        return;
+      if (playbackRestart) {
+        const int playerState = api.getState
+          ? api.getState(player) : -1;
+        // Assim como a janela de video do REAPER, a emenda e dirigida pela
+        // nova posicao da fonte: reaproveita o decoder aquecido e volta ao
+        // quadro inicial imediatamente. So recria o objeto se o VLC declarou
+        // erro real; Ended/Stopped ainda aceitam play + seek no mesmo player.
+        if (playerState == kVlcError) {
+          createPlayer(
+            current, std::max(1, watchdogRecoveryStage));
+          return;
+        }
+        if (api.play(player) != 0) {
+          createPlayer(current, 1);
+          return;
+        }
+        const FrameHeartbeat heartbeat = readFrameHeartbeat();
+        loopRestartPending = true;
+        loopRestartTarget = current.sourceTime;
+        loopRestartFrameSequence = heartbeat.sequence;
+        loopRestartRequestedAt = now;
+        loopRestartGuardUntil =
+          now + std::chrono::milliseconds(750);
       }
       api.setTime(player, secondsToMilliseconds(current.sourceTime));
       if (playbackRestart) {
         api.setPause(player, 0);
-        initialSyncPending = true;
-        initialSyncForceAt =
-          now + std::chrono::milliseconds(350);
+        initialSyncPending = false;
+        initialSyncForceAt = {};
+        watchdogRecoveryStage = 0;
+        lastWatchdogRecoveryAt = {};
       }
       armWatchdogGrace(
-        current, now, std::chrono::milliseconds(600));
+        current, now, playbackRestart
+          ? std::chrono::milliseconds(120)
+          : std::chrono::milliseconds(600));
       watchdogCommandIssued = true;
     }
 
@@ -1294,7 +1480,18 @@ struct Decoder::Impl {
         output.width = publishedWidth;
         output.height = publishedHeight;
         output.stride = publishedStride;
-        output.timestamp = publishedTimestamp;
+        // O callback de video e independente da worker que consulta o relogio
+        // do VLC. Exigir que a worker carimbasse cada quadro antes de entrega-lo
+        // introduzia ate um ciclo inteiro de atraso e, dependendo da fase entre
+        // o timer da janela e o vout, fazia a apresentacao cair visualmente para
+        // metade do FPS. O pixel ja e um snapshot imutavel e pode ser apresentado
+        // imediatamente; o tempo solicitado e uma referencia segura ate a worker
+        // associar o relogio exato do player a esta sequencia.
+        output.timestamp =
+          publishedTimestampSequence == publishedFrameSequence
+            ? publishedTimestamp
+            : latestRequestedTime.load(std::memory_order_relaxed);
+        output.sequence = publishedFrameSequence;
         return true;
       }
     }

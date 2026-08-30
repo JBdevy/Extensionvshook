@@ -677,6 +677,12 @@ static custom_action_register_t g_telepromptSettingsAction = {
   0, "VSHOOKNEWTELEPROMPTSETTINGS",
   "VS Hook: Configurações do Teleprompt", nullptr
 };
+static custom_action_register_t g_videoWindowAction = {
+  0, "VSHOOKNEWVIDEOWINDOW", "VS Hook: Abrir janela de vídeo", nullptr
+};
+static custom_action_register_t g_videoStretchAction = {
+  0, "VSHOOKNEWVIDEOSTRETCH", "VS Hook: Stretch da janela de vídeo", nullptr
+};
 static custom_action_register_t g_recadosAction = {
   0, "VSHOOKNEWRECADOS",
   "VS Hook: Recados", nullptr
@@ -702,6 +708,8 @@ static int g_convertMp3CommandId = 0;
 static int g_telepromptOneCommandId = 0;
 static int g_telepromptTwoCommandId = 0;
 static int g_telepromptSettingsCommandId = 0;
+static int g_videoWindowCommandId = 0;
+static int g_videoStretchCommandId = 0;
 static int g_recadosCommandId = 0;
 static int g_bigClockHookCommandId = 0;
 static int g_bigClockHookTwoCommandId = 0;
@@ -1720,6 +1728,7 @@ static std::map<int, std::chrono::steady_clock::time_point>
   g_nativeUiBlockMidiLastTriggeredAt;
 static std::map<std::string, std::chrono::steady_clock::time_point>
   g_nativeUiKeyboardLastTriggeredAt;
+static bool g_nativeUiPlaylistStepKeyHeld[2]{false, false};
 static int g_nativeUiPendingBlockMidiNumber = 0;
 static std::vector<std::string> g_nativeUiBulkSpacePendingActions;
 static bool g_nativeUiBulkSpaceWaitForStop = false;
@@ -1757,6 +1766,13 @@ static void nativeToggleTelepromptWindow(int slot);
 static void nativeCloseAllTelepromptWindows();
 static void nativeRestoreTelepromptWindowsIfRequested();
 static void nativeOpenTelepromptSettings();
+static bool nativeVideoWindowIsOpen();
+static bool nativeOpenVideoWindow();
+static void nativeCloseVideoWindow(bool clearRequestedState = true);
+static void nativeToggleVideoWindow();
+static bool nativeVideoStretchEnabled();
+static bool nativeVideoRequestedOpen();
+static void nativeToggleVideoStretch();
 static void nativeOpenRecadosApp();
 static bool nativeBigClockWindowIsOpen(int slot = 0);
 static bool nativeOpenBigClockWindow(int slot = 0);
@@ -4715,7 +4731,7 @@ static bool nativeCommandStartsProjectTransition(int command)
 static bool nativeIsRegisteredExtensionCommand(int command)
 {
   if (command <= 0) return false;
-  const std::array<int, 15> fixedCommands = {
+  const std::array<int, 17> fixedCommands = {
     g_nativeInterfaceCommandId,
     g_hookControllerCommandId,
     g_extensionBypassCommandId,
@@ -4728,6 +4744,8 @@ static bool nativeIsRegisteredExtensionCommand(int command)
     g_telepromptOneCommandId,
     g_telepromptTwoCommandId,
     g_telepromptSettingsCommandId,
+    g_videoWindowCommandId,
+    g_videoStretchCommandId,
     g_recadosCommandId,
     g_bigClockHookCommandId,
     g_bigClockHookTwoCommandId
@@ -4846,6 +4864,16 @@ static bool hookCommand(int command, int flag)
   if (g_telepromptSettingsCommandId != 0 &&
       command == g_telepromptSettingsCommandId) {
     nativeOpenTelepromptSettings();
+    return true;
+  }
+  if (g_videoWindowCommandId != 0 &&
+      command == g_videoWindowCommandId) {
+    nativeToggleVideoWindow();
+    return true;
+  }
+  if (g_videoStretchCommandId != 0 &&
+      command == g_videoStretchCommandId) {
+    nativeToggleVideoStretch();
     return true;
   }
   if (g_recadosCommandId != 0 &&
@@ -4988,6 +5016,16 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
     nativeOpenTelepromptSettings();
     return true;
   }
+  if (g_videoWindowCommandId != 0 &&
+      command == g_videoWindowCommandId) {
+    nativeToggleVideoWindow();
+    return true;
+  }
+  if (g_videoStretchCommandId != 0 &&
+      command == g_videoStretchCommandId) {
+    nativeToggleVideoStretch();
+    return true;
+  }
   if (g_recadosCommandId != 0 &&
       command == g_recadosCommandId) {
     nativeOpenRecadosApp();
@@ -5075,6 +5113,14 @@ static int toggleActionState(int commandId)
   if (g_telepromptTwoCommandId != 0 &&
       commandId == g_telepromptTwoCommandId) {
     return nativeTelepromptWindowIsOpen(2) ? 1 : 0;
+  }
+  if (g_videoWindowCommandId != 0 &&
+      commandId == g_videoWindowCommandId) {
+    return nativeVideoWindowIsOpen() ? 1 : 0;
+  }
+  if (g_videoStretchCommandId != 0 &&
+      commandId == g_videoStretchCommandId) {
+    return nativeVideoStretchEnabled() ? 1 : 0;
   }
   if (g_bigClockHookCommandId != 0 &&
       commandId == g_bigClockHookCommandId) {
@@ -5227,6 +5273,10 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
       nativeTelepromptWindowIsOpen(1));
     setMenuCommandChecked(hMenu, g_telepromptTwoCommandId,
       nativeTelepromptWindowIsOpen(2));
+    setMenuCommandChecked(hMenu, g_videoWindowCommandId,
+      nativeVideoWindowIsOpen());
+    setMenuCommandChecked(hMenu, g_videoStretchCommandId,
+      nativeVideoStretchEnabled());
     setMenuCommandChecked(hMenu, g_bigClockHookCommandId,
       nativeBigClockWindowIsOpen(0));
     setMenuCommandChecked(hMenu, g_bigClockHookTwoCommandId,
@@ -5244,11 +5294,12 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   // cada opcao aponta diretamente para uma action interna deste produto.
   HMENU vsHookMenu = CreatePopupMenu();
   HMENU telepromptMenu = CreatePopupMenu();
+  HMENU videoMenu = CreatePopupMenu();
   HMENU startupMenu = CreatePopupMenu();
   HMENU timecodeMenu = CreatePopupMenu();
   HMENU projectSyncMenu = CreatePopupMenu();
   HMENU bigClockMenu = CreatePopupMenu();
-  if (!vsHookMenu || !telepromptMenu || !startupMenu ||
+  if (!vsHookMenu || !telepromptMenu || !videoMenu || !startupMenu ||
       !timecodeMenu || !projectSyncMenu || !bigClockMenu) return;
 
   appendMenuString(vsHookMenu, "Executar", g_nativeInterfaceCommandId, nativeAppActivePanelIsOpen());
@@ -5261,6 +5312,11 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
   appendMenuString(telepromptMenu, "Configurações",
     g_telepromptSettingsCommandId, false);
   insertMenuSubMenu(vsHookMenu, telepromptMenu, "Teleprompt", -1);
+  appendMenuString(videoMenu, "Abrir janela",
+    g_videoWindowCommandId, nativeVideoWindowIsOpen());
+  appendMenuString(videoMenu, "Stretch",
+    g_videoStretchCommandId, nativeVideoStretchEnabled());
+  insertMenuSubMenu(vsHookMenu, videoMenu, "Vídeo", -1);
   appendMenuString(
     vsHookMenu, "Recados", g_recadosCommandId, false);
   appendMenuString(
@@ -31252,6 +31308,7 @@ static bool nativePremixTrackIsHidden(const std::string& trackName)
   return normalized == "TELEPROMPT1" ||
     normalized == "TELEPROMPT2" ||
     normalized == "CIFRAS" ||
+    normalized == "MEDIA" ||
     normalized == "TIMECODE";
 }
 
@@ -56949,6 +57006,8 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_SYSKEYUP:
     case WM_KEYUP:
       if (wParam == VK_UP || wParam == VK_DOWN) {
+        g_nativeUiPlaylistStepKeyHeld[
+          wParam == VK_UP ? 0 : 1] = false;
         nativeUiResetNavigationRepeat(
           static_cast<int>(wParam));
         return 0;
@@ -56956,6 +57015,34 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       break;
     case WM_SYSKEYDOWN:
     case WM_KEYDOWN:
+      {
+        const bool playlistStepModifier =
+#ifdef __APPLE__
+          (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+          (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+#else
+          (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+#endif
+        if (playlistStepModifier &&
+            (wParam == VK_UP || wParam == VK_DOWN)) {
+          const int keyIndex = wParam == VK_UP ? 0 : 1;
+          // Command/Ctrl + seta alterna um repertório por pressionamento.
+          // Interceptar antes do navegador comum impede que o autorepeat da
+          // seta continue percorrendo músicas no macOS.
+          nativeUiResetNavigationRepeat();
+          if (!g_nativeUiPlaylistStepKeyHeld[keyIndex]) {
+            g_nativeUiPlaylistStepKeyHeld[keyIndex] = true;
+            if (!g_nativeAppActivePanelModel.regionsPage &&
+                !g_nativeAppActivePanelModel.mixerPage) {
+              nativeUiStepActivePlaylist(
+                wParam == VK_UP ? -1 : 1);
+              g_nativeForceStateBuild.store(true);
+              InvalidateRect(hwnd, nullptr, FALSE);
+            }
+          }
+          return 0;
+        }
+      }
       if (nativeUiPrepareNavigationKeyDown(hwnd, wParam)) {
         return 0;
       }
@@ -59302,6 +59389,7 @@ static bool
 struct NativeTelepromptHeldVideoFrame {
   std::shared_ptr<const std::vector<std::uint8_t>> sharedPixels;
   std::vector<std::uint8_t> pixels;
+  std::size_t pixelOffset = 0;
   int width = 0;
   int height = 0;
   int stride = 0;
@@ -59559,8 +59647,9 @@ static void nativeTelepromptApplySettingsJson(
   next.chordsEnabled = nativeTelepromptJsonBool(
     json, "chordsEnabled",
     nativeTelepromptJsonBool(json, "showChords", next.chordsEnabled));
-  next.clearMode = nativeTelepromptJsonBool(
-    json, "clearMode", next.clearMode);
+  // O modo Clear foi removido das janelas de Teleprompt. Mídia de vídeo
+  // agora pertence exclusivamente à janela da pista MEDIA.
+  next.clearMode = false;
   const bool legacyRgb = nativeTelepromptJsonBool(
     json, "rgbBorderEnabled", false);
   next.rgbWindowBorderEnabled = nativeTelepromptJsonBool(
@@ -60833,10 +60922,11 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
     const auto cacheAgeMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(
         now - cache.builtAt).count();
-    // O snapshot, fila e cronômetro não fazem parte da revisão do projeto.
-    // Uma atualização curta mantém esses dados responsivos sem reler a pista
-    // e reconstruir JSON em todo repaint de 16 ms.
-    rebuild = cacheAgeMs >= 100;
+    // Durante Play, os limites do item já indicam exatamente quando a pista
+    // precisa ser relida. A varredura periódica de 100 ms na thread da UI
+    // causava uma pequena pausa visível no vídeo. Parado, a leitura curta
+    // continua para acompanhar o cursor de edição imediatamente.
+    rebuild = !livePlaying && cacheAgeMs >= 50;
   }
   if (!rebuild &&
       livePosition < cache.lastObservedPosition - 0.0005) {
@@ -60862,6 +60952,20 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
   }
 
   NativeTelepromptRenderState state = cache.state;
+  {
+    // O cronômetro continua vivo sem obrigar a reescanear as pistas durante
+    // a reprodução. Estas variáveis são protegidas pelo mesmo mutex nativo.
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    state.timerExpired = nativeTimerCountdownExpiredLocked();
+    state.timerText = nativeFormatTimerTextFromSeconds(
+      nativeTimerDisplaySecLocked(), state.timerExpired);
+  }
+  std::string spacedTimer;
+  for (char c : state.timerText) {
+    if (c == ':') spacedTimer += " : ";
+    else spacedTimer += c;
+  }
+  state.timerText = spacedTimer;
   state.projectPosition = livePosition;
   state.playing = livePlaying;
   state.progress =
@@ -62214,6 +62318,7 @@ static bool nativeTelepromptDrawHeldImageFrame(
   if (bits && rowSpan >= sourceWidth &&
       VSHookMacDrawTelepromptBitmap(
         dc, bits, sourceWidth, sourceHeight, rowSpan, flipped,
+        false,
         drawX, drawY, drawWidth, drawHeight)) {
     return true;
   }
@@ -62244,6 +62349,80 @@ static bool nativeTelepromptDrawHeldImageFrame(
 }
 
 #if defined(_WIN32) || defined(__APPLE__)
+static void nativeTelepromptVideoDrawRect(
+  int sourceWidth,
+  int sourceHeight,
+  const RECT& available,
+  double mediaScale,
+  bool stretch,
+  int& drawX,
+  int& drawY,
+  int& drawWidth,
+  int& drawHeight)
+{
+  const int availableWidth = std::max(
+    1, static_cast<int>(available.right - available.left));
+  const int availableHeight = std::max(
+    1, static_cast<int>(available.bottom - available.top));
+  const double safeScale = nativeTelepromptClamp(
+    mediaScale, 0.25, 3.0);
+  if (stretch) {
+    // Equivale a desligar "Preserve video aspect ratio" no REAPER: em 100%
+    // o quadro ocupa toda a area, sem barras e sem conservar a proporcao.
+    drawWidth = std::max(
+      1, static_cast<int>(std::lround(availableWidth * safeScale)));
+    drawHeight = std::max(
+      1, static_cast<int>(std::lround(availableHeight * safeScale)));
+  } else {
+    const double fitScale = std::min(
+      static_cast<double>(availableWidth) / std::max(1, sourceWidth),
+      static_cast<double>(availableHeight) / std::max(1, sourceHeight));
+    const double drawScale = std::max(0.01, fitScale * safeScale);
+    drawWidth = std::max(
+      1, static_cast<int>(std::lround(sourceWidth * drawScale)));
+    drawHeight = std::max(
+      1, static_cast<int>(std::lround(sourceHeight * drawScale)));
+  }
+  drawX = available.left + (availableWidth - drawWidth) / 2;
+  drawY = available.top + (availableHeight - drawHeight) / 2;
+}
+
+static void nativeVideoClearOutsideDrawRect(
+  HDC dc,
+  const RECT& available,
+  int drawX,
+  int drawY,
+  int drawWidth,
+  int drawHeight)
+{
+  if (!dc) return;
+  if (drawY > available.top) {
+    nativeAppActiveFillRect(dc,
+      RECT{available.left, available.top,
+           available.right, drawY}, RGB(0, 0, 0));
+  }
+  if (drawY + drawHeight < available.bottom) {
+    nativeAppActiveFillRect(dc,
+      RECT{available.left, drawY + drawHeight,
+           available.right, available.bottom}, RGB(0, 0, 0));
+  }
+  const int visibleTop = std::max(
+    static_cast<int>(available.top), drawY);
+  const int visibleBottom = std::min(
+    static_cast<int>(available.bottom), drawY + drawHeight);
+  if (visibleBottom > visibleTop && drawX > available.left) {
+    nativeAppActiveFillRect(dc,
+      RECT{available.left, visibleTop,
+           drawX, visibleBottom}, RGB(0, 0, 0));
+  }
+  if (visibleBottom > visibleTop &&
+      drawX + drawWidth < available.right) {
+    nativeAppActiveFillRect(dc,
+      RECT{drawX + drawWidth, visibleTop,
+           available.right, visibleBottom}, RGB(0, 0, 0));
+  }
+}
+
 static bool nativeTelepromptDrawHeldVideoFrame(
   HDC dc,
   int index,
@@ -62254,32 +62433,28 @@ static bool nativeTelepromptDrawHeldVideoFrame(
   const NativeTelepromptHeldVideoFrame& frame =
     g_nativeTelepromptHeldVideoFrame[index];
   const std::uint8_t* framePixels = frame.sharedPixels
-    ? frame.sharedPixels->data()
+    ? frame.sharedPixels->data() + frame.pixelOffset
     : (frame.pixels.empty() ? nullptr : frame.pixels.data());
   if (!framePixels || frame.width <= 0 ||
       frame.height <= 0 || frame.stride < frame.width * 4) {
     return false;
   }
-  const int availableWidth = std::max(
-    1, static_cast<int>(available.right - available.left));
-  const int availableHeight = std::max(
-    1, static_cast<int>(available.bottom - available.top));
-  const double fitScale = std::min(
-    static_cast<double>(availableWidth) / frame.width,
-    static_cast<double>(availableHeight) / frame.height);
-  const double drawScale = std::max(
-    0.01, fitScale * nativeTelepromptClamp(
-      settings.mediaScale, 0.25, 3.0));
-  const int drawWidth = std::max(
-    1, static_cast<int>(std::lround(
-      frame.width * drawScale)));
-  const int drawHeight = std::max(
-    1, static_cast<int>(std::lround(
-      frame.height * drawScale)));
-  const int drawX = available.left +
-    (availableWidth - drawWidth) / 2;
-  const int drawY = available.top +
-    (availableHeight - drawHeight) / 2;
+  int drawX = 0;
+  int drawY = 0;
+  int drawWidth = 1;
+  int drawHeight = 1;
+  nativeTelepromptVideoDrawRect(
+    frame.width,
+    frame.height,
+    available,
+    settings.mediaScale,
+    false,
+    drawX,
+    drawY,
+    drawWidth,
+    drawHeight);
+  nativeVideoClearOutsideDrawRect(
+    dc, available, drawX, drawY, drawWidth, drawHeight);
 #ifdef _WIN32
   BITMAPINFO bitmapInfo{};
   bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -62288,7 +62463,9 @@ static bool nativeTelepromptDrawHeldVideoFrame(
   bitmapInfo.bmiHeader.biPlanes = 1;
   bitmapInfo.bmiHeader.biBitCount = 32;
   bitmapInfo.bmiHeader.biCompression = BI_RGB;
-  const int oldStretchMode = SetStretchBltMode(dc, HALFTONE);
+  // COLORONCOLOR evita o filtro HALFTONE pesado em cada paint. Para vídeo
+  // em movimento isso reduz bastante o custo de apresentação no Windows.
+  const int oldStretchMode = SetStretchBltMode(dc, COLORONCOLOR);
   const int renderedLines = StretchDIBits(
     dc, drawX, drawY, drawWidth, drawHeight,
     0, 0, frame.width, frame.height,
@@ -62303,7 +62480,9 @@ static bool nativeTelepromptDrawHeldVideoFrame(
     VSHookMacDrawTelepromptBitmap(
       dc, framePixels,
       frame.width, frame.height, frame.stride / 4,
-      false, drawX, drawY, drawWidth, drawHeight);
+      false,
+      nativeStartsWith(frame.playbackKey, "video|"),
+      drawX, drawY, drawWidth, drawHeight);
 #endif
 }
 #endif
@@ -62371,6 +62550,10 @@ static bool nativeTelepromptDrawStaticImageDirect(
     g_nativeTelepromptHeldVideoFrame[index];
   held.sharedPixels = decoded.storage;
   held.pixels.clear();
+  held.pixelOffset = decoded.storage && decoded.pixels
+    ? static_cast<std::size_t>(
+        decoded.pixels - decoded.storage->data())
+    : 0;
   held.width = decoded.width;
   held.height = decoded.height;
   held.stride = decoded.stride;
@@ -62562,21 +62745,22 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
       playbackKey, decoderWarmingUp);
   }
 
-  const double fitScale = std::min(
-    static_cast<double>(availableW) / decoded.width,
-    static_cast<double>(availableH) / decoded.height);
-  const double drawScale = std::max(
-    0.01, fitScale * scaleLimit);
-  const int drawW = std::max(
-    1, static_cast<int>(
-      std::lround(decoded.width * drawScale)));
-  const int drawH = std::max(
-    1, static_cast<int>(
-      std::lround(decoded.height * drawScale)));
-  const int drawX =
-    available.left + (availableW - drawW) / 2;
-  const int drawY =
-    available.top + (availableH - drawH) / 2;
+  int drawX = 0;
+  int drawY = 0;
+  int drawW = 1;
+  int drawH = 1;
+  nativeTelepromptVideoDrawRect(
+    decoded.width,
+    decoded.height,
+    available,
+    settings.mediaScale,
+    false,
+    drawX,
+    drawY,
+    drawW,
+    drawH);
+  nativeVideoClearOutsideDrawRect(
+    dc, available, drawX, drawY, drawW, drawH);
 
 #ifdef _WIN32
   BITMAPINFO bitmapInfo{};
@@ -62591,10 +62775,11 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
   // BI_RGB permite zero e evita truncar buffers grandes para DWORD.
   bitmapInfo.bmiHeader.biSizeImage = 0;
 
+  // HALFTONE custa caro e era executado em todo ciclo de pintura, mesmo
+  // quando o vídeo tinha menos FPS que a janela. COLORONCOLOR deixa a
+  // apresentação em tempo real mais leve sem mudar o decoder VLC.
   const int oldStretchMode =
-    SetStretchBltMode(dc, HALFTONE);
-  POINT oldBrushOrigin{0, 0};
-  SetBrushOrgEx(dc, 0, 0, &oldBrushOrigin);
+    SetStretchBltMode(dc, COLORONCOLOR);
   const int renderedLines = StretchDIBits(
     dc,
     drawX, drawY, drawW, drawH,
@@ -62603,8 +62788,6 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
     &bitmapInfo,
     DIB_RGB_COLORS,
     SRCCOPY);
-  SetBrushOrgEx(
-    dc, oldBrushOrigin.x, oldBrushOrigin.y, nullptr);
   if (oldStretchMode != 0) {
     SetStretchBltMode(dc, oldStretchMode);
   }
@@ -62623,6 +62806,7 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
       decoded.height,
       decoded.stride / 4,
       false,
+      true,
       drawX,
       drawY,
       drawW,
@@ -62641,11 +62825,14 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
     // conserva sempre o quadro mais recente sem copiar varios MB por paint.
     held.sharedPixels = decoded.storage;
     held.pixels.clear();
+    held.pixelOffset = static_cast<std::size_t>(
+      decoded.pixels - decoded.storage->data());
     held.stride = decoded.stride;
   } else {
     // Defesa para um decoder futuro que nao publique storage. Ainda assim,
     // atualiza a copia em todo quadro valido, nunca apenas no primeiro.
     held.sharedPixels.reset();
+    held.pixelOffset = 0;
     const int heldStride = decoded.width * 4;
     held.pixels.resize(
       static_cast<std::size_t>(heldStride) *
@@ -62703,11 +62890,10 @@ static bool nativeTelepromptDrawMedia(
           dc, slot, state, settings, available)) {
       return true;
     }
-#ifdef _WIN32
-    return false;
-#endif
-    // SWELL/Metal pode não expor CGContext. Nesse caso o Mac continua pelo
-    // framebuffer Retina abaixo, usando o mesmo snapshot em cache.
+    // Se o HDC direto recusar StretchDIBits (algo que pode ocorrer em alguns
+    // monitores/driveres no Windows), continua no raster LICE abaixo usando o
+    // mesmo snapshot do VLC. Nao troca de decoder nem reabre a midia; apenas
+    // desenha o mesmo quadro por uma superficie compativel com a janela.
   }
 #endif
   const int index = nativeTelepromptIndex(slot);
@@ -62781,12 +62967,17 @@ static bool nativeTelepromptDrawMedia(
     static_cast<double>(availableH) / sourceH);
   const double drawScale = std::max(
     0.01, fitScale * scaleLimit);
-  const int drawW = std::max(
-    1, static_cast<int>(
-      std::lround(sourceW * drawScale)));
-  const int drawH = std::max(
-    1, static_cast<int>(
-      std::lround(sourceH * drawScale)));
+  const bool stretchVideo = false;
+  const int drawW = stretchVideo
+    ? std::max(1, static_cast<int>(std::lround(
+        availableW * scaleLimit)))
+    : std::max(1, static_cast<int>(
+        std::lround(sourceW * drawScale)));
+  const int drawH = stretchVideo
+    ? std::max(1, static_cast<int>(std::lround(
+        availableH * scaleLimit)))
+    : std::max(1, static_cast<int>(
+        std::lround(sourceH * drawScale)));
   const int drawX = available.left + (availableW - drawW) / 2;
   const int drawY = available.top + (availableH - drawH) / 2;
 #ifdef __APPLE__
@@ -62801,6 +62992,7 @@ static bool nativeTelepromptDrawMedia(
         dc, sourceBits,
         sourceW, sourceH, sourceRowSpan,
         sourceFlipped,
+        mediaType == "video",
         drawX, drawY, drawW, drawH)) {
     nativeTelepromptReleaseMediaFrame(frame);
     g_nativeTelepromptMediaStatus[index].store(3);
@@ -62994,7 +63186,6 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
 #endif
     EndPaint(hwnd, &paint);
   };
-  nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
   if (client.right <= client.left || client.bottom <= client.top) {
     finishPaint();
     return;
@@ -63009,7 +63200,16 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   const NativeTelepromptRenderState state =
     nativeTelepromptReadRenderState(slot);
   const bool videoStatePresent =
-    state.mediaType == "video" && !state.mediaPath.empty();
+    nativeLower(state.mediaType) == "video" &&
+    !state.mediaPath.empty();
+  // No Windows, video e overlays precisam permanecer no mesmo backbuffer.
+  // Pintar o video diretamente no HDC da janela e desenhar cronometro, bordas
+  // e cifras logo depois expunha os dois estagios ao compositor: a cada quadro
+  // o video apagava os overlays por um instante, causando a piscada. A copia
+  // final unica apresenta a composicao completa de forma atomica.
+  if (!videoStatePresent) {
+    nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
+  }
   if (videoStatePresent) {
     g_nativeTelepromptVideoStatePresent[index] = true;
   } else if (g_nativeTelepromptVideoStatePresent[index]) {
@@ -63069,8 +63269,14 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   if (mediaOverlayActive) {
     // A mídia usa toda a área da janela e mantém a proporção original.
     // Quando a proporção não coincide, o fundo preto completa as sobras.
-    nativeTelepromptDrawMedia(
-      dc, slot, state, settings, client);
+    if (!nativeTelepromptDrawMedia(
+          dc, slot, state, settings, client)) {
+      nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
+    }
+  } else if (videoStatePresent && !technicalNoticeActive) {
+    // Preview esconde a mídia. Como o caminho de vídeo pinta diretamente no
+    // HDC, limpa explicitamente a saída anterior somente nessa transição.
+    nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
   }
 
   if (settings.clearMode) {
@@ -64462,6 +64668,9 @@ static void nativeRestoreTelepromptWindowsIfRequested()
       nativeOpenTelepromptWindow(slot);
     }
   }
+  if (nativeVideoRequestedOpen() && !nativeVideoWindowIsOpen()) {
+    nativeOpenVideoWindow();
+  }
 }
 
 static void nativeCloseAllTelepromptWindows()
@@ -64522,6 +64731,774 @@ static void nativeCloseAllTelepromptWindows()
     g_nativeTelepromptStaticImageStatus[index].store(0);
   }
   vshook_static_image::clearCache();
+}
+
+// Janela exclusiva da pista MEDIA. Ela reutiliza o mesmo relógio, seeks,
+// loops e tratamento de item esticado do decoder VLC do Teleprompt, mas não
+// compõe letras, cifras, preview, recados ou qualquer outra camada.
+static constexpr const char* kNativeVideoWindowSection =
+  "VS_HOOK_NATIVE_VIDEO_WINDOW";
+static constexpr UINT_PTR kNativeVideoWindowTimer = 0x56535649;
+static NativeTelepromptWindowState g_nativeVideoWindow;
+static std::unique_ptr<vshook_video::Decoder> g_nativeVideoWindowDecoder;
+static NativeTelepromptRenderStateCache g_nativeVideoRenderStateCache;
+static NativeTelepromptHeldVideoFrame g_nativeVideoHeldFrame;
+static std::string g_nativeVideoHeldTargetKey;
+static std::chrono::steady_clock::time_point
+  g_nativeVideoHeldTargetStartedAt{};
+static std::uint64_t g_nativeVideoPresentedSequence = 0;
+static std::string g_nativeVideoPresentedPlaybackKey;
+static int g_nativeVideoPresentedWidth = 0;
+static int g_nativeVideoPresentedHeight = 0;
+static bool g_nativeVideoPresentedStretch = false;
+
+static bool nativeVideoPersistentBool(
+  const char* key, bool fallback)
+{
+  if (!GetExtState_ptr || !key) return fallback;
+  const char* raw = GetExtState_ptr(kNativeVideoWindowSection, key);
+  if (!raw || !*raw) return fallback;
+  const std::string value = nativeLower(nativeTrim(raw));
+  return value == "1" || value == "true" || value == "yes" ||
+    value == "on";
+}
+
+static void nativeVideoWriteBool(const char* key, bool value)
+{
+  if (!SetExtState_ptr || !key) return;
+  SetExtState_ptr(
+    kNativeVideoWindowSection, key, value ? "1" : "0", true);
+}
+
+static int nativeVideoReadInt(const char* key, int fallback)
+{
+  if (!GetExtState_ptr || !key) return fallback;
+  const char* raw = GetExtState_ptr(kNativeVideoWindowSection, key);
+  if (!raw || !*raw) return fallback;
+  char* end = nullptr;
+  const long value = std::strtol(raw, &end, 10);
+  return end && end != raw ? static_cast<int>(value) : fallback;
+}
+
+static void nativeVideoWriteInt(const char* key, int value)
+{
+  if (!SetExtState_ptr || !key) return;
+  const std::string text = std::to_string(value);
+  SetExtState_ptr(kNativeVideoWindowSection, key, text.c_str(), true);
+}
+
+static void nativeVideoSaveNormalRect(const RECT& rect)
+{
+  if (rect.right <= rect.left || rect.bottom <= rect.top) return;
+  nativeVideoWriteInt("WINDOW_X_V1", rect.left);
+  nativeVideoWriteInt("WINDOW_Y_V1", rect.top);
+  nativeVideoWriteInt("WINDOW_W_V1", rect.right - rect.left);
+  nativeVideoWriteInt("WINDOW_H_V1", rect.bottom - rect.top);
+}
+
+static bool nativeVideoStretchEnabled()
+{
+  return nativeVideoPersistentBool("STRETCH_V1", false);
+}
+
+static bool nativeVideoRequestedOpen()
+{
+  return nativeVideoPersistentBool("OPEN_V1", false);
+}
+
+static void nativeToggleVideoStretch()
+{
+  nativeVideoWriteBool(
+    "STRETCH_V1", !nativeVideoStretchEnabled());
+  if (g_nativeVideoWindow.hwnd &&
+      IsWindow(g_nativeVideoWindow.hwnd)) {
+    g_nativeVideoPresentedSequence = 0;
+    InvalidateRect(g_nativeVideoWindow.hwnd, nullptr, FALSE);
+  }
+  if (RefreshToolbar2_ptr && g_videoStretchCommandId != 0) {
+    RefreshToolbar2_ptr(0, g_videoStretchCommandId);
+  }
+}
+
+static NativeTelepromptRenderState nativeVideoBuildRenderState()
+{
+  NativeTelepromptRenderState state;
+  if (!EnumProjects_ptr) return state;
+  char projectPath[4096] = "";
+  ReaProject* project = EnumProjects_ptr(
+    -1, projectPath, static_cast<int>(sizeof(projectPath)));
+  if (!project) return state;
+
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+  }
+  const int playState =
+    GetPlayStateEx_ptr ? GetPlayStateEx_ptr(project) : 0;
+  const bool livePlaying =
+    (playState & 1) == 1 || (playState & 4) == 4;
+  const bool transportPositionActive =
+    livePlaying || (playState & 2) == 2;
+  double livePosition = 0.0;
+  if (transportPositionActive && GetPlayPositionEx_ptr) {
+    livePosition = GetPlayPositionEx_ptr(project);
+  } else if (GetCursorPositionEx_ptr) {
+    livePosition = GetCursorPositionEx_ptr(project);
+  }
+  const std::string liveState = nativeBuildTelepromptStateJson(
+    project, songs, 4, "MEDIA",
+    transportPositionActive, livePosition, std::string());
+  state.mediaProjectIdentity =
+    normalizeSlashes(nativeTrim(projectPath)) + "#" +
+    std::to_string(static_cast<unsigned long long>(
+      reinterpret_cast<std::uintptr_t>(project)));
+  state.mediaType = nativeJsonExtractString(liveState, "mediaType");
+  state.mediaSourcePath =
+    nativeJsonExtractString(liveState, "mediaSourcePath");
+  state.mediaPath = nativeJsonExtractString(liveState, "mediaPath");
+  state.mediaItemGuid = nativeJsonExtractString(liveState, "itemGuid");
+  state.mediaItemIndex = static_cast<int>(nativeTelepromptJsonNumber(
+    liveState, "itemIndex", -1.0));
+  state.mediaCurrentTime = std::max(0.0, nativeTelepromptJsonNumber(
+    liveState, "mediaCurrentTime", 0.0));
+  state.mediaOffset = nativeTelepromptJsonNumber(
+    liveState, "mediaOffset", 0.0);
+  state.mediaPlayrate = std::max(0.000001, nativeTelepromptJsonNumber(
+    liveState, "mediaPlayrate", 1.0));
+  state.mediaSourceLength = std::max(0.0, nativeTelepromptJsonNumber(
+    liveState, "mediaSourceLength", 0.0));
+  state.mediaLoopsSource = nativeTelepromptJsonBool(
+    liveState, "mediaLoopsSource", false);
+  state.itemStart = nativeTelepromptJsonNumber(
+    liveState, "itemStart", 0.0);
+  state.itemEnd = nativeTelepromptJsonNumber(
+    liveState, "itemEnd", 0.0);
+  state.nextChangePosition = nativeTelepromptJsonNumber(
+    liveState, "nextChangePosition", -1.0);
+  state.projectPosition = livePosition;
+  state.playing = livePlaying;
+  return state;
+}
+
+static NativeTelepromptRenderState nativeVideoReadRenderState()
+{
+  NativeTelepromptRenderStateCache& cache =
+    g_nativeVideoRenderStateCache;
+  const auto now = std::chrono::steady_clock::now();
+  ReaProject* project =
+    EnumProjects_ptr ? EnumProjects_ptr(-1, nullptr, 0) : nullptr;
+  const int projectChangeCount =
+    project && GetProjectStateChangeCount_ptr
+      ? GetProjectStateChangeCount_ptr(project) : -1;
+  const int playState =
+    project && GetPlayStateEx_ptr ? GetPlayStateEx_ptr(project) : 0;
+  const bool livePlaying =
+    (playState & 1) == 1 || (playState & 4) == 4;
+  const bool transportPositionActive =
+    livePlaying || (playState & 2) == 2;
+  double livePosition = 0.0;
+  if (project) {
+    if (transportPositionActive && GetPlayPositionEx_ptr) {
+      livePosition = GetPlayPositionEx_ptr(project);
+    } else if (GetCursorPositionEx_ptr) {
+      livePosition = GetCursorPositionEx_ptr(project);
+    }
+  }
+  bool rebuild = !cache.valid || cache.project != project ||
+    cache.projectChangeCount != projectChangeCount ||
+    cache.playState != playState;
+  if (!rebuild) {
+    rebuild = !livePlaying &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - cache.builtAt).count() >= 50;
+  }
+  if (!rebuild &&
+      livePosition < cache.lastObservedPosition - 0.0005) {
+    rebuild = true;
+  }
+  if (!rebuild && cache.state.nextChangePosition >= 0.0 &&
+      livePosition >= cache.state.nextChangePosition - 0.0005) {
+    rebuild = true;
+  }
+  if (rebuild) {
+    cache.state = nativeVideoBuildRenderState();
+    cache.valid = true;
+    cache.project = project;
+    cache.projectChangeCount = projectChangeCount;
+    cache.playState = playState;
+    cache.builtAt = now;
+  }
+  NativeTelepromptRenderState state = cache.state;
+  state.projectPosition = livePosition;
+  state.playing = livePlaying;
+  if (state.mediaType == "image" || state.mediaType == "video") {
+    const double linearSourceTime = state.mediaOffset +
+      std::max(0.0, livePosition - state.itemStart) *
+        state.mediaPlayrate;
+    if (state.mediaLoopsSource && state.mediaSourceLength > 0.000001) {
+      state.mediaCurrentTime =
+        std::fmod(linearSourceTime, state.mediaSourceLength);
+      if (state.mediaCurrentTime < 0.0) {
+        state.mediaCurrentTime += state.mediaSourceLength;
+      }
+    } else {
+      state.mediaCurrentTime = std::max(0.0, linearSourceTime);
+    }
+  }
+  cache.state.projectPosition = state.projectPosition;
+  cache.state.playing = state.playing;
+  cache.state.mediaCurrentTime = state.mediaCurrentTime;
+  cache.lastObservedPosition = livePosition;
+  return state;
+}
+
+static bool nativeVideoDrawBgra(
+  HDC dc,
+  const std::uint8_t* pixels,
+  int sourceWidth,
+  int sourceHeight,
+  int sourceStride,
+  const RECT& available,
+  bool stretch,
+  bool fastScaling)
+{
+  if (!dc || !pixels || sourceWidth <= 0 || sourceHeight <= 0 ||
+      sourceStride < sourceWidth * 4) return false;
+  int drawX = 0;
+  int drawY = 0;
+  int drawW = 1;
+  int drawH = 1;
+  nativeTelepromptVideoDrawRect(
+    sourceWidth, sourceHeight, available, 1.0, stretch,
+    drawX, drawY, drawW, drawH);
+  // Limpa somente as faixas fora do quadro, nunca intercala preto sobre o
+  // vídeo entre duas apresentações consecutivas.
+  nativeVideoClearOutsideDrawRect(
+    dc, available, drawX, drawY, drawW, drawH);
+#ifdef _WIN32
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  info.bmiHeader.biWidth = sourceWidth;
+  info.bmiHeader.biHeight = -sourceHeight;
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+  const int oldMode = SetStretchBltMode(
+    dc, fastScaling ? COLORONCOLOR : HALFTONE);
+  const int lines = StretchDIBits(
+    dc, drawX, drawY, drawW, drawH,
+    0, 0, sourceWidth, sourceHeight,
+    pixels, &info, DIB_RGB_COLORS, SRCCOPY);
+  if (oldMode != 0) SetStretchBltMode(dc, oldMode);
+  return lines > 0;
+#else
+  return sourceStride % 4 == 0 &&
+    VSHookMacDrawTelepromptBitmap(
+      dc, pixels, sourceWidth, sourceHeight,
+      sourceStride / 4, false, fastScaling,
+      drawX, drawY, drawW, drawH);
+#endif
+}
+
+static bool nativeVideoDrawHeldFrame(
+  HDC dc, const RECT& available, bool stretch)
+{
+  const std::uint8_t* pixels = g_nativeVideoHeldFrame.sharedPixels
+    ? g_nativeVideoHeldFrame.sharedPixels->data() +
+        g_nativeVideoHeldFrame.pixelOffset
+    : (g_nativeVideoHeldFrame.pixels.empty()
+        ? nullptr : g_nativeVideoHeldFrame.pixels.data());
+  return nativeVideoDrawBgra(
+    dc, pixels,
+    g_nativeVideoHeldFrame.width,
+    g_nativeVideoHeldFrame.height,
+    g_nativeVideoHeldFrame.stride,
+    available, stretch, true);
+}
+
+static void nativeVideoPaint(HWND hwnd)
+{
+  PAINTSTRUCT paint{};
+  HDC dc = BeginPaint(hwnd, &paint);
+  if (!dc) return;
+  RECT client{0, 0, 0, 0};
+  GetClientRect(hwnd, &client);
+  const NativeTelepromptRenderState state =
+    nativeVideoReadRenderState();
+  const bool stretch = nativeVideoStretchEnabled();
+  const std::string mediaType = nativeLower(state.mediaType);
+  bool rendered = false;
+
+  if (mediaType == "video" && !state.mediaPath.empty()) {
+    if (!g_nativeVideoWindowDecoder) {
+      g_nativeVideoWindowDecoder =
+        std::make_unique<vshook_video::Decoder>();
+    }
+    const int availableW = std::max(
+      1, static_cast<int>(client.right - client.left));
+    const int availableH = std::max(
+      1, static_cast<int>(client.bottom - client.top));
+    int requestedW = 1;
+    int requestedH = 1;
+    nativeTelepromptClampDecodeRequest(
+      availableW, availableH, requestedW, requestedH);
+    const std::string playbackKey =
+      nativeTelepromptMediaHoldKey(state);
+    vshook_video::DecodedFrame decoded;
+    if (g_nativeVideoWindowDecoder->frameAt(
+          state.mediaPath, playbackKey,
+          state.mediaCurrentTime, state.playing,
+          state.mediaPlayrate, requestedW, requestedH,
+          decoded) && decoded.pixels && decoded.width > 0 &&
+        decoded.height > 0 && decoded.stride >= decoded.width * 4) {
+      const bool samePresentedFrame = state.playing &&
+        decoded.sequence != 0 &&
+        decoded.sequence == g_nativeVideoPresentedSequence &&
+        playbackKey == g_nativeVideoPresentedPlaybackKey &&
+        availableW == g_nativeVideoPresentedWidth &&
+        availableH == g_nativeVideoPresentedHeight &&
+        stretch == g_nativeVideoPresentedStretch;
+      rendered = samePresentedFrame || nativeVideoDrawBgra(
+        dc, decoded.pixels, decoded.width, decoded.height,
+        decoded.stride, client, stretch, true);
+      if (!samePresentedFrame && rendered) {
+        g_nativeVideoPresentedSequence = decoded.sequence;
+        g_nativeVideoPresentedPlaybackKey = playbackKey;
+        g_nativeVideoPresentedWidth = availableW;
+        g_nativeVideoPresentedHeight = availableH;
+        g_nativeVideoPresentedStretch = stretch;
+      }
+      g_nativeVideoHeldFrame.sharedPixels = decoded.storage;
+      g_nativeVideoHeldFrame.pixels.clear();
+      g_nativeVideoHeldFrame.pixelOffset =
+        decoded.storage && decoded.pixels
+          ? static_cast<std::size_t>(
+              decoded.pixels - decoded.storage->data())
+          : 0;
+      g_nativeVideoHeldFrame.width = decoded.width;
+      g_nativeVideoHeldFrame.height = decoded.height;
+      g_nativeVideoHeldFrame.stride = decoded.stride;
+      g_nativeVideoHeldFrame.playbackKey = playbackKey;
+      g_nativeVideoHeldTargetKey.clear();
+      g_nativeVideoHeldTargetStartedAt = {};
+    } else {
+      const auto now = std::chrono::steady_clock::now();
+      if (g_nativeVideoHeldTargetKey != playbackKey) {
+        g_nativeVideoHeldTargetKey = playbackKey;
+        g_nativeVideoHeldTargetStartedAt = now;
+      }
+      const bool sameItem =
+        g_nativeVideoHeldFrame.playbackKey == playbackKey;
+      const int holdMs = sameItem
+        ? kNativeTelepromptHeldMediaRecoveryMs
+        : kNativeTelepromptHeldMediaWarmupMs;
+      if (g_nativeVideoHeldTargetStartedAt !=
+            std::chrono::steady_clock::time_point{} &&
+          now - g_nativeVideoHeldTargetStartedAt <=
+            std::chrono::milliseconds(holdMs)) {
+        rendered = nativeVideoDrawHeldFrame(dc, client, stretch);
+      }
+    }
+  } else if (mediaType == "image" && !state.mediaPath.empty()) {
+    if (g_nativeVideoWindowDecoder) {
+      g_nativeVideoWindowDecoder->reset();
+    }
+    g_nativeVideoHeldFrame = NativeTelepromptHeldVideoFrame{};
+    g_nativeVideoPresentedSequence = 0;
+    vshook_static_image::DecodedImage image;
+    if (vshook_static_image::decodeFile(state.mediaPath, image, nullptr)) {
+      rendered = nativeVideoDrawBgra(
+        dc, image.pixels, image.width, image.height,
+        image.stride, client, stretch, false);
+    }
+  } else {
+    if (g_nativeVideoWindowDecoder) {
+      g_nativeVideoWindowDecoder->reset();
+    }
+    g_nativeVideoHeldFrame = NativeTelepromptHeldVideoFrame{};
+    g_nativeVideoHeldTargetKey.clear();
+    g_nativeVideoHeldTargetStartedAt = {};
+    g_nativeVideoPresentedSequence = 0;
+    g_nativeVideoPresentedPlaybackKey.clear();
+  }
+  if (!rendered) {
+    nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
+  }
+  EndPaint(hwnd, &paint);
+}
+
+static void nativeVideoToggleFullscreen()
+{
+  NativeTelepromptWindowState& window = g_nativeVideoWindow;
+  if (!window.hwnd || !IsWindow(window.hwnd)) return;
+  if (!window.fullscreen) {
+    GetWindowRect(window.hwnd, &window.restoreRect);
+    nativeVideoSaveNormalRect(window.restoreRect);
+    const std::vector<NativeTelepromptMonitor> monitors =
+      nativeTelepromptEnumerateMonitors();
+    const NativeTelepromptMonitor* monitor =
+      nativeTelepromptMonitorForRect(monitors, window.restoreRect);
+    if (!monitor) monitor = nativeTelepromptPrimaryMonitor(monitors);
+#ifdef _WIN32
+    window.restoreStyle = GetWindowLongPtr(window.hwnd, GWL_STYLE);
+    window.restoreOwner = reinterpret_cast<HWND>(
+      GetWindowLongPtr(window.hwnd, GWLP_HWNDPARENT));
+    SetWindowLongPtr(window.hwnd, GWLP_HWNDPARENT, 0);
+    SetWindowLongPtr(window.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+    if (monitor) {
+      SetWindowPos(window.hwnd, HWND_TOP,
+        monitor->monitorRect.left, monitor->monitorRect.top,
+        monitor->monitorRect.right - monitor->monitorRect.left,
+        monitor->monitorRect.bottom - monitor->monitorRect.top,
+        SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+#else
+    if (!VSHookMacSetTelepromptFullscreen(window.hwnd, true)) return;
+#endif
+    window.fullscreen = true;
+  } else {
+#ifdef _WIN32
+    SetWindowLongPtr(window.hwnd, GWL_STYLE,
+      window.restoreStyle
+        ? window.restoreStyle
+        : (WS_POPUP | WS_THICKFRAME | WS_VISIBLE));
+    SetWindowLongPtr(window.hwnd, GWLP_HWNDPARENT,
+      reinterpret_cast<LONG_PTR>(window.restoreOwner));
+    window.restoreOwner = nullptr;
+    SetWindowPos(window.hwnd, nullptr,
+      window.restoreRect.left, window.restoreRect.top,
+      window.restoreRect.right - window.restoreRect.left,
+      window.restoreRect.bottom - window.restoreRect.top,
+      SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+#else
+    if (!VSHookMacSetTelepromptFullscreen(window.hwnd, false)) return;
+#endif
+    window.fullscreen = false;
+  }
+  InvalidateRect(window.hwnd, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK nativeVideoWndProc(
+  HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+  NativeTelepromptWindowState& window = g_nativeVideoWindow;
+  switch (message) {
+    case WM_CREATE:
+    case WM_INITDIALOG:
+      SetTimer(hwnd, kNativeVideoWindowTimer, 16, nullptr);
+      return 0;
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_PAINT:
+      nativeVideoPaint(hwnd);
+      return 0;
+    case WM_TIMER:
+      if (wParam == kNativeVideoWindowTimer) {
+#ifdef __APPLE__
+        if (window.fullscreen) {
+          VSHookMacMaintainTelepromptFullscreen(hwnd);
+        }
+#endif
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+      }
+      break;
+    case WM_SIZE:
+      g_nativeVideoPresentedSequence = 0;
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+    case WM_NCHITTEST:
+      return window.fullscreen
+        ? HTCLIENT : nativeTelepromptResizeHitTest(hwnd, lParam);
+    case WM_SETCURSOR: {
+      const int hitTest = LOWORD(lParam);
+      if (nativeTelepromptIsResizeHit(hitTest)) {
+        HCURSOR cursor = LoadCursor(nullptr, IDC_SIZEWE);
+        if (hitTest == HTTOP || hitTest == HTBOTTOM) {
+          cursor = LoadCursor(nullptr, IDC_SIZENS);
+        } else if (hitTest == HTTOPLEFT ||
+                   hitTest == HTBOTTOMRIGHT) {
+          cursor = LoadCursor(nullptr, IDC_SIZENWSE);
+        } else if (hitTest == HTTOPRIGHT ||
+                   hitTest == HTBOTTOMLEFT) {
+          cursor = LoadCursor(nullptr, IDC_SIZENESW);
+        }
+        SetCursor(cursor);
+        return 1;
+      }
+      break;
+    }
+    case WM_GETMINMAXINFO: {
+      MINMAXINFO* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+      if (limits) {
+        limits->ptMinTrackSize.x = 420;
+        limits->ptMinTrackSize.y = 260;
+        return 0;
+      }
+      break;
+    }
+#ifndef _WIN32
+    case WM_NCLBUTTONDOWN:
+      if (!window.fullscreen &&
+          nativeTelepromptIsResizeHit(static_cast<int>(wParam))) {
+        window.dragging = false;
+        window.resizing = true;
+        window.resizeHitTest = static_cast<int>(wParam);
+        GetCursorPos(&window.resizeStartCursor);
+        GetWindowRect(hwnd, &window.resizeStartWindow);
+        SetCapture(hwnd);
+        return 0;
+      }
+      break;
+    case WM_NCLBUTTONUP:
+      if (window.resizing) {
+        window.resizing = false;
+        window.resizeHitTest = HTNOWHERE;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        RECT rect{0, 0, 0, 0};
+        if (GetWindowRect(hwnd, &rect)) nativeVideoSaveNormalRect(rect);
+        return 0;
+      }
+      break;
+#endif
+    case WM_LBUTTONDBLCLK:
+      window.dragging = false;
+      window.pendingDoubleClickAction = 1;
+      SetCapture(hwnd);
+      return 0;
+    case WM_RBUTTONDBLCLK:
+      window.dragging = false;
+      window.pendingDoubleClickAction = 2;
+      SetCapture(hwnd);
+      return 0;
+    case WM_CONTEXTMENU:
+      // A janela nao possui menu de contexto. Consumir tambem impede que o
+      // clique direito seja encaminhado ao grid do REAPER que esta atras.
+      return 0;
+    case WM_LBUTTONDOWN:
+      if (!window.fullscreen) {
+        window.dragging = true;
+        GetCursorPos(&window.dragStartCursor);
+        GetWindowRect(hwnd, &window.dragStartWindow);
+        SetCapture(hwnd);
+      }
+      return 0;
+    case WM_MOUSEMOVE:
+#ifndef _WIN32
+      if (window.resizing && GetCapture() == hwnd) {
+        nativeTelepromptApplyManualResize(window);
+        return 0;
+      }
+#endif
+      if (window.dragging && GetCapture() == hwnd) {
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        SetWindowPos(hwnd, nullptr,
+          window.dragStartWindow.left +
+            cursor.x - window.dragStartCursor.x,
+          window.dragStartWindow.top +
+            cursor.y - window.dragStartCursor.y,
+          0, 0, SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+        return 0;
+      }
+      break;
+    case WM_LBUTTONUP:
+      if (window.pendingDoubleClickAction == 1) {
+        window.pendingDoubleClickAction = 0;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        nativeVideoToggleFullscreen();
+        return 0;
+      }
+#ifndef _WIN32
+      if (window.resizing) {
+        window.resizing = false;
+        window.resizeHitTest = HTNOWHERE;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        RECT rect{0, 0, 0, 0};
+        if (GetWindowRect(hwnd, &rect)) nativeVideoSaveNormalRect(rect);
+        return 0;
+      }
+#endif
+      if (window.dragging) {
+        window.dragging = false;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        RECT rect{0, 0, 0, 0};
+        if (!window.fullscreen && GetWindowRect(hwnd, &rect)) {
+          nativeVideoSaveNormalRect(rect);
+        }
+        return 0;
+      }
+      break;
+    case WM_RBUTTONUP:
+      if (window.pendingDoubleClickAction == 2) {
+        window.pendingDoubleClickAction = 0;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        nativeCloseVideoWindow();
+        return 0;
+      }
+      return 0;
+    case WM_CAPTURECHANGED:
+      window.resizing = false;
+      window.resizeHitTest = HTNOWHERE;
+      window.dragging = false;
+      break;
+    case WM_KILLFOCUS:
+      window.spaceKeyDown = false;
+      break;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+      if (wParam == VK_SPACE) {
+        window.spaceKeyDown = false;
+        return 0;
+      }
+      break;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+      if (wParam == VK_SPACE) {
+        if (window.spaceKeyDown) return 0;
+        window.spaceKeyDown = true;
+        if (nativeTimecodeReceiveBlocksLocalSpace()) return 0;
+        if (nativeStopBreakModifierDown()) {
+          g_globalStopBreakRequested.store(true);
+          return 0;
+        }
+        if (g_stopPauseModeEnabled.load()) {
+          g_globalStopPauseRequested.store(true);
+          return 0;
+        }
+        if (Main_OnCommand_ptr) {
+          Main_OnCommand_ptr(kReaperTransportPlayStopCommandId, 0);
+          g_nativeForceStateBuild.store(true);
+        }
+        return 0;
+      }
+      if (wParam == VK_ESCAPE) {
+        if (window.fullscreen) nativeVideoToggleFullscreen();
+        else nativeCloseVideoWindow();
+        return 0;
+      }
+      break;
+#ifdef _WIN32
+    case WM_EXITSIZEMOVE: {
+      RECT rect{0, 0, 0, 0};
+      if (!window.fullscreen && GetWindowRect(hwnd, &rect)) {
+        nativeVideoSaveNormalRect(rect);
+      }
+      return 0;
+    }
+#endif
+    case WM_CLOSE:
+      nativeCloseVideoWindow();
+      return 0;
+    case WM_DESTROY:
+      KillTimer(hwnd, kNativeVideoWindowTimer);
+#ifdef __APPLE__
+      VSHookMacReleaseTelepromptFullscreen(hwnd);
+#endif
+      if (window.hwnd == hwnd) window.hwnd = nullptr;
+      return 0;
+    default:
+      break;
+  }
+  return DefWindowProc(hwnd, message, wParam, lParam);
+}
+
+static bool nativeVideoWindowIsOpen()
+{
+  return g_nativeVideoWindow.hwnd &&
+    IsWindow(g_nativeVideoWindow.hwnd);
+}
+
+static bool nativeOpenVideoWindow()
+{
+  if (nativeVideoWindowIsOpen()) {
+    ShowWindow(g_nativeVideoWindow.hwnd, SW_SHOW);
+    SetFocus(g_nativeVideoWindow.hwnd);
+    return true;
+  }
+  const int savedX = nativeVideoReadInt("WINDOW_X_V1", 180);
+  const int savedY = nativeVideoReadInt("WINDOW_Y_V1", 140);
+  const int savedW = std::max(
+    420, nativeVideoReadInt("WINDOW_W_V1", 960));
+  const int savedH = std::max(
+    260, nativeVideoReadInt("WINDOW_H_V1", 540));
+  HWND hwnd = nullptr;
+#ifdef _WIN32
+  const wchar_t* className = L"VS_HOOK_NATIVE_VIDEO_WINDOW";
+  WNDCLASSEXW wc{};
+  wc.cbSize = sizeof(wc);
+  if (!GetClassInfoExW(g_pluginInstance, className, &wc)) {
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc = nativeVideoWndProc;
+    wc.hInstance = g_pluginInstance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = className;
+    if (!RegisterClassExW(&wc)) return false;
+  }
+  hwnd = CreateWindowExW(
+    WS_EX_TOOLWINDOW, className, L"VS Hook - Vídeo",
+    WS_POPUP | WS_THICKFRAME | WS_VISIBLE,
+    savedX, savedY, savedW, savedH,
+    GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
+    nullptr, g_pluginInstance, nullptr);
+#else
+  const char* resizableWindow = reinterpret_cast<const char*>(
+    static_cast<INT_PTR>(0x400001));
+  hwnd = CreateDialogParam(
+    g_pluginInstance, resizableWindow,
+    GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
+    reinterpret_cast<DLGPROC>(nativeVideoWndProc), 0);
+  if (hwnd) {
+    SetWindowText(hwnd, "VS Hook - Vídeo");
+    SetWindowPos(hwnd, nullptr,
+      savedX, savedY, savedW, savedH,
+      SWP_NOZORDER | SWP_NOACTIVATE);
+  }
+#endif
+  if (!hwnd) return false;
+  g_nativeVideoWindow.hwnd = hwnd;
+  ShowWindow(hwnd, SW_SHOW);
+  SetFocus(hwnd);
+  nativeVideoWriteBool("OPEN_V1", true);
+  if (RefreshToolbar2_ptr && g_videoWindowCommandId != 0) {
+    RefreshToolbar2_ptr(0, g_videoWindowCommandId);
+  }
+  InvalidateRect(hwnd, nullptr, FALSE);
+  return true;
+}
+
+static void nativeCloseVideoWindow(bool clearRequestedState)
+{
+  if (clearRequestedState) nativeVideoWriteBool("OPEN_V1", false);
+  HWND hwnd = g_nativeVideoWindow.hwnd;
+  if (hwnd && IsWindow(hwnd)) {
+    RECT rect{0, 0, 0, 0};
+    if (!g_nativeVideoWindow.fullscreen &&
+        GetWindowRect(hwnd, &rect)) {
+      nativeVideoSaveNormalRect(rect);
+    }
+    DestroyWindow(hwnd);
+  }
+  g_nativeVideoWindow = NativeTelepromptWindowState{};
+  if (g_nativeVideoWindowDecoder) {
+    g_nativeVideoWindowDecoder->reset();
+  }
+  g_nativeVideoWindowDecoder.reset();
+  g_nativeVideoHeldFrame = NativeTelepromptHeldVideoFrame{};
+  g_nativeVideoPresentedSequence = 0;
+  g_nativeVideoPresentedPlaybackKey.clear();
+  g_nativeVideoRenderStateCache = NativeTelepromptRenderStateCache{};
+  if (RefreshToolbar2_ptr && g_videoWindowCommandId != 0) {
+    RefreshToolbar2_ptr(0, g_videoWindowCommandId);
+  }
+}
+
+static void nativeToggleVideoWindow()
+{
+  if (nativeVideoWindowIsOpen()) nativeCloseVideoWindow();
+  else nativeOpenVideoWindow();
 }
 
 static void nativeOpenTelepromptElectronApp(bool recados)
@@ -73047,6 +74024,13 @@ static std::string nativeBuildTpMediaResponse(const std::string& req)
     return nativeHttpResponse(400, "{\"ok\":false,\"error\":\"missing_media_path\"}");
   }
   mediaPath = nativeTrim(mediaPath);
+  // Vídeo pertence exclusivamente às janelas nativas do Teleprompt. O app
+  // remoto recebe letras e imagens, portanto a extensão não abre nem envia
+  // arquivos de vídeo pela rede.
+  if (nativeDetectTelepromptMediaType(mediaPath) == "video") {
+    return nativeHttpResponse(
+      404, "{\"ok\":false,\"error\":\"network_video_disabled\"}");
+  }
   size_t totalSize = 0;
   if (!nativeGetBinaryFileSize(mediaPath, totalSize)) {
     return nativeHttpResponse(404, "{\"ok\":false,\"error\":\"media_not_found\"}");
@@ -74903,6 +75887,7 @@ static void nativeSetExtensionBypass(bool enabled)
     // Limpa a intencao de restaurar Teleprompts ao reabrir o painel.
     nativeCloseTelepromptWindow(1, true);
     nativeCloseTelepromptWindow(2, true);
+    nativeCloseVideoWindow(true);
     nativeCloseAllTelepromptWindows();
     nativeCloseBigClockWindow(0);
     nativeCloseBigClockWindow(1);
@@ -75647,6 +76632,12 @@ static bool initialize()
     plugin_register_ptr("custom_action",
       (void*)&g_telepromptSettingsAction);
   if (g_telepromptSettingsCommandId != 0) hasRegisteredAction = true;
+  g_videoWindowCommandId = plugin_register_ptr(
+    "custom_action", (void*)&g_videoWindowAction);
+  if (g_videoWindowCommandId != 0) hasRegisteredAction = true;
+  g_videoStretchCommandId = plugin_register_ptr(
+    "custom_action", (void*)&g_videoStretchAction);
+  if (g_videoStretchCommandId != 0) hasRegisteredAction = true;
   g_recadosCommandId =
     plugin_register_ptr(
       "custom_action", (void*)&g_recadosAction);
@@ -75823,6 +76814,7 @@ static void shutdown()
   nativeDestroyBpmScanAccessor();
 
   nativeCloseAppActivePanel();
+  nativeCloseVideoWindow(false);
   nativeCloseAllTelepromptWindows();
   nativeCloseBigClockWindow(0);
   nativeCloseBigClockWindow(1);
@@ -75897,6 +76889,14 @@ static void shutdown()
     plugin_register_ptr("-custom_action",
       (void*)&g_telepromptSettingsAction);
     g_telepromptSettingsCommandId = 0;
+  }
+  if (g_videoWindowCommandId != 0) {
+    plugin_register_ptr("-custom_action", (void*)&g_videoWindowAction);
+    g_videoWindowCommandId = 0;
+  }
+  if (g_videoStretchCommandId != 0) {
+    plugin_register_ptr("-custom_action", (void*)&g_videoStretchAction);
+    g_videoStretchCommandId = 0;
   }
   if (g_recadosCommandId != 0) {
     plugin_register_ptr(

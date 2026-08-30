@@ -21,6 +21,7 @@ extern "C" bool VSHookMacDrawTelepromptBitmap(
   int sourceHeight,
   int sourceRowSpanPixels,
   bool sourceFlipped,
+  bool fastScaling,
   int destinationX,
   int destinationY,
   int destinationWidth,

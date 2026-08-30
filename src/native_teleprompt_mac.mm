@@ -207,6 +207,7 @@ extern "C" bool VSHookMacDrawTelepromptBitmap(
   int sourceHeight,
   int sourceRowSpanPixels,
   bool sourceFlipped,
+  bool fastScaling,
   int destinationX,
   int destinationY,
   int destinationWidth,
@@ -252,8 +253,10 @@ extern "C" bool VSHookMacDrawTelepromptBitmap(
 
   CGContextSaveGState(context);
   CGContextSetInterpolationQuality(
-    context, kCGInterpolationHigh);
-  CGContextSetShouldAntialias(context, true);
+    context, fastScaling
+      ? kCGInterpolationLow
+      : kCGInterpolationHigh);
+  CGContextSetShouldAntialias(context, !fastScaling);
   CGContextTranslateCTM(
     context,
     static_cast<CGFloat>(destinationX),
