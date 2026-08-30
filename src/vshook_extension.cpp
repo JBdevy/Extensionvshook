@@ -12368,11 +12368,13 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   // 3) imagem entra se não houver vídeo.
   bool itemFound = false;
   int chosenItemIndex = -1;
+  std::string chosenItemGuid;
   double chosenItemStart = 0.0;
   double chosenItemEnd = 0.0;
 
   int chosenMediaPriority = 0; // 0 nenhum, 1 imagem, 2 vídeo
   int chosenMediaIndex = -1;
+  std::string chosenMediaGuid;
   double chosenMediaStart = 0.0;
   double chosenMediaEnd = 0.0;
   double chosenMediaOffset = 0.0;
@@ -12405,6 +12407,7 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
 
   std::vector<std::string> textParts;
   int chosenTextIndex = -1;
+  std::string chosenTextGuid;
   double chosenTextStart = 0.0;
   double chosenTextEnd = 0.0;
 
@@ -12494,6 +12497,7 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
       itemFound = true;
       if (chosenItemIndex < 0) {
         chosenItemIndex = i;
+        chosenItemGuid = nativeMediaItemGuid(currentItem, std::string());
         chosenItemStart = itemStart;
         chosenItemEnd = itemEnd;
       }
@@ -12509,6 +12513,8 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
         appendTextPart(currentText);
         if (chosenTextIndex < 0) {
           chosenTextIndex = i;
+          chosenTextGuid = nativeMediaItemGuid(
+            currentItem, std::string());
           chosenTextStart = itemStart;
           chosenTextEnd = itemEnd;
         }
@@ -12517,6 +12523,8 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
       if (currentPriority > 0 && (currentPriority > chosenMediaPriority || (currentPriority == chosenMediaPriority && i >= chosenMediaIndex))) {
         chosenMediaPriority = currentPriority;
         chosenMediaIndex = i;
+        chosenMediaGuid = nativeMediaItemGuid(
+          currentItem, std::string());
         chosenMediaStart = itemStart;
         chosenMediaEnd = itemEnd;
         mediaSourcePath = currentMediaSourcePath;
@@ -12557,10 +12565,12 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
 
   if (chosenMediaPriority > 0) {
     chosenItemIndex = chosenMediaIndex;
+    chosenItemGuid = chosenMediaGuid;
     chosenItemStart = chosenMediaStart;
     chosenItemEnd = chosenMediaEnd;
   } else if (chosenTextIndex >= 0) {
     chosenItemIndex = chosenTextIndex;
+    chosenItemGuid = chosenTextGuid;
     chosenItemStart = chosenTextStart;
     chosenItemEnd = chosenTextEnd;
     mediaType = "text";
@@ -12614,7 +12624,7 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   out << "\"trackIndex\":" << trackIndex << ",";
   out << "\"itemFound\":" << (itemFound ? "true" : "false") << ",";
   out << "\"itemIndex\":" << chosenItemIndex << ",";
-  out << "\"itemGuid\":\"\",";
+  out << "\"itemGuid\":" << nativeJsonString(chosenItemGuid) << ",";
   out << "\"itemStart\":" << nativeNumber(chosenItemStart) << ",";
   out << "\"itemEnd\":" << nativeNumber(chosenItemEnd) << ",";
   out << "\"progressStart\":" << nativeNumber(progressStart) << ",";
@@ -59220,6 +59230,8 @@ struct NativeTelepromptRenderState {
   std::string mediaType = "text";
   std::string mediaSourcePath;
   std::string mediaPath;
+  std::string mediaItemGuid;
+  std::string mediaProjectIdentity;
   int mediaItemIndex = -1;
   double mediaCurrentTime = 0.0;
   double mediaOffset = 0.0;
@@ -59266,6 +59278,10 @@ static double g_nativeTelepromptDecodedVideoTimestamp[2]{-1.0, -1.0};
 static std::string g_nativeTelepromptDecodedVideoPath[2];
 static std::unique_ptr<vshook_video::Decoder>
   g_nativeTelepromptPlatformVideoDecoder[2];
+// Marca somente a presenca real de um item de video no estado da pista.
+// Preview e recados podem esconder temporariamente a midia, mas nao devem
+// desmontar o decoder que continua acompanhando o transporte por baixo.
+static bool g_nativeTelepromptVideoStatePresent[2]{false, false};
 static PCM_source* g_nativeTelepromptVideoSource[2]{nullptr, nullptr};
 static std::string g_nativeTelepromptVideoSourcePath[2];
 static std::chrono::steady_clock::time_point
@@ -59299,6 +59315,9 @@ static int g_nativeTelepromptHeldMediaKind[2]{0, 0};
 // Uma midia anterior pode cobrir somente o curto aquecimento do novo decoder.
 // A chave impede que uma falha permanente de B deixe A presa na tela.
 static constexpr int kNativeTelepromptHeldMediaWarmupMs = 1000;
+// Durante a recuperacao da propria midia, o ultimo quadro evita um flash
+// preto, mas nunca pode virar uma tela congelada permanente.
+static constexpr int kNativeTelepromptHeldMediaRecoveryMs = 4000;
 static std::string g_nativeTelepromptHeldTransitionTargetKey[2];
 static std::chrono::steady_clock::time_point
   g_nativeTelepromptHeldTransitionStartedAt[2]{};
@@ -59364,6 +59383,28 @@ static NativeTelepromptRenderStateCache
 static int nativeTelepromptIndex(int slot)
 {
   return slot == 2 ? 1 : 0;
+}
+
+static void nativeTelepromptResetPlatformVideoPlayback(int index)
+{
+  if (index < 0 || index >= 2) return;
+  g_nativeTelepromptVideoStatePresent[index] = false;
+  if (g_nativeTelepromptPlatformVideoDecoder[index]) {
+    g_nativeTelepromptPlatformVideoDecoder[index]->reset();
+  }
+  g_nativeTelepromptDecodedVideoTimestamp[index] = -1.0;
+  g_nativeTelepromptDecodedVideoPath[index].clear();
+  g_nativeTelepromptPlatformVideoStatus[index].store(0);
+  // Fora de um item nao existe quadro valido para conservar. O hold serve
+  // somente para aquecer/recuperar uma midia ainda ativa; em uma area vazia a
+  // janela precisa voltar imediatamente ao fundo preto.
+  g_nativeTelepromptHeldVideoFrame[index] =
+    NativeTelepromptHeldVideoFrame{};
+  if (g_nativeTelepromptHeldMediaKind[index] == 2) {
+    g_nativeTelepromptHeldMediaKind[index] = 0;
+  }
+  g_nativeTelepromptHeldTransitionTargetKey[index].clear();
+  g_nativeTelepromptHeldTransitionStartedAt[index] = {};
 }
 
 static double nativeTelepromptJsonNumber(
@@ -60562,6 +60603,8 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
     snapshot, telepromptPrefix + "MediaSourcePath");
   state.mediaPath = nativeJsonExtractString(
     snapshot, telepromptPrefix + "MediaPath");
+  state.mediaItemGuid = nativeJsonExtractString(
+    snapshot, telepromptPrefix + "ItemGuid");
   state.mediaItemIndex = static_cast<int>(
     nativeTelepromptJsonNumber(
       snapshot, (telepromptPrefix + "ItemIndex").c_str(), -1.0));
@@ -60610,8 +60653,18 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
   // TELEPROMPT a cada quadro para imagem, vídeo e letra entrarem exatamente
   // na posição do item, acompanhando a mesma posição viva usada pelo REAPER.
   if (EnumProjects_ptr) {
-    ReaProject* project = EnumProjects_ptr(-1, nullptr, 0);
+    char projectPath[4096] = "";
+    ReaProject* project = EnumProjects_ptr(
+      -1, projectPath, static_cast<int>(sizeof(projectPath)));
     if (project) {
+      // Caminho + instancia aberta + GUID do item impedem reutilizar um player
+      // de outro projeto. O ponteiro continua sendo o fallback para projetos
+      // ainda nao salvos, cujo caminho e vazio.
+      state.mediaProjectIdentity =
+        normalizeSlashes(nativeTrim(projectPath)) + "#" +
+        std::to_string(
+          static_cast<unsigned long long>(
+            reinterpret_cast<std::uintptr_t>(project)));
       const int playState =
         GetPlayStateEx_ptr ? GetPlayStateEx_ptr(project) : 0;
       const bool livePlaying =
@@ -60652,6 +60705,8 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
         nativeJsonExtractString(liveState, "mediaSourcePath");
       state.mediaPath =
         nativeJsonExtractString(liveState, "mediaPath");
+      state.mediaItemGuid =
+        nativeJsonExtractString(liveState, "itemGuid");
       state.mediaItemIndex = static_cast<int>(
         nativeTelepromptJsonNumber(
           liveState, "itemIndex", -1.0));
@@ -61432,6 +61487,9 @@ struct NativeTelepromptMediaFrame {
   bool warmingUp = false;
 };
 
+static std::string nativeTelepromptMediaHoldKey(
+  const NativeTelepromptRenderState& state);
+
 static bool nativeTelepromptBitmapFingerprint(
   LICE_IBitmap* image,
   std::uint64_t& fingerprint)
@@ -61604,10 +61662,7 @@ nativeTelepromptAcquirePlatformVideoFrame(
   }
 
   const std::string playbackKey =
-    state.mediaPath + "|" +
-    std::to_string(state.mediaItemIndex) + "|" +
-    nativeNumber(state.itemStart) + "|" +
-    nativeNumber(state.itemEnd);
+    nativeTelepromptMediaHoldKey(state);
   vshook_video::DecodedFrame decoded;
   if (!g_nativeTelepromptPlatformVideoDecoder[index]->frameAt(
         state.mediaPath, playbackKey, state.mediaCurrentTime,
@@ -62258,10 +62313,26 @@ static std::string nativeTelepromptMediaHoldKey(
 {
   const std::string mediaType = nativeLower(state.mediaType);
   if (mediaType == "video") {
-    return state.mediaPath + "|" +
-      std::to_string(state.mediaItemIndex) + "|" +
-      nativeNumber(state.itemStart) + "|" +
-      nativeNumber(state.itemEnd);
+    const std::string itemIdentity = !state.mediaItemGuid.empty()
+      ? std::string("guid:") + state.mediaItemGuid
+      : std::string("index:") +
+          std::to_string(state.mediaItemIndex);
+    std::string key = std::string("video|") + state.mediaPath +
+      "|project:" + state.mediaProjectIdentity +
+      "|item:" + itemIdentity +
+      "|start:" + nativeNumber(state.itemStart) +
+      "|end:" + nativeNumber(state.itemEnd) +
+      "|offset:" + nativeNumber(state.mediaOffset) +
+      "|rate:" + nativeNumber(state.mediaPlayrate) +
+      "|loop:" + (state.mediaLoopsSource ? "1" : "0");
+    // O comprimento participa do mapeamento somente quando existe loop. Para
+    // item comum, o REAPER pode descobri-lo alguns paints depois e isso nao
+    // deve trocar a chave/recriar um player que ja esta reproduzindo.
+    if (state.mediaLoopsSource) {
+      key += "|source-length:" +
+        nativeNumber(state.mediaSourceLength);
+    }
+    return key;
   }
   if (mediaType == "image" && !state.mediaPath.empty()) {
     return std::string("image|") + state.mediaPath;
@@ -62350,9 +62421,21 @@ static bool nativeTelepromptDrawHeldMediaFrame(
   }
 
   if (heldKey == requestedKey) {
-    // Uma falha transitoria pode reutilizar indefinidamente o ultimo quadro
-    // valido da propria midia; ele nunca representa o item anterior.
-    nativeTelepromptResetHeldMediaTransition(index);
+    const auto now = std::chrono::steady_clock::now();
+    if (g_nativeTelepromptHeldTransitionTargetKey[index] !=
+          requestedKey ||
+        g_nativeTelepromptHeldTransitionStartedAt[index] ==
+          std::chrono::steady_clock::time_point{}) {
+      g_nativeTelepromptHeldTransitionTargetKey[index] = requestedKey;
+      g_nativeTelepromptHeldTransitionStartedAt[index] = now;
+    }
+    const int holdLimitMs = decoderWarmingUp
+      ? kNativeTelepromptHeldMediaRecoveryMs
+      : kNativeTelepromptHeldMediaWarmupMs;
+    if (now - g_nativeTelepromptHeldTransitionStartedAt[index] >=
+        std::chrono::milliseconds(holdLimitMs)) {
+      return false;
+    }
   } else {
     if (!decoderWarmingUp) {
       nativeTelepromptResetHeldMediaTransition(index);
@@ -62925,6 +63008,16 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   }
   const NativeTelepromptRenderState state =
     nativeTelepromptReadRenderState(slot);
+  const bool videoStatePresent =
+    state.mediaType == "video" && !state.mediaPath.empty();
+  if (videoStatePresent) {
+    g_nativeTelepromptVideoStatePresent[index] = true;
+  } else if (g_nativeTelepromptVideoStatePresent[index]) {
+    // A pista realmente deixou de fornecer video. Nao usa preview, recado ou
+    // visibilidade como criterio: esses overlays apenas cobrem a midia e nao
+    // podem interromper seu decoder.
+    nativeTelepromptResetPlatformVideoPlayback(index);
+  }
   NativeTechnicalNotice technicalNotice;
   NativeTechnicalNoticeSettings technicalNoticeSettings;
   const bool technicalNoticeActive =
@@ -62968,6 +63061,8 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   if (!hasMedia && !technicalNoticeActive) {
     // Texto/preview nao participa da retencao de midia. Evita que uma imagem
     // antiga reapareca se uma nova midia for aberta muito tempo depois.
+    g_nativeTelepromptHeldVideoFrame[index] =
+      NativeTelepromptHeldVideoFrame{};
     g_nativeTelepromptHeldMediaKind[index] = 0;
     nativeTelepromptResetHeldMediaTransition(index);
   }
@@ -64143,6 +64238,10 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       KillTimer(hwnd,
         kNativeTelepromptTimerBase +
           static_cast<UINT_PTR>(slot));
+      // Sem janela nao existe consumidor de video. Para o player assíncrono
+      // uma unica vez; ao reabrir, o mesmo objeto recebe um estado novo.
+      nativeTelepromptResetPlatformVideoPlayback(
+        nativeTelepromptIndex(slot));
 #ifdef __APPLE__
       VSHookMacReleaseTelepromptFullscreen(hwnd);
 #endif
@@ -67141,6 +67240,7 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string tp1MediaOffset = nativeJsonExtractString(tp1Json, "mediaOffset");
   const std::string tp1MediaPlayrate = nativeJsonExtractString(tp1Json, "mediaPlayrate");
   const std::string tp1ItemIndex = nativeJsonExtractString(tp1Json, "itemIndex");
+  const std::string tp1ItemGuid = nativeJsonExtractString(tp1Json, "itemGuid");
   const double tp1ItemStart = nativeTelepromptJsonNumber(tp1Json, "itemStart", 0.0);
   const double tp1ItemEnd = nativeTelepromptJsonNumber(tp1Json, "itemEnd", 0.0);
   const double tp1ProgressStart = nativeTelepromptJsonNumber(
@@ -67167,6 +67267,7 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string tp2MediaOffset = nativeJsonExtractString(tp2Json, "mediaOffset");
   const std::string tp2MediaPlayrate = nativeJsonExtractString(tp2Json, "mediaPlayrate");
   const std::string tp2ItemIndex = nativeJsonExtractString(tp2Json, "itemIndex");
+  const std::string tp2ItemGuid = nativeJsonExtractString(tp2Json, "itemGuid");
   const double tp2ItemStart = nativeTelepromptJsonNumber(tp2Json, "itemStart", 0.0);
   const double tp2ItemEnd = nativeTelepromptJsonNumber(tp2Json, "itemEnd", 0.0);
   const double tp2ProgressStart = nativeTelepromptJsonNumber(
@@ -67877,6 +67978,7 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"tp1MediaOffset\":" << (tp1MediaOffset.empty() ? std::string("0") : tp1MediaOffset) << ",";
   json << "\"tp1MediaPlayrate\":" << (tp1MediaPlayrate.empty() ? std::string("1") : tp1MediaPlayrate) << ",";
   json << "\"telepromptTp1ItemIndex\":" << (tp1ItemIndex.empty() ? std::string("-1") : tp1ItemIndex) << ",";
+  json << "\"telepromptTp1ItemGuid\":" << nativeJsonString(tp1ItemGuid) << ",";
   json << "\"telepromptTp1ItemStart\":" << nativeNumber(tp1ItemStart) << ",";
   json << "\"telepromptTp1ItemEnd\":" << nativeNumber(tp1ItemEnd) << ",";
   json << "\"telepromptTp1ProgressStart\":" << nativeNumber(tp1ProgressStart) << ",";
@@ -67903,6 +68005,7 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"tp2MediaOffset\":" << (tp2MediaOffset.empty() ? std::string("0") : tp2MediaOffset) << ",";
   json << "\"tp2MediaPlayrate\":" << (tp2MediaPlayrate.empty() ? std::string("1") : tp2MediaPlayrate) << ",";
   json << "\"telepromptTp2ItemIndex\":" << (tp2ItemIndex.empty() ? std::string("-1") : tp2ItemIndex) << ",";
+  json << "\"telepromptTp2ItemGuid\":" << nativeJsonString(tp2ItemGuid) << ",";
   json << "\"telepromptTp2ItemStart\":" << nativeNumber(tp2ItemStart) << ",";
   json << "\"telepromptTp2ItemEnd\":" << nativeNumber(tp2ItemEnd) << ",";
   json << "\"telepromptTp2ProgressStart\":" << nativeNumber(tp2ProgressStart) << ",";

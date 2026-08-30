@@ -38,6 +38,19 @@ struct libvlc_media_t;
 struct libvlc_media_player_t;
 using libvlc_time_t = std::int64_t;
 
+// Mantem os mesmos valores de libvlc_state_t sem exigir os headers do VLC no
+// computador que compila a extensao. O runtime continua carregado dinamicamente.
+enum VlcPlayerState : int {
+  kVlcNothingSpecial = 0,
+  kVlcOpening = 1,
+  kVlcBuffering = 2,
+  kVlcPlaying = 3,
+  kVlcPaused = 4,
+  kVlcStopped = 5,
+  kVlcEnded = 6,
+  kVlcError = 7
+};
+
 using VideoLockCallback = void* (*)(void*, void**);
 using VideoUnlockCallback = void (*)(void*, void*, void* const*);
 using VideoDisplayCallback = void (*)(void*, void*);
@@ -283,6 +296,7 @@ struct VlcApi {
   void (*setTime)(libvlc_media_player_t*, libvlc_time_t) = nullptr;
   void (*nextFrame)(libvlc_media_player_t*) = nullptr;
   libvlc_time_t (*getTime)(libvlc_media_player_t*) = nullptr;
+  int (*getState)(libvlc_media_player_t*) = nullptr;
   int (*setRate)(libvlc_media_player_t*, float) = nullptr;
   int (*setMute)(libvlc_media_player_t*, int) = nullptr;
   void (*setVideoCallbacks)(
@@ -377,6 +391,9 @@ struct VlcApi {
     // um seek enquanto o player esta pausado. Continua opcional para manter
     // compatibilidade com runtimes que nao exportem essa funcao.
     bind(nextFrame, "libvlc_media_player_next_frame");
+    // Tambem e opcional: o relogio e o heartbeat de video continuam sendo a
+    // verificacao de seguranca quando um runtime compativel nao exporta state.
+    bind(getState, "libvlc_media_player_get_state");
     return true;
   }
 };
@@ -437,6 +454,12 @@ struct Decoder::Impl {
     std::uint64_t serial = 0;
   };
 
+  struct FrameHeartbeat {
+    bool hasFrame = false;
+    std::uint64_t sequence = 0;
+    std::chrono::steady_clock::time_point publishedAt{};
+  };
+
   VlcApi api;
   libvlc_instance_t* instance = nullptr;
   libvlc_media_t* media = nullptr;
@@ -462,6 +485,8 @@ struct Decoder::Impl {
   int publishedHeight = 0;
   int publishedStride = 0;
   double publishedTimestamp = -1.0;
+  std::uint64_t publishedFrameSequence = 0;
+  std::chrono::steady_clock::time_point lastFramePublishedAt{};
   int formatWidth = 1;
   int formatHeight = 1;
   int formatStride = 4;
@@ -477,6 +502,17 @@ struct Decoder::Impl {
   bool previousRequestValid = false;
   double previousRequestSourceTime = 0.0;
   std::chrono::steady_clock::time_point previousRequestWall{};
+  bool initialSyncPending = false;
+  std::chrono::steady_clock::time_point initialSyncForceAt{};
+  std::chrono::steady_clock::time_point playerCreatedAt{};
+  std::chrono::steady_clock::time_point watchdogGraceUntil{};
+  std::chrono::steady_clock::time_point lastWatchdogCheckAt{};
+  std::chrono::steady_clock::time_point lastWatchdogRecoveryAt{};
+  double lastWatchdogRequestedTime = 0.0;
+  double lastWatchdogPlayerTime = -1.0;
+  std::uint64_t lastWatchdogFrameSequence = 0;
+  int watchdogClockStallChecks = 0;
+  int watchdogRecoveryStage = 0;
 
   Impl()
   {
@@ -649,6 +685,9 @@ struct Decoder::Impl {
     self->publishedStride = self->formatStride;
     self->publishedTimestamp =
       self->latestRequestedTime.load(std::memory_order_relaxed);
+    ++self->publishedFrameSequence;
+    self->lastFramePublishedAt =
+      std::chrono::steady_clock::now();
     self->statusCode.store(2, std::memory_order_release);
   }
 
@@ -664,6 +703,17 @@ struct Decoder::Impl {
     publishedHeight = 0;
     publishedStride = 0;
     publishedTimestamp = -1.0;
+    lastFramePublishedAt = {};
+  }
+
+  FrameHeartbeat readFrameHeartbeat()
+  {
+    std::lock_guard<std::mutex> lock(frameMutex);
+    FrameHeartbeat heartbeat;
+    heartbeat.hasFrame = publishedFrame != nullptr;
+    heartbeat.sequence = publishedFrameSequence;
+    heartbeat.publishedAt = lastFramePublishedAt;
+    return heartbeat;
   }
 
   void destroyPlayer()
@@ -678,8 +728,20 @@ struct Decoder::Impl {
       media = nullptr;
     }
     playerStarted = false;
+    activePlaying = false;
     previousRequestValid = false;
     activeStoppedSourceTime = -1.0;
+    initialSyncPending = false;
+    initialSyncForceAt = {};
+    playerCreatedAt = {};
+    watchdogGraceUntil = {};
+    lastWatchdogCheckAt = {};
+    lastWatchdogRecoveryAt = {};
+    lastWatchdogRequestedTime = 0.0;
+    lastWatchdogPlayerTime = -1.0;
+    lastWatchdogFrameSequence = 0;
+    watchdogClockStallChecks = 0;
+    watchdogRecoveryStage = 0;
     {
       std::lock_guard<std::mutex> lock(frameMutex);
       activePath.clear();
@@ -719,8 +781,12 @@ struct Decoder::Impl {
     return true;
   }
 
-  bool createPlayer(const Request& current)
+  bool createPlayer(
+    const Request& current,
+    int recoveryStage = 0)
   {
+    const int requestedRecoveryStage =
+      std::max(0, recoveryStage);
     destroyPlayer();
     maximumWidth = std::max(2, current.requestedWidth);
     maximumHeight = std::max(2, current.requestedHeight);
@@ -746,8 +812,9 @@ struct Decoder::Impl {
     api.setVideoFormatCallbacks(
       player, &Impl::formatCallback, &Impl::cleanupCallback);
     api.setMute(player, 1);
-    api.setRate(player, static_cast<float>(
-      std::max(0.05, std::min(8.0, current.playbackRate))));
+    const double safeRate =
+      std::max(0.05, std::min(8.0, current.playbackRate));
+    api.setRate(player, static_cast<float>(safeRate));
     statusCode.store(1, std::memory_order_release);
     if (api.play(player) != 0) {
       statusCode.store(-204, std::memory_order_release);
@@ -768,11 +835,254 @@ struct Decoder::Impl {
       activeStoppedSourceTime = current.sourceTime;
     }
     activePlaying = current.playing;
-    activeRate = current.playbackRate;
+    activeRate = safeRate;
+    const auto now = std::chrono::steady_clock::now();
+    const FrameHeartbeat heartbeat = readFrameHeartbeat();
+    // play() e assíncrono. O primeiro seek pode chegar enquanto o VLC ainda
+    // esta em Opening e ser simplesmente ignorado. Assim que o player ficar
+    // pronto, applyRequest reaplica uma unica vez o alvo mais recente.
+    initialSyncPending = true;
+    initialSyncForceAt = now + std::chrono::milliseconds(1500);
+    playerCreatedAt = now;
+    watchdogGraceUntil = now + std::chrono::milliseconds(1500);
+    lastWatchdogCheckAt = now;
+    lastWatchdogRecoveryAt = requestedRecoveryStage > 0
+      ? now : std::chrono::steady_clock::time_point{};
+    lastWatchdogRequestedTime = current.sourceTime;
+    lastWatchdogPlayerTime = -1.0;
+    lastWatchdogFrameSequence = heartbeat.sequence;
+    watchdogClockStallChecks = 0;
+    watchdogRecoveryStage = requestedRecoveryStage;
     previousRequestValid = true;
     previousRequestSourceTime = current.sourceTime;
-    previousRequestWall = std::chrono::steady_clock::now();
+    previousRequestWall = now;
     return true;
+  }
+
+  void armWatchdogGrace(
+    const Request& current,
+    const std::chrono::steady_clock::time_point now,
+    std::chrono::milliseconds grace)
+  {
+    const FrameHeartbeat heartbeat = readFrameHeartbeat();
+    watchdogGraceUntil = now + grace;
+    lastWatchdogCheckAt = now;
+    lastWatchdogRequestedTime = current.sourceTime;
+    lastWatchdogPlayerTime = -1.0;
+    lastWatchdogFrameSequence = heartbeat.sequence;
+    watchdogClockStallChecks = 0;
+  }
+
+  bool finishInitialSync(
+    const Request& current,
+    const std::chrono::steady_clock::time_point now,
+    double safeRate)
+  {
+    if (!initialSyncPending || !player) return false;
+
+    const int playerState = api.getState
+      ? api.getState(player) : -1;
+    const libvlc_time_t playerTime = api.getTime(player);
+    const bool stateReady = current.playing
+      ? playerState == kVlcPlaying
+      : (playerState == kVlcPlaying ||
+         playerState == kVlcPaused ||
+         playerState == kVlcStopped ||
+         playerState == kVlcEnded);
+    const bool stateUnavailableButClockReady =
+      playerState < 0 && playerTime >= 0;
+    const bool openingTimedOut =
+      initialSyncForceAt !=
+        std::chrono::steady_clock::time_point{} &&
+      now >= initialSyncForceAt;
+
+    // Aguarda o play assincrono sair de Opening/Buffering. Enquanto isso o
+    // comando inicial continua valendo como best effort e a UI nunca bloqueia.
+    if (!stateReady && !stateUnavailableButClockReady &&
+        !openingTimedOut) {
+      return true;
+    }
+
+    if (playerState == kVlcError) {
+      createPlayer(
+        current, std::max(1, watchdogRecoveryStage + 1));
+      return true;
+    }
+
+    api.setRate(player, static_cast<float>(safeRate));
+    activeRate = safeRate;
+    if (current.playing) {
+      if (api.play(player) != 0) {
+        createPlayer(
+          current, std::max(1, watchdogRecoveryStage + 1));
+        return true;
+      }
+      api.setTime(
+        player, secondsToMilliseconds(current.sourceTime));
+      api.setPause(player, 0);
+      activeStoppedSourceTime = -1.0;
+    } else {
+      api.setPause(player, 1);
+      api.setTime(
+        player, secondsToMilliseconds(current.sourceTime));
+      if (api.nextFrame) api.nextFrame(player);
+      activeStoppedSourceTime = current.sourceTime;
+    }
+    activePlaying = current.playing;
+    initialSyncPending = false;
+    initialSyncForceAt = {};
+    armWatchdogGrace(
+      current, now, std::chrono::milliseconds(900));
+    return true;
+  }
+
+  void runPlaybackWatchdog(
+    const Request& current,
+    const std::chrono::steady_clock::time_point now,
+    double safeRate)
+  {
+    if (!player || !current.playing || initialSyncPending ||
+        now < watchdogGraceUntil) {
+      return;
+    }
+    if (lastWatchdogCheckAt !=
+          std::chrono::steady_clock::time_point{} &&
+        now - lastWatchdogCheckAt <
+          std::chrono::milliseconds(250)) {
+      return;
+    }
+
+    const double checkElapsed = lastWatchdogCheckAt ==
+        std::chrono::steady_clock::time_point{}
+      ? 0.25
+      : std::max(
+          0.001,
+          std::chrono::duration<double>(
+            now - lastWatchdogCheckAt).count());
+    const double requestedAdvance =
+      current.sourceTime - lastWatchdogRequestedTime;
+    const libvlc_time_t rawPlayerTime = api.getTime(player);
+    const double playerTime = rawPlayerTime >= 0
+      ? static_cast<double>(rawPlayerTime) / 1000.0 : -1.0;
+    const double playerAdvance =
+      playerTime >= 0.0 && lastWatchdogPlayerTime >= 0.0
+        ? playerTime - lastWatchdogPlayerTime : 0.0;
+    const int playerState = api.getState
+      ? api.getState(player) : -1;
+    const FrameHeartbeat heartbeat = readFrameHeartbeat();
+
+    // Um seek/loop para tras ja e tratado pelo caminho de playbackJump. Aqui
+    // apenas troca a linha de base para nao confundir esse salto com stall.
+    if (requestedAdvance < -0.05) {
+      lastWatchdogCheckAt = now;
+      lastWatchdogRequestedTime = current.sourceTime;
+      lastWatchdogPlayerTime = playerTime;
+      lastWatchdogFrameSequence = heartbeat.sequence;
+      watchdogClockStallChecks = 0;
+      watchdogGraceUntil = now + std::chrono::milliseconds(600);
+      return;
+    }
+
+    const double minimumRequestedAdvance = std::max(
+      0.003, checkElapsed * safeRate * 0.15);
+    const bool sourceAdvancing =
+      requestedAdvance > minimumRequestedAdvance;
+    const double minimumPlayerAdvance = std::max(
+      0.002, std::max(0.0, requestedAdvance) * 0.10);
+    const bool playerClockAdvanced =
+      playerTime >= 0.0 && lastWatchdogPlayerTime >= 0.0 &&
+      playerAdvance >= minimumPlayerAdvance;
+    const bool frameAdvanced =
+      heartbeat.sequence != lastWatchdogFrameSequence;
+
+    if (sourceAdvancing && lastWatchdogPlayerTime >= 0.0 &&
+        playerTime >= 0.0 && !playerClockAdvanced) {
+      ++watchdogClockStallChecks;
+    } else {
+      watchdogClockStallChecks = 0;
+    }
+
+    const bool invalidPlayingState = sourceAdvancing &&
+      (playerState == kVlcPaused ||
+       playerState == kVlcStopped ||
+       playerState == kVlcEnded ||
+       playerState == kVlcError);
+    const bool openingTooLong = sourceAdvancing &&
+      (playerState == kVlcNothingSpecial ||
+       playerState == kVlcOpening ||
+       playerState == kVlcBuffering) &&
+      now - playerCreatedAt >= std::chrono::seconds(5);
+    const bool driftTooLarge = sourceAdvancing &&
+      playerTime >= 0.0 &&
+      std::abs(playerTime - current.sourceTime) > 0.75;
+    const bool clockUnavailable = sourceAdvancing &&
+      playerTime < 0.0 &&
+      now - playerCreatedAt >= std::chrono::seconds(5);
+    const bool frameStale = sourceAdvancing &&
+      ((heartbeat.hasFrame &&
+        heartbeat.publishedAt !=
+          std::chrono::steady_clock::time_point{} &&
+        now - heartbeat.publishedAt >= std::chrono::seconds(2)) ||
+       (!heartbeat.hasFrame &&
+        now - playerCreatedAt >= std::chrono::seconds(5)));
+    const bool clockStalled = sourceAdvancing &&
+      watchdogClockStallChecks >= 2;
+    const bool unhealthy = invalidPlayingState || openingTooLong ||
+      driftTooLarge || clockUnavailable || frameStale || clockStalled;
+
+    lastWatchdogCheckAt = now;
+    lastWatchdogRequestedTime = current.sourceTime;
+    lastWatchdogPlayerTime = playerTime;
+    lastWatchdogFrameSequence = heartbeat.sequence;
+
+    if (!unhealthy) {
+      // So considera a recuperacao concluida quando alguma saida real do VLC
+      // voltou a avançar; a intencao activePlaying, sozinha, nao basta.
+      if (sourceAdvancing &&
+          (playerClockAdvanced || frameAdvanced) &&
+          playerState != kVlcPaused &&
+          playerState != kVlcStopped &&
+          playerState != kVlcEnded &&
+          playerState != kVlcError) {
+        watchdogRecoveryStage = 0;
+      }
+      return;
+    }
+
+    if (lastWatchdogRecoveryAt !=
+          std::chrono::steady_clock::time_point{} &&
+        now - lastWatchdogRecoveryAt <
+          std::chrono::milliseconds(800)) {
+      return;
+    }
+
+    if (watchdogRecoveryStage == 0 &&
+        playerState != kVlcError) {
+      // Primeiro tenta a retomada barata. Isso tira o VLC de Paused/Ended e
+      // preserva o player, o ultimo quadro e os buffers ja aquecidos.
+      if (api.play(player) == 0) {
+        api.setRate(player, static_cast<float>(safeRate));
+        api.setTime(
+          player, secondsToMilliseconds(current.sourceTime));
+        api.setPause(player, 0);
+        activePlaying = true;
+        activeStoppedSourceTime = -1.0;
+        watchdogRecoveryStage = 1;
+        lastWatchdogRecoveryAt = now;
+        statusCode.store(1, std::memory_order_release);
+        armWatchdogGrace(
+          current, now, std::chrono::milliseconds(900));
+        return;
+      }
+    }
+
+    // Se play+seek nao produziu progresso, o objeto interno do VLC esta
+    // inutilizavel. Recria apenas na worker e conserva o frame desenhado pela
+    // janela enquanto o novo player aquece.
+    const int nextRecoveryStage =
+      std::max(2, watchdogRecoveryStage + 1);
+    statusCode.store(1, std::memory_order_release);
+    createPlayer(current, nextRecoveryStage);
   }
 
   void applyRequest(const Request& current)
@@ -814,9 +1124,16 @@ struct Decoder::Impl {
       activeRate = safeRate;
     }
     const auto now = std::chrono::steady_clock::now();
+    if (finishInitialSync(current, now, safeRate)) {
+      previousRequestValid = true;
+      previousRequestSourceTime = current.sourceTime;
+      previousRequestWall = now;
+      return;
+    }
     const bool wasPlaying = activePlaying;
     bool playbackJump = false;
     bool playbackRestart = false;
+    bool watchdogCommandIssued = false;
     if (previousRequestValid && wasPlaying && current.playing) {
       const double elapsed = std::chrono::duration<double>(
         now - previousRequestWall).count();
@@ -826,11 +1143,14 @@ struct Decoder::Impl {
       // Corrige apenas um salto real do transporte (seek, loop ou troca de
       // posicao). Pequenos desvios entre os relogios do REAPER e do VLC nao
       // podem gerar set_time, pois cada chamada interrompe o fluxo de frames.
-      playbackJump = std::abs(actualAdvance - expectedAdvance) > 0.30;
       // Se o mesmo item voltar ao inicio antes de o worker observar o Stop,
       // o player do VLC pode continuar no estado Ended. set_time sozinho nao
       // retira esse estado; um novo play e necessario antes do seek.
-      playbackRestart = actualAdvance < -0.15;
+      // Usa um limite curto tambem para fontes pequenas/repetidas: nelas o
+      // retorno inteiro pode ser menor que o limite geral de seek.
+      playbackRestart = actualAdvance < -0.01;
+      playbackJump = playbackRestart ||
+        std::abs(actualAdvance - expectedAdvance) > 0.30;
     }
 
     if (current.playing != activePlaying) {
@@ -852,8 +1172,20 @@ struct Decoder::Impl {
         }
         api.setPause(player, 0);
         activeStoppedSourceTime = -1.0;
+        watchdogRecoveryStage = 0;
+        lastWatchdogRecoveryAt = {};
+        armWatchdogGrace(
+          current, now, std::chrono::milliseconds(900));
+        // play() pode responder sucesso ainda em Ended/Opening. Confirma o
+        // reposicionamento assim que o estado real voltar a Playing.
+        initialSyncPending = true;
+        initialSyncForceAt =
+          now + std::chrono::milliseconds(350);
+        watchdogCommandIssued = true;
       } else {
         api.setPause(player, 1);
+        watchdogRecoveryStage = 0;
+        watchdogClockStallChecks = 0;
       }
       activePlaying = current.playing;
     }
@@ -878,6 +1210,19 @@ struct Decoder::Impl {
         return;
       }
       api.setTime(player, secondsToMilliseconds(current.sourceTime));
+      if (playbackRestart) {
+        api.setPause(player, 0);
+        initialSyncPending = true;
+        initialSyncForceAt =
+          now + std::chrono::milliseconds(350);
+      }
+      armWatchdogGrace(
+        current, now, std::chrono::milliseconds(600));
+      watchdogCommandIssued = true;
+    }
+
+    if (!watchdogCommandIssued) {
+      runPlaybackWatchdog(current, now, safeRate);
     }
 
     previousRequestValid = true;
