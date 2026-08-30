@@ -472,6 +472,7 @@ struct Decoder::Impl {
   std::string activePlaybackKey;
   bool activePlaying = false;
   double activeRate = 1.0;
+  double activeStoppedSourceTime = -1.0;
   bool playerStarted = false;
   bool previousRequestValid = false;
   double previousRequestSourceTime = 0.0;
@@ -678,6 +679,7 @@ struct Decoder::Impl {
     }
     playerStarted = false;
     previousRequestValid = false;
+    activeStoppedSourceTime = -1.0;
     {
       std::lock_guard<std::mutex> lock(frameMutex);
       activePath.clear();
@@ -753,10 +755,17 @@ struct Decoder::Impl {
       return false;
     }
     playerStarted = true;
-    api.setTime(player, secondsToMilliseconds(current.sourceTime));
-    api.setPause(player, current.playing ? 0 : 1);
-    if (!current.playing && api.nextFrame) {
-      api.nextFrame(player);
+    if (current.playing) {
+      api.setTime(player, secondsToMilliseconds(current.sourceTime));
+      api.setPause(player, 0);
+      activeStoppedSourceTime = -1.0;
+    } else {
+      // Pause antes do seek impede o player recém-criado de avançar alguns
+      // quadros por conta própria enquanto o transporte do REAPER está parado.
+      api.setPause(player, 1);
+      api.setTime(player, secondsToMilliseconds(current.sourceTime));
+      if (api.nextFrame) api.nextFrame(player);
+      activeStoppedSourceTime = current.sourceTime;
     }
     activePlaying = current.playing;
     activeRate = current.playbackRate;
@@ -842,6 +851,7 @@ struct Decoder::Impl {
           api.setTime(player, secondsToMilliseconds(current.sourceTime));
         }
         api.setPause(player, 0);
+        activeStoppedSourceTime = -1.0;
       } else {
         api.setPause(player, 1);
       }
@@ -849,18 +859,18 @@ struct Decoder::Impl {
     }
 
     if (!current.playing) {
-      const libvlc_time_t playerTime = api.getTime(player);
-      const double drift = playerTime >= 0
-        ? std::abs(
-            static_cast<double>(playerTime) / 1000.0 -
-            current.sourceTime)
-        : std::numeric_limits<double>::infinity();
       // A transicao Play -> Stop sempre força o quadro do cursor de edicao.
-      // Sem isso, o VLC mantinha visualmente o ultimo quadro reproduzido,
-      // parecendo Pause mesmo com o REAPER ja parado em outra posicao.
-      if (wasPlaying || drift > 0.018) {
+      // Depois disso, somente uma mudança real no cursor solicita outro
+      // quadro. Comparar com get_time() criava um ciclo: next_frame avançava,
+      // o avanço era tratado como drift, o código voltava e avançava de novo.
+      const bool stoppedTargetChanged =
+        activeStoppedSourceTime < 0.0 ||
+        std::abs(
+          activeStoppedSourceTime - current.sourceTime) > 0.008;
+      if (wasPlaying || stoppedTargetChanged) {
         api.setTime(player, secondsToMilliseconds(current.sourceTime));
         if (api.nextFrame) api.nextFrame(player);
+        activeStoppedSourceTime = current.sourceTime;
       }
     } else if (wasPlaying && playbackJump) {
       if (playbackRestart && api.play(player) != 0) {

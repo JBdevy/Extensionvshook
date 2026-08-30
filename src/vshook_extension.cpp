@@ -31230,6 +31230,21 @@ static bool nativeUiApplyConverterParts()
   return true;
 }
 
+static bool nativePremixTrackIsHidden(const std::string& trackName)
+{
+  std::string normalized;
+  normalized.reserve(trackName.size());
+  for (unsigned char ch : trackName) {
+    if (std::isalnum(ch)) {
+      normalized.push_back(static_cast<char>(std::toupper(ch)));
+    }
+  }
+  return normalized == "TELEPROMPT1" ||
+    normalized == "TELEPROMPT2" ||
+    normalized == "CIFRAS" ||
+    normalized == "TIMECODE";
+}
+
 static void nativeUiAppendPremixItems(
   ReaProject* project,
   const NativeSongWindow& song)
@@ -31247,6 +31262,10 @@ static void nativeUiAppendPremixItems(
     MediaTrack* track = GetTrack_ptr(project, trackIndex);
     if (!track) continue;
     const std::string trackName = nativeTrackName(track, trackIndex);
+    // Pistas técnicas não fazem parte da mixagem musical do Premix. A
+    // normalização acima também cobre nomes como "TELEPROMPT 1" e
+    // "TELEPROMPT-2" sem depender de uma grafia única no projeto.
+    if (nativePremixTrackIsHidden(trackName)) continue;
     const int itemCount = GetTrackNumMediaItems_ptr(track);
     for (int itemIndex = 0; itemIndex < itemCount; ++itemIndex) {
       MediaItem* item = GetTrackMediaItem_ptr(track, itemIndex);
@@ -47078,6 +47097,17 @@ static bool nativeUiHandleMixerHit(
   return false;
 }
 
+static bool nativeUiMixerRouteHitAtPoint(const POINT& point)
+{
+  for (const auto& hit : g_nativeMixerHits) {
+    if (hit.kind == NativeMixerHitKind::Route &&
+        PtInRect(&hit.rect, point)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
 {
   auto finishPcCommand = [](bool handled) {
@@ -54693,7 +54723,8 @@ static bool nativeUiHasConfiguredKeyboardBinding(int code)
 static bool nativeUiExecuteMixerTrackAction(
   const std::string& trackId,
   const std::string& action,
-  const NativeUiMidiEvent* midiEvent = nullptr)
+  const NativeUiMidiEvent* midiEvent = nullptr,
+  int desiredToggleState = -1)
 {
   std::ostringstream command;
   if (action == "volume") {
@@ -54709,9 +54740,53 @@ static bool nativeUiExecuteMixerTrackAction(
             << (action == "solo"
                 ? "mixer_toggle_solo" : "mixer_toggle_mute")
             << "\",\"targetId\":"
-            << nativeJsonString(trackId) << "}";
+            << nativeJsonString(trackId);
+    if (desiredToggleState >= 0) {
+      command << ",\""
+              << (action == "solo"
+                  ? "desiredSolo" : "desiredMute")
+              << "\":"
+              << (desiredToggleState != 0 ? "true" : "false");
+    }
+    command << "}";
   }
   return nativeApplyMixerCommand(command.str());
+}
+
+static bool nativeUiExecuteMixerToggleGroup(
+  const std::vector<std::pair<std::string, MediaTrack*>>& tracks,
+  const std::string& action)
+{
+  if (tracks.empty() ||
+      (action != "mute" && action != "solo") ||
+      !GetMediaTrackInfo_Value_ptr) {
+    return false;
+  }
+  const char* field = action == "solo" ? "I_SOLO" : "B_MUTE";
+  bool anyActive = false;
+  for (const auto& track : tracks) {
+    if (!track.second) continue;
+    const double current =
+      GetMediaTrackInfo_Value_ptr(track.second, field);
+    if ((action == "solo" && current > 0.0) ||
+        (action == "mute" && current > 0.5)) {
+      anyActive = true;
+      break;
+    }
+  }
+
+  // Um mesmo atalho representa um único grupo. Se qualquer pista já está
+  // ativa, o próximo acionamento desliga todas; somente um grupo totalmente
+  // desligado é ligado. Assim uma alteração manual não inverte pistas
+  // individualmente nem deixa o grupo fora de sincronia.
+  const int desiredState = anyActive ? 0 : 1;
+  for (const auto& track : tracks) {
+    if (track.second) {
+      nativeUiExecuteMixerTrackAction(
+        track.first, action, nullptr, desiredState);
+    }
+  }
+  return true;
 }
 
 static bool nativeUiApplyMixerBulkDirect(const std::string& rawAction)
@@ -54862,22 +54937,25 @@ static bool nativeUiProcessTunerKeyboardBinding(int code)
 static bool nativeUiProcessMixerKeyboardBinding(int code)
 {
   bool handled = false;
-  for (const auto& track : nativeUiMixerBindingTracks()) {
-    for (const std::string& action : {
-           std::string("mute"), std::string("solo")}) {
+  const auto bindingTracks = nativeUiMixerBindingTracks();
+  for (const std::string& action : {
+         std::string("mute"), std::string("solo")}) {
+    std::vector<std::pair<std::string, MediaTrack*>> matches;
+    for (const auto& track : bindingTracks) {
       if (nativeUiStoredKeyboardCode(
             nativeUiReadMixerBinding(
               track.first, action, "keyboard")) != code) {
         continue;
       }
-      handled = true;
-      const std::string token = track.first + "|" +
-        action + "|" + std::to_string(code);
-      if (nativeUiThrottleInput(
-            g_nativeUiKeyboardLastTriggeredAt, token, 180)) {
-        nativeUiExecuteMixerTrackAction(
-          track.first, action);
-      }
+      matches.push_back(track);
+    }
+    if (matches.empty()) continue;
+    handled = true;
+    const std::string token =
+      "mixer_group|" + action + "|" + std::to_string(code);
+    if (nativeUiThrottleInput(
+          g_nativeUiKeyboardLastTriggeredAt, token, 180)) {
+      nativeUiExecuteMixerToggleGroup(matches, action);
     }
   }
   return handled;
@@ -55222,22 +55300,33 @@ static bool nativeUiProcessMixerMidiTrigger(
   }
 
   bool handled = false;
-  for (const auto& track : nativeUiMixerBindingTracks()) {
-    for (const std::string& action : {
-           std::string("mute"), std::string("solo"),
-           std::string("volume")}) {
+  const auto bindingTracks = nativeUiMixerBindingTracks();
+  for (const std::string& action : {
+         std::string("mute"), std::string("solo")}) {
+    std::vector<std::pair<std::string, MediaTrack*>> matches;
+    for (const auto& track : bindingTracks) {
       const std::string binding = nativeUiReadMixerBinding(
         track.first, action, "midi");
       if (!nativeUiMidiBindingMatches(binding, event)) continue;
-      handled = true;
-      if (action == "volume") {
-        if (event.type == "cc") {
-          nativeUiExecuteMixerTrackAction(
-            track.first, action, &event);
-        }
-      } else if (event.type == "pc" || event.press) {
-        nativeUiExecuteMixerTrackAction(track.first, action);
-      }
+      matches.push_back(track);
+    }
+    if (matches.empty()) continue;
+    handled = true;
+    if (event.type == "pc" || event.press) {
+      nativeUiExecuteMixerToggleGroup(matches, action);
+    }
+  }
+
+  // Volume continua absoluto e independente por pista; somente os toggles de
+  // Mute/Solo precisam compartilhar a decisão do grupo.
+  for (const auto& track : bindingTracks) {
+    const std::string binding = nativeUiReadMixerBinding(
+      track.first, "volume", "midi");
+    if (!nativeUiMidiBindingMatches(binding, event)) continue;
+    handled = true;
+    if (event.type == "cc") {
+      nativeUiExecuteMixerTrackAction(
+        track.first, "volume", &event);
     }
   }
   return handled;
@@ -56160,13 +56249,32 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP: {
       const bool mouseDown = message == WM_LBUTTONDOWN;
+      const POINT point = nativeAppActiveClickPoint(hwnd, lParam);
+      const bool opensMixerRouteWindow =
+        !g_state.directorInterfaceBlocked &&
+        g_nativeMainModalKind == NativeMainModalKind::None &&
+        !g_nativeMixerRenameOpen &&
+        !g_nativePartsRenameOpen &&
+        g_nativeAppActivePanelModel.mixerPage &&
+        nativeUiMixerRouteHitAtPoint(point);
+#ifndef _WIN32
+      // Se o DOWN já foi processado, este UP será consumido pelo latch abaixo.
+      // Não importa se o ponteiro saiu alguns pixels do botão: ele ainda
+      // pertence ao gesto que abriu o popup I/O e não pode recuperar o foco.
+      const bool handledMouseUpPending =
+        !mouseDown && g_nativeAppActiveMouseDownHandled;
+#else
+      const bool handledMouseUpPending = false;
+#endif
       // Alguns comandos executados no mouse-up devolvem o foco ao arrange do
-      // REAPER. Reivindica o teclado nas duas fases do clique.
-      if (GetFocus() != hwnd) {
+      // REAPER. Reivindica o teclado nas duas fases do clique, exceto no I/O:
+      // no SWELL/macOS o comando pode abrir no mouse-down e o mouse-up seguinte
+      // não pode roubar o foco do popup de roteamento recém-aberto.
+      if (!opensMixerRouteWindow && !handledMouseUpPending &&
+          GetFocus() != hwnd) {
         SetFocus(hwnd);
       }
       if (mouseDown) nativeUiCancelPendingMusicNavigation();
-      const POINT point = nativeAppActiveClickPoint(hwnd, lParam);
       if (mouseDown && !g_state.directorInterfaceBlocked &&
           nativeUiBeginMainPartsResize(hwnd, point)) {
         nativeUiSetFrameTimerInterval(
@@ -56443,16 +56551,6 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         return 0;
       }
       if (!g_state.directorInterfaceBlocked) {
-        bool opensMixerRouteWindow = false;
-        if (g_nativeAppActivePanelModel.mixerPage) {
-          for (const auto& hit : g_nativeMixerHits) {
-            if (hit.kind == NativeMixerHitKind::Route &&
-                PtInRect(&hit.rect, point)) {
-              opensMixerRouteWindow = true;
-              break;
-            }
-          }
-        }
         const bool handled =
           nativeMainHandleControlClick(point, false);
         if (!handled) {
@@ -61945,13 +62043,13 @@ static void nativeTelepromptClampDecodeRequest(
   int& outputWidth,
   int& outputHeight)
 {
-  // A orientação da mídia só é conhecida pelo decoder. Um limite quadrado
-  // de 3840 permite acompanhar a resolução física de monitores 4K/Retina;
-  // o decoder ainda conserva a proporção e nunca ultrapassa a fonte.
-  outputWidth = std::max(
-    1, std::min(3840, requestedWidth));
-  outputHeight = std::max(
-    1, std::min(3840, requestedHeight));
+  // TP1 e TP2 possuem players independentes. Permitir dois rasters 4K ao
+  // mesmo tempo sobrecarregava conversão e cópia de quadros, fazendo a TP2
+  // aparentar FPS menor. Full HD preserva a proporção e mantém as duas
+  // janelas com o mesmo orçamento de renderização no Windows e no macOS.
+  nativeTelepromptClampToFullHd(
+    requestedWidth, requestedHeight,
+    outputWidth, outputHeight);
 }
 
 static bool nativeTelepromptHoldImageFrame(
@@ -65605,6 +65703,7 @@ static std::string nativeBuildPremixItemRowsJson(ReaProject* project, const Nati
     MediaTrack* track = GetTrack_ptr(project, trackIndex);
     if (!track) continue;
     const std::string trackName = nativeTrackName(track, trackIndex);
+    if (nativePremixTrackIsHidden(trackName)) continue;
     const std::string trackGuid = nativeTrackGuid(track, trackIndex);
     const int itemCount = GetTrackNumMediaItems_ptr(track);
     for (int itemIndex = 0; itemIndex < itemCount; ++itemIndex) {
@@ -65734,6 +65833,7 @@ static std::string nativeBuildPremixTrackRowsJson(ReaProject* project, const Nat
     if (groupsOnly && folderDepth <= 0) continue;
     const std::string guid = nativeTrackGuid(track, i);
     const std::string name = nativeTrackName(track, i);
+    if (nativePremixTrackIsHidden(name)) continue;
     NativePremixTrackState liveState;
     liveState.volume = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "D_VOL") : 1.0;
     liveState.mute = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "B_MUTE") > 0.5 : false;
@@ -70026,7 +70126,12 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
     type == "mixer_bulk_unsolo";
   // Estados de pista sao publicados abaixo, depois da mutacao, como valores
   // absolutos. Repetir um toggle apos timeout poderia desfazer o primeiro.
-  if (!trackStateMutation) nativeTimecodeLanRecordCommand(commandBody);
+  // Abrir o popup I/O é uma ação puramente local de interface. Não replica
+  // para outro computador e, principalmente, não permite que um retorno de
+  // sincronização execute novamente o comando toggle e feche a janela.
+  if (!trackStateMutation && type != "mixer_route") {
+    nativeTimecodeLanRecordCommand(commandBody);
+  }
   if (!EnumProjects_ptr) return false;
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
@@ -70101,6 +70206,18 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
     return true;
   }
   if (type == "mixer_route") {
+    // 40293 é toggle. Entregas duplicadas do mesmo gesto (DOWN/UP no SWELL ou
+    // eventos repetidos de um docker) abririam e fechariam o I/O imediatamente.
+    static std::string lastRouteTrackId;
+    static std::chrono::steady_clock::time_point lastRouteOpenedAt{};
+    const auto now = std::chrono::steady_clock::now();
+    if (id == lastRouteTrackId &&
+        lastRouteOpenedAt.time_since_epoch().count() != 0 &&
+        now - lastRouteOpenedAt < std::chrono::milliseconds(350)) {
+      return true;
+    }
+    lastRouteTrackId = id;
+    lastRouteOpenedAt = now;
     MediaTrack* master =
       GetMasterTrack_ptr ? GetMasterTrack_ptr(project) : nullptr;
     if (tr == master) {
@@ -70195,10 +70312,28 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
     changed = SetMediaTrackInfo_Value_ptr(tr, "D_VOL", 1.0);
   } else if (type == "mixer_toggle_mute") {
     const double cur = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(tr, "B_MUTE") : 0.0;
-    changed = SetMediaTrackInfo_Value_ptr(tr, "B_MUTE", cur > 0.5 ? 0.0 : 1.0);
+    const std::string desired =
+      nativeJsonExtractString(commandBody, "desiredMute");
+    const bool current = cur > 0.5;
+    const bool next = desired.empty()
+      ? !current
+      : nativeBoolFromText(desired, current);
+    if (current != next) {
+      changed = SetMediaTrackInfo_Value_ptr(
+        tr, "B_MUTE", next ? 1.0 : 0.0);
+    }
   } else if (type == "mixer_toggle_solo") {
     const double cur = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(tr, "I_SOLO") : 0.0;
-    changed = SetMediaTrackInfo_Value_ptr(tr, "I_SOLO", cur > 0.5 ? 0.0 : 1.0);
+    const std::string desired =
+      nativeJsonExtractString(commandBody, "desiredSolo");
+    const bool current = cur > 0.0;
+    const bool next = desired.empty()
+      ? !current
+      : nativeBoolFromText(desired, current);
+    if (current != next) {
+      changed = SetMediaTrackInfo_Value_ptr(
+        tr, "I_SOLO", next ? 1.0 : 0.0);
+    }
   }
   if (changed) {
     if (TrackList_AdjustWindows_ptr) TrackList_AdjustWindows_ptr(false);
