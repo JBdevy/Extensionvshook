@@ -5685,7 +5685,6 @@ struct NativeProjectSyncTrackState {
 struct NativeProjectSyncLiveTrackState {
   std::string id;
   std::string name;
-  std::string structureKey;
   int trackIndex = 0;
   int folderDepth = 0;
   int itemCount = 0;
@@ -5765,7 +5764,7 @@ struct NativeProjectSyncApplyState {
   int64_t stateUpdatedAtMs = 0;
   bool automatic = false;
   bool applyConfigurations = false;
-  // Plano interno, uma entidade por linha (TRACK/ITEM/FXTRACK). Ele nunca e
+  // Plano interno, uma entidade por linha (TRACK/ITEM). Ele nunca e
   // exibido na conferencia; serve apenas para evitar varrer/aplicar o projeto
   // inteiro quando poucas entidades realmente diferem.
   std::string differencePlan;
@@ -25136,58 +25135,10 @@ static std::string nativeProjectSyncBuildStructuralManifest(
       // preflight nem iniciar copia de projeto/midia.
       "1.000000\t0\t0");
 
-    const int fxCount = TrackFX_GetCount_ptr
-      ? std::max(0, TrackFX_GetCount_ptr(track)) : 0;
-    for (int fxIndex = 0; fxIndex < fxCount && !overflow; ++fxIndex) {
-      std::string fxGuid;
-      if (TrackFX_GetFXGUID_ptr && guidToString_ptr) {
-        GUID* guid = TrackFX_GetFXGUID_ptr(track, fxIndex);
-        if (guid) {
-          char buffer[80] = "";
-          guidToString_ptr(guid, buffer);
-          fxGuid = buffer;
-        }
-      }
-      if (fxGuid.empty()) fxGuid = std::to_string(fxIndex + 1);
-      char fxNameBuffer[1024] = "";
-      if (TrackFX_GetFXName_ptr) {
-        TrackFX_GetFXName_ptr(
-          track, fxIndex, fxNameBuffer,
-          static_cast<int>(sizeof(fxNameBuffer)));
-      }
-      const std::string normalizedFxName =
-        nativeProjectSyncNormalizeUnicodeNfc(fxNameBuffer);
-      std::ostringstream parameterState;
-      const int parameterCount = TrackFX_GetNumParams_ptr
-        ? std::max(0, TrackFX_GetNumParams_ptr(track, fxIndex)) : 0;
-      parameterState << parameterCount;
-      if (TrackFX_GetParamNormalized_ptr) {
-        for (int parameterIndex = 0;
-             parameterIndex < parameterCount; ++parameterIndex) {
-          double value = TrackFX_GetParamNormalized_ptr(
-            track, fxIndex, parameterIndex);
-          if (!std::isfinite(value)) value = 0.0;
-          // Seis casas evitam falso positivo por pequenas diferenças de
-          // ponto flutuante entre Windows e macOS sem esconder uma alteração
-          // audível de parâmetro.
-          parameterState << ':' << nativeProjectSyncNumber(value);
-        }
-      }
-      const std::string parameterHash =
-        nativeProjectSyncHashText(parameterState.str());
-      const std::string fxIdentity = trackGuid + ":fx:" + fxGuid;
-      addRecord(
-        "FX\t" + nativeUiBackupEscape(fxIdentity) + "\t" +
-        nativeUiBackupEscape(trackGuid) + "\t" +
-        std::to_string(fxIndex + 1) + "\t" +
-        nativeUiBackupEscape(fxGuid) + "\t" +
-        nativeUiBackupEscape(normalizedFxName) + "\t" +
-        ((!TrackFX_GetEnabled_ptr ||
-          TrackFX_GetEnabled_ptr(track, fxIndex)) ? "1" : "0") + "\t" +
-        ((TrackFX_GetOffline_ptr &&
-          TrackFX_GetOffline_ptr(track, fxIndex)) ? "1" : "0") + "\t" +
-        parameterHash);
-    }
+    // FX de pista permanecem locais em cada computador. Plugins nativos e de
+    // terceiros podem serializar/normalizar estado de forma diferente entre
+    // Windows e macOS; inclui-los no manifesto criava diferencas permanentes
+    // mesmo depois de Aplicar. O Project Sync nao diagnostica nem copia FXCHAIN.
 
     for (int itemIndex = 0; itemIndex < itemCount && !overflow;
          ++itemIndex) {
@@ -25641,6 +25592,12 @@ nativeProjectSyncParseManifest(const std::string& manifest)
       parsed.error = "manifest_record_invalid";
       return parsed;
     }
+    if (type == "FX") {
+      // Compatibilidade com um peer de versao anterior: aceita o registro para
+      // nao invalidar o manifesto inteiro, mas o exclui da comparacao e de todo
+      // plano de aplicacao. Plugins de pista sao estado local do computador.
+      continue;
+    }
     if (type == "CONFIG") {
       const std::string section = nativeUiBackupUnescape(fields[1]);
       const std::string key = nativeUiBackupUnescape(fields[2]);
@@ -25691,7 +25648,6 @@ static std::string nativeProjectSyncCategoryForIdentity(
 {
   if (identity.rfind("TRACK\t", 0) == 0) return "tracks";
   if (identity.rfind("ITEM\t", 0) == 0) return "files";
-  if (identity.rfind("FX\t", 0) == 0) return "plugins";
   if (identity.rfind("REGION\t", 0) == 0) return "regions";
   if (identity.rfind("MARKER\t", 0) == 0) return "markers";
   if (identity.rfind("TEMPO\t", 0) == 0) return "tempoMarkers";
@@ -25712,7 +25668,6 @@ static std::string nativeProjectSyncCategoryLabel(
 {
   if (category == "tracks") return "Pistas";
   if (category == "files") return "Arquivos/itens";
-  if (category == "plugins") return "Plugins";
   if (category == "regions") return "Regioes";
   if (category == "markers") return "Marcadores";
   if (category == "tempoMarkers") return "Marcadores de tempo";
@@ -25738,7 +25693,6 @@ static void nativeProjectSyncBuildComparePresentation(
   message << "\n\nPC A (mestre) x PC B (escravo)";
   for (const std::string& category : {
          std::string("tracks"), std::string("files"),
-         std::string("plugins"),
          std::string("regions"), std::string("markers"),
          std::string("tempoMarkers"), std::string("configs"),
          std::string("project")}) {
@@ -26096,7 +26050,7 @@ static void nativeProjectSyncShowDiffModal(
     nativeJsonExtractRawValue(diffJson, "summary"));
   for (const std::string& category : {
          std::string("tracks"), std::string("files"),
-         std::string("plugins"), std::string("regions"),
+         std::string("regions"),
          std::string("markers"), std::string("tempoMarkers"),
          std::string("configs"), std::string("project")}) {
     const int count = std::max<int>(0, static_cast<int>(
@@ -27005,7 +26959,6 @@ struct NativeProjectSyncDifferencePlan {
   bool scoped = false;
   std::set<std::string> trackIds;
   std::set<std::string> itemIds;
-  std::set<std::string> fxTrackIds;
 };
 
 static NativeProjectSyncDifferencePlan nativeProjectSyncParseDifferencePlan(
@@ -27026,10 +26979,10 @@ static NativeProjectSyncDifferencePlan nativeProjectSyncParseDifferencePlan(
     }
     if (kind == "track") plan.trackIds.insert(id);
     else if (kind == "item") plan.itemIds.insert(id);
-    else if (kind == "fxtrack") plan.fxTrackIds.insert(id);
+    // FXTRACK existia em versoes antigas. Ignora deliberadamente: plugins de
+    // pista nao pertencem mais ao Project Sync.
   }
-  plan.scoped = !plan.trackIds.empty() || !plan.itemIds.empty() ||
-    !plan.fxTrackIds.empty();
+  plan.scoped = !plan.trackIds.empty() || !plan.itemIds.empty();
   return plan;
 }
 
@@ -27045,8 +26998,6 @@ static std::string nativeProjectSyncMergeDifferencePlans(
     incoming.trackIds.begin(), incoming.trackIds.end());
   merged.itemIds.insert(
     incoming.itemIds.begin(), incoming.itemIds.end());
-  merged.fxTrackIds.insert(
-    incoming.fxTrackIds.begin(), incoming.fxTrackIds.end());
   std::ostringstream output;
   const auto append = [&](const char* kind,
                           const std::set<std::string>& ids) {
@@ -27057,7 +27008,6 @@ static std::string nativeProjectSyncMergeDifferencePlans(
   };
   append("TRACK", merged.trackIds);
   append("ITEM", merged.itemIds);
-  append("FXTRACK", merged.fxTrackIds);
   std::string result = output.str();
   if (result.size() > 128 * 1024) result.resize(128 * 1024);
   return result;
@@ -28974,7 +28924,7 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
   const int confirmation = ShowMessageBox_ptr(
     "Aplicar as modificacoes do PC A neste PC B?\n\n"
     "O VS Hook vai baixar somente os arquivos que faltam, validar o pacote, "
-    "e aplicar pistas, itens, plugins e timeline "
+    "e aplicar pistas, itens e timeline "
     "diretamente neste projeto aberto. O roteamento e as cores locais nao "
     "serao alterados. As configuracoes visuais continuam separadas.\n\n"
     "Continuar?",
@@ -29023,7 +28973,7 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
       ? 0 : found->second;
   };
   requiresFileBundle = requiresFileBundle ||
-    categoryCount("files") > 0 || categoryCount("plugins") > 0 ||
+    categoryCount("files") > 0 ||
     categoryCount("project") > 0;
   tracksDiffer = categoryCount("tracks") > 0;
   timelineDiffers = categoryCount("regions") > 0 ||
@@ -29192,24 +29142,6 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
         planLines.insert("ITEM\t" + id);
       } else if (difference.category == "tracks") {
         planLines.insert("TRACK\t" + id);
-      } else if (difference.category == "plugins") {
-        const std::string identity = "FX\t" + difference.id;
-        const auto primary = remoteParsed.structural.find(identity);
-        const auto secondary = localParsed.structural.find(identity);
-        std::string selectedLine;
-        if (primary != remoteParsed.structural.end()) {
-          selectedLine = primary->second;
-        } else if (secondary != localParsed.structural.end()) {
-          selectedLine = secondary->second;
-        }
-        if (!selectedLine.empty()) {
-          const std::vector<std::string> fields =
-            nativeProjectSyncTsvFields(selectedLine);
-          if (fields.size() == 9) {
-            planLines.insert("FXTRACK\t" + nativeLower(nativeTrim(
-              nativeUiBackupUnescape(fields[2]))));
-          }
-        }
       }
     }
     std::ostringstream encodedPlan;
@@ -29511,10 +29443,7 @@ static std::string nativeProjectSyncMergeTrackChunk(
     nativeProjectSyncRppTrackGuid(source);
   const bool importTrackMetadata = !scoped ||
     differencePlan->trackIds.count(sourceTrackGuid) != 0;
-  const bool importFx = !scoped || importTrackMetadata ||
-    differencePlan->fxTrackIds.count(sourceTrackGuid) != 0;
   std::map<std::string, std::string> sourceLines;
-  std::vector<std::string> sourceFxBlocks;
   std::vector<std::string> sourceItemBlocks;
   std::map<std::string, std::string> targetItemsByGuid;
   std::vector<std::pair<std::string, std::string>> targetItemBlocks;
@@ -29522,7 +29451,8 @@ static std::string nativeProjectSyncMergeTrackChunk(
   for (const auto& segment : sourceSegments) {
     if (segment.block &&
         (segment.key == "fxchain" || segment.key == "fxchain_rec")) {
-      sourceFxBlocks.push_back(segment.text);
+      // FX do PC A nao entra na mesclagem.
+      continue;
     } else if (segment.block && segment.key == "item") {
       sourceItemBlocks.push_back(segment.text);
     } else if (!segment.block && !segment.key.empty()) {
@@ -29595,7 +29525,9 @@ static std::string nativeProjectSyncMergeTrackChunk(
     const auto sourceLine = sourceLines.find("mutesolo");
     if (sourceLine != sourceLines.end()) result << sourceLine->second;
   }
-  for (const auto& block : (importFx ? sourceFxBlocks : targetFxBlocks)) {
+  // A cadeia de FX do PC B nunca e substituida. Isso vale inclusive quando a
+  // pista recebe nome, ordem, pasta ou itens do PC A.
+  for (const auto& block : targetFxBlocks) {
     result << block;
   }
   std::set<std::string> sourceItemIds;
@@ -29634,7 +29566,9 @@ static std::string nativeProjectSyncSanitizeNewTrackChunk(
   if (segments.size() < 2) return {};
   std::ostringstream result;
   for (const auto& segment : segments) {
-    if (!nativeProjectSyncTrackChunkIsRoutingLine(segment)) {
+    const bool fxBlock = segment.block &&
+      (segment.key == "fxchain" || segment.key == "fxchain_rec");
+    if (!fxBlock && !nativeProjectSyncTrackChunkIsRoutingLine(segment)) {
       result << segment.text;
     }
   }
@@ -37677,7 +37611,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       };
       for (const std::string& category : {
              std::string("tracks"), std::string("files"),
-             std::string("plugins"), std::string("regions"),
+             std::string("regions"),
              std::string("markers"), std::string("tempoMarkers"),
              std::string("configs"), std::string("project")}) {
         if (g_nativeProjectSyncDiffModalCategoryCounts.count(category) != 0 ||
@@ -69845,21 +69779,6 @@ static bool nativeProjectSyncLiveTrackStateChanged(
     before.name != after.name;
 }
 
-static std::string nativeProjectSyncLiveTrackStructureKey(
-  MediaTrack* track)
-{
-  std::string chunk;
-  if (!nativeProjectSyncReadTrackChunk(track, chunk)) return {};
-  std::ostringstream relevant;
-  for (const auto& segment : nativeProjectSyncRppTrackSegments(chunk)) {
-    if (segment.block &&
-        (segment.key == "fxchain" || segment.key == "fxchain_rec")) {
-      relevant << segment.key << '\n' << segment.text << '\n';
-    }
-  }
-  return nativeProjectSyncHashText(relevant.str());
-}
-
 static NativeProjectSyncLiveItemState
 nativeProjectSyncReadLiveItemState(
   ReaProject* project,
@@ -70055,7 +69974,7 @@ static void nativeProjectSyncPublishLiveTrackUpsert(
     return command.str();
   };
   std::string command = build(requestedChunk);
-  // Uma pista com muitos itens/FX pode exceder o envelope. Nesse caso nao
+  // Uma pista com muitos itens pode exceder o envelope. Nesse caso nao
   // cria uma pista incompleta: o bundle inicial/incremental e quem deve
   // transportar esse chunk grande.
   if (command.size() > 480 * 1024) return;
@@ -70319,8 +70238,6 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
     trackState.folderDepth = GetMediaTrackInfo_Value_ptr
       ? static_cast<int>(std::lround(GetMediaTrackInfo_Value_ptr(
           track, "I_FOLDERDEPTH"))) : 0;
-    trackState.structureKey =
-      nativeProjectSyncLiveTrackStructureKey(track);
     if (trackState.id.empty()) continue;
     const int itemCount = GetTrackNumMediaItems_ptr(track);
     trackState.itemCount = itemCount;
@@ -70415,28 +70332,6 @@ static void nativeProjectSyncPollLiveProjectOnMainThread()
         }
       }
       nativeProjectSyncPublishLiveTrackUpsert(trackState, chunk);
-    }
-  }
-
-  // FX de uma pista existente também é estrutura autoritativa do PC A. O
-  // chunk é mesclado no PC B preservando exclusivamente o routing local.
-  for (const auto& entry : tracks) {
-    const auto previous =
-      g_nativeProjectSyncLiveTrackBaseline.find(entry.first);
-    if (previous == g_nativeProjectSyncLiveTrackBaseline.end() ||
-        previous->second.structureKey == entry.second.structureKey) {
-      continue;
-    }
-    // O patch curto atualiza imediatamente o FX. A reconciliação automática
-    // garante também arquivos/estado extenso que não caibam no comando LAN.
-    requiresAutomaticResync = true;
-    automaticDifferencePlan.insert(
-      "FXTRACK\t" + nativeLower(entry.first));
-    std::string chunk;
-    const auto pointer = trackPointers.find(entry.first);
-    if (pointer != trackPointers.end() &&
-        nativeProjectSyncReadTrackChunk(pointer->second, chunk)) {
-      nativeProjectSyncPublishLiveTrackUpsert(entry.second, chunk);
     }
   }
 
@@ -70928,7 +70823,7 @@ static bool nativeApplyProjectSyncLiveCommand(
       const std::string sourceChunk =
         nativeJsonExtractString(commandBody, "trackChunk");
       if (sourceChunk.empty() || sourceChunk.size() > 480 * 1024) {
-        // Sem o chunk completo nao existe como reproduzir itens/FX da pista.
+        // Sem o chunk completo nao existe como reproduzir os itens da pista.
         // Aguarda o próximo upsert/bundle em vez de criar uma pista parcial.
         return true;
       }
