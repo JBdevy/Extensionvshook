@@ -62979,7 +62979,7 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
 
   // HALFTONE custa caro e era executado em todo ciclo de pintura, mesmo
   // quando o vídeo tinha menos FPS que a janela. COLORONCOLOR deixa a
-  // apresentação em tempo real mais leve sem mudar o decoder VLC.
+  // apresentação em tempo real mais leve sem mudar o decoder FFmpeg.
   const int oldStretchMode =
     SetStretchBltMode(dc, COLORONCOLOR);
   const int renderedLines = StretchDIBits(
@@ -63094,7 +63094,7 @@ static bool nativeTelepromptDrawMedia(
     }
     // Se o HDC direto recusar StretchDIBits (algo que pode ocorrer em alguns
     // monitores/driveres no Windows), continua no raster LICE abaixo usando o
-    // mesmo snapshot do VLC. Nao troca de decoder nem reabre a midia; apenas
+    // mesmo snapshot do FFmpeg. Nao troca de decoder nem reabre a midia; apenas
     // desenha o mesmo quadro por uma superficie compativel com a janela.
   }
 #endif
@@ -64936,15 +64936,14 @@ static void nativeCloseAllTelepromptWindows()
 }
 
 // Janela exclusiva da pista MEDIA. Ela reutiliza o mesmo relógio, seeks,
-// loops e tratamento de item esticado do decoder VLC do Teleprompt, mas não
+// loops e tratamento de item esticado do decoder FFmpeg do Teleprompt, mas não
 // compõe letras, cifras, preview, recados ou qualquer outra camada.
 static constexpr const char* kNativeVideoWindowSection =
   "VS_HOOK_NATIVE_VIDEO_WINDOW";
 static constexpr UINT_PTR kNativeVideoWindowTimer = 0x56535649;
 static NativeTelepromptWindowState g_nativeVideoWindow;
-static std::unique_ptr<vshook_video::NativeWindowPlayer>
-  g_nativeVideoWindowPlayer;
-static bool g_nativeVideoDirectOutputActive = false;
+static std::unique_ptr<vshook_video::Decoder>
+  g_nativeVideoWindowDecoder;
 static NativeTelepromptRenderStateCache g_nativeVideoRenderStateCache;
 static std::uint64_t g_nativeVideoPresentedSequence = 0;
 static std::string g_nativeVideoPresentedPlaybackKey;
@@ -65215,9 +65214,9 @@ static void nativeVideoPaint(HWND hwnd)
   bool rendered = false;
 
   if (mediaType == "video" && !state.mediaPath.empty()) {
-    if (!g_nativeVideoWindowPlayer) {
-      g_nativeVideoWindowPlayer =
-        std::make_unique<vshook_video::NativeWindowPlayer>();
+    if (!g_nativeVideoWindowDecoder) {
+      g_nativeVideoWindowDecoder =
+        std::make_unique<vshook_video::Decoder>();
     }
     const int availableW = std::max(
       1, static_cast<int>(client.right - client.left));
@@ -65226,27 +65225,31 @@ static void nativeVideoPaint(HWND hwnd)
     const std::string playbackKey =
       nativeTelepromptMediaHoldKey(state);
     const bool changingVideo =
-      !g_nativeVideoDirectOutputActive ||
+      g_nativeVideoPresentedPlaybackKey.empty() ||
       playbackKey != g_nativeVideoPresentedPlaybackKey;
     if (changingVideo) {
       nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
     }
-    rendered = g_nativeVideoWindowPlayer->update(
+    vshook_video::DecodedFrame frame;
+    rendered = g_nativeVideoWindowDecoder->frameAt(
       state.mediaPath, playbackKey,
       state.mediaCurrentTime, state.playing,
       state.mediaPlayrate,
-      reinterpret_cast<void*>(hwnd),
-      availableW, availableH, stretch);
-    g_nativeVideoDirectOutputActive = rendered;
+      availableW, availableH, frame);
+    if (rendered) {
+      rendered = nativeVideoDrawBgra(
+        dc, frame.pixels, frame.width, frame.height,
+        frame.stride, client, stretch, true);
+      if (rendered) g_nativeVideoPresentedSequence = frame.sequence;
+    }
     g_nativeVideoPresentedPlaybackKey = playbackKey;
     g_nativeVideoPresentedWidth = availableW;
     g_nativeVideoPresentedHeight = availableH;
     g_nativeVideoPresentedStretch = stretch;
   } else if (mediaType == "image" && !state.mediaPath.empty()) {
-    // Libera o vout antes de voltar a desenhar no HWND/NSView da janela.
-    // Assim nenhum quadro atrasado do VLC cobre a imagem atual.
-    g_nativeVideoWindowPlayer.reset();
-    g_nativeVideoDirectOutputActive = false;
+    // Libera o decoder antes de voltar a desenhar a imagem estatica. Assim
+    // nenhum quadro atrasado cobre a imagem atual.
+    g_nativeVideoWindowDecoder.reset();
     g_nativeVideoPresentedSequence = 0;
     g_nativeVideoPresentedPlaybackKey.clear();
     vshook_static_image::DecodedImage image;
@@ -65256,8 +65259,7 @@ static void nativeVideoPaint(HWND hwnd)
         image.stride, client, stretch, false);
     }
   } else {
-    g_nativeVideoWindowPlayer.reset();
-    g_nativeVideoDirectOutputActive = false;
+    g_nativeVideoWindowDecoder.reset();
     g_nativeVideoPresentedSequence = 0;
     g_nativeVideoPresentedPlaybackKey.clear();
   }
@@ -65533,10 +65535,8 @@ static LRESULT CALLBACK nativeVideoWndProc(
     case WM_DESTROY:
       KillTimer(hwnd, kNativeVideoWindowTimer);
       // Pode chegar aqui por destruicao externa, sem passar por
-      // nativeCloseVideoWindow. Desanexa o vout enquanto o HWND/NSView ainda
-      // existe.
-      g_nativeVideoWindowPlayer.reset();
-      g_nativeVideoDirectOutputActive = false;
+      // nativeCloseVideoWindow.
+      g_nativeVideoWindowDecoder.reset();
 #ifdef __APPLE__
       VSHookMacReleaseTelepromptFullscreen(hwnd);
 #endif
@@ -65623,15 +65623,12 @@ static void nativeCloseVideoWindow(bool clearRequestedState)
         GetWindowRect(hwnd, &rect)) {
       nativeVideoSaveNormalRect(rect);
     }
-    // O player precisa soltar a superficie nativa antes da janela deixar de
-    // existir. Isso tambem impede o segundo clique de atravessar para o REAPER.
-    g_nativeVideoWindowPlayer.reset();
-    g_nativeVideoDirectOutputActive = false;
+    // Interrompe a worker antes da janela deixar de existir.
+    g_nativeVideoWindowDecoder.reset();
     DestroyWindow(hwnd);
   }
   g_nativeVideoWindow = NativeTelepromptWindowState{};
-  g_nativeVideoWindowPlayer.reset();
-  g_nativeVideoDirectOutputActive = false;
+  g_nativeVideoWindowDecoder.reset();
   g_nativeVideoPresentedSequence = 0;
   g_nativeVideoPresentedPlaybackKey.clear();
   g_nativeVideoRenderStateCache = NativeTelepromptRenderStateCache{};

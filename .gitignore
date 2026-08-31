@@ -1,6 +1,7 @@
 # CMake build folders (somente na raiz)
 /build/
 /build-*/
+/ffmpeg-runtime-test-*/
 
 # CMake generated files
 CMakeCache.txt

@@ -19,10 +19,10 @@ struct DecodedFrame {
   std::uint64_t sequence = 0;
 };
 
-// Reprodutor/decoder baseado exclusivamente no libVLC. O vídeo roda pelo relógio local
-// depois de carregado; frameAt() envia somente mudanças de transporte e
-// correções de sincronismo, e devolve imediatamente o último quadro pronto.
-// Todo carregamento, seek e decode acontece fora da thread da interface.
+// Decoder FFmpeg dirigido exclusivamente pelo relogio do REAPER. frameAt()
+// devolve imediatamente o ultimo quadro pronto; abertura, seek e decode
+// acontecem na worker. O FFmpeg nunca possui um relogio de transporte
+// independente, evitando drift, quadro antecipado no Stop e estado Ended.
 class Decoder {
 public:
   Decoder();
@@ -40,37 +40,6 @@ public:
     int requestedWidth,
     int requestedHeight,
     DecodedFrame& output);
-  void reset();
-  int status() const;
-
-private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
-};
-
-// Saida nativa do proprio VLC para uma janela dedicada. Diferentemente de
-// Decoder, este caminho nao converte nem copia cada quadro para BGRA: o vout do
-// VLC apresenta diretamente na superficie da janela e pode manter 60 fps em
-// tela cheia com aceleracao de hardware. Teleprompts continuam usando Decoder
-// porque precisam compor texto e outros overlays sobre os pixels do video.
-class NativeWindowPlayer {
-public:
-  NativeWindowPlayer();
-  ~NativeWindowPlayer();
-
-  NativeWindowPlayer(const NativeWindowPlayer&) = delete;
-  NativeWindowPlayer& operator=(const NativeWindowPlayer&) = delete;
-
-  bool update(
-    const std::string& utf8Path,
-    const std::string& playbackKey,
-    double sourceTime,
-    bool playing,
-    double playbackRate,
-    void* nativeWindow,
-    int windowWidth,
-    int windowHeight,
-    bool stretch);
   void reset();
   int status() const;
 

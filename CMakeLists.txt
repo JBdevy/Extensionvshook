@@ -29,6 +29,30 @@ set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
 option(VSHOOK_BUILD_TESTS "Build native VS Hook license tests" OFF)
 
+# O runtime do FFmpeg e carregado dinamicamente de
+# REAPER/UserPlugins/VSHookRuntime/FFmpeg. Durante a compilacao precisamos
+# apenas dos headers da mesma serie ABI usada pelo runtime (FFmpeg 8.1.x).
+find_path(VSHOOK_FFMPEG_INCLUDE_DIR
+  NAMES libavcodec/avcodec.h
+  HINTS
+    "$ENV{VSHOOK_FFMPEG_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../ffmpeg-8.1.2"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg-8.1.2"
+)
+if(NOT VSHOOK_FFMPEG_INCLUDE_DIR)
+  include(FetchContent)
+  FetchContent_Declare(vshook_ffmpeg_headers
+    URL "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz"
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  )
+  FetchContent_GetProperties(vshook_ffmpeg_headers)
+  if(NOT vshook_ffmpeg_headers_POPULATED)
+    FetchContent_Populate(vshook_ffmpeg_headers)
+  endif()
+  set(VSHOOK_FFMPEG_INCLUDE_DIR
+    "${vshook_ffmpeg_headers_SOURCE_DIR}")
+endif()
+
 if(APPLE)
   enable_language(OBJCXX)
 endif()
@@ -56,11 +80,13 @@ if(VSHOOK_BUILD_TESTS)
 
   if(WIN32 OR APPLE)
     add_executable(vshook_video_decoder_smoke_test
-      src/native_video_decoder_vlc.cpp
+      src/native_video_decoder_ffmpeg.cpp
       tests/native_video_decoder_smoke_test.cpp
     )
     target_include_directories(vshook_video_decoder_smoke_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/ffmpeg_compat
+      ${VSHOOK_FFMPEG_INCLUDE_DIR}
     )
     if(WIN32)
       target_compile_definitions(vshook_video_decoder_smoke_test PRIVATE
@@ -80,13 +106,13 @@ add_library(reaper_vshook SHARED
 
 if(WIN32)
   target_sources(reaper_vshook PRIVATE
-    src/native_video_decoder_vlc.cpp
+    src/native_video_decoder_ffmpeg.cpp
   )
 elseif(APPLE)
   target_sources(reaper_vshook PRIVATE
     src/native_keyboard_mac.mm
     src/native_teleprompt_mac.mm
-    src/native_video_decoder_vlc.cpp
+    src/native_video_decoder_ffmpeg.cpp
   )
 endif()
 
@@ -94,6 +120,8 @@ target_include_directories(reaper_vshook PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/sdk
   ${CMAKE_CURRENT_SOURCE_DIR}/WDL
   ${CMAKE_CURRENT_SOURCE_DIR}/WDL/swell
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/ffmpeg_compat
+  ${VSHOOK_FFMPEG_INCLUDE_DIR}
 )
 
 target_compile_definitions(reaper_vshook PRIVATE
@@ -168,5 +196,6 @@ if(APPLE)
   target_link_options(reaper_vshook PRIVATE
     "-undefined" "dynamic_lookup"
     "-Wl,-exported_symbol,_ReaperPluginEntry"
+    "-Wl,-rpath,@loader_path/VSHookRuntime/FFmpeg/lib"
   )
 endif()

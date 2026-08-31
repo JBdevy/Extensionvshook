@@ -37,10 +37,10 @@ bool setRuntimeDirectory(const std::string& directory)
   MultiByteToWideChar(
     CP_UTF8, 0, directory.c_str(), -1, wide.data(), length);
   return SetEnvironmentVariableW(
-    L"VSHOOK_VLC_RUNTIME", wide.c_str()) != FALSE;
+    L"VSHOOK_FFMPEG_RUNTIME", wide.c_str()) != FALSE;
 #else
   return setenv(
-    "VSHOOK_VLC_RUNTIME", directory.c_str(), 1) == 0;
+    "VSHOOK_FFMPEG_RUNTIME", directory.c_str(), 1) == 0;
 #endif
 }
 
@@ -153,7 +153,7 @@ int main(int argc, char** argv)
 {
   if (argc < 3 || argc > 4) {
     std::cerr <<
-      "uso: teste <diretorio-vlc> <video> [duracao-segundos]\n";
+      "uso: teste <diretorio-ffmpeg> <video> [duracao-segundos]\n";
     return 2;
   }
   if (!setRuntimeDirectory(argv[1])) {
@@ -280,7 +280,7 @@ int main(int argc, char** argv)
   }
 
   // 4. A retomada da mesma midia/chave precisa voltar a publicar quadros. E
-  // este trecho que detecta o bug em que activePlaying ficava true, mas o VLC
+  // este trecho detecta se o decoder deixa de acompanhar o relogio solicitado
   // permanecia parado no quadro obtido pelo seek.
   const auto resumeStartedAt = SteadyClock::now();
   double firstResumeTimestamp = pausedFrame.timestamp;
@@ -317,7 +317,7 @@ int main(int argc, char** argv)
   }
 
   // 5. Um item com B_LOOPSRC volta do fim da fonte para o inicio sem trocar a
-  // playbackKey. Essa emenda precisa tirar o VLC de Ended e substituir o
+  // playbackKey. Essa emenda precisa substituir imediatamente o
   // ultimo quadro pelo primeiro quadro do novo ciclo.
   const auto beforeLoopStartedAt = SteadyClock::now();
   double beforeLoopTimestamp = -1.0;
@@ -387,7 +387,7 @@ int main(int argc, char** argv)
   }
 
   // 6. Quando a duracao e fornecida, deixa o player chegar repetidas vezes ao
-  // fim fisico da fonte (estado Ended do VLC) e volta ao inicio com a mesma
+  // fim fisico da fonte e volta ao inicio com a mesma
   // chave. Isso reproduz B_LOOPSRC em um item esticado e tambem limita o tempo
   // em que o ultimo quadro pode ficar preso antes do ciclo seguinte aparecer.
   constexpr int requiredPhysicalLoops = 3;
@@ -420,7 +420,7 @@ int main(int argc, char** argv)
         return 13;
       }
 
-      // Mantem o relogio alem do fim o bastante para o VLC realmente entrar
+      // Mantem o relogio alem do fim o bastante para detectar quadro preso
       // em Ended. O cronometro da recuperacao so comeca quando B_LOOPSRC volta
       // para o inicio, portanto essa preparacao nao mascara a latencia medida.
       const auto endingAt = SteadyClock::now();
