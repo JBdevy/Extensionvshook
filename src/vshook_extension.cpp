@@ -59118,7 +59118,13 @@ static void nativeCloseAppActivePanel()
 // ==========================================================
 
 static constexpr UINT_PTR kNativeTelepromptTimerBase = 0x56535450;
+#ifdef _WIN32
 static constexpr UINT kNativeVideoPollMessage = WM_APP + 0x0561;
+#else
+// WM_APP pertence à API Win32 e não existe no SWELL do macOS. O SWELL aceita
+// mensagens de aplicação pelo mesmo intervalo numérico reservado pelo Windows.
+static constexpr UINT kNativeVideoPollMessage = 0x8000u + 0x0561u;
+#endif
 static constexpr double kNativeVideoPollPeriodSeconds = 1.0 / 120.0;
 
 // A decodificacao e assincrona. O callback do decoder acorda a HWND assim que
