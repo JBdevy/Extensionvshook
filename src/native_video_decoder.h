@@ -1,6 +1,8 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,13 +21,14 @@ struct DecodedFrame {
   std::uint64_t sequence = 0;
 };
 
-// Decoder FFmpeg dirigido exclusivamente pelo relogio do REAPER. frameAt()
-// devolve imediatamente o ultimo quadro pronto; abertura, seek e decode
-// acontecem na worker. O FFmpeg nunca possui um relogio de transporte
-// independente, evitando drift, quadro antecipado no Stop e estado Ended.
+// Decoder FFmpeg assíncrono. O REAPER ancora Play/Stop/seek e, durante Play,
+// os timestamps do próprio vídeo mantêm o avanço sequencial entre essas
+// descontinuidades. frameAt() sempre devolve imediatamente o último quadro.
 class Decoder {
 public:
-  Decoder();
+  using FrameReadyCallback = std::function<void()>;
+
+  explicit Decoder(FrameReadyCallback frameReady = {});
   ~Decoder();
 
   Decoder(const Decoder&) = delete;
@@ -39,6 +42,16 @@ public:
     double playbackRate,
     int requestedWidth,
     int requestedHeight,
+    DecodedFrame& output);
+  bool frameAt(
+    const std::string& utf8Path,
+    const std::string& playbackKey,
+    double sourceTime,
+    bool playing,
+    double playbackRate,
+    int requestedWidth,
+    int requestedHeight,
+    std::chrono::steady_clock::time_point sourceSampledAt,
     DecodedFrame& output);
   void reset();
   int status() const;

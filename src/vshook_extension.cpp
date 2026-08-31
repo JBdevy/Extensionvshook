@@ -59118,6 +59118,143 @@ static void nativeCloseAppActivePanel()
 // ==========================================================
 
 static constexpr UINT_PTR kNativeTelepromptTimerBase = 0x56535450;
+static constexpr UINT kNativeVideoPollMessage = WM_APP + 0x0561;
+static constexpr double kNativeVideoPollPeriodSeconds = 1.0 / 120.0;
+
+// A decodificacao e assincrona. O callback do decoder acorda a HWND assim que
+// um quadro fica pronto; este pulso de 120 Hz continua como amostragem do
+// transporte e seguranca caso a mensagem instantanea seja coalescida. Nenhuma
+// dessas threads toca na API do REAPER. A mensagem nunca cria backlog.
+struct NativeVideoPollPulse {
+  std::atomic<bool> stopRequested{true};
+  std::atomic<bool> messagePending{false};
+  std::thread worker;
+  HWND hwnd = nullptr;
+
+  ~NativeVideoPollPulse()
+  {
+    stopRequested.store(true, std::memory_order_release);
+    if (worker.joinable()) worker.join();
+  }
+};
+
+static void nativeStopVideoPollPulse(NativeVideoPollPulse& pulse)
+{
+  pulse.stopRequested.store(true, std::memory_order_release);
+  if (pulse.worker.joinable()) pulse.worker.join();
+  pulse.messagePending.store(false, std::memory_order_release);
+  pulse.hwnd = nullptr;
+}
+
+static void nativeStartVideoPollPulse(
+  NativeVideoPollPulse& pulse,
+  HWND hwnd)
+{
+  nativeStopVideoPollPulse(pulse);
+  if (!hwnd) return;
+  pulse.hwnd = hwnd;
+  pulse.stopRequested.store(false, std::memory_order_release);
+  pulse.worker = std::thread([&pulse]() {
+    using PollClock = std::chrono::steady_clock;
+    const auto period = std::chrono::duration_cast<PollClock::duration>(
+      std::chrono::duration<double>(
+        kNativeVideoPollPeriodSeconds));
+    auto nextPollAt = PollClock::now() + period;
+    while (!pulse.stopRequested.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_until(nextPollAt);
+      if (pulse.stopRequested.load(std::memory_order_acquire)) break;
+      const auto now = PollClock::now();
+      if (now - nextPollAt > std::chrono::milliseconds(100)) {
+        nextPollAt = now;
+      }
+      nextPollAt += period;
+      bool expected = false;
+      if (pulse.messagePending.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        if (!PostMessage(
+              pulse.hwnd, kNativeVideoPollMessage, 0, 0)) {
+          pulse.messagePending.store(
+            false, std::memory_order_release);
+        }
+      }
+    }
+  });
+}
+
+static vshook_video::Decoder::FrameReadyCallback
+nativeMakeVideoFrameReadyCallback(
+  NativeVideoPollPulse& pulse,
+  HWND hwnd)
+{
+  if (!hwnd) return {};
+  return [&pulse, hwnd]() {
+    if (pulse.stopRequested.load(std::memory_order_acquire)) return;
+    bool expected = false;
+    if (!pulse.messagePending.compare_exchange_strong(
+          expected, true,
+          std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+      return;
+    }
+    if (!PostMessage(hwnd, kNativeVideoPollMessage, 0, 0)) {
+      pulse.messagePending.store(false, std::memory_order_release);
+    }
+  };
+}
+
+// SetTimer recebe milissegundos inteiros. Usar 16 ms fixos cria um relogio
+// de 62,5 Hz; em video 60 fps isso repete quadros em um ritmo constante e
+// aparece como microtravamento. Mantemos aqui uma linha de tempo de 60 Hz e
+// recalculamos cada disparo pela deadline absoluta. Alem de alternar 16/17 ms
+// corretamente, ela recupera pequenos atrasos do loop de mensagens sem
+// acumular drift. O mesmo relogio e usado por HWND no Windows e pelo SWELL no
+// macOS.
+static constexpr double kNativeVideoRefreshPeriodSeconds = 1.0 / 60.0;
+
+struct NativeVideoRefreshTimer {
+  std::chrono::steady_clock::time_point nextFrameAt{};
+};
+
+static void nativeResetVideoRefreshTimer(
+  NativeVideoRefreshTimer& timer)
+{
+  timer.nextFrameAt = {};
+}
+
+static void nativeArmVideoRefreshTimer(
+  HWND hwnd,
+  UINT_PTR timerId,
+  NativeVideoRefreshTimer& timer,
+  bool advanceExistingDeadline)
+{
+  if (!hwnd) return;
+  using RefreshClock = std::chrono::steady_clock;
+  const auto now = RefreshClock::now();
+  const auto framePeriod = std::chrono::duration_cast<
+    RefreshClock::duration>(
+      std::chrono::duration<double>(
+        kNativeVideoRefreshPeriodSeconds));
+  const bool hasDeadline =
+    timer.nextFrameAt.time_since_epoch() !=
+      RefreshClock::duration::zero();
+  if (!advanceExistingDeadline || !hasDeadline) {
+    timer.nextFrameAt = now + framePeriod;
+  } else {
+    // Se a thread principal atrasou, pula somente deadlines deste timer de
+    // repaint. A linha de tempo do decoder continua independente deste timer.
+    do {
+      timer.nextFrameAt += framePeriod;
+    } while (timer.nextFrameAt <= now);
+  }
+  const double remainingMs = std::chrono::duration<double, std::milli>(
+    timer.nextFrameAt - now).count();
+  const UINT delayMs = static_cast<UINT>(std::max(
+    1.0, std::min(100.0, std::ceil(remainingMs))));
+  KillTimer(hwnd, timerId);
+  SetTimer(hwnd, timerId, delayMs, nullptr);
+}
 
 struct NativeTelepromptSettings {
   std::string preset = "night";
@@ -59528,6 +59665,7 @@ struct NativeTelepromptRenderState {
   double mediaSourceLength = 0.0;
   bool mediaLoopsSource = false;
   double projectPosition = 0.0;
+  std::chrono::steady_clock::time_point transportSampledAt{};
   double nextChangePosition = -1.0;
   double itemStart = 0.0;
   double itemEnd = 0.0;
@@ -59547,6 +59685,8 @@ struct NativeTelepromptRenderState {
 static NativeTelepromptWindowState g_nativeTelepromptWindows[2] = {
   {nullptr, 1}, {nullptr, 2}
 };
+static NativeVideoRefreshTimer g_nativeTelepromptRefreshTimers[2];
+static NativeVideoPollPulse g_nativeTelepromptVideoPollPulses[2];
 static int g_nativeTelepromptCreatingSlot = 1;
 static NativeTelepromptSettings g_nativeTelepromptSettings[2];
 static std::string g_nativeTelepromptSettingsJson[2];
@@ -59567,6 +59707,10 @@ static double g_nativeTelepromptDecodedVideoTimestamp[2]{-1.0, -1.0};
 static std::string g_nativeTelepromptDecodedVideoPath[2];
 static std::unique_ptr<vshook_video::Decoder>
   g_nativeTelepromptPlatformVideoDecoder[2];
+static std::uint64_t
+  g_nativeTelepromptPresentedVideoSequence[2]{0, 0};
+static int g_nativeTelepromptVideoRequestedWidth[2]{0, 0};
+static int g_nativeTelepromptVideoRequestedHeight[2]{0, 0};
 // Marca somente a presenca real de um item de video no estado da pista.
 // Preview e recados podem esconder temporariamente a midia, mas nao devem
 // desmontar o decoder que continua acompanhando o transporte por baixo.
@@ -59684,6 +59828,9 @@ static void nativeTelepromptResetPlatformVideoPlayback(int index)
   }
   g_nativeTelepromptDecodedVideoTimestamp[index] = -1.0;
   g_nativeTelepromptDecodedVideoPath[index].clear();
+  g_nativeTelepromptPresentedVideoSequence[index] = 0;
+  g_nativeTelepromptVideoRequestedWidth[index] = 0;
+  g_nativeTelepromptVideoRequestedHeight[index] = 0;
   g_nativeTelepromptPlatformVideoStatus[index].store(0);
   // Fora de um item nao existe quadro valido para conservar. O hold serve
   // somente para aquecer/recuperar uma midia ainda ativa; em uma area vazia a
@@ -61114,6 +61261,7 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
       livePosition = GetCursorPositionEx_ptr(project);
     }
   }
+  const auto transportSampledAt = std::chrono::steady_clock::now();
 
   bool rebuild =
     !cache.valid ||
@@ -61154,6 +61302,7 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
   }
 
   NativeTelepromptRenderState state = cache.state;
+  state.transportSampledAt = transportSampledAt;
   {
     // O cronômetro continua vivo sem obrigar a reescanear as pistas durante
     // a reprodução. Estas variáveis são protegidas pelo mesmo mutex nativo.
@@ -61964,7 +62113,10 @@ nativeTelepromptAcquirePlatformVideoFrame(
   const int index = nativeTelepromptIndex(slot);
   if (!g_nativeTelepromptPlatformVideoDecoder[index]) {
     g_nativeTelepromptPlatformVideoDecoder[index] =
-      std::make_unique<vshook_video::Decoder>();
+      std::make_unique<vshook_video::Decoder>(
+        nativeMakeVideoFrameReadyCallback(
+          g_nativeTelepromptVideoPollPulses[index],
+          g_nativeTelepromptWindows[index].hwnd));
   }
 
   const std::string playbackKey =
@@ -61973,7 +62125,8 @@ nativeTelepromptAcquirePlatformVideoFrame(
   if (!g_nativeTelepromptPlatformVideoDecoder[index]->frameAt(
         state.mediaPath, playbackKey, state.mediaCurrentTime,
         state.playing, state.mediaPlayrate,
-        requestedWidth, requestedHeight, decoded) ||
+        requestedWidth, requestedHeight,
+        state.transportSampledAt, decoded) ||
       !decoded.pixels ||
       decoded.width <= 0 ||
       decoded.height <= 0 ||
@@ -62868,7 +63021,10 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
   const int index = nativeTelepromptIndex(slot);
   if (!g_nativeTelepromptPlatformVideoDecoder[index]) {
     g_nativeTelepromptPlatformVideoDecoder[index] =
-      std::make_unique<vshook_video::Decoder>();
+      std::make_unique<vshook_video::Decoder>(
+        nativeMakeVideoFrameReadyCallback(
+          g_nativeTelepromptVideoPollPulses[index],
+          g_nativeTelepromptWindows[index].hwnd));
   }
 
   const std::string playbackKey =
@@ -62903,6 +63059,8 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
     uncappedRequestedHeight,
     requestedWidth,
     requestedHeight);
+  g_nativeTelepromptVideoRequestedWidth[index] = requestedWidth;
+  g_nativeTelepromptVideoRequestedHeight[index] = requestedHeight;
   vshook_video::DecodedFrame decoded;
   if (!g_nativeTelepromptPlatformVideoDecoder[index]->frameAt(
         state.mediaPath,
@@ -62912,6 +63070,7 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
         state.mediaPlayrate,
         requestedWidth,
         requestedHeight,
+        state.transportSampledAt,
         decoded) ||
       !decoded.pixels ||
       decoded.width <= 0 ||
@@ -63016,6 +63175,10 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
 #endif
   const int decoderStatus =
     g_nativeTelepromptPlatformVideoDecoder[index]->status();
+  if (rendered) {
+    g_nativeTelepromptPresentedVideoSequence[index] =
+      decoded.sequence;
+  }
   g_nativeTelepromptPlatformVideoStatus[index].store(
     rendered ? std::max(2, decoderStatus) : -106);
   g_nativeTelepromptMediaStatus[index].store(
@@ -64190,6 +64353,54 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   finishPaint();
 }
 
+static void nativeTelepromptPrimeVideoDecoder(
+  HWND hwnd,
+  int slot)
+{
+#if defined(_WIN32) || defined(__APPLE__)
+  if (!hwnd || !IsWindow(hwnd)) return;
+  const int index = nativeTelepromptIndex(slot);
+  const int requestedWidth =
+    g_nativeTelepromptVideoRequestedWidth[index];
+  const int requestedHeight =
+    g_nativeTelepromptVideoRequestedHeight[index];
+  // O primeiro paint calcula a area real depois das bordas/overlays. Reusar
+  // essas dimensoes evita alternar tamanhos e reconverter o mesmo quadro.
+  if (requestedWidth <= 1 || requestedHeight <= 1) return;
+  const NativeTelepromptRenderState state =
+    nativeTelepromptReadRenderState(slot);
+  if (nativeLower(state.mediaType) != "video" ||
+      state.mediaPath.empty()) {
+    return;
+  }
+  if (!g_nativeTelepromptPlatformVideoDecoder[index]) {
+    g_nativeTelepromptPlatformVideoDecoder[index] =
+      std::make_unique<vshook_video::Decoder>(
+        nativeMakeVideoFrameReadyCallback(
+          g_nativeTelepromptVideoPollPulses[index], hwnd));
+  }
+  vshook_video::DecodedFrame frame;
+  if (g_nativeTelepromptPlatformVideoDecoder[index]->frameAt(
+        state.mediaPath,
+        nativeTelepromptMediaHoldKey(state),
+        state.mediaCurrentTime,
+        state.playing,
+        state.mediaPlayrate,
+        requestedWidth,
+        requestedHeight,
+        state.transportSampledAt,
+        frame) &&
+      frame.pixels &&
+      frame.sequence !=
+        g_nativeTelepromptPresentedVideoSequence[index]) {
+    InvalidateRect(hwnd, nullptr, FALSE);
+  }
+#else
+  (void)hwnd;
+  (void)slot;
+#endif
+}
+
 static void nativeTelepromptToggleFullscreen(int slot)
 {
   const int index = nativeTelepromptIndex(slot);
@@ -64430,10 +64641,26 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
-      SetTimer(hwnd,
+      nativeResetVideoRefreshTimer(
+        g_nativeTelepromptRefreshTimers[
+          nativeTelepromptIndex(slot)]);
+      nativeArmVideoRefreshTimer(
+        hwnd,
         kNativeTelepromptTimerBase +
           static_cast<UINT_PTR>(slot),
-        16, nullptr);
+        g_nativeTelepromptRefreshTimers[
+          nativeTelepromptIndex(slot)],
+        false);
+      nativeStartVideoPollPulse(
+        g_nativeTelepromptVideoPollPulses[
+          nativeTelepromptIndex(slot)],
+        hwnd);
+      return 0;
+    case kNativeVideoPollMessage:
+      g_nativeTelepromptVideoPollPulses[
+        nativeTelepromptIndex(slot)].messagePending.store(
+          false, std::memory_order_release);
+      nativeTelepromptPrimeVideoDecoder(hwnd, slot);
       return 0;
     case WM_NCHITTEST:
       // O centro continua sendo cliente para preservar arraste e duplo clique.
@@ -64499,6 +64726,13 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
     case WM_TIMER:
       if (wParam == kNativeTelepromptTimerBase +
           static_cast<UINT_PTR>(slot)) {
+        nativeArmVideoRefreshTimer(
+          hwnd,
+          kNativeTelepromptTimerBase +
+            static_cast<UINT_PTR>(slot),
+          g_nativeTelepromptRefreshTimers[
+            nativeTelepromptIndex(slot)],
+          true);
 #ifdef __APPLE__
         if (window.fullscreen) {
           VSHookMacMaintainTelepromptFullscreen(hwnd);
@@ -64643,9 +64877,15 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       nativeCloseTelepromptWindow(slot);
       return 0;
     case WM_DESTROY:
+      nativeStopVideoPollPulse(
+        g_nativeTelepromptVideoPollPulses[
+          nativeTelepromptIndex(slot)]);
       KillTimer(hwnd,
         kNativeTelepromptTimerBase +
           static_cast<UINT_PTR>(slot));
+      nativeResetVideoRefreshTimer(
+        g_nativeTelepromptRefreshTimers[
+          nativeTelepromptIndex(slot)]);
       // Sem janela nao existe consumidor de video. Para o player assíncrono
       // uma unica vez; ao reabrir, o mesmo objeto recebe um estado novo.
       nativeTelepromptResetPlatformVideoPlayback(
@@ -64942,6 +65182,8 @@ static constexpr const char* kNativeVideoWindowSection =
   "VS_HOOK_NATIVE_VIDEO_WINDOW";
 static constexpr UINT_PTR kNativeVideoWindowTimer = 0x56535649;
 static NativeTelepromptWindowState g_nativeVideoWindow;
+static NativeVideoRefreshTimer g_nativeVideoRefreshTimer;
+static NativeVideoPollPulse g_nativeVideoPollPulse;
 static std::unique_ptr<vshook_video::Decoder>
   g_nativeVideoWindowDecoder;
 static NativeTelepromptRenderStateCache g_nativeVideoRenderStateCache;
@@ -65104,6 +65346,7 @@ static NativeTelepromptRenderState nativeVideoReadRenderState()
       livePosition = GetCursorPositionEx_ptr(project);
     }
   }
+  const auto transportSampledAt = std::chrono::steady_clock::now();
   bool rebuild = !cache.valid || cache.project != project ||
     cache.projectChangeCount != projectChangeCount ||
     cache.playState != playState;
@@ -65129,6 +65372,7 @@ static NativeTelepromptRenderState nativeVideoReadRenderState()
     cache.builtAt = now;
   }
   NativeTelepromptRenderState state = cache.state;
+  state.transportSampledAt = transportSampledAt;
   state.projectPosition = livePosition;
   state.playing = livePlaying;
   if (state.mediaType == "image" || state.mediaType == "video") {
@@ -65216,7 +65460,9 @@ static void nativeVideoPaint(HWND hwnd)
   if (mediaType == "video" && !state.mediaPath.empty()) {
     if (!g_nativeVideoWindowDecoder) {
       g_nativeVideoWindowDecoder =
-        std::make_unique<vshook_video::Decoder>();
+        std::make_unique<vshook_video::Decoder>(
+          nativeMakeVideoFrameReadyCallback(
+            g_nativeVideoPollPulse, hwnd));
     }
     const int availableW = std::max(
       1, static_cast<int>(client.right - client.left));
@@ -65235,7 +65481,8 @@ static void nativeVideoPaint(HWND hwnd)
       state.mediaPath, playbackKey,
       state.mediaCurrentTime, state.playing,
       state.mediaPlayrate,
-      availableW, availableH, frame);
+      availableW, availableH,
+      state.transportSampledAt, frame);
     if (rendered) {
       rendered = nativeVideoDrawBgra(
         dc, frame.pixels, frame.width, frame.height,
@@ -65267,6 +65514,48 @@ static void nativeVideoPaint(HWND hwnd)
     nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
   }
   EndPaint(hwnd, &paint);
+}
+
+static void nativeVideoPrimeDecoder(HWND hwnd)
+{
+#if defined(_WIN32) || defined(__APPLE__)
+  if (!hwnd || !IsWindow(hwnd)) return;
+  const NativeTelepromptRenderState state =
+    nativeVideoReadRenderState();
+  if (nativeLower(state.mediaType) != "video" ||
+      state.mediaPath.empty()) {
+    return;
+  }
+  if (!g_nativeVideoWindowDecoder) {
+    g_nativeVideoWindowDecoder =
+      std::make_unique<vshook_video::Decoder>(
+        nativeMakeVideoFrameReadyCallback(
+          g_nativeVideoPollPulse, hwnd));
+  }
+  RECT client{0, 0, 0, 0};
+  GetClientRect(hwnd, &client);
+  const int requestedWidth = std::max(
+    1, static_cast<int>(client.right - client.left));
+  const int requestedHeight = std::max(
+    1, static_cast<int>(client.bottom - client.top));
+  vshook_video::DecodedFrame frame;
+  if (g_nativeVideoWindowDecoder->frameAt(
+        state.mediaPath,
+        nativeTelepromptMediaHoldKey(state),
+        state.mediaCurrentTime,
+        state.playing,
+        state.mediaPlayrate,
+        requestedWidth,
+        requestedHeight,
+        state.transportSampledAt,
+        frame) &&
+      frame.pixels &&
+      frame.sequence != g_nativeVideoPresentedSequence) {
+    InvalidateRect(hwnd, nullptr, FALSE);
+  }
+#else
+  (void)hwnd;
+#endif
 }
 
 static void nativeVideoToggleFullscreen()
@@ -65327,7 +65616,16 @@ static LRESULT CALLBACK nativeVideoWndProc(
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
-      SetTimer(hwnd, kNativeVideoWindowTimer, 16, nullptr);
+      nativeResetVideoRefreshTimer(g_nativeVideoRefreshTimer);
+      nativeArmVideoRefreshTimer(
+        hwnd, kNativeVideoWindowTimer,
+        g_nativeVideoRefreshTimer, false);
+      nativeStartVideoPollPulse(g_nativeVideoPollPulse, hwnd);
+      return 0;
+    case kNativeVideoPollMessage:
+      g_nativeVideoPollPulse.messagePending.store(
+        false, std::memory_order_release);
+      nativeVideoPrimeDecoder(hwnd);
       return 0;
     case WM_ERASEBKGND:
       return 1;
@@ -65336,6 +65634,9 @@ static LRESULT CALLBACK nativeVideoWndProc(
       return 0;
     case WM_TIMER:
       if (wParam == kNativeVideoWindowTimer) {
+        nativeArmVideoRefreshTimer(
+          hwnd, kNativeVideoWindowTimer,
+          g_nativeVideoRefreshTimer, true);
 #ifdef __APPLE__
         if (window.fullscreen) {
           VSHookMacMaintainTelepromptFullscreen(hwnd);
@@ -65533,7 +65834,9 @@ static LRESULT CALLBACK nativeVideoWndProc(
       nativeCloseVideoWindow();
       return 0;
     case WM_DESTROY:
+      nativeStopVideoPollPulse(g_nativeVideoPollPulse);
       KillTimer(hwnd, kNativeVideoWindowTimer);
+      nativeResetVideoRefreshTimer(g_nativeVideoRefreshTimer);
       // Pode chegar aqui por destruicao externa, sem passar por
       // nativeCloseVideoWindow.
       g_nativeVideoWindowDecoder.reset();

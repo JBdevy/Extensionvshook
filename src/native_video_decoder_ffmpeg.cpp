@@ -7,6 +7,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <d3d11.h>
+#include <mmsystem.h>
+#include <wrl/client.h>
 #else
 #include <dlfcn.h>
 #include <unistd.h>
@@ -18,6 +21,9 @@ extern "C" {
 #include <libavutil/buffer.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
+#ifdef _WIN32
+#include <libavutil/hwcontext_d3d11va.h>
+#endif
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 }
@@ -35,6 +41,7 @@ extern "C" {
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace vshook_video {
@@ -444,9 +451,11 @@ struct Decoder::Impl {
     int requestedHeight = 2;
     bool playing = false;
     std::uint64_t serial = 0;
+    std::chrono::steady_clock::time_point sampledAt{};
   };
 
   FfmpegApi api;
+  Decoder::FrameReadyCallback frameReady;
   std::mutex requestMutex;
   std::condition_variable requestChanged;
   std::thread worker;
@@ -477,6 +486,23 @@ struct Decoder::Impl {
   AVBufferRef* hardwareDevice = nullptr;
   AVPixelFormat hardwarePixelFormat = AV_PIX_FMT_NONE;
   SwsContext* scaler = nullptr;
+#ifdef _WIN32
+  Microsoft::WRL::ComPtr<ID3D11Device> gpuDevice;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> gpuContext;
+  Microsoft::WRL::ComPtr<ID3D11VideoDevice> gpuVideoDevice;
+  Microsoft::WRL::ComPtr<ID3D11VideoContext> gpuVideoContext;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator>
+    gpuProcessorEnumerator;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessor> gpuProcessor;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> gpuOutputTexture;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> gpuReadbackTexture;
+  Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView>
+    gpuOutputView;
+  int gpuInputWidth = 0;
+  int gpuInputHeight = 0;
+  int gpuOutputWidth = 0;
+  int gpuOutputHeight = 0;
+#endif
   int videoStreamIndex = -1;
   AVStream* videoStream = nullptr;
   double timeBase = 0.0;
@@ -494,12 +520,21 @@ struct Decoder::Impl {
   double previousSourceTime = 0.0;
   double previousPlaybackRate = 1.0;
   std::chrono::steady_clock::time_point previousRequestAt{};
+  // Durante Play os quadros avancam por uma deadline propria e sequencial.
+  // A posicao recebida do REAPER serve apenas para detectar uma mudanca real
+  // de transporte; jitter do timer da interface nunca escolhe/pula quadros.
+  bool playbackSchedulerActive = false;
+  std::chrono::steady_clock::time_point nextPlaybackFrameAt{};
   int convertedWidth = 0;
   int convertedHeight = 0;
   double convertedTimestamp = -1.0;
 
-  Impl()
+  explicit Impl(Decoder::FrameReadyCallback callback)
+    : frameReady(std::move(callback))
   {
+#ifdef _WIN32
+    timeBeginPeriod(1);
+#endif
     worker = std::thread([this]() { workerLoop(); });
   }
 
@@ -512,6 +547,9 @@ struct Decoder::Impl {
     requestChanged.notify_all();
     if (worker.joinable()) worker.join();
     closeMedia();
+#ifdef _WIN32
+    timeEndPeriod(1);
+#endif
   }
 
   static AVPixelFormat selectHardwareFormat(
@@ -542,8 +580,30 @@ struct Decoder::Impl {
     publishedTimestamp = -1.0;
   }
 
+#ifdef _WIN32
+  void clearGpuProcessor()
+  {
+    gpuOutputView.Reset();
+    gpuReadbackTexture.Reset();
+    gpuOutputTexture.Reset();
+    gpuProcessor.Reset();
+    gpuProcessorEnumerator.Reset();
+    gpuVideoContext.Reset();
+    gpuVideoDevice.Reset();
+    gpuContext.Reset();
+    gpuDevice.Reset();
+    gpuInputWidth = 0;
+    gpuInputHeight = 0;
+    gpuOutputWidth = 0;
+    gpuOutputHeight = 0;
+  }
+#endif
+
   void closeMedia()
   {
+#ifdef _WIN32
+    clearGpuProcessor();
+#endif
     if (scaler && api.swsFreeContext) api.swsFreeContext(scaler);
     scaler = nullptr;
     if (decodedFrame && api.frameFree) api.frameFree(&decodedFrame);
@@ -568,6 +628,8 @@ struct Decoder::Impl {
     activePath.clear();
     activePlaybackKey.clear();
     previousRequestValid = false;
+    playbackSchedulerActive = false;
+    nextPlaybackFrameAt = {};
     convertedWidth = 0;
     convertedHeight = 0;
     convertedTimestamp = -1.0;
@@ -879,6 +941,225 @@ struct Decoder::Impl {
     return replacement;
   }
 
+#ifdef _WIN32
+  AVD3D11VADeviceContext* d3dHardwareContext() const
+  {
+    if (!hardwareDevice || !hardwareDevice->data) return nullptr;
+    auto* deviceContext = reinterpret_cast<AVHWDeviceContext*>(
+      hardwareDevice->data);
+    return deviceContext
+      ? static_cast<AVD3D11VADeviceContext*>(deviceContext->hwctx)
+      : nullptr;
+  }
+
+  bool configureGpuProcessor(
+    const AVFrame* frame,
+    int outputWidth,
+    int outputHeight)
+  {
+    AVD3D11VADeviceContext* hardware = d3dHardwareContext();
+    if (!hardware || !hardware->device ||
+        !hardware->device_context ||
+        !hardware->video_device || !hardware->video_context ||
+        !frame || frame->width <= 0 || frame->height <= 0) {
+      return false;
+    }
+    if (gpuProcessorEnumerator && gpuProcessor &&
+        gpuOutputTexture && gpuReadbackTexture && gpuOutputView &&
+        gpuDevice.Get() == hardware->device &&
+        gpuInputWidth == frame->width &&
+        gpuInputHeight == frame->height &&
+        gpuOutputWidth == outputWidth &&
+        gpuOutputHeight == outputHeight) {
+      return true;
+    }
+
+    clearGpuProcessor();
+    gpuDevice = hardware->device;
+    gpuContext = hardware->device_context;
+    gpuVideoDevice = hardware->video_device;
+    gpuVideoContext = hardware->video_context;
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+    content.InputFrameFormat =
+      D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    const double frameRate = nominalFrameDuration > 0.000001
+      ? 1.0 / nominalFrameDuration : 60.0;
+    content.InputFrameRate.Numerator = static_cast<UINT>(std::max(
+      1.0, std::round(frameRate * 1000.0)));
+    content.InputFrameRate.Denominator = 1000;
+    content.InputWidth = static_cast<UINT>(frame->width);
+    content.InputHeight = static_cast<UINT>(frame->height);
+    content.OutputFrameRate = content.InputFrameRate;
+    content.OutputWidth = static_cast<UINT>(outputWidth);
+    content.OutputHeight = static_cast<UINT>(outputHeight);
+    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    if (FAILED(gpuVideoDevice->CreateVideoProcessorEnumerator(
+          &content, gpuProcessorEnumerator.GetAddressOf())) ||
+        !gpuProcessorEnumerator ||
+        FAILED(gpuVideoDevice->CreateVideoProcessor(
+          gpuProcessorEnumerator.Get(), 0,
+          gpuProcessor.GetAddressOf())) ||
+        !gpuProcessor) {
+      clearGpuProcessor();
+      return false;
+    }
+
+    D3D11_TEXTURE2D_DESC outputDescription{};
+    outputDescription.Width = static_cast<UINT>(outputWidth);
+    outputDescription.Height = static_cast<UINT>(outputHeight);
+    outputDescription.MipLevels = 1;
+    outputDescription.ArraySize = 1;
+    outputDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    outputDescription.SampleDesc.Count = 1;
+    outputDescription.Usage = D3D11_USAGE_DEFAULT;
+    outputDescription.BindFlags = D3D11_BIND_RENDER_TARGET;
+    if (FAILED(gpuDevice->CreateTexture2D(
+          &outputDescription, nullptr,
+          gpuOutputTexture.GetAddressOf())) ||
+        !gpuOutputTexture) {
+      clearGpuProcessor();
+      return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDescription{};
+    outputViewDescription.ViewDimension =
+      D3D11_VPOV_DIMENSION_TEXTURE2D;
+    outputViewDescription.Texture2D.MipSlice = 0;
+    if (FAILED(gpuVideoDevice->CreateVideoProcessorOutputView(
+          gpuOutputTexture.Get(),
+          gpuProcessorEnumerator.Get(),
+          &outputViewDescription,
+          gpuOutputView.GetAddressOf())) ||
+        !gpuOutputView) {
+      clearGpuProcessor();
+      return false;
+    }
+
+    D3D11_TEXTURE2D_DESC readbackDescription = outputDescription;
+    readbackDescription.Usage = D3D11_USAGE_STAGING;
+    readbackDescription.BindFlags = 0;
+    readbackDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(gpuDevice->CreateTexture2D(
+          &readbackDescription, nullptr,
+          gpuReadbackTexture.GetAddressOf())) ||
+        !gpuReadbackTexture) {
+      clearGpuProcessor();
+      return false;
+    }
+    gpuInputWidth = frame->width;
+    gpuInputHeight = frame->height;
+    gpuOutputWidth = outputWidth;
+    gpuOutputHeight = outputHeight;
+    return true;
+  }
+
+  bool convertHardwareFrameToBgra(
+    const AVFrame* frame,
+    int outputWidth,
+    int outputHeight,
+    std::vector<std::uint8_t>& destination,
+    int destinationStride)
+  {
+    if (!frame || !frame->data[0] ||
+        !configureGpuProcessor(frame, outputWidth, outputHeight)) {
+      return false;
+    }
+    AVD3D11VADeviceContext* hardware = d3dHardwareContext();
+    if (!hardware) return false;
+    auto* inputTexture = reinterpret_cast<ID3D11Texture2D*>(
+      frame->data[0]);
+    D3D11_TEXTURE2D_DESC inputDescription{};
+    inputTexture->GetDesc(&inputDescription);
+    const UINT arraySlice = static_cast<UINT>(
+      reinterpret_cast<std::uintptr_t>(frame->data[1]));
+    if (arraySlice >= std::max<UINT>(1, inputDescription.ArraySize)) {
+      return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDescription{};
+    inputViewDescription.FourCC = 0;
+    inputViewDescription.ViewDimension =
+      D3D11_VPIV_DIMENSION_TEXTURE2D;
+    inputViewDescription.Texture2D.MipSlice = 0;
+    inputViewDescription.Texture2D.ArraySlice = arraySlice;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inputView;
+    if (FAILED(gpuVideoDevice->CreateVideoProcessorInputView(
+          inputTexture,
+          gpuProcessorEnumerator.Get(),
+          &inputViewDescription,
+          inputView.GetAddressOf())) ||
+        !inputView) {
+      return false;
+    }
+
+    struct HardwareLock {
+      AVD3D11VADeviceContext* context = nullptr;
+      explicit HardwareLock(AVD3D11VADeviceContext* value)
+        : context(value)
+      {
+        if (context && context->lock) {
+          context->lock(context->lock_ctx);
+        }
+      }
+      ~HardwareLock()
+      {
+        if (context && context->unlock) {
+          context->unlock(context->lock_ctx);
+        }
+      }
+    } lock(hardware);
+
+    RECT sourceRectangle{0, 0, frame->width, frame->height};
+    RECT destinationRectangle{0, 0, outputWidth, outputHeight};
+    gpuVideoContext->VideoProcessorSetStreamFrameFormat(
+      gpuProcessor.Get(), 0,
+      D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    gpuVideoContext->VideoProcessorSetStreamSourceRect(
+      gpuProcessor.Get(), 0, TRUE, &sourceRectangle);
+    gpuVideoContext->VideoProcessorSetStreamDestRect(
+      gpuProcessor.Get(), 0, TRUE, &destinationRectangle);
+    gpuVideoContext->VideoProcessorSetOutputTargetRect(
+      gpuProcessor.Get(), TRUE, &destinationRectangle);
+    gpuVideoContext->VideoProcessorSetStreamAutoProcessingMode(
+      gpuProcessor.Get(), 0, TRUE);
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = inputView.Get();
+    if (FAILED(gpuVideoContext->VideoProcessorBlt(
+          gpuProcessor.Get(), gpuOutputView.Get(),
+          0, 1, &stream))) {
+      return false;
+    }
+
+    gpuContext->CopyResource(
+      gpuReadbackTexture.Get(), gpuOutputTexture.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT mapResult = gpuContext->Map(
+      gpuReadbackTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(mapResult) || !mapped.pData ||
+        mapped.RowPitch < static_cast<UINT>(destinationStride)) {
+      if (SUCCEEDED(mapResult)) {
+        gpuContext->Unmap(gpuReadbackTexture.Get(), 0);
+      }
+      return false;
+    }
+    const auto* source = static_cast<const std::uint8_t*>(
+      mapped.pData);
+    const std::size_t rowBytes = static_cast<std::size_t>(
+      destinationStride);
+    for (int row = 0; row < outputHeight; ++row) {
+      std::memcpy(
+        destination.data() +
+          static_cast<std::size_t>(row) * rowBytes,
+        source + static_cast<std::size_t>(row) * mapped.RowPitch,
+        rowBytes);
+    }
+    gpuContext->Unmap(gpuReadbackTexture.Get(), 0);
+    return true;
+  }
+#endif
+
   bool publishDisplayFrame(const Request& current)
   {
     if (!displayFrame || displayTimestamp < 0.0) return false;
@@ -931,19 +1212,10 @@ struct Decoder::Impl {
       convertedWidth == outputWidth &&
       convertedHeight == outputHeight;
     if (sameFrame) {
-      statusCode.store(2, std::memory_order_release);
-      return true;
-    }
-
-    if (hardwarePixelFormat != AV_PIX_FMT_NONE &&
-        displayFrame->format == hardwarePixelFormat) {
-      api.frameUnref(softwareFrame);
-      if (api.hwFrameTransferData(
-            softwareFrame, displayFrame, 0) < 0) {
-        statusCode.store(-305, std::memory_order_release);
-        return false;
+      if (statusCode.load(std::memory_order_acquire) < 2) {
+        statusCode.store(2, std::memory_order_release);
       }
-      source = softwareFrame;
+      return true;
     }
 
     const int stride = outputWidth * 4;
@@ -951,26 +1223,47 @@ struct Decoder::Impl {
       static_cast<std::size_t>(stride) *
       static_cast<std::size_t>(outputHeight);
     auto pixels = acquirePixelBuffer(byteCount);
-    scaler = api.swsGetCachedContext(
-      scaler,
-      source->width, source->height,
-      static_cast<AVPixelFormat>(source->format),
-      outputWidth, outputHeight, AV_PIX_FMT_BGRA,
-      SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!scaler) {
-      statusCode.store(-305, std::memory_order_release);
-      return false;
+    bool converted = false;
+#ifdef _WIN32
+    if (hardwarePixelFormat != AV_PIX_FMT_NONE &&
+        displayFrame->format == hardwarePixelFormat) {
+      converted = convertHardwareFrameToBgra(
+        displayFrame, outputWidth, outputHeight,
+        *pixels, stride);
     }
-    std::uint8_t* destinationData[4] = {
-      pixels->data(), nullptr, nullptr, nullptr
-    };
-    const int destinationStride[4] = {stride, 0, 0, 0};
-    const int scaled = api.swsScale(
-      scaler, source->data, source->linesize,
-      0, source->height, destinationData, destinationStride);
-    if (scaled != outputHeight) {
-      statusCode.store(-305, std::memory_order_release);
-      return false;
+#endif
+    if (!converted) {
+      if (hardwarePixelFormat != AV_PIX_FMT_NONE &&
+          displayFrame->format == hardwarePixelFormat) {
+        api.frameUnref(softwareFrame);
+        if (api.hwFrameTransferData(
+              softwareFrame, displayFrame, 0) < 0) {
+          statusCode.store(-305, std::memory_order_release);
+          return false;
+        }
+        source = softwareFrame;
+      }
+      scaler = api.swsGetCachedContext(
+        scaler,
+        source->width, source->height,
+        static_cast<AVPixelFormat>(source->format),
+        outputWidth, outputHeight, AV_PIX_FMT_BGRA,
+        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+      if (!scaler) {
+        statusCode.store(-305, std::memory_order_release);
+        return false;
+      }
+      std::uint8_t* destinationData[4] = {
+        pixels->data(), nullptr, nullptr, nullptr
+      };
+      const int destinationStride[4] = {stride, 0, 0, 0};
+      const int scaled = api.swsScale(
+        scaler, source->data, source->linesize,
+        0, source->height, destinationData, destinationStride);
+      if (scaled != outputHeight) {
+        statusCode.store(-305, std::memory_order_release);
+        return false;
+      }
     }
 
     {
@@ -987,24 +1280,115 @@ struct Decoder::Impl {
     convertedWidth = outputWidth;
     convertedHeight = outputHeight;
     convertedTimestamp = displayTimestamp;
-    statusCode.store(2, std::memory_order_release);
+    // 3 identifica o caminho D3D11 Video Processor; 2 continua sendo a
+    // conversao swscale. Ambos representam quadro valido.
+    statusCode.store(converted ? 3 : 2, std::memory_order_release);
+    if (frameReady) frameReady();
     return true;
+  }
+
+  std::chrono::steady_clock::time_point playbackDeadlineForTimestamp(
+    const Request& current,
+    double timestamp,
+    std::chrono::steady_clock::time_point fallbackAnchor = {}) const
+  {
+    using PlaybackClock = std::chrono::steady_clock;
+    if (timestamp >= 0.0 &&
+        current.sampledAt != PlaybackClock::time_point{}) {
+      const double delay =
+        (timestamp - current.sourceTime) /
+        std::max(0.000001, current.playbackRate);
+      return current.sampledAt +
+        std::chrono::duration_cast<PlaybackClock::duration>(
+          std::chrono::duration<double>(delay));
+    }
+    const auto anchor =
+      fallbackAnchor != PlaybackClock::time_point{}
+        ? fallbackAnchor : PlaybackClock::now();
+    const double delay = nominalFrameDuration /
+      std::max(0.000001, current.playbackRate);
+    return anchor +
+      std::chrono::duration_cast<PlaybackClock::duration>(
+        std::chrono::duration<double>(std::max(0.001, delay)));
+  }
+
+  void scheduleNextPlaybackFrame(const Request& current)
+  {
+    nextPlaybackFrameAt = playbackDeadlineForTimestamp(
+      current, lookaheadTimestamp);
+    playbackSchedulerActive = true;
+  }
+
+  void advanceSequentialPlayback(const Request& current)
+  {
+    if (!playbackSchedulerActive || !current.playing ||
+        !format || current.path != activePath ||
+        current.playbackKey != activePlaybackKey) {
+      playbackSchedulerActive = false;
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (lookaheadTimestamp >= 0.0) {
+      const auto transportDeadline = playbackDeadlineForTimestamp(
+        current, lookaheadTimestamp, now);
+      if (transportDeadline > now) {
+        // Uma nova amostra do transporte pode corrigir alguns microssegundos
+        // da fase. Nunca mostra o quadro antes da posicao efetiva do REAPER.
+        nextPlaybackFrameAt = transportDeadline;
+        return;
+      }
+    }
+
+    bool advanced = false;
+    if (lookaheadTimestamp >= 0.0) {
+      api.frameUnref(displayFrame);
+      api.frameMoveRef(displayFrame, lookaheadFrame);
+      displayTimestamp = lookaheadTimestamp;
+      lookaheadTimestamp = -1.0;
+      advanced = true;
+    } else if (decodeNextFrame()) {
+      moveDecodedTo(displayFrame, displayTimestamp);
+      advanced = true;
+    }
+
+    // Deixa exatamente um AVFrame pronto. Nunca percorre varios quadros para
+    // alcancar um atraso momentaneo da interface.
+    if (lookaheadTimestamp < 0.0 && decodeNextFrame()) {
+      moveDecodedTo(lookaheadFrame, lookaheadTimestamp);
+    }
+    if (advanced) publishDisplayFrame(current);
+    // A proxima deadline volta a ser calculada pela amostra viva do REAPER.
+    // Se o decoder estiver atrasado, ela ja estara no passado e o loop avanca
+    // imediatamente, sem mudar a origem do relogio nem fazer seek.
+    scheduleNextPlaybackFrame(current);
   }
 
   bool shouldSeek(const Request& current) const
   {
     if (!previousRequestValid) return current.sourceTime > 0.15;
     if (current.playbackKey != activePlaybackKey) return true;
-    const auto now = std::chrono::steady_clock::now();
+    const auto now =
+      current.sampledAt !=
+        std::chrono::steady_clock::time_point{}
+        ? current.sampledAt
+        : std::chrono::steady_clock::now();
     const double elapsed = std::max(
       0.0, std::chrono::duration<double>(
         now - previousRequestAt).count());
     if (previousPlaying && current.playing) {
+      if (std::abs(
+            current.playbackRate - previousPlaybackRate) > 0.000001) {
+        return true;
+      }
       const double expected = elapsed * std::max(
         0.000001, previousPlaybackRate);
       const double actual =
         current.sourceTime - previousSourceTime;
-      return actual < -0.01 || std::abs(actual - expected) > 0.25;
+      const double discontinuity = std::max(
+        0.08, nominalFrameDuration * 4.0);
+      return actual < -0.01 ||
+        std::abs(actual - expected) > discontinuity;
     }
     if (previousPlaying != current.playing) {
       // Stop e Play precisam sempre acordar exatamente no cursor atual.
@@ -1037,18 +1421,44 @@ struct Decoder::Impl {
     if (forceSeek) {
       statusCode.store(1, std::memory_order_release);
     }
-    if (chooseFrame(current.sourceTime, forceSeek)) {
-      publishDisplayFrame(current);
+    const bool startContinuousPlayback =
+      current.playing &&
+      (!previousRequestValid || !previousPlaying ||
+       !playbackSchedulerActive || forceSeek);
+    if (current.playing) {
+      if (startContinuousPlayback) {
+        if (chooseFrame(current.sourceTime, forceSeek)) {
+          publishDisplayFrame(current);
+          scheduleNextPlaybackFrame(current);
+        }
+      } else {
+        // Durante a reproducao a posicao recebida serve apenas para detectar
+        // seek. Esta chamada barata tambem reconverte o quadro atual se a
+        // janela mudou de tamanho, sem avancar o video.
+        publishDisplayFrame(current);
+      }
+    } else {
+      playbackSchedulerActive = false;
+      nextPlaybackFrameAt = {};
+      if (chooseFrame(current.sourceTime, forceSeek)) {
+        publishDisplayFrame(current);
+      }
     }
     previousRequestValid = true;
     previousPlaying = current.playing;
     previousSourceTime = current.sourceTime;
     previousPlaybackRate = current.playbackRate;
-    previousRequestAt = std::chrono::steady_clock::now();
+    previousRequestAt = current.sampledAt !=
+        std::chrono::steady_clock::time_point{}
+      ? current.sampledAt : std::chrono::steady_clock::now();
   }
 
   void workerLoop()
   {
+#ifdef _WIN32
+    SetThreadPriority(
+      GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
     if (!api.load()) {
       statusCode.store(-300, std::memory_order_release);
       return;
@@ -1056,17 +1466,44 @@ struct Decoder::Impl {
     std::uint64_t handledSerial = 0;
     for (;;) {
       Request current;
+      bool hasChangedRequest = false;
       {
         std::unique_lock<std::mutex> lock(requestMutex);
-        requestChanged.wait(lock, [&]() {
+        const auto changed = [&]() {
           return stopRequested ||
             (hasRequest && request.serial != handledSerial);
-        });
+        };
+        if (playbackSchedulerActive &&
+            nextPlaybackFrameAt !=
+              std::chrono::steady_clock::time_point{}) {
+          requestChanged.wait_until(
+            lock, nextPlaybackFrameAt, changed);
+        } else {
+          requestChanged.wait(lock, changed);
+        }
         if (stopRequested) break;
-        current = request;
-        handledSerial = current.serial;
+        if (hasRequest && request.serial != handledSerial) {
+          current = request;
+          handledSerial = current.serial;
+          hasChangedRequest = true;
+        }
       }
-      applyRequest(current);
+      if (hasChangedRequest) applyRequest(current);
+
+      if (playbackSchedulerActive &&
+          std::chrono::steady_clock::now() >=
+            nextPlaybackFrameAt) {
+        Request latest;
+        bool haveLatest = false;
+        {
+          std::lock_guard<std::mutex> lock(requestMutex);
+          if (hasRequest && request.serial == handledSerial) {
+            latest = request;
+            haveLatest = true;
+          }
+        }
+        if (haveLatest) advanceSequentialPlayback(latest);
+      }
     }
     closeMedia();
   }
@@ -1079,23 +1516,63 @@ struct Decoder::Impl {
     double playbackRate,
     int requestedWidth,
     int requestedHeight,
+    std::chrono::steady_clock::time_point sourceSampledAt,
     DecodedFrame& output)
   {
     output = {};
     if (path.empty() || playbackKey.empty()) return false;
+    bool wakeWorker = false;
     {
       std::lock_guard<std::mutex> lock(requestMutex);
+      const auto now =
+        sourceSampledAt !=
+          std::chrono::steady_clock::time_point{}
+          ? sourceSampledAt
+          : std::chrono::steady_clock::now();
+      const double nextSourceTime = std::max(0.0, sourceTime);
+      const double nextPlaybackRate = std::max(0.000001, playbackRate);
+      const int nextWidth = std::max(2, requestedWidth);
+      const int nextHeight = std::max(2, requestedHeight);
+
+      wakeWorker = !hasRequest ||
+        request.path != path ||
+        request.playbackKey != playbackKey ||
+        request.playing != playing ||
+        std::abs(request.playbackRate - nextPlaybackRate) > 0.000001 ||
+        request.requestedWidth != nextWidth ||
+        request.requestedHeight != nextHeight;
+
+      if (!wakeWorker && playing) {
+        // A posicao do REAPER continua sendo amostrada para reconhecer seek,
+        // mas o movimento normal do transporte nao acorda a thread do video.
+        // Assim a decodificacao segue somente as deadlines dos proprios
+        // quadros, como uma reproducao comum.
+        const double elapsed = std::max(
+          0.0, std::chrono::duration<double>(
+            now - request.sampledAt).count());
+        const double expected = elapsed * request.playbackRate;
+        const double actual = nextSourceTime - request.sourceTime;
+        wakeWorker = actual < -0.01 ||
+          std::abs(actual - expected) > 0.08;
+      } else if (!wakeWorker && !playing) {
+        // Parado, qualquer reposicionamento real do cursor deve buscar e
+        // publicar imediatamente o quadro correspondente.
+        wakeWorker = std::abs(
+          nextSourceTime - request.sourceTime) > 0.0005;
+      }
+
       request.path = path;
       request.playbackKey = playbackKey;
-      request.sourceTime = std::max(0.0, sourceTime);
+      request.sourceTime = nextSourceTime;
       request.playing = playing;
-      request.playbackRate = std::max(0.000001, playbackRate);
-      request.requestedWidth = std::max(2, requestedWidth);
-      request.requestedHeight = std::max(2, requestedHeight);
-      ++request.serial;
+      request.playbackRate = nextPlaybackRate;
+      request.requestedWidth = nextWidth;
+      request.requestedHeight = nextHeight;
+      request.sampledAt = now;
+      if (wakeWorker) ++request.serial;
       hasRequest = true;
     }
-    requestChanged.notify_one();
+    if (wakeWorker) requestChanged.notify_one();
 
     std::lock_guard<std::mutex> lock(frameMutex);
     if (!publishedPixels || publishedPath != path ||
@@ -1128,8 +1605,8 @@ struct Decoder::Impl {
   }
 };
 
-Decoder::Decoder()
-  : impl_(std::make_unique<Impl>()) {}
+Decoder::Decoder(FrameReadyCallback frameReady)
+  : impl_(std::make_unique<Impl>(std::move(frameReady))) {}
 
 Decoder::~Decoder() = default;
 
@@ -1145,7 +1622,24 @@ bool Decoder::frameAt(
 {
   return impl_ && impl_->frameAt(
     utf8Path, playbackKey, sourceTime, playing, playbackRate,
-    requestedWidth, requestedHeight, output);
+    requestedWidth, requestedHeight,
+    std::chrono::steady_clock::now(), output);
+}
+
+bool Decoder::frameAt(
+  const std::string& utf8Path,
+  const std::string& playbackKey,
+  double sourceTime,
+  bool playing,
+  double playbackRate,
+  int requestedWidth,
+  int requestedHeight,
+  std::chrono::steady_clock::time_point sourceSampledAt,
+  DecodedFrame& output)
+{
+  return impl_ && impl_->frameAt(
+    utf8Path, playbackKey, sourceTime, playing, playbackRate,
+    requestedWidth, requestedHeight, sourceSampledAt, output);
 }
 
 void Decoder::reset()

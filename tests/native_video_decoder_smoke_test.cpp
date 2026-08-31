@@ -22,6 +22,7 @@ using SteadyClock = std::chrono::steady_clock;
 struct FrameObservation {
   double timestamp = -1.0;
   std::uint64_t checksum = 0;
+  std::uint64_t sequence = 0;
   int width = 0;
   int height = 0;
   bool hasNonzeroPixel = false;
@@ -62,6 +63,7 @@ bool observeFrame(
   }
 
   observation.timestamp = frame.timestamp;
+  observation.sequence = frame.sequence;
   observation.width = frame.width;
   observation.height = frame.height;
   const std::size_t bytes = std::min<std::size_t>(
@@ -151,9 +153,10 @@ bool settleAndHoldStoppedTarget(
 
 int main(int argc, char** argv)
 {
-  if (argc < 3 || argc > 4) {
+  if (argc < 3 || argc > 5) {
     std::cerr <<
-      "uso: teste <diretorio-ffmpeg> <video> [duracao-segundos]\n";
+      "uso: teste <diretorio-ffmpeg> <video> [duracao-segundos] "
+      "[--cadence]\n";
     return 2;
   }
   if (!setRuntimeDirectory(argv[1])) {
@@ -163,7 +166,10 @@ int main(int argc, char** argv)
 
   const std::string videoPath = argv[2];
   const double sourceDuration = argc == 4
-    ? std::strtod(argv[3], nullptr) : 0.0;
+    ? std::strtod(argv[3], nullptr)
+    : (argc == 5 ? std::strtod(argv[3], nullptr) : 0.0);
+  const bool measureCadence =
+    argc == 5 && std::string(argv[4]) == "--cadence";
   const std::string playbackKey = "smoke-test";
   vshook_video::Decoder decoder;
 
@@ -517,6 +523,66 @@ int main(int argc, char** argv)
     }
   }
 
+  int cadenceRequests = 0;
+  int cadenceUniqueFrames = 0;
+  int cadenceRepeatedFrames = 0;
+  int cadenceSkippedIntervals = 0;
+  int cadenceBackwardFrames = 0;
+  double cadenceMaximumTimestampStep = 0.0;
+  if (measureCadence) {
+    vshook_video::Decoder cadenceDecoder;
+    constexpr double cadenceSeconds = 5.0;
+    constexpr double cadencePeriodSeconds = 1.0 / 120.0;
+    constexpr double sourceFramePeriodSeconds = 1.0 / 60.0;
+    const std::string cadenceKey = "cadence-test";
+    FrameObservation warmFrame;
+    const auto warmStartedAt = SteadyClock::now();
+    while (!observeFrame(
+             cadenceDecoder, videoPath, cadenceKey,
+             0.0, false, warmFrame) &&
+           std::chrono::duration<double>(
+             SteadyClock::now() - warmStartedAt).count() < 3.0) {
+      waitForDecoder();
+    }
+
+    const auto cadenceStartedAt = SteadyClock::now();
+    auto nextRequestAt = cadenceStartedAt;
+    double lastTimestamp = -1.0;
+    while (std::chrono::duration<double>(
+             SteadyClock::now() - cadenceStartedAt).count() <
+           cadenceSeconds) {
+      const double elapsed = std::chrono::duration<double>(
+        SteadyClock::now() - cadenceStartedAt).count();
+      FrameObservation observation;
+      if (observeFrame(
+            cadenceDecoder, videoPath, cadenceKey,
+            elapsed, true, observation)) {
+        if (lastTimestamp < 0.0 ||
+            observation.timestamp > lastTimestamp + 0.005) {
+          ++cadenceUniqueFrames;
+          if (lastTimestamp >= 0.0) {
+            const double step = observation.timestamp - lastTimestamp;
+            cadenceMaximumTimestampStep = std::max(
+              cadenceMaximumTimestampStep, step);
+            if (step > sourceFramePeriodSeconds * 1.55) {
+              ++cadenceSkippedIntervals;
+            }
+          }
+          lastTimestamp = observation.timestamp;
+        } else if (observation.timestamp < lastTimestamp - 0.005) {
+          ++cadenceBackwardFrames;
+        } else {
+          ++cadenceRepeatedFrames;
+        }
+      }
+      ++cadenceRequests;
+      nextRequestAt += std::chrono::duration_cast<
+        SteadyClock::duration>(
+          std::chrono::duration<double>(cadencePeriodSeconds));
+      std::this_thread::sleep_until(nextRequestAt);
+    }
+  }
+
   std::cout << "status=" << decoder.status()
             << " frame=" << width << 'x' << height
             << " checksum=" << checksum
@@ -536,6 +602,13 @@ int main(int argc, char** argv)
             << " physicalLoopCycles=" << physicalLoopCycles
             << " maxPhysicalLoopRecovery="
             << maximumPhysicalLoopRecovery
+            << " cadenceRequests=" << cadenceRequests
+            << " cadenceUniqueFrames=" << cadenceUniqueFrames
+            << " cadenceRepeatedFrames=" << cadenceRepeatedFrames
+            << " cadenceSkippedIntervals=" << cadenceSkippedIntervals
+            << " cadenceBackwardFrames=" << cadenceBackwardFrames
+            << " cadenceMaximumTimestampStep="
+            << cadenceMaximumTimestampStep
             << '\n';
   return 0;
 }

@@ -112,6 +112,7 @@ if(VSHOOK_BUILD_TESTS)
         WIN32_LEAN_AND_MEAN
         NOMINMAX
       )
+      target_link_libraries(vshook_video_decoder_smoke_test PRIVATE winmm)
     endif()
   endif()
 endif()
@@ -166,6 +167,7 @@ if(WIN32)
     propsys
     normaliz
     windowscodecs
+    winmm
   )
 endif()
 
