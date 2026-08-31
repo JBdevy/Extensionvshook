@@ -307,6 +307,15 @@ struct VlcApi {
   int (*getState)(libvlc_media_player_t*) = nullptr;
   int (*setRate)(libvlc_media_player_t*, float) = nullptr;
   int (*setMute)(libvlc_media_player_t*, int) = nullptr;
+#ifdef _WIN32
+  void (*setNativeWindow)(libvlc_media_player_t*, void*) = nullptr;
+#else
+  void (*setNativeWindow)(libvlc_media_player_t*, void*) = nullptr;
+#endif
+  void (*setAspectRatio)(libvlc_media_player_t*, const char*) = nullptr;
+  void (*setScale)(libvlc_media_player_t*, float) = nullptr;
+  void (*setMouseInput)(libvlc_media_player_t*, unsigned) = nullptr;
+  void (*setKeyInput)(libvlc_media_player_t*, unsigned) = nullptr;
   void (*setVideoCallbacks)(
     libvlc_media_player_t*, VideoLockCallback,
     VideoUnlockCallback, VideoDisplayCallback, void*) = nullptr;
@@ -402,6 +411,15 @@ struct VlcApi {
     // Tambem e opcional: o relogio e o heartbeat de video continuam sendo a
     // verificacao de seguranca quando um runtime compativel nao exporta state.
     bind(getState, "libvlc_media_player_get_state");
+#ifdef _WIN32
+    bind(setNativeWindow, "libvlc_media_player_set_hwnd");
+#else
+    bind(setNativeWindow, "libvlc_media_player_set_nsobject");
+#endif
+    bind(setAspectRatio, "libvlc_video_set_aspect_ratio");
+    bind(setScale, "libvlc_video_set_scale");
+    bind(setMouseInput, "libvlc_video_set_mouse_input");
+    bind(setKeyInput, "libvlc_video_set_key_input");
     return true;
   }
 };
@@ -1045,7 +1063,7 @@ struct Decoder::Impl {
       const bool targetFramePublished =
         heartbeat.sequence != initialSyncFrameSequence &&
         playerTimeSeconds >= 0.0 &&
-        std::abs(playerTimeSeconds - current.sourceTime) <= 0.12;
+        std::abs(playerTimeSeconds - current.sourceTime) <= 0.035;
       if (!targetFramePublished) {
         // O seek enviado durante Opening pode ser ignorado. Reaplica de forma
         // espaçada quando o player estiver pronto, mantendo-o ativo apenas até
@@ -1346,7 +1364,9 @@ struct Decoder::Impl {
           now + std::chrono::milliseconds(350);
         watchdogCommandIssued = true;
       } else {
-        api.setPause(player, 1);
+        // Nao congela aqui o ultimo quadro do playback. O bloco de Stop logo
+        // abaixo mantem o vout acordado somente ate publicar o quadro exato
+        // da posicao para a qual o cursor de edicao voltou.
         watchdogRecoveryStage = 0;
         watchdogClockStallChecks = 0;
       }
@@ -1355,17 +1375,33 @@ struct Decoder::Impl {
 
     if (!current.playing) {
       // A transicao Play -> Stop sempre força o quadro do cursor de edicao.
-      // Depois disso, somente uma mudança real no cursor solicita outro
-      // quadro. next_frame nao pode ser usado aqui: ele avanca alem do seek e
-      // fazia a janela mostrar um ponto diferente do cursor, especialmente no
-      // inicio do video.
+      // Um set_time com o VLC pausado pode conservar na tela o ultimo quadro
+      // tocado. Faz o mesmo handshake usado na abertura: play + seek, aguarda
+      // o callback do quadro alvo e somente entao pausa. Depois disso, apenas
+      // uma mudanca real no cursor solicita outro quadro.
       const bool stoppedTargetChanged =
         activeStoppedSourceTime < 0.0 ||
         std::abs(
           activeStoppedSourceTime - current.sourceTime) > 0.008;
       if (wasPlaying || stoppedTargetChanged) {
+        const FrameHeartbeat heartbeat = readFrameHeartbeat();
+        if (api.play(player) != 0) {
+          createPlayer(current);
+          return;
+        }
         api.setTime(player, secondsToMilliseconds(current.sourceTime));
-        activeStoppedSourceTime = current.sourceTime;
+        api.setPause(player, 0);
+        activeStoppedSourceTime = -1.0;
+        initialSyncPending = true;
+        initialSyncForceAt = now + std::chrono::milliseconds(600);
+        initialSyncFrameSequence = heartbeat.sequence;
+        lastInitialStoppedSeekAt = now;
+        armWatchdogGrace(
+          current, now, std::chrono::milliseconds(700));
+        previousRequestValid = true;
+        previousRequestSourceTime = current.sourceTime;
+        previousRequestWall = now;
+        return;
       }
     } else if (wasPlaying && playbackJump) {
       if (playbackRestart) {
@@ -1540,6 +1576,441 @@ void Decoder::reset()
 }
 
 int Decoder::status() const
+{
+  return impl_
+    ? impl_->statusCode.load(std::memory_order_acquire)
+    : -299;
+}
+
+struct NativeWindowPlayer::Impl {
+  struct Request {
+    std::string path;
+    std::string playbackKey;
+    double sourceTime = 0.0;
+    double playbackRate = 1.0;
+    void* nativeWindow = nullptr;
+    int windowWidth = 1;
+    int windowHeight = 1;
+    bool playing = false;
+    bool stretch = false;
+    std::uint64_t serial = 0;
+  };
+
+  VlcApi api;
+  libvlc_instance_t* instance = nullptr;
+  libvlc_media_t* media = nullptr;
+  libvlc_media_player_t* player = nullptr;
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::thread worker;
+  Request request;
+  bool hasRequest = false;
+  bool stopRequested = false;
+  std::atomic<int> statusCode{0};
+
+  std::string activePath;
+  std::string activePlaybackKey;
+  void* activeWindow = nullptr;
+  bool activePlaying = false;
+  bool activeStretch = false;
+  int activeWindowWidth = 1;
+  int activeWindowHeight = 1;
+  double activeRate = 1.0;
+  double activeStoppedTime = -1.0;
+  double previousSourceTime = 0.0;
+  std::chrono::steady_clock::time_point previousRequestAt{};
+  std::chrono::steady_clock::time_point lastClockCorrectionAt{};
+  bool previousRequestValid = false;
+  bool initialStoppedFramePending = false;
+  double initialStoppedTarget = 0.0;
+  std::chrono::steady_clock::time_point initialStoppedDeadline{};
+
+  Impl()
+  {
+    worker = std::thread([this]() { workerLoop(); });
+  }
+
+  ~Impl()
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stopRequested = true;
+    }
+    changed.notify_all();
+    if (worker.joinable()) worker.join();
+  }
+
+  bool initialize()
+  {
+    if (!api.load()) {
+      statusCode.store(-200, std::memory_order_release);
+      return false;
+    }
+    if (!api.setNativeWindow) {
+      statusCode.store(-205, std::memory_order_release);
+      return false;
+    }
+    setEnvironmentValue("VLC_PLUGIN_PATH", api.pluginDirectory);
+    std::vector<std::string> ownedArguments = {
+      "--intf=dummy",
+      "--no-audio",
+      "--no-video-title-show",
+      "--no-osd",
+      "--no-stats",
+      "--avcodec-hw=any",
+      "--drop-late-frames",
+      "--quiet"
+    };
+    std::vector<const char*> arguments;
+    arguments.reserve(ownedArguments.size());
+    for (const std::string& argument : ownedArguments) {
+      arguments.push_back(argument.c_str());
+    }
+    instance = acquireSharedVlcInstance(api, arguments);
+    if (!instance) {
+      statusCode.store(-201, std::memory_order_release);
+      return false;
+    }
+    return true;
+  }
+
+  void destroyPlayer()
+  {
+    if (player) {
+      api.stop(player);
+      // Desanexa antes de liberar para que o vout nao conserve a superficie
+      // depois de a janela dedicada ser fechada ou trocar para uma imagem.
+      if (api.setNativeWindow) api.setNativeWindow(player, nullptr);
+      api.releasePlayer(player);
+      player = nullptr;
+    }
+    if (media) {
+      api.releaseMedia(media);
+      media = nullptr;
+    }
+    activePath.clear();
+    activePlaybackKey.clear();
+    activeWindow = nullptr;
+    activePlaying = false;
+    activeStoppedTime = -1.0;
+    previousRequestValid = false;
+    initialStoppedFramePending = false;
+    initialStoppedDeadline = {};
+  }
+
+  void applyAspect(const Request& current, bool force)
+  {
+    if (!player || !api.setAspectRatio) return;
+    if (!force && activeStretch == current.stretch &&
+        activeWindowWidth == current.windowWidth &&
+        activeWindowHeight == current.windowHeight) {
+      return;
+    }
+    if (api.setScale) api.setScale(player, 0.0f);
+    if (current.stretch) {
+      const std::string ratio =
+        std::to_string(std::max(1, current.windowWidth)) + ":" +
+        std::to_string(std::max(1, current.windowHeight));
+      api.setAspectRatio(player, ratio.c_str());
+    } else {
+      api.setAspectRatio(player, nullptr);
+    }
+    activeStretch = current.stretch;
+    activeWindowWidth = current.windowWidth;
+    activeWindowHeight = current.windowHeight;
+  }
+
+  bool createPlayer(const Request& current)
+  {
+    destroyPlayer();
+    if (!instance || current.path.empty() || !current.nativeWindow) return false;
+    const std::string path = mediaPathForVlc(current.path);
+    media = api.newMediaPath(instance, path.c_str());
+    if (!media) {
+      statusCode.store(-202, std::memory_order_release);
+      return false;
+    }
+    player = api.newPlayerFromMedia(media);
+    if (!player) {
+      statusCode.store(-203, std::memory_order_release);
+      destroyPlayer();
+      return false;
+    }
+    api.setNativeWindow(player, current.nativeWindow);
+    if (api.setMouseInput) api.setMouseInput(player, 0);
+    if (api.setKeyInput) api.setKeyInput(player, 0);
+    api.setMute(player, 1);
+    const double rate = std::max(0.05, std::min(8.0, current.playbackRate));
+    api.setRate(player, static_cast<float>(rate));
+    activePath = current.path;
+    activePlaybackKey = current.playbackKey;
+    activeWindow = current.nativeWindow;
+    activeRate = rate;
+    activeStretch = !current.stretch;
+    activeWindowWidth = 0;
+    activeWindowHeight = 0;
+    applyAspect(current, true);
+    statusCode.store(1, std::memory_order_release);
+    if (api.play(player) != 0) {
+      statusCode.store(-204, std::memory_order_release);
+      destroyPlayer();
+      return false;
+    }
+    api.setTime(player, secondsToMilliseconds(current.sourceTime));
+    activePlaying = current.playing;
+    const auto now = std::chrono::steady_clock::now();
+    if (!current.playing) {
+      // Um vout novo precisa chegar a Playing antes que Pause produza o quadro
+      // do seek. A worker pausa assim que o relogio alcanca o alvo (ou no prazo
+      // defensivo), sem bloquear a interface.
+      initialStoppedFramePending = true;
+      initialStoppedTarget = current.sourceTime;
+      initialStoppedDeadline = now + std::chrono::milliseconds(450);
+      activeStoppedTime = -1.0;
+    }
+    previousRequestValid = true;
+    previousSourceTime = current.sourceTime;
+    previousRequestAt = now;
+    lastClockCorrectionAt = now;
+    return true;
+  }
+
+  void finishInitialStoppedFrame(
+    const Request& current,
+    const std::chrono::steady_clock::time_point now)
+  {
+    if (!initialStoppedFramePending || !player || current.playing) return;
+    const libvlc_time_t rawTime = api.getTime(player);
+    const double playerTime = rawTime >= 0
+      ? static_cast<double>(rawTime) / 1000.0 : -1.0;
+    const int state = api.getState ? api.getState(player) : kVlcPlaying;
+    const bool nearTarget = playerTime >= 0.0 &&
+      std::abs(playerTime - initialStoppedTarget) <= 0.035;
+    const bool ready = state == kVlcPlaying || state == kVlcPaused;
+    if (!(nearTarget && ready) && now < initialStoppedDeadline) return;
+    api.setTime(player, secondsToMilliseconds(initialStoppedTarget));
+    api.setPause(player, 1);
+    activeStoppedTime = initialStoppedTarget;
+    initialStoppedFramePending = false;
+    initialStoppedDeadline = {};
+    statusCode.store(2, std::memory_order_release);
+  }
+
+  bool beginStoppedFrame(
+    const Request& current,
+    const std::chrono::steady_clock::time_point now)
+  {
+    if (!player) return false;
+    if (api.play(player) != 0) return false;
+    api.setTime(player, secondsToMilliseconds(current.sourceTime));
+    api.setPause(player, 0);
+    initialStoppedFramePending = true;
+    initialStoppedTarget = current.sourceTime;
+    initialStoppedDeadline = now + std::chrono::milliseconds(450);
+    activeStoppedTime = -1.0;
+    return true;
+  }
+
+  void applyRequest(const Request& current)
+  {
+    if (current.path.empty() || !current.nativeWindow) {
+      destroyPlayer();
+      statusCode.store(0, std::memory_order_release);
+      return;
+    }
+    if (!player || current.path != activePath ||
+        current.playbackKey != activePlaybackKey ||
+        current.nativeWindow != activeWindow) {
+      createPlayer(current);
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    applyAspect(current, false);
+    const double rate = std::max(0.05, std::min(8.0, current.playbackRate));
+    if (std::abs(rate - activeRate) > 0.0001) {
+      api.setRate(player, static_cast<float>(rate));
+      activeRate = rate;
+    }
+
+    if (initialStoppedFramePending) {
+      if (current.playing) {
+        initialStoppedFramePending = false;
+        initialStoppedDeadline = {};
+        api.play(player);
+        api.setPause(player, 0);
+        activePlaying = true;
+      } else if (std::abs(current.sourceTime - initialStoppedTarget) > 0.008) {
+        initialStoppedTarget = current.sourceTime;
+        initialStoppedDeadline = now + std::chrono::milliseconds(300);
+        api.setTime(player, secondsToMilliseconds(current.sourceTime));
+      }
+      finishInitialStoppedFrame(current, now);
+      previousRequestValid = true;
+      previousSourceTime = current.sourceTime;
+      previousRequestAt = now;
+      return;
+    }
+
+    const bool wasPlaying = activePlaying;
+    bool stoppedFrameStarted = false;
+    if (current.playing != activePlaying) {
+      if (current.playing) {
+        api.play(player);
+        api.setTime(player, secondsToMilliseconds(current.sourceTime));
+        api.setPause(player, 0);
+        activeStoppedTime = -1.0;
+      } else {
+        if (!beginStoppedFrame(current, now)) {
+          createPlayer(current);
+          return;
+        }
+        stoppedFrameStarted = true;
+      }
+      activePlaying = current.playing;
+    }
+
+    if (!current.playing) {
+      if (!stoppedFrameStarted &&
+          (activeStoppedTime < 0.0 ||
+           std::abs(activeStoppedTime - current.sourceTime) > 0.008)) {
+        if (!beginStoppedFrame(current, now)) {
+          createPlayer(current);
+          return;
+        }
+      }
+    } else {
+      bool jump = false;
+      bool restart = false;
+      if (previousRequestValid && wasPlaying) {
+        const double elapsed = std::chrono::duration<double>(
+          now - previousRequestAt).count();
+        const double expected = elapsed * rate;
+        const double actual = current.sourceTime - previousSourceTime;
+        restart = actual < -0.01;
+        jump = restart || std::abs(actual - expected) > 0.30;
+      }
+      const int state = api.getState ? api.getState(player) : kVlcPlaying;
+      if (restart || state == kVlcEnded || state == kVlcStopped) {
+        api.play(player);
+        api.setTime(player, secondsToMilliseconds(current.sourceTime));
+        api.setPause(player, 0);
+      } else if (jump) {
+        api.setTime(player, secondsToMilliseconds(current.sourceTime));
+      } else if (now - lastClockCorrectionAt >=
+                   std::chrono::milliseconds(80)) {
+        const libvlc_time_t rawTime = api.getTime(player);
+        if (rawTime >= 0) {
+          const double playerTime = static_cast<double>(rawTime) / 1000.0;
+          // O relogio do VLC e escravo do grid. Uma tolerancia de meio
+          // segundo deixava a nossa janela visivelmente adiantada em relacao
+          // a janela nativa do REAPER.
+          if (std::abs(playerTime - current.sourceTime) > 0.075) {
+            api.setTime(player, secondsToMilliseconds(current.sourceTime));
+          }
+        }
+        lastClockCorrectionAt = now;
+      }
+    }
+
+    previousRequestValid = true;
+    previousSourceTime = current.sourceTime;
+    previousRequestAt = now;
+    statusCode.store(2, std::memory_order_release);
+  }
+
+  void workerLoop()
+  {
+    if (!initialize()) return;
+    std::uint64_t handledSerial = 0;
+    for (;;) {
+      Request current;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait_for(lock, std::chrono::milliseconds(10), [&]() {
+          return stopRequested ||
+            (hasRequest && request.serial != handledSerial);
+        });
+        if (stopRequested) break;
+        if (!hasRequest) continue;
+        current = request;
+        handledSerial = current.serial;
+      }
+      applyRequest(current);
+    }
+    destroyPlayer();
+    releaseSharedVlcInstance(api, instance);
+  }
+
+  bool update(
+    const std::string& path,
+    const std::string& playbackKey,
+    double sourceTime,
+    bool playing,
+    double playbackRate,
+    void* nativeWindow,
+    int windowWidth,
+    int windowHeight,
+    bool stretch)
+  {
+    if (path.empty() || playbackKey.empty() || !nativeWindow) return false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      request.path = path;
+      request.playbackKey = playbackKey;
+      request.sourceTime = std::max(0.0, sourceTime);
+      request.playing = playing;
+      request.playbackRate = playbackRate;
+      request.nativeWindow = nativeWindow;
+      request.windowWidth = std::max(1, windowWidth);
+      request.windowHeight = std::max(1, windowHeight);
+      request.stretch = stretch;
+      ++request.serial;
+      hasRequest = true;
+    }
+    changed.notify_one();
+    return statusCode.load(std::memory_order_acquire) >= 0;
+  }
+
+  void reset()
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      request = Request{};
+      ++request.serial;
+      hasRequest = true;
+    }
+    changed.notify_one();
+  }
+};
+
+NativeWindowPlayer::NativeWindowPlayer()
+  : impl_(std::make_unique<Impl>()) {}
+
+NativeWindowPlayer::~NativeWindowPlayer() = default;
+
+bool NativeWindowPlayer::update(
+  const std::string& utf8Path,
+  const std::string& playbackKey,
+  double sourceTime,
+  bool playing,
+  double playbackRate,
+  void* nativeWindow,
+  int windowWidth,
+  int windowHeight,
+  bool stretch)
+{
+  return impl_ && impl_->update(
+    utf8Path, playbackKey, sourceTime, playing, playbackRate,
+    nativeWindow, windowWidth, windowHeight, stretch);
+}
+
+void NativeWindowPlayer::reset()
+{
+  if (impl_) impl_->reset();
+}
+
+int NativeWindowPlayer::status() const
 {
   return impl_
     ? impl_->statusCode.load(std::memory_order_acquire)

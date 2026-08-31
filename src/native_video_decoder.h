@@ -48,4 +48,35 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+// Saida nativa do proprio VLC para uma janela dedicada. Diferentemente de
+// Decoder, este caminho nao converte nem copia cada quadro para BGRA: o vout do
+// VLC apresenta diretamente na superficie da janela e pode manter 60 fps em
+// tela cheia com aceleracao de hardware. Teleprompts continuam usando Decoder
+// porque precisam compor texto e outros overlays sobre os pixels do video.
+class NativeWindowPlayer {
+public:
+  NativeWindowPlayer();
+  ~NativeWindowPlayer();
+
+  NativeWindowPlayer(const NativeWindowPlayer&) = delete;
+  NativeWindowPlayer& operator=(const NativeWindowPlayer&) = delete;
+
+  bool update(
+    const std::string& utf8Path,
+    const std::string& playbackKey,
+    double sourceTime,
+    bool playing,
+    double playbackRate,
+    void* nativeWindow,
+    int windowWidth,
+    int windowHeight,
+    bool stretch);
+  void reset();
+  int status() const;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 } // namespace vshook_video

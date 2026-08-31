@@ -1420,6 +1420,13 @@ static std::string g_nativeUiTemporaryPopupText;
 static std::string g_nativeUiTemporaryPopupColorMode;
 static std::chrono::steady_clock::time_point
   g_nativeUiTemporaryPopupUntil;
+struct NativeUiDeferredPopup {
+  std::string text;
+  std::string colorMode;
+  std::chrono::milliseconds duration{1};
+};
+static std::deque<NativeUiDeferredPopup>
+  g_nativeUiDeferredPopups;
 static RECT g_nativeMainModalConfirmRect{0, 0, 0, 0};
 static RECT g_nativeMainModalCancelRect{0, 0, 0, 0};
 static RECT g_nativeMainModalCloseRect{0, 0, 0, 0};
@@ -20501,23 +20508,152 @@ static bool nativeUiIsCustomizeModal(
     kind == NativeMainModalKind::CustomizeBorderColor;
 }
 
+static std::chrono::milliseconds nativeUiPopupDuration(
+  double durationSeconds)
+{
+  return std::chrono::milliseconds(
+    std::max(1, static_cast<int>(
+      std::round(durationSeconds * 1000.0))));
+}
+
+static void nativeUiWakeTemporaryPopupPaint()
+{
+  if (!g_nativeAppActivePanelHwnd) return;
+  nativeUiSetFrameTimerInterval(
+    g_nativeAppActivePanelHwnd,
+    kNativeUiFrameActiveIntervalMs);
+  InvalidateRect(g_nativeAppActivePanelHwnd,
+    nullptr, FALSE);
+}
+
+static void nativeUiActivateTemporaryPopup(
+  const NativeUiDeferredPopup& popup,
+  std::chrono::steady_clock::time_point now =
+    std::chrono::steady_clock::now())
+{
+  g_nativeUiTemporaryPopupText = popup.text;
+  g_nativeUiTemporaryPopupColorMode = popup.colorMode;
+  g_nativeUiTemporaryPopupUntil =
+    now + popup.duration;
+}
+
+static void nativeUiDeferTemporaryPopup(
+  NativeUiDeferredPopup popup,
+  bool atFront = false)
+{
+  if (popup.text.empty()) return;
+  if (!atFront && !g_nativeUiDeferredPopups.empty()) {
+    NativeUiDeferredPopup& last =
+      g_nativeUiDeferredPopups.back();
+    if (last.text == popup.text &&
+        last.colorMode == popup.colorMode) {
+      last.duration = popup.duration;
+      return;
+    }
+  }
+  constexpr size_t kMaxDeferredPopups = 16;
+  if (g_nativeUiDeferredPopups.size() >=
+      kMaxDeferredPopups) {
+    if (atFront) {
+      g_nativeUiDeferredPopups.pop_back();
+    } else {
+      g_nativeUiDeferredPopups.pop_front();
+    }
+  }
+  if (atFront) {
+    g_nativeUiDeferredPopups.push_front(
+      std::move(popup));
+  } else {
+    g_nativeUiDeferredPopups.push_back(
+      std::move(popup));
+  }
+}
+
+static bool nativeUiManualStopFadeoutPopupActive()
+{
+  std::lock_guard<std::mutex> lock(
+    g_nativeManualStopFadeoutMutex);
+  return g_nativeManualStopFadeoutRuntime.active;
+}
+
+static void nativeUiShowTemporaryPopupWithColor(
+  const std::string& text,
+  const std::string& colorMode,
+  double durationSeconds)
+{
+  if (text.empty()) {
+    g_nativeUiTemporaryPopupText.clear();
+    g_nativeUiTemporaryPopupColorMode.clear();
+    g_nativeUiTemporaryPopupUntil =
+      std::chrono::steady_clock::time_point{};
+    g_nativeUiDeferredPopups.clear();
+    nativeUiWakeTemporaryPopupPaint();
+    return;
+  }
+
+  NativeUiDeferredPopup popup;
+  popup.text = text;
+  popup.colorMode = colorMode;
+  popup.duration = nativeUiPopupDuration(
+    durationSeconds);
+  if (nativeUiManualStopFadeoutPopupActive() ||
+      !g_nativeUiDeferredPopups.empty()) {
+    nativeUiDeferTemporaryPopup(std::move(popup));
+  } else {
+    nativeUiActivateTemporaryPopup(popup);
+  }
+  nativeUiWakeTemporaryPopupPaint();
+}
+
 static void nativeUiShowTemporaryPopup(
   const std::string& text,
   double durationSeconds = 1.2)
 {
-  g_nativeUiTemporaryPopupColorMode.clear();
-  g_nativeUiTemporaryPopupText = text;
-  const auto duration = std::chrono::milliseconds(
-    std::max(1, static_cast<int>(
-      std::round(durationSeconds * 1000.0))));
-  g_nativeUiTemporaryPopupUntil =
-    std::chrono::steady_clock::now() + duration;
-  if (g_nativeAppActivePanelHwnd) {
-    nativeUiSetFrameTimerInterval(
-      g_nativeAppActivePanelHwnd,
-      kNativeUiFrameActiveIntervalMs);
-    InvalidateRect(g_nativeAppActivePanelHwnd,
-      nullptr, FALSE);
+  nativeUiShowTemporaryPopupWithColor(
+    text, "", durationSeconds);
+}
+
+static void nativeUiAdvanceTemporaryPopupQueue(
+  bool fadeoutActive,
+  std::chrono::steady_clock::time_point now)
+{
+  if (fadeoutActive) {
+    if (!g_nativeUiTemporaryPopupText.empty()) {
+      if (now < g_nativeUiTemporaryPopupUntil) {
+        NativeUiDeferredPopup interrupted;
+        interrupted.text =
+          g_nativeUiTemporaryPopupText;
+        interrupted.colorMode =
+          g_nativeUiTemporaryPopupColorMode;
+        interrupted.duration =
+          std::max(std::chrono::milliseconds(1),
+            std::chrono::duration_cast<
+              std::chrono::milliseconds>(
+                g_nativeUiTemporaryPopupUntil - now));
+        nativeUiDeferTemporaryPopup(
+          std::move(interrupted), true);
+      }
+      g_nativeUiTemporaryPopupText.clear();
+      g_nativeUiTemporaryPopupColorMode.clear();
+      g_nativeUiTemporaryPopupUntil =
+        std::chrono::steady_clock::time_point{};
+    }
+    return;
+  }
+
+  if (!g_nativeUiTemporaryPopupText.empty() &&
+      now >= g_nativeUiTemporaryPopupUntil) {
+    g_nativeUiTemporaryPopupText.clear();
+    g_nativeUiTemporaryPopupColorMode.clear();
+    g_nativeUiTemporaryPopupUntil =
+      std::chrono::steady_clock::time_point{};
+  }
+  if (g_nativeUiTemporaryPopupText.empty() &&
+      !g_nativeUiDeferredPopups.empty()) {
+    NativeUiDeferredPopup next =
+      std::move(g_nativeUiDeferredPopups.front());
+    g_nativeUiDeferredPopups.pop_front();
+    nativeUiActivateTemporaryPopup(next, now);
   }
 }
 
@@ -20584,8 +20720,8 @@ static void nativeUiShowBatteryPopup(
   const std::string& text,
   const std::string& colorMode)
 {
-  nativeUiShowTemporaryPopup(text, 3.0);
-  g_nativeUiTemporaryPopupColorMode = colorMode;
+  nativeUiShowTemporaryPopupWithColor(
+    text, colorMode, 3.0);
 }
 
 static void nativeUiPollBatteryState()
@@ -25504,8 +25640,11 @@ nativeProjectSyncCompareTrackRecords(
   comparison.equivalent = primary[1] == secondary[1] &&
     primary[2] == secondary[2] &&
     nativeProjectSyncUnicodeEqual(primary[3], secondary[3]) &&
-    primary[4] == secondary[4] &&
-    primary[5] == secondary[5];
+    primary[4] == secondary[4];
+  // A quantidade de itens (campo 5) e derivada dos registros ITEM, que ja
+  // possuem comparacao e plano de aplicacao proprios. Trata-la tambem como
+  // metadado da pista duplicava cada diferenca de item na categoria Pistas e
+  // podia manter a conferencia bloqueada mesmo depois de os itens convergirem.
   if (!comparison.equivalent) {
     comparison.primarySummary = nativeProjectSyncRecordSummary(primary);
     comparison.secondarySummary = nativeProjectSyncRecordSummary(secondary);
@@ -27113,8 +27252,11 @@ nativeProjectSyncRppReferences(
             ? afterLine : std::min(afterLine, itemLineEnd);
           const std::string itemText = nativeTrim(
             rpp.substr(itemLine, itemEnd - itemLine));
-          if (nativeLower(itemText).rfind("guid ", 0) == 0) {
-            itemId = nativeLower(nativeTrim(itemText.substr(5)));
+          if (nativeLower(itemText).rfind("iguid ", 0) == 0) {
+            // IGUID pertence ao MediaItem. A linha GUID que aparece depois,
+            // dentro de <TAKE>, pertence ao take e nao serve para filtrar o
+            // differencePlan nem para associar a midia do bundle.
+            itemId = nativeLower(nativeTrim(itemText.substr(6)));
             break;
           }
           if (itemLineEnd == std::string::npos ||
@@ -29041,17 +29183,31 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
       if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
       bool directApplied = true;
       if (tracksDiffer) {
+        // Primeiro conclui toda a ordem. ReorderSelectedTracks pode recalcular
+        // os fechamentos de pasta das pistas vizinhas; aplicar I_FOLDERDEPTH
+        // dentro deste mesmo loop fazia uma reorganizacao posterior desfazer
+        // a profundidade que ja havia sido copiada.
         for (size_t targetIndex = 0;
              targetIndex < targets.size(); ++targetIndex) {
           MediaTrack* track = targets[targetIndex].track;
-          SetOnlyTrackSelected_ptr(track);
-          if (!ReorderSelectedTracks_ptr(
-                static_cast<int>(targetIndex), 0)) {
-            directApplied = false;
-            directError = "Nao foi possivel alinhar a ordem das pistas.";
-            break;
+          if (GetTrack_ptr(project,
+                static_cast<int>(targetIndex)) != track) {
+            SetOnlyTrackSelected_ptr(track);
+            if (!ReorderSelectedTracks_ptr(
+                  static_cast<int>(targetIndex), 0)) {
+              directApplied = false;
+              directError = "Nao foi possivel alinhar a ordem das pistas.";
+              break;
+            }
           }
-          track = GetTrack_ptr(project, static_cast<int>(targetIndex));
+        }
+        // Com a ordem estabilizada, aplica os metadados estruturais. Nenhuma
+        // outra movimentacao de pista ocorre depois desta passada.
+        for (size_t targetIndex = 0;
+             directApplied && targetIndex < targets.size();
+             ++targetIndex) {
+          MediaTrack* track = GetTrack_ptr(
+            project, static_cast<int>(targetIndex));
           std::vector<char> writableName(
             targets[targetIndex].name.begin(),
             targets[targetIndex].name.end());
@@ -29364,6 +29520,20 @@ static std::string nativeProjectSyncRppTrackGuid(
   return nativeLower(nativeTrim(value));
 }
 
+static bool nativeProjectSyncRppTrackFolderDepth(
+  const std::string& chunk,
+  int& folderDepthOut)
+{
+  const std::string isBus =
+    nativeProjectSyncRppNamedValue(chunk, "isbus");
+  std::istringstream values(isBus);
+  int folderMode = 0;
+  int folderDepth = 0;
+  if (!(values >> folderMode >> folderDepth)) return false;
+  folderDepthOut = folderDepth;
+  return true;
+}
+
 static std::string nativeProjectSyncMergeNumericLine(
   const std::string& sourceLine,
   const std::string& targetLine,
@@ -29423,8 +29593,11 @@ static std::string nativeProjectSyncRppItemGuid(
   std::string line;
   while (std::getline(input, line)) {
     const std::string trimmed = nativeTrim(line);
-    if (nativeLower(trimmed).rfind("guid ", 0) == 0) {
-      return nativeLower(nativeTrim(trimmed.substr(5)));
+    // No RPP, IGUID identifica o MediaItem. GUID dentro de <TAKE> identifica
+    // o take e nunca corresponde ao GUID publicado no manifesto. Usar GUID
+    // aqui fazia todo plano incremental ITEM falhar silenciosamente.
+    if (nativeLower(trimmed).rfind("iguid ", 0) == 0) {
+      return nativeLower(nativeTrim(trimmed.substr(6)));
     }
   }
   return {};
@@ -29603,7 +29776,8 @@ static bool nativeProjectSyncApplyTracksInPlace(
   if (!project || !CountTracks_ptr || !GetTrack_ptr ||
       !InsertTrackAtIndex_ptr || !DeleteTrack_ptr ||
       !SetOnlyTrackSelected_ptr || !ReorderSelectedTracks_ptr ||
-      !SetTrackStateChunk_ptr || !GetTrackStateChunk_ptr) {
+      !SetTrackStateChunk_ptr || !GetTrackStateChunk_ptr ||
+      !SetMediaTrackInfo_Value_ptr) {
     errorOut = "O REAPER nao disponibilizou as APIs de pistas para aplicar no projeto aberto.";
     return false;
   }
@@ -29625,10 +29799,13 @@ static bool nativeProjectSyncApplyTracksInPlace(
     byName.emplace(nativeLower(nativeTrim(nativeTrackName(track, index))), track);
   }
   std::set<MediaTrack*> used;
+  std::vector<bool> createdTargets(sourceChunks.size(), false);
+  // Fase 1: cria e reorganiza todas as pistas. O REAPER pode recalcular
+  // I_FOLDERDEPTH ao mover uma pista, portanto nenhum chunk estrutural e
+  // aplicado antes que a ordem inteira esteja estabilizada.
   for (size_t sourceIndex = 0; sourceIndex < sourceChunks.size();
        ++sourceIndex) {
     const std::string& sourceChunk = sourceChunks[sourceIndex];
-    const auto sourceSegments = nativeProjectSyncRppTrackSegments(sourceChunk);
     std::string sourceGuid = nativeProjectSyncRppTrackGuid(sourceChunk);
     if (sourceGuid.empty()) {
       sourceGuid = nativeLower(nativeTrim(
@@ -29663,11 +29840,14 @@ static bool nativeProjectSyncApplyTracksInPlace(
         return false;
       }
     } else {
-      SetOnlyTrackSelected_ptr(target);
-      if (!ReorderSelectedTracks_ptr(
-            static_cast<int>(sourceIndex), 0)) {
-        errorOut = "Nao foi possivel alinhar a ordem das pistas no PC B.";
-        return false;
+      if (GetTrack_ptr(project,
+            static_cast<int>(sourceIndex)) != target) {
+        SetOnlyTrackSelected_ptr(target);
+        if (!ReorderSelectedTracks_ptr(
+              static_cast<int>(sourceIndex), 0)) {
+          errorOut = "Nao foi possivel alinhar a ordem das pistas no PC B.";
+          return false;
+        }
       }
       target = GetTrack_ptr(project, static_cast<int>(sourceIndex));
     }
@@ -29675,8 +29855,38 @@ static bool nativeProjectSyncApplyTracksInPlace(
       errorOut = "A pista de destino deixou de existir durante a aplicacao.";
       return false;
     }
+    createdTargets[sourceIndex] = created;
+    used.insert(target);
+  }
+
+  // As pistas que serao removidas ja ficaram depois da ordem do PC A. Apaga
+  // antes de gravar os chunks finais, porque a exclusao tambem pode ajustar o
+  // fechamento de uma pasta vizinha.
+  for (int index = CountTracks_ptr(project) - 1;
+       index >= static_cast<int>(sourceChunks.size()); --index) {
+    MediaTrack* extra = GetTrack_ptr(project, index);
+    if (!extra) continue;
+    if (differencePlan && differencePlan->scoped) {
+      const std::string extraId = nativeLower(
+        nativeTrackGuid(extra, index));
+      if (differencePlan->trackIds.count(extraId) == 0) continue;
+    }
+    DeleteTrack_ptr(extra);
+  }
+
+  // Fase 2: com toda movimentacao terminada, aplica os chunks e preserva os
+  // FX/routings locais conforme as regras do Project Sync.
+  for (size_t sourceIndex = 0; sourceIndex < sourceChunks.size();
+       ++sourceIndex) {
+    const std::string& sourceChunk = sourceChunks[sourceIndex];
+    MediaTrack* target = GetTrack_ptr(
+      project, static_cast<int>(sourceIndex));
+    if (!target) {
+      errorOut = "A pista de destino deixou de existir durante a aplicacao.";
+      return false;
+    }
     std::string finalChunk;
-    if (created) {
+    if (createdTargets[sourceIndex]) {
       finalChunk = nativeProjectSyncSanitizeNewTrackChunk(sourceChunk);
     } else {
       std::string targetChunk;
@@ -29692,18 +29902,36 @@ static bool nativeProjectSyncApplyTracksInPlace(
       errorOut = "O REAPER recusou a atualizacao de uma pista no projeto aberto.";
       return false;
     }
-    used.insert(target);
   }
-  for (int index = CountTracks_ptr(project) - 1;
-       index >= static_cast<int>(sourceChunks.size()); --index) {
-    MediaTrack* extra = GetTrack_ptr(project, index);
-    if (!extra) continue;
-    if (differencePlan && differencePlan->scoped) {
-      const std::string extraId = nativeLower(
-        nativeTrackGuid(extra, index));
-      if (differencePlan->trackIds.count(extraId) == 0) continue;
+
+  // SetTrackStateChunk ainda pode normalizar ISBUS enquanto os chunks
+  // seguintes sao gravados. A passada final reaplica somente as profundidades
+  // autorizadas pelo plano, depois que nenhuma outra operacao pode altera-las.
+  for (size_t sourceIndex = 0; sourceIndex < sourceChunks.size();
+       ++sourceIndex) {
+    const std::string& sourceChunk = sourceChunks[sourceIndex];
+    std::string sourceGuid =
+      nativeProjectSyncRppTrackGuid(sourceChunk);
+    if (sourceGuid.empty()) {
+      sourceGuid = nativeLower(nativeTrim(
+        nativeProjectSyncRppNamedValue(sourceChunk, "trackid")));
     }
-    DeleteTrack_ptr(extra);
+    if (differencePlan && differencePlan->scoped &&
+        differencePlan->trackIds.count(sourceGuid) == 0) {
+      continue;
+    }
+    int folderDepth = 0;
+    if (!nativeProjectSyncRppTrackFolderDepth(
+          sourceChunk, folderDepth)) {
+      continue;
+    }
+    MediaTrack* target = GetTrack_ptr(
+      project, static_cast<int>(sourceIndex));
+    if (!target || !SetMediaTrackInfo_Value_ptr(
+          target, "I_FOLDERDEPTH", folderDepth)) {
+      errorOut = "Nao foi possivel finalizar a estrutura de pastas das pistas no PC B.";
+      return false;
+    }
   }
   return true;
 }
@@ -30043,6 +30271,10 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
   std::string requestId;
   std::string remoteManifestRevision;
   std::string storedRemoteConfigSnapshot;
+  bool postApplyCompared = false;
+  bool postApplyStructurallyReady = true;
+  int postApplyStructuralDifferences = 0;
+  std::string postApplyDiffJson;
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     remoteManifest = g_nativeProjectSyncPreflight.remoteManifest;
@@ -30060,14 +30292,35 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
     result.configApplied = configurationsApplied ||
       result.configDifferenceCount == 0;
     nativeProjectSyncBuildComparePresentation(result);
+    postApplyCompared = true;
+    postApplyStructurallyReady = result.structuralDifferenceCount == 0;
+    postApplyStructuralDifferences = result.structuralDifferenceCount;
+    postApplyDiffJson = result.diffJson;
     nativeProjectSyncStorePreflightResult(
       requestId, result.ready, result.diffJson,
       remoteManifestRevision, remoteManifest,
       storedRemoteConfigSnapshot);
   }
+  if (!pending.automatic && postApplyCompared &&
+      !postApplyStructurallyReady) {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    if (g_nativeProjectSyncApply.requestId == pending.requestId) {
+      g_nativeProjectSyncApply.state = "error";
+      g_nativeProjectSyncApply.stateUpdatedAtMs = nativeSteadyNowMs();
+      g_nativeProjectSyncApply.error =
+        "A aplicacao terminou, mas " +
+        std::to_string(postApplyStructuralDifferences) +
+        " diferencas estruturais ainda permanecem.";
+    }
+  }
   g_nativeForceSnapshotBuild.store(true);
   g_nativeForceStateBuild.store(true);
-  nativeUiCloseMainModal();
+  if (!pending.automatic && postApplyCompared &&
+      !postApplyStructurallyReady && !postApplyDiffJson.empty()) {
+    nativeProjectSyncShowDiffModal(postApplyDiffJson);
+  } else {
+    nativeUiCloseMainModal();
+  }
   bool queuedAutomatic = false;
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
@@ -30096,7 +30349,12 @@ static void nativeProjectSyncCommitPendingOpenOnMainThread()
     }
   }
   if (queuedAutomatic) g_nativeForceStateBuild.store(true);
-  if (applyConfigurations && !configurationsApplied) {
+  if (!pending.automatic && postApplyCompared &&
+      !postApplyStructurallyReady) {
+    nativeUiShowTemporaryPopup(
+      "A aplicacao terminou, mas a conferencia ainda encontrou diferencas.",
+      3.2);
+  } else if (applyConfigurations && !configurationsApplied) {
     nativeUiShowTemporaryPopup(
       configurationError.empty()
         ? "Projeto aplicado; as configuracoes nao puderam ser copiadas."
@@ -32889,12 +33147,12 @@ nativeUiHelpTopicContent(const std::string& topic)
   if (topic == "shortcuts_symbols") {
 #ifdef __APPLE__
     const char* stopBreakShortcut =
-      "Fn + Espaco: executa Stop Break sem mover o cursor e sem FaderOut.";
+      "Fn + Espaco: inicia Play quando parado ou executa Stop Break quando tocando, com um toque mesmo usando Play Protection.";
     const char* playlistStepShortcut =
       "Command + seta para cima/baixo: abre o repertorio anterior ou o proximo. Funciona somente na aba Repertorios.";
 #else
     const char* stopBreakShortcut =
-      "Ctrl + Espaco: executa Stop Break sem mover o cursor e sem FaderOut.";
+      "Ctrl + Espaco: inicia Play quando parado ou executa Stop Break quando tocando, com um toque mesmo usando Play Protection.";
     const char* playlistStepShortcut =
       "Ctrl + seta para cima/baixo: abre o repertorio anterior ou o proximo. Funciona somente na aba Repertorios.";
 #endif
@@ -44391,6 +44649,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
   nativeUiReadManualStopFadeoutVisualState(
     fadeoutActive, fadeoutRestorePending,
     fadeoutProgress, fadeoutDurationSec);
+  nativeUiAdvanceTemporaryPopupQueue(
+    fadeoutActive,
+    std::chrono::steady_clock::now());
   if (fadeoutActive) {
     const int popupW = std::max(170,
       std::min(width - 20,
@@ -52727,6 +52988,8 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       return 0;
     case WM_KILLFOCUS:
       nativeUiResetNavigationRepeat();
+      g_nativeUiPlaylistStepKeyHeld[0] = false;
+      g_nativeUiPlaylistStepKeyHeld[1] = false;
       nativeUiReleaseMusicSelectionForArrangeEditing();
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
@@ -56019,7 +56282,8 @@ static bool nativeUiNeedsTimedVisualRefresh()
   // Depois do prazo ainda precisamos de um último quadro para o paint apagar
   // o popup. O próprio paint limpa o texto e encerra os próximos repaints.
   const bool popupPending =
-    !g_nativeUiTemporaryPopupText.empty();
+    !g_nativeUiTemporaryPopupText.empty() ||
+    !g_nativeUiDeferredPopups.empty();
   const bool timerModalCaret =
     g_nativeMainModalKind == NativeMainModalKind::TimerConfig;
   const bool projectSyncApplyBusy =
@@ -56952,8 +57216,10 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       {
         const bool playlistStepModifier =
 #ifdef __APPLE__
-          (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
-          (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+          // No SWELL/macOS, Command chega como FCONTROL/VK_CONTROL. VK_LWIN
+          // representa a tecla Control fisica, nao Command.
+          (lParam & FCONTROL) != 0 ||
+          (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 #else
           (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 #endif
@@ -57105,13 +57371,15 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       if (!g_state.directorInterfaceBlocked &&
           wParam == VK_SPACE) {
         if (nativeStopBreakModifierDown()) {
+          const bool transportActive = nativeUiTransportActive();
           nativeUiShowShortcutPopup(
 #ifdef __APPLE__
             "Fn + Espaco",
 #else
             "Ctrl + Espaco",
 #endif
-            "Stop Break executado");
+            transportActive
+              ? "Stop Break executado" : "Play executado");
           g_globalStopBreakRequested.store(true);
           return 0;
         }
@@ -57721,8 +57989,8 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 #ifdef __APPLE__
         const bool playlistStepModifier =
-          (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
-          (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+          (lParam & FCONTROL) != 0 ||
+          (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 #else
         const bool playlistStepModifier = controlModifier;
 #endif
@@ -64674,12 +64942,10 @@ static constexpr const char* kNativeVideoWindowSection =
   "VS_HOOK_NATIVE_VIDEO_WINDOW";
 static constexpr UINT_PTR kNativeVideoWindowTimer = 0x56535649;
 static NativeTelepromptWindowState g_nativeVideoWindow;
-static std::unique_ptr<vshook_video::Decoder> g_nativeVideoWindowDecoder;
+static std::unique_ptr<vshook_video::NativeWindowPlayer>
+  g_nativeVideoWindowPlayer;
+static bool g_nativeVideoDirectOutputActive = false;
 static NativeTelepromptRenderStateCache g_nativeVideoRenderStateCache;
-static NativeTelepromptHeldVideoFrame g_nativeVideoHeldFrame;
-static std::string g_nativeVideoHeldTargetKey;
-static std::chrono::steady_clock::time_point
-  g_nativeVideoHeldTargetStartedAt{};
 static std::uint64_t g_nativeVideoPresentedSequence = 0;
 static std::string g_nativeVideoPresentedPlaybackKey;
 static int g_nativeVideoPresentedWidth = 0;
@@ -64935,22 +65201,6 @@ static bool nativeVideoDrawBgra(
 #endif
 }
 
-static bool nativeVideoDrawHeldFrame(
-  HDC dc, const RECT& available, bool stretch)
-{
-  const std::uint8_t* pixels = g_nativeVideoHeldFrame.sharedPixels
-    ? g_nativeVideoHeldFrame.sharedPixels->data() +
-        g_nativeVideoHeldFrame.pixelOffset
-    : (g_nativeVideoHeldFrame.pixels.empty()
-        ? nullptr : g_nativeVideoHeldFrame.pixels.data());
-  return nativeVideoDrawBgra(
-    dc, pixels,
-    g_nativeVideoHeldFrame.width,
-    g_nativeVideoHeldFrame.height,
-    g_nativeVideoHeldFrame.stride,
-    available, stretch, true);
-}
-
 static void nativeVideoPaint(HWND hwnd)
 {
   PAINTSTRUCT paint{};
@@ -64965,81 +65215,40 @@ static void nativeVideoPaint(HWND hwnd)
   bool rendered = false;
 
   if (mediaType == "video" && !state.mediaPath.empty()) {
-    if (!g_nativeVideoWindowDecoder) {
-      g_nativeVideoWindowDecoder =
-        std::make_unique<vshook_video::Decoder>();
+    if (!g_nativeVideoWindowPlayer) {
+      g_nativeVideoWindowPlayer =
+        std::make_unique<vshook_video::NativeWindowPlayer>();
     }
     const int availableW = std::max(
       1, static_cast<int>(client.right - client.left));
     const int availableH = std::max(
       1, static_cast<int>(client.bottom - client.top));
-    int requestedW = 1;
-    int requestedH = 1;
-    nativeTelepromptClampDecodeRequest(
-      availableW, availableH, requestedW, requestedH);
     const std::string playbackKey =
       nativeTelepromptMediaHoldKey(state);
-    vshook_video::DecodedFrame decoded;
-    if (g_nativeVideoWindowDecoder->frameAt(
-          state.mediaPath, playbackKey,
-          state.mediaCurrentTime, state.playing,
-          state.mediaPlayrate, requestedW, requestedH,
-          decoded) && decoded.pixels && decoded.width > 0 &&
-        decoded.height > 0 && decoded.stride >= decoded.width * 4) {
-      const bool samePresentedFrame = state.playing &&
-        decoded.sequence != 0 &&
-        decoded.sequence == g_nativeVideoPresentedSequence &&
-        playbackKey == g_nativeVideoPresentedPlaybackKey &&
-        availableW == g_nativeVideoPresentedWidth &&
-        availableH == g_nativeVideoPresentedHeight &&
-        stretch == g_nativeVideoPresentedStretch;
-      rendered = samePresentedFrame || nativeVideoDrawBgra(
-        dc, decoded.pixels, decoded.width, decoded.height,
-        decoded.stride, client, stretch, true);
-      if (!samePresentedFrame && rendered) {
-        g_nativeVideoPresentedSequence = decoded.sequence;
-        g_nativeVideoPresentedPlaybackKey = playbackKey;
-        g_nativeVideoPresentedWidth = availableW;
-        g_nativeVideoPresentedHeight = availableH;
-        g_nativeVideoPresentedStretch = stretch;
-      }
-      g_nativeVideoHeldFrame.sharedPixels = decoded.storage;
-      g_nativeVideoHeldFrame.pixels.clear();
-      g_nativeVideoHeldFrame.pixelOffset =
-        decoded.storage && decoded.pixels
-          ? static_cast<std::size_t>(
-              decoded.pixels - decoded.storage->data())
-          : 0;
-      g_nativeVideoHeldFrame.width = decoded.width;
-      g_nativeVideoHeldFrame.height = decoded.height;
-      g_nativeVideoHeldFrame.stride = decoded.stride;
-      g_nativeVideoHeldFrame.playbackKey = playbackKey;
-      g_nativeVideoHeldTargetKey.clear();
-      g_nativeVideoHeldTargetStartedAt = {};
-    } else {
-      const auto now = std::chrono::steady_clock::now();
-      if (g_nativeVideoHeldTargetKey != playbackKey) {
-        g_nativeVideoHeldTargetKey = playbackKey;
-        g_nativeVideoHeldTargetStartedAt = now;
-      }
-      const bool sameItem =
-        g_nativeVideoHeldFrame.playbackKey == playbackKey;
-      const int holdMs = sameItem
-        ? kNativeTelepromptHeldMediaRecoveryMs
-        : kNativeTelepromptHeldMediaWarmupMs;
-      if (g_nativeVideoHeldTargetStartedAt !=
-            std::chrono::steady_clock::time_point{} &&
-          now - g_nativeVideoHeldTargetStartedAt <=
-            std::chrono::milliseconds(holdMs)) {
-        rendered = nativeVideoDrawHeldFrame(dc, client, stretch);
-      }
+    const bool changingVideo =
+      !g_nativeVideoDirectOutputActive ||
+      playbackKey != g_nativeVideoPresentedPlaybackKey;
+    if (changingVideo) {
+      nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
     }
+    rendered = g_nativeVideoWindowPlayer->update(
+      state.mediaPath, playbackKey,
+      state.mediaCurrentTime, state.playing,
+      state.mediaPlayrate,
+      reinterpret_cast<void*>(hwnd),
+      availableW, availableH, stretch);
+    g_nativeVideoDirectOutputActive = rendered;
+    g_nativeVideoPresentedPlaybackKey = playbackKey;
+    g_nativeVideoPresentedWidth = availableW;
+    g_nativeVideoPresentedHeight = availableH;
+    g_nativeVideoPresentedStretch = stretch;
   } else if (mediaType == "image" && !state.mediaPath.empty()) {
-    if (g_nativeVideoWindowDecoder) {
-      g_nativeVideoWindowDecoder->reset();
-    }
-    g_nativeVideoHeldFrame = NativeTelepromptHeldVideoFrame{};
+    // Libera o vout antes de voltar a desenhar no HWND/NSView da janela.
+    // Assim nenhum quadro atrasado do VLC cobre a imagem atual.
+    g_nativeVideoWindowPlayer.reset();
+    g_nativeVideoDirectOutputActive = false;
     g_nativeVideoPresentedSequence = 0;
+    g_nativeVideoPresentedPlaybackKey.clear();
     vshook_static_image::DecodedImage image;
     if (vshook_static_image::decodeFile(state.mediaPath, image, nullptr)) {
       rendered = nativeVideoDrawBgra(
@@ -65047,12 +65256,8 @@ static void nativeVideoPaint(HWND hwnd)
         image.stride, client, stretch, false);
     }
   } else {
-    if (g_nativeVideoWindowDecoder) {
-      g_nativeVideoWindowDecoder->reset();
-    }
-    g_nativeVideoHeldFrame = NativeTelepromptHeldVideoFrame{};
-    g_nativeVideoHeldTargetKey.clear();
-    g_nativeVideoHeldTargetStartedAt = {};
+    g_nativeVideoWindowPlayer.reset();
+    g_nativeVideoDirectOutputActive = false;
     g_nativeVideoPresentedSequence = 0;
     g_nativeVideoPresentedPlaybackKey.clear();
   }
@@ -65327,6 +65532,11 @@ static LRESULT CALLBACK nativeVideoWndProc(
       return 0;
     case WM_DESTROY:
       KillTimer(hwnd, kNativeVideoWindowTimer);
+      // Pode chegar aqui por destruicao externa, sem passar por
+      // nativeCloseVideoWindow. Desanexa o vout enquanto o HWND/NSView ainda
+      // existe.
+      g_nativeVideoWindowPlayer.reset();
+      g_nativeVideoDirectOutputActive = false;
 #ifdef __APPLE__
       VSHookMacReleaseTelepromptFullscreen(hwnd);
 #endif
@@ -65413,14 +65623,15 @@ static void nativeCloseVideoWindow(bool clearRequestedState)
         GetWindowRect(hwnd, &rect)) {
       nativeVideoSaveNormalRect(rect);
     }
+    // O player precisa soltar a superficie nativa antes da janela deixar de
+    // existir. Isso tambem impede o segundo clique de atravessar para o REAPER.
+    g_nativeVideoWindowPlayer.reset();
+    g_nativeVideoDirectOutputActive = false;
     DestroyWindow(hwnd);
   }
   g_nativeVideoWindow = NativeTelepromptWindowState{};
-  if (g_nativeVideoWindowDecoder) {
-    g_nativeVideoWindowDecoder->reset();
-  }
-  g_nativeVideoWindowDecoder.reset();
-  g_nativeVideoHeldFrame = NativeTelepromptHeldVideoFrame{};
+  g_nativeVideoWindowPlayer.reset();
+  g_nativeVideoDirectOutputActive = false;
   g_nativeVideoPresentedSequence = 0;
   g_nativeVideoPresentedPlaybackKey.clear();
   g_nativeVideoRenderStateCache = NativeTelepromptRenderStateCache{};
@@ -73358,10 +73569,23 @@ static void nativeProcessGlobalStopBreakOnMainThread()
 {
   if (!g_globalStopBreakRequested.exchange(false)) return;
   if (!nativeIsRuntimeControlActive()) return;
-  if (!nativePlayProtectionShouldAllow("stop")) return;
-  nativeApplyTransportCommand(
-    "{\"type\":\"director_stop_break\",\"payload\":{\"noSeek\":true,\"preserveCursor\":true,\"transportOnly\":true,\"ignoreFadeout\":true,\"stopBreak\":true}}"
-  );
+  // O atalho com modificador e a saida deliberada do Play Protection: um
+  // unico toque sempre produz uma acao. Parado, inicia o Play normal (inclui
+  // a selecao/fila corrente); tocando ou pausado, conserva a semantica do
+  // Stop Break, sem FaderOut e sem mover o cursor.
+  g_nativePlayProtectionLastTapAt =
+    std::chrono::steady_clock::time_point{};
+  g_nativePlayProtectionLastAction.clear();
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  const int playState = project && GetPlayStateEx_ptr
+    ? GetPlayStateEx_ptr(project) : 0;
+  if (playState == 0) {
+    nativeApplyTransportCommand("{\"type\":\"play_button\"}");
+  } else {
+    nativeApplyTransportCommand(
+      "{\"type\":\"director_stop_break\",\"payload\":{\"noSeek\":true,\"preserveCursor\":true,\"transportOnly\":true,\"ignoreFadeout\":true,\"stopBreak\":true}}"
+    );
+  }
 }
 
 static void nativeProcessGlobalStopPauseOnMainThread()
@@ -75864,6 +76088,7 @@ static void nativeUiResetForProjectTabChange()
   g_nativeUiTemporaryPopupColorMode.clear();
   g_nativeUiTemporaryPopupUntil =
     std::chrono::steady_clock::time_point{};
+  g_nativeUiDeferredPopups.clear();
 
   if (g_nativeAppActivePanelHwnd &&
       GetCapture() == g_nativeAppActivePanelHwnd) {
