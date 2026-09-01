@@ -33031,10 +33031,20 @@ static bool nativeUiApplyRowRename()
   // para impedir que um item receba um nome composto somente por espacos.
   std::string nextName = nativeUpperNamePtBrKeepParentheses(
     g_nativeUiRenameInput);
-  if (nativeTrim(nextName).empty() &&
-      (!g_nativeUiRenameBlock ||
-       (g_nativeMainRowInlineRenameOpen &&
-        g_nativeUiRenameBlockCustomName))) {
+  const bool emptyName = nativeTrim(nextName).empty();
+  if (emptyName && g_nativeMainRowInlineRenameOpen) {
+    if (g_nativeUiRenameBlock) {
+      // No rename direto, apagar todo o texto remove a personalizacao. O
+      // fluxo normal do bloco abaixo recompõe BLOCO 01, BLOCO 02 etc.
+      g_nativeUiRenameBlockCustomName = false;
+      nextName.clear();
+    } else {
+      // Uma musica/regiao nunca pode receber nome vazio. Sair da linha com o
+      // campo vazio equivale a cancelar e preserva exatamente o nome atual.
+      nativeUiCloseMainModal();
+      return true;
+    }
+  } else if (emptyName && !g_nativeUiRenameBlock) {
     return false;
   }
   char pathBuf[2048] = "";
