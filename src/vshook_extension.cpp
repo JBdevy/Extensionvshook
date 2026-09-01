@@ -20676,7 +20676,11 @@ static bool nativeUiStepActivePlaylist(int direction)
   ReaProject* project = getCurrentProject(
     pathBuf, static_cast<int>(sizeof(pathBuf)));
   if (!project) return false;
-  const auto playlists = nativeUiReadPlaylistRecords(project);
+  const bool multiProjectPlaylists =
+    g_nativeMultiProjectPlaylistsEnabled.load();
+  const auto playlists = multiProjectPlaylists
+    ? nativeUiReadOpenProjectPlaylistRecords()
+    : nativeUiReadPlaylistRecords(project);
 #ifdef __APPLE__
   const char* shortcutKey =
     direction < 0 ? "Command + ↑" : "Command + ↓";
@@ -20690,9 +20694,57 @@ static bool nativeUiStepActivePlaylist(int direction)
       "Não há mais repertórios");
     return true;
   }
-  const int current = nativeUiCurrentPlaylistIndex(
-    project, playlists);
-  const int target = current + (direction < 0 ? -1 : 1);
+  int current = -1;
+  int target = -1;
+  if (multiProjectPlaylists) {
+    for (size_t index = 0; index < playlists.size(); ++index) {
+      const auto& playlist = playlists[index];
+      if (playlist.projectActive && playlist.playlistActive) {
+        current = static_cast<int>(index);
+        break;
+      }
+    }
+
+    if (current >= 0) {
+      target = current + (direction < 0 ? -1 : 1);
+    } else {
+      // Uma aba sem repertório também participa da ordem das abas. Nesse
+      // caso, pula diretamente para o repertório mais próximo da aba anterior
+      // ou seguinte, em vez de informar incorretamente que a lista acabou.
+      int currentProjectIndex = -1;
+      if (EnumProjects_ptr) {
+        for (int projectIndex = 0; projectIndex < 64; ++projectIndex) {
+          ReaProject* candidate = EnumProjects_ptr(
+            projectIndex, nullptr, 0);
+          if (!candidate) break;
+          if (candidate == project) {
+            currentProjectIndex = projectIndex;
+            break;
+          }
+        }
+      }
+      if (direction < 0) {
+        for (int index = static_cast<int>(playlists.size()) - 1;
+             index >= 0; --index) {
+          if (playlists[static_cast<size_t>(index)].projectIndex <
+              currentProjectIndex) {
+            target = index;
+            break;
+          }
+        }
+      } else {
+        for (size_t index = 0; index < playlists.size(); ++index) {
+          if (playlists[index].projectIndex > currentProjectIndex) {
+            target = static_cast<int>(index);
+            break;
+          }
+        }
+      }
+    }
+  } else {
+    current = nativeUiCurrentPlaylistIndex(project, playlists);
+    target = current + (direction < 0 ? -1 : 1);
+  }
   if (target < 0 ||
       target >= static_cast<int>(playlists.size())) {
     nativeUiShowShortcutPopup(
@@ -20700,18 +20752,31 @@ static bool nativeUiStepActivePlaylist(int direction)
       "Não há mais repertórios");
     return true;
   }
+  const auto& targetPlaylist =
+    playlists[static_cast<size_t>(target)];
   std::ostringstream command;
   command << "{\"type\":\"select_playlist\",\"playlistId\":"
-          << (target + 1)
+          << (targetPlaylist.localIndex + 1)
           << ",\"playlistName\":"
-          << nativeJsonString(playlists[static_cast<size_t>(target)].name)
+          << nativeJsonString(targetPlaylist.name);
+  if (multiProjectPlaylists) {
+    command << ",\"projectTabIndex\":"
+            << targetPlaylist.projectIndex
+            << ",\"projectId\":"
+            << nativeJsonString(targetPlaylist.projectId)
+            << ",\"projectPath\":"
+            << nativeJsonString(targetPlaylist.projectPath)
+            << ",\"projectName\":"
+            << nativeJsonString(targetPlaylist.projectName);
+  }
+  command
           << "}";
   const bool changed = nativeApplyPlaylistCommand(command.str());
   if (changed) {
     nativeUiShowShortcutPopup(
       shortcutKey,
       "Repertório: " +
-        playlists[static_cast<size_t>(target)].name);
+        targetPlaylist.name);
   }
   return changed;
 }
