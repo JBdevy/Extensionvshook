@@ -767,6 +767,7 @@ struct NativeAppActivePanelModel {
     int enumIndex = -1;
     int tunerValue = 0;
     bool block = false;
+    bool blockCustomName = false;
     bool blockCustomCentered = false;
     bool child = false;
     bool markerChild = false;
@@ -1582,6 +1583,10 @@ static std::string g_nativeUiRenameId;
 static std::string g_nativeUiRenameOriginalName;
 static std::string g_nativeUiRenameInput;
 static size_t g_nativeUiRenameInputCursor = 0;
+// Ctrl + clique direito no Windows, ou Command + clique direito no macOS,
+// edita o nome dentro da propria linha sem abrir o modal completo.
+static bool g_nativeMainRowInlineRenameOpen = false;
+static RECT g_nativeMainRowInlineRenameInputRect{0, 0, 0, 0};
 static std::string g_nativeUiTimerMode = "progressive";
 static std::string g_nativeUiTimerDigits = "000000";
 static int g_nativeUiTimerDigitCursor = 0;
@@ -8711,6 +8716,7 @@ struct NativeSongWindow {
   double blockDurationSec = 0.0;
   int sourceNumber = 0;
   bool isBlock = false;
+  bool blockCustomName = false;
   bool blockCustomCentered = false;
   bool isHashParent = false;
   bool isHashChild = false;
@@ -9690,6 +9696,8 @@ static std::string nativeSongToJson(const NativeSongWindow& item, int index)
   oss << "\"isBlock\":" << (item.isBlock ? "true" : "false") << ",";
   oss << "\"blockCustomCentered\":"
       << (item.blockCustomCentered ? "true" : "false") << ",";
+  oss << "\"blockCustomName\":"
+      << (item.blockCustomName ? "true" : "false") << ",";
   oss << "\"isPlayable\":" << (!item.isBlock ? "true" : "false") << ",";
   oss << "\"source_number\":" << item.sourceNumber << ",";
   oss << "\"sourceNumber\":" << item.sourceNumber << ",";
@@ -13005,6 +13013,8 @@ static std::string nativeBuildPlaylistsJson(ReaProject* project, const std::vect
         item.name = name.empty() ? (std::string("BLOCO ") + std::to_string(std::abs(sourceNumber))) : name;
         item.type = "block";
         item.isBlock = true;
+        item.blockCustomName =
+          fields.size() > 14 && fields[14] == "1";
         item.blockCustomCentered =
           fields.size() > 13 && fields[13] == "1";
         item.sourceNumber = sourceNumber;
@@ -17662,6 +17672,7 @@ static uint64_t nativeUiRowsSourceSignature(
     nativeUiHashValue(hash, item.bpmOriginal);
     nativeUiHashValue(hash, item.bpmGeneric);
     nativeUiHashValue(hash, item.isBlock);
+    nativeUiHashValue(hash, item.blockCustomName);
     nativeUiHashValue(hash, item.blockCustomCentered);
     nativeUiHashValue(hash, item.isHashChild);
     nativeUiHashValue(hash, item.isRegionChild);
@@ -18528,6 +18539,19 @@ static bool nativeUiTextCommandModifierDown()
 #endif
 }
 
+static bool nativeUiRowInlineRenameModifierDown()
+{
+#ifdef __APPLE__
+  // No clique de mouse, o NSEvent e a fonte mais confiavel para Command. Os
+  // estados VK_* cobrem dockers/remapeamentos que passam pelo SWELL.
+  return VSHookMacCurrentEventHasCommandModifier() ||
+    (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+    (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+#else
+  return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+#endif
+}
+
 static NativeUiTextInputKind nativeUiFocusedTextInputKind()
 {
   if (g_nativeMainBpmEditOpen &&
@@ -18537,6 +18561,10 @@ static NativeUiTextInputKind nativeUiFocusedTextInputKind()
   if (g_nativeMixerRenameOpen &&
       g_nativeMainModalKind == NativeMainModalKind::None) {
     return NativeUiTextInputKind::MixerRename;
+  }
+  if (g_nativeMainRowInlineRenameOpen &&
+      g_nativeMainModalKind == NativeMainModalKind::None) {
+    return NativeUiTextInputKind::RenameRow;
   }
   if (g_nativePartsRenameOpen) {
     return NativeUiTextInputKind::PartsRename;
@@ -22465,7 +22493,8 @@ static bool nativeUiRenumberPlaylistBlocks(
       changed = true;
     }
     const std::string rawName = nativeUnescapeExtField(fields[5]);
-    if (nativeUiBlockHasAutomaticNumber(rawName)) {
+    const bool customName = fields.size() > 14 && fields[14] == "1";
+    if (!customName && nativeUiBlockHasAutomaticNumber(rawName)) {
       std::ostringstream name;
       name << "BLOCO " << std::setw(2) << std::setfill('0')
            << blockNumber;
@@ -32446,6 +32475,8 @@ static void nativeUiCloseMainModal()
   g_nativeUiRenameOriginalName.clear();
   g_nativeUiRenameInput.clear();
   g_nativeUiRenameInputCursor = 0;
+  g_nativeMainRowInlineRenameOpen = false;
+  g_nativeMainRowInlineRenameInputRect = RECT{0, 0, 0, 0};
   g_nativeUiRenameBlockCustomName = false;
   g_nativeUiRenameBlockCentered = false;
   g_nativeUiRenameFamilyParent = false;
@@ -32897,10 +32928,13 @@ static void nativeUiOpenRowRename(
   const NativeAppActivePanelModel::Row& row,
   bool regionsPage)
 {
+  g_nativeMainRowInlineRenameOpen = false;
+  g_nativeMainRowInlineRenameInputRect = RECT{0, 0, 0, 0};
   g_nativeUiRenameRegionsPage = regionsPage;
   g_nativeUiRenameBlock = row.block;
   g_nativeUiRenameBlockCustomName =
-    row.block && !nativeUiBlockNameIsFormatted(row.name);
+    row.block && (row.blockCustomName ||
+      !nativeUiBlockNameIsFormatted(row.name));
   g_nativeUiRenameBlockCentered =
     row.block && row.blockCustomCentered;
   g_nativeUiRenameMarkerChild = row.markerChild;
@@ -32937,6 +32971,49 @@ static void nativeUiOpenRowRename(
   g_nativeMainModalKind = NativeMainModalKind::RenameRow;
 }
 
+static bool nativeUiRowMatchesRenameTarget(
+  const NativeAppActivePanelModel::Row& row,
+  bool regionsPage)
+{
+  if (regionsPage != g_nativeUiRenameRegionsPage ||
+      row.block != g_nativeUiRenameBlock) {
+    return false;
+  }
+  if (!g_nativeUiRenameId.empty() && row.id == g_nativeUiRenameId) {
+    if (row.block) {
+      return row.order == g_nativeUiRenamePlaylistOrder ||
+        row.sourceNumber == g_nativeUiRenameSourceNumber;
+    }
+    return std::fabs(row.start - g_nativeUiRenameStart) <= 0.002 &&
+      std::fabs(row.end - g_nativeUiRenameEnd) <= 0.002;
+  }
+  return row.sourceNumber == g_nativeUiRenameSourceNumber &&
+    std::fabs(row.start - g_nativeUiRenameStart) <= 0.002 &&
+    std::fabs(row.end - g_nativeUiRenameEnd) <= 0.002;
+}
+
+static void nativeUiOpenRowInlineRename(
+  const NativeAppActivePanelModel::Row& row,
+  bool regionsPage)
+{
+  nativeUiOpenRowRename(row, regionsPage);
+  // Renomear um bloco diretamente significa escolher explicitamente um nome
+  // personalizado. O texto mostrado na linha e o ponto de partida do editor.
+  if (row.block) {
+    g_nativeUiRenameBlockCustomName = true;
+    g_nativeUiRenameInput = row.name;
+    g_nativeUiRenameInputCursor = g_nativeUiRenameInput.size();
+  }
+  g_nativeMainModalKind = NativeMainModalKind::None;
+  g_nativeMainRowInlineRenameOpen = true;
+  g_nativeMainRowInlineRenameInputRect = RECT{0, 0, 0, 0};
+  // Comeca com o nome inteiro selecionado para a primeira digitacao substituir
+  // o valor, comportamento esperado de um rename direto.
+  g_nativeUiTextSelectionKind = NativeUiTextInputKind::RenameRow;
+  g_nativeUiTextSelectionAnchor = 0;
+  g_nativeUiTextMouseSelecting = false;
+}
+
 static std::string nativeUiJoinFields(
   const std::vector<std::string>& fields)
 {
@@ -32954,7 +33031,12 @@ static bool nativeUiApplyRowRename()
   // para impedir que um item receba um nome composto somente por espacos.
   std::string nextName = nativeUpperNamePtBrKeepParentheses(
     g_nativeUiRenameInput);
-  if (nativeTrim(nextName).empty() && !g_nativeUiRenameBlock) return false;
+  if (nativeTrim(nextName).empty() &&
+      (!g_nativeUiRenameBlock ||
+       (g_nativeMainRowInlineRenameOpen &&
+        g_nativeUiRenameBlockCustomName))) {
+    return false;
+  }
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
   if (!project) return false;
@@ -32973,7 +33055,7 @@ static bool nativeUiApplyRowRename()
     }
     auto fields = nativeSplit(itemLines[static_cast<size_t>(itemIndex)], '\t');
     if (fields.size() < 6) return false;
-    while (fields.size() <= 13) fields.push_back("");
+    while (fields.size() <= 14) fields.push_back("");
     int blockNumber = std::abs(std::atoi(fields[2].c_str()));
     if (blockNumber <= 0) blockNumber = g_nativeUiRenamePlaylistOrder;
     std::string fullName;
@@ -33000,6 +33082,7 @@ static bool nativeUiApplyRowRename()
     }
     fields[5] = nativeEscapeExtField(fullName);
     fields[13] = g_nativeUiRenameBlockCentered ? "1" : "0";
+    fields[14] = g_nativeUiRenameBlockCustomName ? "1" : "0";
     itemLines[static_cast<size_t>(itemIndex)] = nativeUiJoinFields(fields);
     if (!nativeUiSavePlaylistRecords(project, playlists)) return false;
     nativeUiCloseMainModal();
@@ -36449,6 +36532,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
   g_nativeMainFamilyButtonHits.clear();
   g_nativeMainRowHits.clear();
   g_nativeMainLiveResetHits.clear();
+  g_nativeMainRowInlineRenameInputRect = RECT{0, 0, 0, 0};
 
   if (rowCount <= 0 || visibleRows <= 0) {
     RECT emptyRect{listRect.left + 2, listInnerTop,
@@ -36942,6 +37026,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
       }
       const int labelX = rowRect.left +
         indexColumnW + 7 + childIndent;
+      const bool editingInlineRow =
+        g_nativeMainRowInlineRenameOpen &&
+        g_nativeMainModalKind == NativeMainModalKind::None &&
+        nativeUiRowMatchesRenameTarget(
+          row, g_nativeAppActivePanelModel.regionsPage);
       if (isSelected && !isPlaying &&
           !isDraggingSource && !row.block) {
         const COLORREF selectionArrowColor =
@@ -36970,7 +37059,54 @@ static void nativePaintAppActivePanel(HWND hwnd)
         (nativeUiBlockNameIsFormatted(row.name) ||
          blockSymbolMode != "none" ||
          row.blockCustomCentered);
-      if (designerBlockName) {
+      if (editingInlineRow) {
+        const int editorRight = std::max(labelX + 28,
+          std::min(
+            static_cast<int>(rowRect.right) - 4,
+            std::min(timeX - 4,
+              labelX + std::max(80, rowMetrics.labelMaxWidth))));
+        g_nativeMainRowInlineRenameInputRect = RECT{
+          labelX, rowRect.top + 2,
+          editorRight, rowRect.bottom - 2};
+        nativeAppActiveFillRect(dc,
+          g_nativeMainRowInlineRenameInputRect,
+          RGB(3, 7, 14));
+        const COLORREF editorEdge = RGB(56, 189, 248);
+        nativeAppActiveFillRect(dc,
+          RECT{g_nativeMainRowInlineRenameInputRect.left,
+            g_nativeMainRowInlineRenameInputRect.top,
+            g_nativeMainRowInlineRenameInputRect.right,
+            g_nativeMainRowInlineRenameInputRect.top + 1},
+          editorEdge);
+        nativeAppActiveFillRect(dc,
+          RECT{g_nativeMainRowInlineRenameInputRect.left,
+            g_nativeMainRowInlineRenameInputRect.bottom - 1,
+            g_nativeMainRowInlineRenameInputRect.right,
+            g_nativeMainRowInlineRenameInputRect.bottom},
+          editorEdge);
+        nativeAppActiveFillRect(dc,
+          RECT{g_nativeMainRowInlineRenameInputRect.left,
+            g_nativeMainRowInlineRenameInputRect.top,
+            g_nativeMainRowInlineRenameInputRect.left + 1,
+            g_nativeMainRowInlineRenameInputRect.bottom},
+          editorEdge);
+        nativeAppActiveFillRect(dc,
+          RECT{g_nativeMainRowInlineRenameInputRect.right - 1,
+            g_nativeMainRowInlineRenameInputRect.top,
+            g_nativeMainRowInlineRenameInputRect.right,
+            g_nativeMainRowInlineRenameInputRect.bottom},
+          editorEdge);
+        nativeUiDrawEditableText(dc,
+          RECT{g_nativeMainRowInlineRenameInputRect.left + 6,
+            g_nativeMainRowInlineRenameInputRect.top,
+            g_nativeMainRowInlineRenameInputRect.right - 5,
+            g_nativeMainRowInlineRenameInputRect.bottom},
+          g_nativeUiRenameInput,
+          NativeUiTextInputKind::RenameRow,
+          true, cursorVisible, RGB(248, 250, 252), rowFont,
+          DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+            DT_END_ELLIPSIS | DT_NOPREFIX);
+      } else if (designerBlockName) {
         const COLORREF ornamentColor = nativeUiNamedVisualColor(
           nativeUiVisualPref(visualPrefs,
             "block_symbol_" + blockSymbolMode +
@@ -46844,6 +46980,14 @@ static bool nativeUiTextInputHitInfo(
     leftPadding = 6;
     return true;
   }
+  if (g_nativeMainRowInlineRenameOpen &&
+      g_nativeMainModalKind == NativeMainModalKind::None &&
+      PtInRect(&g_nativeMainRowInlineRenameInputRect, point)) {
+    kind = NativeUiTextInputKind::RenameRow;
+    rect = g_nativeMainRowInlineRenameInputRect;
+    leftPadding = 6;
+    return true;
+  }
   if (g_nativePartsRenameOpen &&
       PtInRect(&g_nativePartsRenameInputRect, point)) {
     kind = NativeUiTextInputKind::PartsRename;
@@ -46998,8 +47142,13 @@ static void nativeUiUpdateTextMouseSelection(
       leftPadding = 52;
       break;
     case NativeUiTextInputKind::CreatePlaylist:
-    case NativeUiTextInputKind::RenameRow:
       rect = g_nativeMainModalInputRect;
+      leftPadding = 6;
+      break;
+    case NativeUiTextInputKind::RenameRow:
+      rect = g_nativeMainRowInlineRenameOpen
+        ? g_nativeMainRowInlineRenameInputRect
+        : g_nativeMainModalInputRect;
       leftPadding = 6;
       break;
     case NativeUiTextInputKind::PartsRename: {
@@ -47445,6 +47594,38 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     }
     return handled;
   };
+  const bool inlineRenameGesture =
+    rightClick && nativeUiRowInlineRenameModifierDown();
+  if (rightClick && g_nativeMainRowInlineRenameOpen) {
+    const NativeAppActivePanelModel::Row* clickedRow = nullptr;
+    for (const auto& hit : g_nativeMainRowHits) {
+      if (!PtInRect(&hit.rect, point) ||
+          hit.sourceIndex >= g_nativeAppActivePanelModel.rows.size()) {
+        continue;
+      }
+      clickedRow = &g_nativeAppActivePanelModel.rows[hit.sourceIndex];
+      break;
+    }
+    if (clickedRow && nativeUiRowMatchesRenameTarget(
+          *clickedRow, g_nativeAppActivePanelModel.regionsPage)) {
+      if (inlineRenameGesture) {
+        // Repetir o gesto na mesma linha apenas prepara a substituicao do nome.
+        g_nativeUiTextSelectionKind = NativeUiTextInputKind::RenameRow;
+        g_nativeUiTextSelectionAnchor = 0;
+        g_nativeUiRenameInputCursor = g_nativeUiRenameInput.size();
+      } else {
+        // O clique direito comum continua abrindo o editor completo e preserva
+        // qualquer texto que ja tenha sido digitado diretamente na linha.
+        g_nativeMainRowInlineRenameOpen = false;
+        g_nativeMainRowInlineRenameInputRect = RECT{0, 0, 0, 0};
+        g_nativeMainModalKind = NativeMainModalKind::RenameRow;
+      }
+      return true;
+    }
+    // Ao sair da linha, confirma primeiro o rename direto. Um nome invalido
+    // mantem o campo aberto para evitar perda silenciosa do que foi digitado.
+    if (!nativeUiApplyRowRename()) return true;
+  }
   if (!rightClick && g_nativeMainBpmEditOpen) {
     if (PtInRect(&g_nativeMainBpmEditRect, point)) {
       g_nativeMainBpmEditCursor = nativeUiTextCursorFromPoint(
@@ -47868,8 +48049,13 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
         g_nativeAppActivePanelModel.rows[
           rowSourceIndex];
       if (rightClick) {
-        nativeUiOpenRowRename(row,
-          g_nativeAppActivePanelModel.regionsPage);
+        if (inlineRenameGesture) {
+          nativeUiOpenRowInlineRename(row,
+            g_nativeAppActivePanelModel.regionsPage);
+        } else {
+          nativeUiOpenRowRename(row,
+            g_nativeAppActivePanelModel.regionsPage);
+        }
       } else {
         const bool regionsPage =
           g_nativeAppActivePanelModel.regionsPage;
@@ -56672,6 +56858,14 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
+      if (mouseDown &&
+          !g_state.directorInterfaceBlocked &&
+          g_nativeMainRowInlineRenameOpen) {
+        if (!nativeUiApplyRowRename()) {
+          InvalidateRect(hwnd, nullptr, FALSE);
+          return 0;
+        }
+      }
       if (!mouseDown &&
           g_nativeUiTextMouseSelecting) {
         nativeUiFinishTextMouseSelection(hwnd, point);
@@ -57344,6 +57538,20 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           nativeUiHandleActiveTextInputKey(
             hwnd, wParam)) {
         return 0;
+      }
+      if (!g_state.directorInterfaceBlocked &&
+          g_nativeMainRowInlineRenameOpen &&
+          g_nativeMainModalKind == NativeMainModalKind::None) {
+        if (wParam == VK_RETURN || wParam == VK_TAB) {
+          nativeUiApplyRowRename();
+          nativeUiRefreshTextInputNow(hwnd);
+          return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+          nativeUiCloseMainModal();
+          nativeUiRefreshTextInputNow(hwnd);
+          return 0;
+        }
       }
 #ifdef _WIN32
       // Enquanto um campo proprio estiver ativo, teclas imprimiveis pertencem
@@ -66469,6 +66677,7 @@ static void nativeRefreshAppActivePanelModel()
       }
       row.parentId = item.parentId;
       row.blockColorHex = item.blockColorHex;
+      row.blockCustomName = item.blockCustomName;
       row.blockCustomCentered = item.blockCustomCentered;
       row.inheritedColorHex = inheritedColorOverride.empty()
         ? item.inheritedBlockColorHex
