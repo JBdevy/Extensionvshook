@@ -60314,9 +60314,11 @@ static void nativeTelepromptApplySettingsJson(
   next.chordsEnabled = nativeTelepromptJsonBool(
     json, "chordsEnabled",
     nativeTelepromptJsonBool(json, "showChords", next.chordsEnabled));
-  // O modo Clear foi removido das janelas de Teleprompt. Mídia de vídeo
-  // agora pertence exclusivamente à janela da pista MEDIA.
-  next.clearMode = false;
+  // Cada janela guarda o próprio Modo Clear. Nesse modo o Teleprompt oculta
+  // letra, cifras, relógios, nomes, progresso, preview e recados, deixando
+  // somente a mídia da própria pista em tela cheia sobre fundo preto.
+  next.clearMode = nativeTelepromptJsonBool(
+    json, "clearMode", next.clearMode);
   const bool legacyRgb = nativeTelepromptJsonBool(
     json, "rgbBorderEnabled", false);
   next.rgbWindowBorderEnabled = nativeTelepromptJsonBool(
