@@ -24092,12 +24092,12 @@ static std::string nativeUiReadDirectorPassword()
 
 static bool nativeUiBlockInterfaceWhenDirectorConnectedEnabled()
 {
-  if (!GetExtState_ptr) return true;
+  if (!GetExtState_ptr) return false;
   const char* raw = GetExtState_ptr(
     kAccessExtSection,
     kAccessBlockInterfaceWhenDirectorConnectedKey);
-  // Ate o usuario escolher, o comportamento padrao e bloquear.
-  return nativeBoolFromText(raw ? raw : "", true);
+  // O bloqueio só é ativado depois que o usuário o habilita explicitamente.
+  return nativeBoolFromText(raw ? raw : "", false);
 }
 
 static bool nativeUiConfigureDirectorPassword()
@@ -55892,6 +55892,25 @@ static bool nativeUiPrepareNavigationKeyDown(
 
 static bool nativeUiAdvanceNavigationRepeat(HWND hwnd)
 {
+#ifdef __APPLE__
+  // O SWELL pode deixar de entregar WM_KEYUP para setas combinadas com
+  // Command. Confere o estado físico e elimina qualquer latch restante antes
+  // que o repetidor próprio mantenha a lista andando sozinho.
+  if (g_nativeUiPlaylistStepKeyHeld[0] &&
+      !VSHookMacIsArrowKeyPressed(-1)) {
+    g_nativeUiPlaylistStepKeyHeld[0] = false;
+  }
+  if (g_nativeUiPlaylistStepKeyHeld[1] &&
+      !VSHookMacIsArrowKeyPressed(1)) {
+    g_nativeUiPlaylistStepKeyHeld[1] = false;
+  }
+  if ((g_nativeUiHeldNavigationKey == VK_UP &&
+       !VSHookMacIsArrowKeyPressed(-1)) ||
+      (g_nativeUiHeldNavigationKey == VK_DOWN &&
+       !VSHookMacIsArrowKeyPressed(1))) {
+    nativeUiResetNavigationRepeat();
+  }
+#endif
   if (!hwnd || !IsWindow(hwnd) ||
       g_nativeUiHeldNavigationKey == 0) {
     return false;
@@ -57198,6 +57217,8 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     }
     case WM_KILLFOCUS:
       nativeUiResetNavigationRepeat();
+      g_nativeUiPlaylistStepKeyHeld[0] = false;
+      g_nativeUiPlaylistStepKeyHeld[1] = false;
       nativeUiReleaseMusicSelectionForArrangeEditing();
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
@@ -57214,24 +57235,32 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_SYSKEYDOWN:
     case WM_KEYDOWN:
       {
+        const bool verticalArrow =
+          wParam == VK_UP || wParam == VK_DOWN;
+        const int playlistStepKeyIndex =
+          wParam == VK_UP ? 0 : 1;
         const bool playlistStepModifier =
 #ifdef __APPLE__
-          // No SWELL/macOS, Command chega como FCONTROL/VK_CONTROL. VK_LWIN
-          // representa a tecla Control fisica, nao Command.
+          // O lParam do autorepeat do SWELL pode perder FCONTROL. Consulta o
+          // NSEvent diretamente para manter Command identificado em todos os
+          // eventos do mesmo pressionamento.
+          VSHookMacCurrentEventHasCommandModifier() ||
           (lParam & FCONTROL) != 0 ||
           (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 #else
           (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 #endif
-        if (playlistStepModifier &&
-            (wParam == VK_UP || wParam == VK_DOWN)) {
-          const int keyIndex = wParam == VK_UP ? 0 : 1;
+        const bool playlistStepAlreadyHeld = verticalArrow &&
+          g_nativeUiPlaylistStepKeyHeld[playlistStepKeyIndex];
+        if (verticalArrow &&
+            (playlistStepModifier || playlistStepAlreadyHeld)) {
           // Command/Ctrl + seta alterna um repertório por pressionamento.
-          // Interceptar antes do navegador comum impede que o autorepeat da
-          // seta continue percorrendo músicas no macOS.
+          // Depois do primeiro evento, o latch também consome repetições nas
+          // quais o SWELL omitir o modificador, impedindo que elas liguem a
+          // navegação contínua das músicas.
           nativeUiResetNavigationRepeat();
-          if (!g_nativeUiPlaylistStepKeyHeld[keyIndex]) {
-            g_nativeUiPlaylistStepKeyHeld[keyIndex] = true;
+          if (playlistStepModifier && !playlistStepAlreadyHeld) {
+            g_nativeUiPlaylistStepKeyHeld[playlistStepKeyIndex] = true;
             if (!g_nativeAppActivePanelModel.regionsPage &&
                 !g_nativeAppActivePanelModel.mixerPage) {
               nativeUiStepActivePlaylist(

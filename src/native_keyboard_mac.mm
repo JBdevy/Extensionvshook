@@ -1,8 +1,26 @@
 #include "native_keyboard_mac.h"
 
 #import <AppKit/AppKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 #include <cstring>
+
+extern "C" bool VSHookMacCurrentEventHasCommandModifier()
+{
+  @autoreleasepool {
+    NSEvent* event = [NSApp currentEvent];
+    if (!event) return false;
+    return ([event modifierFlags] & NSEventModifierFlagCommand) != 0;
+  }
+}
+
+extern "C" bool VSHookMacIsArrowKeyPressed(int direction)
+{
+  // Key codes físicos do macOS: seta para baixo = 125; para cima = 126.
+  const CGKeyCode keyCode = direction < 0 ? 126 : 125;
+  return CGEventSourceKeyState(
+    kCGEventSourceStateCombinedSessionState, keyCode);
+}
 
 extern "C" std::size_t VSHookMacReadCurrentKeyText(
   char* destination,
