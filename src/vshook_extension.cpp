@@ -1587,6 +1587,10 @@ static size_t g_nativeUiRenameInputCursor = 0;
 // edita o nome dentro da propria linha sem abrir o modal completo.
 static bool g_nativeMainRowInlineRenameOpen = false;
 static RECT g_nativeMainRowInlineRenameInputRect{0, 0, 0, 0};
+// O mesmo editor pode pertencer à lista principal ou à Hook Controller. O
+// dono evita que as duas janelas desenhem o campo ao mesmo tempo.
+static bool g_nativeHookControllerRowInlineRenameOwner = false;
+static RECT g_nativeHookControllerRowInlineRenameInputRect{0, 0, 0, 0};
 static std::string g_nativeUiTimerMode = "progressive";
 static std::string g_nativeUiTimerDigits = "000000";
 static int g_nativeUiTimerDigitCursor = 0;
@@ -32477,6 +32481,8 @@ static void nativeUiCloseMainModal()
   g_nativeUiRenameInputCursor = 0;
   g_nativeMainRowInlineRenameOpen = false;
   g_nativeMainRowInlineRenameInputRect = RECT{0, 0, 0, 0};
+  g_nativeHookControllerRowInlineRenameOwner = false;
+  g_nativeHookControllerRowInlineRenameInputRect = RECT{0, 0, 0, 0};
   g_nativeUiRenameBlockCustomName = false;
   g_nativeUiRenameBlockCentered = false;
   g_nativeUiRenameFamilyParent = false;
@@ -32930,6 +32936,8 @@ static void nativeUiOpenRowRename(
 {
   g_nativeMainRowInlineRenameOpen = false;
   g_nativeMainRowInlineRenameInputRect = RECT{0, 0, 0, 0};
+  g_nativeHookControllerRowInlineRenameOwner = false;
+  g_nativeHookControllerRowInlineRenameInputRect = RECT{0, 0, 0, 0};
   g_nativeUiRenameRegionsPage = regionsPage;
   g_nativeUiRenameBlock = row.block;
   g_nativeUiRenameBlockCustomName =
@@ -33007,10 +33015,10 @@ static void nativeUiOpenRowInlineRename(
   g_nativeMainModalKind = NativeMainModalKind::None;
   g_nativeMainRowInlineRenameOpen = true;
   g_nativeMainRowInlineRenameInputRect = RECT{0, 0, 0, 0};
-  // Comeca com o nome inteiro selecionado para a primeira digitacao substituir
-  // o valor, comportamento esperado de um rename direto.
+  // Abre sem selecionar o nome. O cursor fica no final para continuar a
+  // palavra imediatamente, tanto no Windows quanto no macOS.
   g_nativeUiTextSelectionKind = NativeUiTextInputKind::RenameRow;
-  g_nativeUiTextSelectionAnchor = 0;
+  g_nativeUiTextSelectionAnchor = g_nativeUiRenameInputCursor;
   g_nativeUiTextMouseSelecting = false;
 }
 
@@ -37037,6 +37045,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
       const int labelX = rowRect.left +
         indexColumnW + 7 + childIndent;
       const bool editingInlineRow =
+        !g_nativeHookControllerRowInlineRenameOwner &&
         g_nativeMainRowInlineRenameOpen &&
         g_nativeMainModalKind == NativeMainModalKind::None &&
         nativeUiRowMatchesRenameTarget(
@@ -47619,10 +47628,10 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     if (clickedRow && nativeUiRowMatchesRenameTarget(
           *clickedRow, g_nativeAppActivePanelModel.regionsPage)) {
       if (inlineRenameGesture) {
-        // Repetir o gesto na mesma linha apenas prepara a substituicao do nome.
+        // Repetir o gesto mantém a edição no fim sem selecionar o nome.
         g_nativeUiTextSelectionKind = NativeUiTextInputKind::RenameRow;
-        g_nativeUiTextSelectionAnchor = 0;
         g_nativeUiRenameInputCursor = g_nativeUiRenameInput.size();
+        g_nativeUiTextSelectionAnchor = g_nativeUiRenameInputCursor;
       } else {
         // O clique direito comum continua abrindo o editor completo e preserva
         // qualquer texto que ja tenha sido digitado diretamente na linha.
@@ -50652,6 +50661,14 @@ static constexpr const char* kNativeHookControllerTitle =
   "Hook Controller";
 static constexpr const char* kNativeHookControllerDockId =
   "VSHOOKEXT_HOOK_CONTROLLER_V1";
+
+static bool nativeHookControllerInlineRenameActive()
+{
+  return g_nativeHookControllerRowInlineRenameOwner &&
+    g_nativeMainRowInlineRenameOpen &&
+    g_nativeMainModalKind == NativeMainModalKind::None;
+}
+
 static void nativeHookControllerRecreateForDock(bool dock);
 static bool nativeUiBeginMainListPress(HWND hwnd, const POINT& point);
 static void nativeUiUpdateMainListDrag(const POINT& point);
@@ -51253,6 +51270,15 @@ static void nativeHookControllerPaintSongs(
   g_nativeHookControllerSongHits.clear();
   g_nativeHookControllerActionHits.clear();
   g_nativeHookControllerFamilyButtonHits.clear();
+  if (g_nativeHookControllerRowInlineRenameOwner) {
+    g_nativeHookControllerRowInlineRenameInputRect =
+      RECT{0, 0, 0, 0};
+  }
+  const auto caretNowMs =
+    std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const bool inlineRenameCursorVisible =
+    ((caretNowMs / 500) % 2) == 0;
 
   std::vector<NativeSongWindow> sourceSongs;
   {
@@ -51691,14 +51717,41 @@ static void nativeHookControllerPaintSongs(
       textColor = useBlockSongColor
         ? inheritedPaletteColor : RGB(255, 255, 255);
     }
-    nativeUiDrawWrappedText(dc, metrics.lines,
-      textRect.left, rowRect.top + listLayout.paddingY,
-      std::max(1, static_cast<int>(textRect.right - textRect.left)),
-      std::max(1, static_cast<int>(rowRect.bottom - rowRect.top) -
-        listLayout.paddingY * 2),
-      listLayout.lineHeight, textColor,
-      row.familyParent ? boldFont : normalFont,
-      liveMarked, RGB(0, 0, 0));
+    const bool editingInlineRow =
+      g_nativeHookControllerRowInlineRenameOwner &&
+      g_nativeMainRowInlineRenameOpen &&
+      g_nativeMainModalKind == NativeMainModalKind::None &&
+      nativeUiRowMatchesRenameTarget(row, true);
+    if (editingInlineRow) {
+      g_nativeHookControllerRowInlineRenameInputRect = RECT{
+        textRect.left, rowRect.top + 2,
+        textRect.right, rowRect.bottom - 2};
+      nativeAppActiveFillOutlinedRect(dc,
+        g_nativeHookControllerRowInlineRenameInputRect,
+        RGB(3, 7, 14), RGB(56, 189, 248));
+      nativeUiDrawEditableText(dc,
+        RECT{
+          g_nativeHookControllerRowInlineRenameInputRect.left + 6,
+          g_nativeHookControllerRowInlineRenameInputRect.top,
+          g_nativeHookControllerRowInlineRenameInputRect.right - 5,
+          g_nativeHookControllerRowInlineRenameInputRect.bottom},
+        g_nativeUiRenameInput,
+        NativeUiTextInputKind::RenameRow,
+        true, inlineRenameCursorVisible,
+        RGB(248, 250, 252),
+        row.familyParent ? boldFont : normalFont,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+          DT_END_ELLIPSIS | DT_NOPREFIX);
+    } else {
+      nativeUiDrawWrappedText(dc, metrics.lines,
+        textRect.left, rowRect.top + listLayout.paddingY,
+        std::max(1, static_cast<int>(textRect.right - textRect.left)),
+        std::max(1, static_cast<int>(rowRect.bottom - rowRect.top) -
+          listLayout.paddingY * 2),
+        listLayout.lineHeight, textColor,
+        row.familyParent ? boldFont : normalFont,
+        liveMarked, RGB(0, 0, 0));
+    }
     nativeHookControllerDrawText(dc, duration, durationRect,
       liveExecuted ? RGB(255, 224, 46) : textColor,
       normalFont, DT_RIGHT);
@@ -52640,6 +52693,39 @@ static void nativeHookControllerHandleClick(
     g_nativeHookControllerSearchFocused = false;
     InvalidateRect(hwnd, &g_nativeHookControllerSearchRect, FALSE);
   }
+  const bool inlineRenameGesture =
+    rightClick && nativeUiRowInlineRenameModifierDown();
+  if (rightClick && nativeHookControllerInlineRenameActive()) {
+    const NativeAppActivePanelModel::Row* clickedRow = nullptr;
+    for (const auto& hit : g_nativeHookControllerSongHits) {
+      if (!PtInRect(&hit.rect, point)) continue;
+      clickedRow = &hit.row;
+      break;
+    }
+    if (clickedRow &&
+        nativeUiRowMatchesRenameTarget(*clickedRow, true)) {
+      if (inlineRenameGesture) {
+        // Repetir o atalho mantém o cursor no final, sem selecionar o nome.
+        g_nativeUiTextSelectionKind = NativeUiTextInputKind::RenameRow;
+        g_nativeUiRenameInputCursor = g_nativeUiRenameInput.size();
+        g_nativeUiTextSelectionAnchor = g_nativeUiRenameInputCursor;
+        InvalidateRect(hwnd, nullptr, FALSE);
+      } else {
+        // O clique direito comum continua levando ao modal completo.
+        g_nativeMainRowInlineRenameOpen = false;
+        g_nativeHookControllerRowInlineRenameOwner = false;
+        g_nativeHookControllerRowInlineRenameInputRect =
+          RECT{0, 0, 0, 0};
+        g_nativeMainModalKind = NativeMainModalKind::RenameRow;
+        if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
+      }
+      return;
+    }
+    if (!nativeUiApplyRowRename()) {
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return;
+    }
+  }
   if (PtInRect(&g_nativeHookControllerDockRect, point)) {
     if (rightClick) return;
     bool floatingDocker = false;
@@ -52792,8 +52878,18 @@ static void nativeHookControllerHandleClick(
     for (const auto& hit : g_nativeHookControllerSongHits) {
       if (!PtInRect(&hit.rect, point)) continue;
       if (rightClick) {
-        nativeUiOpenRowRename(hit.row, true);
-        if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
+        if (inlineRenameGesture) {
+          nativeUiOpenRowInlineRename(hit.row, true);
+          g_nativeHookControllerRowInlineRenameOwner = true;
+          g_nativeHookControllerRowInlineRenameInputRect =
+            RECT{0, 0, 0, 0};
+          g_nativeHookControllerSearchFocused = false;
+          SetFocus(hwnd);
+          InvalidateRect(hwnd, nullptr, FALSE);
+        } else {
+          nativeUiOpenRowRename(hit.row, true);
+          if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
+        }
         return;
       }
       const bool transportPlaying = nativeUiTransportActive();
@@ -53032,6 +53128,23 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       POINT point{
         static_cast<short>(LOWORD(lParam)),
         static_cast<short>(HIWORD(lParam))};
+      if (nativeHookControllerInlineRenameActive()) {
+        if (PtInRect(
+              &g_nativeHookControllerRowInlineRenameInputRect, point)) {
+          const size_t cursor = nativeUiTextCursorFromPoint(
+            hwnd, g_nativeHookControllerRowInlineRenameInputRect,
+            g_nativeUiRenameInput, point.x, 6);
+          nativeUiCollapseTextSelection(
+            NativeUiTextInputKind::RenameRow, cursor);
+          nativeUiRefreshTextInputNow(hwnd);
+          return 0;
+        }
+        // Um clique fora confirma a edição antes de executar a ação clicada.
+        if (!nativeUiApplyRowRename()) {
+          InvalidateRect(hwnd, nullptr, FALSE);
+          return 0;
+        }
+      }
       if (nativeHookControllerBeginScrollbarDrag(hwnd, point)) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -53248,6 +53361,9 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_KILLFOCUS:
+      if (nativeHookControllerInlineRenameActive()) {
+        nativeUiApplyRowRename();
+      }
       nativeUiResetNavigationRepeat();
       g_nativeUiPlaylistStepKeyHeld[0] = false;
       g_nativeUiPlaylistStepKeyHeld[1] = false;
@@ -53256,11 +53372,32 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       return 0;
     case WM_KEYUP:
     case WM_SYSKEYUP:
+      if (nativeHookControllerInlineRenameActive()) return 0;
       nativeUiResetNavigationRepeat(static_cast<int>(wParam));
       forwardKeyboardToMain();
       return 0;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+      if (nativeHookControllerInlineRenameActive()) {
+        if (wParam == VK_RETURN || wParam == VK_TAB) {
+          nativeUiApplyRowRename();
+          nativeUiRefreshTextInputNow(hwnd);
+          return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+          nativeUiCloseMainModal();
+          nativeUiRefreshTextInputNow(hwnd);
+          return 0;
+        }
+        if (nativeUiHandleActiveTextInputKey(hwnd, wParam)) return 0;
+#ifdef __APPLE__
+        // No macOS o SWELL não envia WM_CHAR para esta janela customizada.
+        if (nativeUiInsertActiveMacKeyText(hwnd)) return 0;
+#endif
+        // Enquanto edita, nenhuma tecla deve navegar a lista ou chegar ao
+        // REAPER. No Windows, os caracteres imprimíveis entram em WM_CHAR.
+        return 0;
+      }
       if ((wParam == VK_UP || wParam == VK_DOWN) &&
           g_nativeHookControllerMode !=
             NativeHookControllerMode::Tcp) {
@@ -53317,6 +53454,11 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       break;
     case WM_CHAR:
     case WM_SYSCHAR:
+      if (nativeHookControllerInlineRenameActive()) {
+        nativeUiInsertActiveTextCodepoint(
+          hwnd, static_cast<uint32_t>(wParam));
+        return 0;
+      }
       if (g_nativeHookControllerMode ==
             NativeHookControllerMode::Songs &&
           g_nativeHookControllerSearchFocused) {
@@ -53349,6 +53491,9 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       return 0;
     case WM_DESTROY:
     case WM_NCDESTROY:
+      if (nativeHookControllerInlineRenameActive()) {
+        nativeUiCloseMainModal();
+      }
       if (message == WM_DESTROY &&
           !g_nativeHookControllerClosing) {
         nativeHookControllerSaveWindowState();
