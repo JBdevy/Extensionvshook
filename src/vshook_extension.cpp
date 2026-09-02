@@ -65964,6 +65964,22 @@ static void nativeVideoPaint(HWND hwnd)
       1, static_cast<int>(client.right - client.left));
     const int availableH = std::max(
       1, static_cast<int>(client.bottom - client.top));
+    int requestedW = availableW;
+    int requestedH = availableH;
+#ifdef __APPLE__
+    // GetClientRect/SWELL trabalha em pontos, enquanto uma janela Retina
+    // precisa de backing pixels. Sem aplicar essa escala, um monitor 2x
+    // recebia do FFmpeg um quadro com metade da resolucao fisica e o
+    // CoreGraphics precisava amplia-lo para apresentar.
+    const double backingScale =
+      VSHookMacTelepromptBackingScale(hwnd);
+    requestedW = std::max(
+      1, std::min(65535, static_cast<int>(std::lround(
+        static_cast<double>(availableW) * backingScale))));
+    requestedH = std::max(
+      1, std::min(65535, static_cast<int>(std::lround(
+        static_cast<double>(availableH) * backingScale))));
+#endif
     const std::string playbackKey =
       nativeTelepromptMediaHoldKey(state);
     const bool changingVideo =
@@ -65977,12 +65993,17 @@ static void nativeVideoPaint(HWND hwnd)
       state.mediaPath, playbackKey,
       state.mediaCurrentTime, state.playing,
       state.mediaPlayrate,
-      availableW, availableH,
+      requestedW, requestedH,
       state.transportSampledAt, frame);
     if (rendered) {
+#ifdef __APPLE__
+      constexpr bool kFastWindowVideoScaling = false;
+#else
+      constexpr bool kFastWindowVideoScaling = true;
+#endif
       rendered = nativeVideoDrawBgra(
         dc, frame.pixels, frame.width, frame.height,
-        frame.stride, client, stretch, true);
+        frame.stride, client, stretch, kFastWindowVideoScaling);
       if (rendered) g_nativeVideoPresentedSequence = frame.sequence;
     }
     g_nativeVideoPresentedPlaybackKey = playbackKey;
@@ -66034,6 +66055,18 @@ static void nativeVideoPrimeDecoder(HWND hwnd)
     1, static_cast<int>(client.right - client.left));
   const int requestedHeight = std::max(
     1, static_cast<int>(client.bottom - client.top));
+  int physicalRequestedWidth = requestedWidth;
+  int physicalRequestedHeight = requestedHeight;
+#ifdef __APPLE__
+  const double backingScale =
+    VSHookMacTelepromptBackingScale(hwnd);
+  physicalRequestedWidth = std::max(
+    1, std::min(65535, static_cast<int>(std::lround(
+      static_cast<double>(requestedWidth) * backingScale))));
+  physicalRequestedHeight = std::max(
+    1, std::min(65535, static_cast<int>(std::lround(
+      static_cast<double>(requestedHeight) * backingScale))));
+#endif
   vshook_video::DecodedFrame frame;
   if (g_nativeVideoWindowDecoder->frameAt(
         state.mediaPath,
@@ -66041,8 +66074,8 @@ static void nativeVideoPrimeDecoder(HWND hwnd)
         state.mediaCurrentTime,
         state.playing,
         state.mediaPlayrate,
-        requestedWidth,
-        requestedHeight,
+        physicalRequestedWidth,
+        physicalRequestedHeight,
         state.transportSampledAt,
         frame) &&
       frame.pixels &&
