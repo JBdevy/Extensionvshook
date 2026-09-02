@@ -28,6 +28,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
 option(VSHOOK_BUILD_TESTS "Build native VS Hook license tests" OFF)
+option(
+  VSHOOK_MAC_NATIVE_VIDEO
+  "Use the AVFoundation video decoder in the macOS extension"
+  ON
+)
 
 # O runtime do FFmpeg e carregado dinamicamente de
 # REAPER/UserPlugins/VSHookRuntime/FFmpeg. Durante a compilacao precisamos
@@ -132,8 +137,19 @@ elseif(APPLE)
   target_sources(reaper_vshook PRIVATE
     src/native_keyboard_mac.mm
     src/native_teleprompt_mac.mm
-    src/native_video_decoder_ffmpeg.cpp
   )
+  if(VSHOOK_MAC_NATIVE_VIDEO)
+    # O teste atual usa AVFoundation/CoreVideo para preservar a conversao de
+    # cor indicada pela midia.
+    target_sources(reaper_vshook PRIVATE
+      src/native_video_decoder_mac.mm
+    )
+  else()
+    # Fallback de uma flag para comparar ou retornar ao FFmpeg no macOS.
+    target_sources(reaper_vshook PRIVATE
+      src/native_video_decoder_ffmpeg.cpp
+    )
+  endif()
 endif()
 
 target_include_directories(reaper_vshook PRIVATE

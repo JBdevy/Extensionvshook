@@ -17,6 +17,7 @@
 #include <limits>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace vshook_video {
@@ -46,12 +47,14 @@ struct Decoder::Impl {
   bool stopRequested = false;
   std::uint64_t handledRequestSerial = 0;
   std::shared_ptr<const std::vector<std::uint8_t>> publishedPixels;
+  FrameReadyCallback frameReady;
   std::string publishedPath;
   std::string publishedPlaybackKey;
   int publishedWidth = 0;
   int publishedHeight = 0;
   int publishedStride = 0;
   double publishedTimestamp = -1.0;
+  std::uint64_t publishedSequence = 0;
   bool hasObservedClock = false;
   std::string lastObservedPath;
   std::string lastObservedPlaybackKey;
@@ -93,7 +96,8 @@ struct Decoder::Impl {
   double frameTimestamp = -1.0;
   std::atomic<int> statusCode{0};
 
-  Impl()
+  explicit Impl(FrameReadyCallback callback)
+    : frameReady(std::move(callback))
   {
     worker = std::thread([this]() { workerLoop(); });
   }
@@ -970,7 +974,11 @@ struct Decoder::Impl {
     bool playing,
     bool forceRestart)
   {
-    if (playing && !sequentialUnsupported) {
+    (void)playing;
+    if (!sequentialUnsupported) {
+      // Mantem o AVAssetReader preparado tambem quando o transporte esta
+      // parado. Assim Play reutiliza o reader ja posicionado no cursor em vez
+      // de pagar a abertura do pipeline depois que o REAPER comecou a tocar.
       if (decodeSequentialFrame(
             sourceTime, forceRestart)) {
         return true;
@@ -993,17 +1001,12 @@ struct Decoder::Impl {
       if (sequentialNeedsMoreSamples) {
         return pixels && !pixels->empty();
       }
-      // Formatos que não aceitem AVAssetReader continuam funcionais pelo
-      // extrator de quadro, mas o caminho normal de reprodução é sequencial.
+      // Formatos que nao aceitem AVAssetReader continuam funcionais pelo
+      // extrator de quadro.
       sequentialUnsupported = true;
       clearSequentialReader();
       return decodeStillFrame(sourceTime);
     }
-    if (sequentialReader || sequentialOutput) {
-      clearSequentialReader();
-    }
-    sequentialReachedEnd = false;
-    sequentialNeedsMoreSamples = false;
     return decodeStillFrame(sourceTime);
   }
 
@@ -1014,23 +1017,27 @@ struct Decoder::Impl {
         width <= 0 || height <= 0) {
       return false;
     }
-    std::lock_guard<std::mutex> lock(stateMutex);
-    if (!hasRequest ||
-        request.path != path ||
-        request.playbackKey != processed.playbackKey ||
-        request.serial != processed.serial) {
-      return false;
+    {
+      std::lock_guard<std::mutex> lock(stateMutex);
+      if (!hasRequest ||
+          request.path != path ||
+          request.playbackKey != processed.playbackKey ||
+          request.serial != processed.serial) {
+        return false;
+      }
+      // Cada decode cria um buffer novo. Publicar o mesmo shared_ptr elimina
+      // uma copia integral por quadro sem permitir que a worker altere um
+      // snapshot que a interface ainda esteja desenhando.
+      publishedPixels = pixels;
+      publishedPath = path;
+      publishedPlaybackKey = processed.playbackKey;
+      publishedWidth = width;
+      publishedHeight = height;
+      publishedStride = width * 4;
+      publishedTimestamp = frameTimestamp;
+      ++publishedSequence;
     }
-    // Cada decode cria um buffer novo. Publicar o mesmo shared_ptr elimina
-    // uma cópia integral por quadro sem permitir que a worker altere um
-    // snapshot que a interface ainda esteja desenhando.
-    publishedPixels = pixels;
-    publishedPath = path;
-    publishedPlaybackKey = processed.playbackKey;
-    publishedWidth = width;
-    publishedHeight = height;
-    publishedStride = width * 4;
-    publishedTimestamp = frameTimestamp;
+    if (frameReady) frameReady();
     return true;
   }
 
@@ -1197,14 +1204,19 @@ struct Decoder::Impl {
     bool playing,
     double playbackRate,
     int requestedWidth,
-    int requestedHeight)
+    int requestedHeight,
+    std::chrono::steady_clock::time_point sourceSampledAt)
   {
     const double safeTime = std::max(0.0, sourceTime);
     const double safeRate =
       std::max(0.1, std::min(4.0, playbackRate));
     const int safeWidth = std::max(1, requestedWidth);
     const int safeHeight = std::max(1, requestedHeight);
-    const auto now = std::chrono::steady_clock::now();
+    const auto now =
+      sourceSampledAt !=
+        std::chrono::steady_clock::time_point{}
+        ? sourceSampledAt
+        : std::chrono::steady_clock::now();
     {
       std::lock_guard<std::mutex> lock(stateMutex);
 
@@ -1328,6 +1340,7 @@ struct Decoder::Impl {
     output.height = publishedHeight;
     output.stride = publishedStride;
     output.timestamp = publishedTimestamp;
+    output.sequence = publishedSequence;
     return true;
   }
 
@@ -1361,8 +1374,8 @@ struct Decoder::Impl {
   }
 };
 
-Decoder::Decoder()
-  : impl_(std::make_unique<Impl>())
+Decoder::Decoder(FrameReadyCallback frameReady)
+  : impl_(std::make_unique<Impl>(std::move(frameReady)))
 {
 }
 
@@ -1387,7 +1400,34 @@ bool Decoder::frameAt(
     playing,
     playbackRate,
     requestedWidth,
-    requestedHeight);
+    requestedHeight,
+    std::chrono::steady_clock::now());
+  return impl_->currentFrame(
+    utf8Path, playbackKey, output);
+}
+
+bool Decoder::frameAt(
+  const std::string& utf8Path,
+  const std::string& playbackKey,
+  double sourceTime,
+  bool playing,
+  double playbackRate,
+  int requestedWidth,
+  int requestedHeight,
+  std::chrono::steady_clock::time_point sourceSampledAt,
+  DecodedFrame& output)
+{
+  output = {};
+  if (!impl_) return false;
+  impl_->submit(
+    utf8Path,
+    playbackKey,
+    sourceTime,
+    playing,
+    playbackRate,
+    requestedWidth,
+    requestedHeight,
+    sourceSampledAt);
   return impl_->currentFrame(
     utf8Path, playbackKey, output);
 }

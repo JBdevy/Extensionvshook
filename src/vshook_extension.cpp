@@ -59613,29 +59613,19 @@ static constexpr UINT kNativeVideoPollMessage = WM_APP + 0x0561;
 // mensagens de aplicação pelo mesmo intervalo numérico reservado pelo Windows.
 static constexpr UINT kNativeVideoPollMessage = 0x8000u + 0x0561u;
 #endif
-static constexpr double kNativeVideoPollPeriodSeconds = 1.0 / 120.0;
-
 // A decodificacao e assincrona. O callback do decoder acorda a HWND assim que
-// um quadro fica pronto; este pulso de 120 Hz continua como amostragem do
-// transporte e seguranca caso a mensagem instantanea seja coalescida. Nenhuma
-// dessas threads toca na API do REAPER. A mensagem nunca cria backlog.
+// um quadro fica pronto. A amostragem do transporte pertence ao WM_TIMER de
+// 60 Hz; um segundo pulso de 120 Hz concorria com WM_PAINT e podia esconder
+// callbacks de quadros novos por usar a mesma flag messagePending.
 struct NativeVideoPollPulse {
   std::atomic<bool> stopRequested{true};
   std::atomic<bool> messagePending{false};
-  std::thread worker;
   HWND hwnd = nullptr;
-
-  ~NativeVideoPollPulse()
-  {
-    stopRequested.store(true, std::memory_order_release);
-    if (worker.joinable()) worker.join();
-  }
 };
 
 static void nativeStopVideoPollPulse(NativeVideoPollPulse& pulse)
 {
   pulse.stopRequested.store(true, std::memory_order_release);
-  if (pulse.worker.joinable()) pulse.worker.join();
   pulse.messagePending.store(false, std::memory_order_release);
   pulse.hwnd = nullptr;
 }
@@ -59648,33 +59638,6 @@ static void nativeStartVideoPollPulse(
   if (!hwnd) return;
   pulse.hwnd = hwnd;
   pulse.stopRequested.store(false, std::memory_order_release);
-  pulse.worker = std::thread([&pulse]() {
-    using PollClock = std::chrono::steady_clock;
-    const auto period = std::chrono::duration_cast<PollClock::duration>(
-      std::chrono::duration<double>(
-        kNativeVideoPollPeriodSeconds));
-    auto nextPollAt = PollClock::now() + period;
-    while (!pulse.stopRequested.load(std::memory_order_acquire)) {
-      std::this_thread::sleep_until(nextPollAt);
-      if (pulse.stopRequested.load(std::memory_order_acquire)) break;
-      const auto now = PollClock::now();
-      if (now - nextPollAt > std::chrono::milliseconds(100)) {
-        nextPollAt = now;
-      }
-      nextPollAt += period;
-      bool expected = false;
-      if (pulse.messagePending.compare_exchange_strong(
-            expected, true,
-            std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        if (!PostMessage(
-              pulse.hwnd, kNativeVideoPollMessage, 0, 0)) {
-          pulse.messagePending.store(
-            false, std::memory_order_release);
-        }
-      }
-    }
-  });
 }
 
 static vshook_video::Decoder::FrameReadyCallback
@@ -64890,6 +64853,9 @@ static void nativeTelepromptPrimeVideoDecoder(
       frame.sequence !=
         g_nativeTelepromptPresentedVideoSequence[index]) {
     InvalidateRect(hwnd, nullptr, FALSE);
+    // Apresenta o frame enquanto a mensagem de callback esta no topo da
+    // fila; WM_PAINT de baixa prioridade podia ficar atras do input do REAPER.
+    UpdateWindow(hwnd);
   }
 #else
   (void)hwnd;
@@ -65243,6 +65209,8 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
         if (nativeLower(timerState.mediaType) == "video" &&
             !timerState.mediaPath.empty()) {
           nativeTelepromptPrimeVideoDecoder(hwnd, slot);
+          // Atualizacao agressiva durante edits/scrolls do Arrange.
+          InvalidateRect(hwnd, nullptr, FALSE);
         } else {
           InvalidateRect(hwnd, nullptr, FALSE);
         }
@@ -65383,6 +65351,17 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
         break;
       }
       break;
+#ifdef __APPLE__
+    // O SWELL do macOS converte Esc em IDCANCEL antes de entregar
+    // WM_KEYDOWN para uma janela de dialogo. No Windows o mesmo atalho chega
+    // pelo bloco acima como VK_ESCAPE.
+    case WM_COMMAND:
+      if (LOWORD(wParam) == IDCANCEL && window.fullscreen) {
+        nativeTelepromptToggleFullscreen(slot);
+        return 0;
+      }
+      break;
+#endif
     case WM_CLOSE:
       // Fechar diretamente pela propria janela deve persistir exatamente o
       // mesmo estado fechado usado pelo comando do menu. Caso contrario o
@@ -66121,6 +66100,7 @@ static void nativeVideoPrimeDecoder(HWND hwnd)
       frame.pixels &&
       frame.sequence != g_nativeVideoPresentedSequence) {
     InvalidateRect(hwnd, nullptr, FALSE);
+    UpdateWindow(hwnd);
   }
 #else
   (void)hwnd;
@@ -66216,6 +66196,7 @@ static LRESULT CALLBACK nativeVideoWndProc(
         if (nativeLower(timerState.mediaType) == "video" &&
             !timerState.mediaPath.empty()) {
           nativeVideoPrimeDecoder(hwnd);
+          InvalidateRect(hwnd, nullptr, FALSE);
         } else {
           InvalidateRect(hwnd, nullptr, FALSE);
         }
@@ -66403,6 +66384,16 @@ static LRESULT CALLBACK nativeVideoWndProc(
         break;
       }
       break;
+#ifdef __APPLE__
+    // Em dialogs SWELL/macOS, Esc e recebido como IDCANCEL, nao como
+    // WM_KEYDOWN. Mantem o comportamento identico ao do Teleprompt.
+    case WM_COMMAND:
+      if (LOWORD(wParam) == IDCANCEL && window.fullscreen) {
+        nativeVideoToggleFullscreen();
+        return 0;
+      }
+      break;
+#endif
 #ifdef _WIN32
     case WM_EXITSIZEMOVE: {
       RECT rect{0, 0, 0, 0};

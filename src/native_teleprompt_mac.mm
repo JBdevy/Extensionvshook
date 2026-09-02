@@ -162,7 +162,9 @@ extern "C" bool VSHookMacSetTelepromptFullscreen(
     if (screen) {
       [window setFrame:[screen frame] display:YES animate:NO];
     }
-    [window orderFrontRegardless];
+    // Ao entrar em tela cheia, esta janela precisa receber o teclado para o
+    // Esc chegar ao WndProc. A manutencao posterior nao rouba foco.
+    [window makeKeyAndOrderFront:nil];
     maintainFullscreenWindow(window);
     return true;
   }

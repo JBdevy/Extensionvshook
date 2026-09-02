@@ -1312,10 +1312,31 @@ struct Decoder::Impl {
         std::chrono::duration<double>(std::max(0.001, delay)));
   }
 
-  void scheduleNextPlaybackFrame(const Request& current)
+  void scheduleNextPlaybackFrame(
+    const Request& current,
+    bool reanchorToTransport)
   {
-    nextPlaybackFrameAt = playbackDeadlineForTimestamp(
-      current, lookaheadTimestamp);
+    if (reanchorToTransport ||
+        nextPlaybackFrameAt ==
+          std::chrono::steady_clock::time_point{}) {
+      nextPlaybackFrameAt = playbackDeadlineForTimestamp(
+        current, lookaheadTimestamp);
+    } else {
+      // Depois do primeiro quadro, a cadencia vem dos PTS da midia.
+      // Reancorar cada frame na amostra quantizada do transporte adiava um
+      // quadro e logo liberava dois, causando a tremida observada.
+      double mediaStep = nominalFrameDuration;
+      if (lookaheadTimestamp >= 0.0 && displayTimestamp >= 0.0) {
+        mediaStep = lookaheadTimestamp - displayTimestamp;
+      }
+      const double wallStep = std::max(
+        0.001,
+        mediaStep / std::max(0.000001, current.playbackRate));
+      nextPlaybackFrameAt +=
+        std::chrono::duration_cast<
+          std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(wallStep));
+    }
     playbackSchedulerActive = true;
   }
 
@@ -1326,18 +1347,6 @@ struct Decoder::Impl {
         current.playbackKey != activePlaybackKey) {
       playbackSchedulerActive = false;
       return;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (lookaheadTimestamp >= 0.0) {
-      const auto transportDeadline = playbackDeadlineForTimestamp(
-        current, lookaheadTimestamp, now);
-      if (transportDeadline > now) {
-        // Uma nova amostra do transporte pode corrigir alguns microssegundos
-        // da fase. Nunca mostra o quadro antes da posicao efetiva do REAPER.
-        nextPlaybackFrameAt = transportDeadline;
-        return;
-      }
     }
 
     bool advanced = false;
@@ -1358,10 +1367,7 @@ struct Decoder::Impl {
       moveDecodedTo(lookaheadFrame, lookaheadTimestamp);
     }
     if (advanced) publishDisplayFrame(current);
-    // A proxima deadline volta a ser calculada pela amostra viva do REAPER.
-    // Se o decoder estiver atrasado, ela ja estara no passado e o loop avanca
-    // imediatamente, sem mudar a origem do relogio nem fazer seek.
-    scheduleNextPlaybackFrame(current);
+    scheduleNextPlaybackFrame(current, false);
   }
 
   bool shouldSeek(const Request& current) const
@@ -1429,7 +1435,7 @@ struct Decoder::Impl {
       if (startContinuousPlayback) {
         if (chooseFrame(current.sourceTime, forceSeek)) {
           publishDisplayFrame(current);
-          scheduleNextPlaybackFrame(current);
+          scheduleNextPlaybackFrame(current, true);
         }
       } else {
         // Durante a reproducao a posicao recebida serve apenas para detectar

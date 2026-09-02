@@ -21,9 +21,8 @@ struct DecodedFrame {
   std::uint64_t sequence = 0;
 };
 
-// Decoder FFmpeg assíncrono. O REAPER ancora Play/Stop/seek e, durante Play,
-// os timestamps do próprio vídeo mantêm o avanço sequencial entre essas
-// descontinuidades. frameAt() sempre devolve imediatamente o último quadro.
+// Decoder de video assincrono (FFmpeg no Windows e AVFoundation no macOS).
+// frameAt() sempre devolve imediatamente o ultimo quadro publicado.
 class Decoder {
 public:
   using FrameReadyCallback = std::function<void()>;
