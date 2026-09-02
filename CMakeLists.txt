@@ -28,15 +28,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
 option(VSHOOK_BUILD_TESTS "Build native VS Hook license tests" OFF)
-option(
-  VSHOOK_MAC_NATIVE_VIDEO
-  "Use the AVFoundation video decoder in the macOS extension"
-  ON
-)
 
 # O runtime do FFmpeg e carregado dinamicamente de
 # REAPER/UserPlugins/VSHookRuntime/FFmpeg. Durante a compilacao precisamos
 # apenas dos headers da mesma serie ABI usada pelo runtime (FFmpeg 8.1.x).
+if(WIN32)
 find_path(VSHOOK_FFMPEG_INCLUDE_DIR
   NAMES libavcodec/avcodec.h
   HINTS
@@ -77,6 +73,7 @@ function(vshook_add_ffmpeg_headers target_name)
     )
   endif()
 endfunction()
+endif()
 
 if(APPLE)
   enable_language(OBJCXX)
@@ -105,19 +102,35 @@ if(VSHOOK_BUILD_TESTS)
 
   if(WIN32 OR APPLE)
     add_executable(vshook_video_decoder_smoke_test
-      src/native_video_decoder_ffmpeg.cpp
       tests/native_video_decoder_smoke_test.cpp
     )
+    if(WIN32)
+      target_sources(vshook_video_decoder_smoke_test PRIVATE
+        src/native_video_decoder_ffmpeg.cpp
+      )
+    elseif(APPLE)
+      target_sources(vshook_video_decoder_smoke_test PRIVATE
+        src/native_video_decoder_mac.mm
+      )
+    endif()
     target_include_directories(vshook_video_decoder_smoke_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
-    vshook_add_ffmpeg_headers(vshook_video_decoder_smoke_test)
     if(WIN32)
+      vshook_add_ffmpeg_headers(vshook_video_decoder_smoke_test)
       target_compile_definitions(vshook_video_decoder_smoke_test PRIVATE
         WIN32_LEAN_AND_MEAN
         NOMINMAX
       )
       target_link_libraries(vshook_video_decoder_smoke_test PRIVATE winmm)
+    elseif(APPLE)
+      target_link_libraries(vshook_video_decoder_smoke_test PRIVATE
+        "-framework Accelerate"
+        "-framework AVFoundation"
+        "-framework CoreGraphics"
+        "-framework CoreMedia"
+        "-framework CoreVideo"
+      )
     endif()
   endif()
 endif()
@@ -138,18 +151,9 @@ elseif(APPLE)
     src/native_keyboard_mac.mm
     src/native_teleprompt_mac.mm
   )
-  if(VSHOOK_MAC_NATIVE_VIDEO)
-    # O teste atual usa AVFoundation/CoreVideo para preservar a conversao de
-    # cor indicada pela midia.
-    target_sources(reaper_vshook PRIVATE
-      src/native_video_decoder_mac.mm
-    )
-  else()
-    # Fallback de uma flag para comparar ou retornar ao FFmpeg no macOS.
-    target_sources(reaper_vshook PRIVATE
-      src/native_video_decoder_ffmpeg.cpp
-    )
-  endif()
+  target_sources(reaper_vshook PRIVATE
+    src/native_video_decoder_mac.mm
+  )
 endif()
 
 target_include_directories(reaper_vshook PRIVATE
@@ -157,7 +161,9 @@ target_include_directories(reaper_vshook PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/WDL
   ${CMAKE_CURRENT_SOURCE_DIR}/WDL/swell
 )
-vshook_add_ffmpeg_headers(reaper_vshook)
+if(WIN32)
+  vshook_add_ffmpeg_headers(reaper_vshook)
+endif()
 
 target_compile_definitions(reaper_vshook PRIVATE
   VSHOOK_EXTENSION_VERSION="${PROJECT_VERSION}"
@@ -233,6 +239,5 @@ if(APPLE)
   target_link_options(reaper_vshook PRIVATE
     "-undefined" "dynamic_lookup"
     "-Wl,-exported_symbol,_ReaperPluginEntry"
-    "-Wl,-rpath,@loader_path/VSHookRuntime/FFmpeg/lib"
   )
 endif()

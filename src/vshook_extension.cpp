@@ -60143,6 +60143,8 @@ static NativeTelepromptWindowState g_nativeTelepromptWindows[2] = {
   {nullptr, 1}, {nullptr, 2}
 };
 static NativeVideoRefreshTimer g_nativeTelepromptRefreshTimers[2];
+static std::chrono::steady_clock::time_point
+  g_nativeTelepromptLastForcedVideoPaint[2]{};
 static NativeVideoPollPulse g_nativeTelepromptVideoPollPulses[2];
 static int g_nativeTelepromptCreatingSlot = 1;
 static NativeTelepromptSettings g_nativeTelepromptSettings[2];
@@ -65103,6 +65105,9 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
+      g_nativeTelepromptLastForcedVideoPaint[
+        nativeTelepromptIndex(slot)] =
+          std::chrono::steady_clock::now();
       nativeResetVideoRefreshTimer(
         g_nativeTelepromptRefreshTimers[
           nativeTelepromptIndex(slot)]);
@@ -65209,8 +65214,25 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
         if (nativeLower(timerState.mediaType) == "video" &&
             !timerState.mediaPath.empty()) {
           nativeTelepromptPrimeVideoDecoder(hwnd, slot);
-          // Atualizacao agressiva durante edits/scrolls do Arrange.
+          // No macOS o callback do AVFoundation já invalida e apresenta cada
+          // quadro novo imediatamente. Invalidar também a 60 Hz pelo timer
+          // duplicava pinturas completas (vídeo + todos os overlays) e fazia
+          // o Teleprompt perder quadros. Mantemos um pulso leve para relógios
+          // e textos; seek/scroll continua sendo amostrado a 60 Hz acima.
+#ifdef __APPLE__
+          const int index = nativeTelepromptIndex(slot);
+          const auto now = std::chrono::steady_clock::now();
+          if (g_nativeTelepromptLastForcedVideoPaint[index] ==
+                std::chrono::steady_clock::time_point{} ||
+              now - g_nativeTelepromptLastForcedVideoPaint[index] >=
+                std::chrono::milliseconds(100)) {
+            g_nativeTelepromptLastForcedVideoPaint[index] = now;
+            InvalidateRect(hwnd, nullptr, FALSE);
+          }
+#else
+          // No Windows a atualização agressiva continua ativa.
           InvalidateRect(hwnd, nullptr, FALSE);
+#endif
         } else {
           InvalidateRect(hwnd, nullptr, FALSE);
         }

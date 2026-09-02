@@ -378,9 +378,15 @@ extern "C" bool VSHookMacDrawTelepromptBitmap(
   if (!image) return false;
 
   CGContextSaveGState(context);
+  // O quadro de video e opaco. Copia-lo diretamente evita que o estado de
+  // composicao herdado do SWELL misture suas cores com o frame anterior.
+  // Textos, relogios e demais overlays sao desenhados normalmente depois.
+  if (fastScaling) {
+    CGContextSetBlendMode(context, kCGBlendModeCopy);
+  }
   CGContextSetInterpolationQuality(
     context, fastScaling
-      ? kCGInterpolationLow
+      ? kCGInterpolationMedium
       : kCGInterpolationHigh);
   CGContextSetShouldAntialias(context, !fastScaling);
   CGContextTranslateCTM(
