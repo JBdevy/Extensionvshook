@@ -3699,7 +3699,8 @@ static void setVsHookTimecodeItemName(
     take, "P_NAME", &value[0], true);
 }
 
-static bool setSmpteGeneratorChunkToMidiMtc(std::string& chunk)
+static bool setSmpteGeneratorChunkToMidiMtc(
+  std::string& chunk, double startTime)
 {
   const size_t sourceTag = chunk.find("<SOURCE LTC");
   if (sourceTag == std::string::npos) return false;
@@ -3711,12 +3712,14 @@ static bool setSmpteGeneratorChunkToMidiMtc(std::string& chunk)
   const std::string sourceIndent =
     chunk.substr(indentStart, sourceTag - indentStart);
   const std::string closingLine = "\n" + sourceIndent + ">";
-  const size_t sourceEnd = chunk.find(closingLine, sourceTag);
+  size_t sourceEnd = chunk.find(closingLine, sourceTag);
   if (sourceEnd == std::string::npos) return false;
 
   size_t lineStart = chunk.find('\n', sourceTag);
   if (lineStart == std::string::npos || lineStart >= sourceEnd) return false;
   ++lineStart;
+  bool startTimeUpdated = false;
+  bool sendUpdated = false;
   while (lineStart < sourceEnd) {
     size_t lineEnd = chunk.find('\n', lineStart);
     if (lineEnd == std::string::npos || lineEnd > sourceEnd) {
@@ -3732,7 +3735,25 @@ static bool setSmpteGeneratorChunkToMidiMtc(std::string& chunk)
       --contentEnd;
     }
     const size_t contentLength = contentEnd - contentStart;
-    if (contentLength >= 4 &&
+    if (contentLength >= 9 &&
+        chunk.compare(contentStart, 9, "STARTTIME") == 0 &&
+        (contentLength == 9 ||
+          chunk[contentStart + 9] == ' ' ||
+          chunk[contentStart + 9] == '\t')) {
+      std::ostringstream value;
+      value << std::setprecision(15) << "STARTTIME "
+            << std::max(0.0, startTime);
+      const std::string replacement = value.str();
+      chunk.replace(contentStart, contentLength, replacement);
+      const ptrdiff_t lengthDelta =
+        static_cast<ptrdiff_t>(replacement.size()) -
+        static_cast<ptrdiff_t>(contentLength);
+      sourceEnd = static_cast<size_t>(
+        static_cast<ptrdiff_t>(sourceEnd) + lengthDelta);
+      lineEnd = static_cast<size_t>(
+        static_cast<ptrdiff_t>(lineEnd) + lengthDelta);
+      startTimeUpdated = true;
+    } else if (contentLength >= 4 &&
         chunk.compare(contentStart, 4, "SEND") == 0 &&
         (contentLength == 4 ||
           chunk[contentStart + 4] == ' ' ||
@@ -3740,18 +3761,27 @@ static bool setSmpteGeneratorChunkToMidiMtc(std::string& chunk)
       // SEND e uma mascara do gerador nativo: 1 = audio LTC, 2 = MIDI MTC.
       // Mantemos apenas o MTC, exatamente como a opcao "Send MIDI (MTC)".
       chunk.replace(contentStart, contentLength, "SEND 2");
-      return true;
+      sendUpdated = true;
     }
     if (lineEnd >= sourceEnd) break;
     lineStart = lineEnd + 1;
   }
 
   const std::string propertyIndent = sourceIndent + "  ";
-  chunk.insert(sourceEnd, "\n" + propertyIndent + "SEND 2");
+  std::string missingProperties;
+  if (!startTimeUpdated) {
+    std::ostringstream value;
+    value << "\n" << propertyIndent << "STARTTIME "
+          << std::setprecision(15) << std::max(0.0, startTime);
+    missingProperties += value.str();
+  }
+  if (!sendUpdated) missingProperties += "\n" + propertyIndent + "SEND 2";
+  if (!missingProperties.empty()) chunk.insert(sourceEnd, missingProperties);
   return true;
 }
 
-static bool configureSmpteGeneratorForMidiMtc(MediaItem* item)
+static bool configureSmpteGeneratorForMidiMtc(
+  MediaItem* item, double startTime)
 {
   if (!item || !GetItemStateChunk_ptr || !SetItemStateChunk_ptr) {
     return false;
@@ -3768,7 +3798,7 @@ static bool configureSmpteGeneratorForMidiMtc(MediaItem* item)
       continue;
     }
     std::string chunk(buffer.data());
-    if (!setSmpteGeneratorChunkToMidiMtc(chunk)) return false;
+    if (!setSmpteGeneratorChunkToMidiMtc(chunk, startTime)) return false;
     return SetItemStateChunk_ptr(item, chunk.c_str(), false);
   }
   return false;
@@ -3911,7 +3941,8 @@ static void addTimecodeForEveryRegion()
         createdItem, "C_BEATATTACHMODE", 0.0);
       setVsHookTimecodeItemName(createdItem, region);
       newGeneratedItems.push_back(createdItem);
-      if (!configureSmpteGeneratorForMidiMtc(createdItem)) {
+      if (!configureSmpteGeneratorForMidiMtc(
+            createdItem, region.start)) {
         succeeded = false;
         break;
       }
