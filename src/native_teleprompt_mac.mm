@@ -4,6 +4,7 @@
 
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include "swell/swell.h"
 
@@ -30,6 +31,19 @@ struct SavedWindowState {
 };
 
 std::map<void*, SavedWindowState> g_fullscreenTeleprompts;
+std::map<void*, CALayer*> g_videoPresentationLayers;
+
+struct VideoFrameProviderStorage {
+  std::shared_ptr<const std::vector<std::uint8_t>> pixels;
+};
+
+void releaseVideoFrameProvider(
+  void* info,
+  const void*,
+  std::size_t)
+{
+  delete static_cast<VideoFrameProviderStorage*>(info);
+}
 
 NSWindow* telepromptWindowFromSwellHandle(void* swellWindow)
 {
@@ -40,6 +54,19 @@ NSWindow* telepromptWindowFromSwellHandle(void* swellWindow)
   }
   if ([object isKindOfClass:[NSView class]]) {
     return [(NSView*)object window];
+  }
+  return nil;
+}
+
+NSView* telepromptViewFromSwellHandle(void* swellWindow)
+{
+  if (!swellWindow) return nil;
+  id object = (id)swellWindow;
+  if ([object isKindOfClass:[NSWindow class]]) {
+    return [(NSWindow*)object contentView];
+  }
+  if ([object isKindOfClass:[NSView class]]) {
+    return (NSView*)object;
   }
   return nil;
 }
@@ -198,6 +225,103 @@ extern "C" double VSHookMacTelepromptBackingScale(
   if (!window) return 1.0;
   return std::max(
     1.0, static_cast<double>([window backingScaleFactor]));
+}
+
+bool VSHookMacPresentVideoFrame(
+  void* swellWindow,
+  const std::shared_ptr<const std::vector<std::uint8_t>>& storage,
+  std::size_t pixelOffset,
+  int sourceWidth,
+  int sourceHeight,
+  int sourceRowSpanPixels,
+  bool stretch)
+{
+  if (![NSThread isMainThread] || !storage ||
+      sourceWidth <= 0 || sourceHeight <= 0 ||
+      sourceRowSpanPixels < sourceWidth) {
+    return false;
+  }
+  const std::size_t bytesPerRow =
+    static_cast<std::size_t>(sourceRowSpanPixels) * 4u;
+  const std::size_t byteCount =
+    bytesPerRow * static_cast<std::size_t>(sourceHeight);
+  if (pixelOffset > storage->size() ||
+      byteCount > storage->size() - pixelOffset) {
+    return false;
+  }
+
+  NSView* view = telepromptViewFromSwellHandle(swellWindow);
+  if (!view) return false;
+  [view setWantsLayer:YES];
+  CALayer* hostLayer = [view layer];
+  if (!hostLayer) return false;
+
+  CALayer* videoLayer = nil;
+  const auto existing = g_videoPresentationLayers.find(swellWindow);
+  if (existing != g_videoPresentationLayers.end()) {
+    videoLayer = existing->second;
+  }
+  if (!videoLayer || [videoLayer superlayer] != hostLayer) {
+    if (videoLayer) [videoLayer removeFromSuperlayer];
+    videoLayer = [CALayer layer];
+    [videoLayer setAutoresizingMask:
+      kCALayerWidthSizable | kCALayerHeightSizable];
+    [videoLayer setBackgroundColor:
+      CGColorGetConstantColor(kCGColorBlack)];
+    [videoLayer setMinificationFilter:kCAFilterLinear];
+    [videoLayer setMagnificationFilter:kCAFilterLinear];
+    [hostLayer addSublayer:videoLayer];
+    g_videoPresentationLayers[swellWindow] = videoLayer;
+  }
+
+  auto* providerStorage = new VideoFrameProviderStorage{storage};
+  CGDataProviderRef provider = CGDataProviderCreateWithData(
+    providerStorage,
+    storage->data() + pixelOffset,
+    byteCount,
+    releaseVideoFrameProvider);
+  if (!provider) {
+    delete providerStorage;
+    return false;
+  }
+  CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+  CGImageRef image = colorSpace
+    ? CGImageCreate(
+        static_cast<std::size_t>(sourceWidth),
+        static_cast<std::size_t>(sourceHeight),
+        8, 32, bytesPerRow, colorSpace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+        provider, nullptr, false, kCGRenderingIntentDefault)
+    : nullptr;
+  if (colorSpace) CGColorSpaceRelease(colorSpace);
+  CGDataProviderRelease(provider);
+  if (!image) return false;
+
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  [videoLayer setFrame:[hostLayer bounds]];
+  [videoLayer setContentsScale:std::max(
+    1.0, static_cast<double>([[view window] backingScaleFactor]))];
+  [videoLayer setContentsGravity:
+    stretch ? kCAGravityResize : kCAGravityResizeAspect];
+  [videoLayer setContents:(id)image];
+  [videoLayer setHidden:NO];
+  [CATransaction commit];
+  CGImageRelease(image);
+  return true;
+}
+
+void VSHookMacClearVideoFrame(void* swellWindow)
+{
+  const auto existing = g_videoPresentationLayers.find(swellWindow);
+  if (existing == g_videoPresentationLayers.end()) return;
+  CALayer* layer = existing->second;
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  [layer setContents:nil];
+  [layer removeFromSuperlayer];
+  [CATransaction commit];
+  g_videoPresentationLayers.erase(existing);
 }
 
 extern "C" bool VSHookMacDrawTelepromptBitmap(

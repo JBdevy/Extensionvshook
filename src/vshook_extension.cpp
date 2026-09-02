@@ -65234,7 +65234,18 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
           VSHookMacMaintainTelepromptFullscreen(hwnd);
         }
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        // A apresentacao acompanha os quadros realmente publicados pelo
+        // FFmpeg nas duas plataformas. Assim um video de 24/25/30 fps nao e
+        // repintado artificialmente a 60 Hz e um video de 60 fps continua
+        // seguindo a sua propria cadencia sem acumular drift.
+        const NativeTelepromptRenderState timerState =
+          nativeTelepromptReadRenderState(slot);
+        if (nativeLower(timerState.mediaType) == "video" &&
+            !timerState.mediaPath.empty()) {
+          nativeTelepromptPrimeVideoDecoder(hwnd, slot);
+        } else {
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
       }
       break;
@@ -65361,9 +65372,15 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
         return 0;
       }
       if (wParam == VK_ESCAPE) {
-        if (window.fullscreen) nativeTelepromptToggleFullscreen(slot);
-        else nativeCloseTelepromptWindow(slot);
-        return 0;
+        HWND focused = GetFocus();
+        const bool ownsKeyboardFocus =
+          focused == hwnd ||
+          (focused && IsChild(hwnd, focused));
+        if (window.fullscreen && ownsKeyboardFocus) {
+          nativeTelepromptToggleFullscreen(slot);
+          return 0;
+        }
+        break;
       }
       break;
     case WM_CLOSE:
@@ -65996,10 +66013,31 @@ static void nativeVideoPaint(HWND hwnd)
       requestedW, requestedH,
       state.transportSampledAt, frame);
     if (rendered) {
+#ifdef __APPLE__
+      std::size_t pixelOffset = 0;
+      if (frame.storage && frame.pixels) {
+        const std::uintptr_t storageBegin =
+          reinterpret_cast<std::uintptr_t>(frame.storage->data());
+        const std::uintptr_t storageEnd =
+          storageBegin + frame.storage->size();
+        const std::uintptr_t frameAddress =
+          reinterpret_cast<std::uintptr_t>(frame.pixels);
+        if (frameAddress >= storageBegin && frameAddress <= storageEnd) {
+          pixelOffset = static_cast<std::size_t>(
+            frameAddress - storageBegin);
+        }
+      }
+      rendered = frame.storage &&
+        VSHookMacPresentVideoFrame(
+          hwnd, frame.storage, pixelOffset,
+          frame.width, frame.height, frame.stride / 4,
+          stretch);
+#else
       constexpr bool kFastWindowVideoScaling = true;
       rendered = nativeVideoDrawBgra(
         dc, frame.pixels, frame.width, frame.height,
         frame.stride, client, stretch, kFastWindowVideoScaling);
+#endif
       if (rendered) g_nativeVideoPresentedSequence = frame.sequence;
     }
     g_nativeVideoPresentedPlaybackKey = playbackKey;
@@ -66009,6 +66047,9 @@ static void nativeVideoPaint(HWND hwnd)
   } else if (mediaType == "image" && !state.mediaPath.empty()) {
     // Libera o decoder antes de voltar a desenhar a imagem estatica. Assim
     // nenhum quadro atrasado cobre a imagem atual.
+#ifdef __APPLE__
+    VSHookMacClearVideoFrame(hwnd);
+#endif
     g_nativeVideoWindowDecoder.reset();
     g_nativeVideoPresentedSequence = 0;
     g_nativeVideoPresentedPlaybackKey.clear();
@@ -66019,6 +66060,9 @@ static void nativeVideoPaint(HWND hwnd)
         image.stride, client, stretch, false);
     }
   } else {
+#ifdef __APPLE__
+    VSHookMacClearVideoFrame(hwnd);
+#endif
     g_nativeVideoWindowDecoder.reset();
     g_nativeVideoPresentedSequence = 0;
     g_nativeVideoPresentedPlaybackKey.clear();
@@ -66167,7 +66211,14 @@ static LRESULT CALLBACK nativeVideoWndProc(
           VSHookMacMaintainTelepromptFullscreen(hwnd);
         }
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        const NativeTelepromptRenderState timerState =
+          nativeVideoReadRenderState();
+        if (nativeLower(timerState.mediaType) == "video" &&
+            !timerState.mediaPath.empty()) {
+          nativeVideoPrimeDecoder(hwnd);
+        } else {
+          InvalidateRect(hwnd, nullptr, FALSE);
+        }
         return 0;
       }
       break;
@@ -66341,9 +66392,15 @@ static LRESULT CALLBACK nativeVideoWndProc(
         return 0;
       }
       if (wParam == VK_ESCAPE) {
-        if (window.fullscreen) nativeVideoToggleFullscreen();
-        else nativeCloseVideoWindow();
-        return 0;
+        HWND focused = GetFocus();
+        const bool ownsKeyboardFocus =
+          focused == hwnd ||
+          (focused && IsChild(hwnd, focused));
+        if (window.fullscreen && ownsKeyboardFocus) {
+          nativeVideoToggleFullscreen();
+          return 0;
+        }
+        break;
       }
       break;
 #ifdef _WIN32
@@ -66453,6 +66510,9 @@ static void nativeCloseVideoWindow(bool clearRequestedState)
     }
     // Interrompe a worker antes da janela deixar de existir.
     g_nativeVideoWindowDecoder.reset();
+#ifdef __APPLE__
+    VSHookMacClearVideoFrame(hwnd);
+#endif
     DestroyWindow(hwnd);
   }
   g_nativeVideoWindow = NativeTelepromptWindowState{};

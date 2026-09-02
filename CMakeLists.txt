@@ -207,6 +207,7 @@ if(APPLE)
     "-framework AVFoundation"
     "-framework CoreGraphics"
     "-framework CoreFoundation"
+    "-framework QuartzCore"
     "-framework ImageIO"
     "-framework CoreMedia"
     "-framework CoreVideo"
