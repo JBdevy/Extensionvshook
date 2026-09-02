@@ -59693,6 +59693,18 @@ static void nativeArmVideoRefreshTimer(
   bool advanceExistingDeadline)
 {
   if (!hwnd) return;
+#ifdef __APPLE__
+  // O SetTimer do SWELL ja e repetitivo. Invalidar e recriar o NSTimer de
+  // dentro do proprio WM_TIMER pode encerrar a sequencia no macOS justamente
+  // antes de o primeiro quadro assincrono do FFmpeg ficar pronto. Armamos uma
+  // unica vez e deixamos o run loop nativo manter o repaint; os callbacks do
+  // decoder e o pulso de transporte continuam antecipando quadros novos.
+  if (!advanceExistingDeadline) {
+    nativeResetVideoRefreshTimer(timer);
+    SetTimer(hwnd, timerId, 16, nullptr);
+  }
+  return;
+#else
   using RefreshClock = std::chrono::steady_clock;
   const auto now = RefreshClock::now();
   const auto framePeriod = std::chrono::duration_cast<
@@ -59717,6 +59729,7 @@ static void nativeArmVideoRefreshTimer(
     1.0, std::min(100.0, std::ceil(remainingMs))));
   KillTimer(hwnd, timerId);
   SetTimer(hwnd, timerId, delayMs, nullptr);
+#endif
 }
 
 struct NativeTelepromptSettings {
