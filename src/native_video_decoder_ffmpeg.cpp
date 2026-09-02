@@ -1,7 +1,5 @@
 #include "native_video_decoder.h"
 
-#if defined(_WIN32) || defined(__APPLE__)
-
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -10,10 +8,6 @@
 #include <d3d11.h>
 #include <mmsystem.h>
 #include <wrl/client.h>
-#else
-#include <dlfcn.h>
-#include <unistd.h>
-#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -21,9 +15,7 @@ extern "C" {
 #include <libavutil/buffer.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
-#ifdef _WIN32
 #include <libavutil/hwcontext_d3d11va.h>
-#endif
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 }
@@ -60,17 +52,12 @@ std::string joinPath(
 {
   if (left.empty()) return right;
   if (right.empty()) return left;
-#ifdef _WIN32
   constexpr char separator = '\\';
-#else
-  constexpr char separator = '/';
-#endif
   const char last = left.back();
   if (last == '/' || last == '\\') return left + right;
   return left + separator + right;
 }
 
-#ifdef _WIN32
 std::wstring utf8ToWide(const std::string& value)
 {
   if (value.empty()) return {};
@@ -125,28 +112,10 @@ bool fileExists(const std::string& path)
   return attributes != INVALID_FILE_ATTRIBUTES &&
     (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
-#else
-std::string moduleDirectory()
-{
-  static const int moduleAnchor = 0;
-  Dl_info information{};
-  if (dladdr(&moduleAnchor, &information) == 0 ||
-      !information.dli_fname) {
-    return {};
-  }
-  return parentPath(information.dli_fname);
-}
-
-bool fileExists(const std::string& path)
-{
-  return !path.empty() && access(path.c_str(), F_OK) == 0;
-}
-#endif
 
 std::string environmentValue(const char* name)
 {
   if (!name || !*name) return {};
-#ifdef _WIN32
   const std::wstring wideName = utf8ToWide(name);
   const DWORD size = GetEnvironmentVariableW(
     wideName.c_str(), nullptr, 0);
@@ -157,10 +126,6 @@ std::string environmentValue(const char* name)
   if (copied == 0 || copied >= size) return {};
   value.resize(copied);
   return wideToUtf8(value);
-#else
-  const char* value = std::getenv(name);
-  return value ? value : "";
-#endif
 }
 
 struct FfmpegLocation {
@@ -179,7 +144,6 @@ FfmpegLocation locationAtRoot(const std::string& candidate)
     candidate, joinPath(candidate, "lib")
   };
   for (const std::string& root : roots) {
-#ifdef _WIN32
     const FfmpegLocation location{
       root,
       joinPath(root, "avutil-60.dll"),
@@ -188,16 +152,6 @@ FfmpegLocation locationAtRoot(const std::string& candidate)
       joinPath(root, "avformat-62.dll"),
       joinPath(root, "swscale-9.dll")
     };
-#else
-    const FfmpegLocation location{
-      root,
-      joinPath(root, "libavutil.60.dylib"),
-      joinPath(root, "libswresample.6.dylib"),
-      joinPath(root, "libavcodec.62.dylib"),
-      joinPath(root, "libavformat.62.dylib"),
-      joinPath(root, "libswscale.9.dylib")
-    };
-#endif
     if (fileExists(location.avutil) &&
         fileExists(location.avcodec) &&
         fileExists(location.avformat) &&
@@ -219,33 +173,15 @@ FfmpegLocation locateFfmpeg()
   if (!extensionDirectory.empty()) {
     roots.push_back(joinPath(
       extensionDirectory, "VSHookRuntime/FFmpeg"));
-#ifdef _WIN32
     roots.push_back(joinPath(
       extensionDirectory, "VSHookRuntime/FFmpeg/win-x64"));
-#else
-    roots.push_back(joinPath(
-      extensionDirectory, "VSHookRuntime/FFmpeg/macos-universal"));
-#endif
   }
 
-#ifdef _WIN32
   const std::string appData = environmentValue("APPDATA");
   if (!appData.empty()) {
     roots.push_back(joinPath(
       appData, "REAPER/UserPlugins/VSHookRuntime/FFmpeg"));
   }
-#else
-  roots.push_back(
-    "/Library/Application Support/REAPER/UserPlugins/"
-    "VSHookRuntime/FFmpeg");
-  const std::string userHome = environmentValue("HOME");
-  if (!userHome.empty()) {
-    roots.push_back(joinPath(
-      userHome,
-      "Library/Application Support/REAPER/UserPlugins/"
-      "VSHookRuntime/FFmpeg"));
-  }
-#endif
 
   for (const std::string& root : roots) {
     FfmpegLocation location = locationAtRoot(root);
@@ -255,11 +191,7 @@ FfmpegLocation locateFfmpeg()
 }
 
 struct FfmpegApi {
-#ifdef _WIN32
   using Library = HMODULE;
-#else
-  using Library = void*;
-#endif
   std::array<Library, 5> libraries{};
 
   int (*formatOpenInput)(
@@ -318,11 +250,7 @@ struct FfmpegApi {
     for (auto iterator = libraries.rbegin();
          iterator != libraries.rend(); ++iterator) {
       if (!*iterator) continue;
-#ifdef _WIN32
       FreeLibrary(*iterator);
-#else
-      dlclose(*iterator);
-#endif
       *iterator = nullptr;
     }
   }
@@ -333,12 +261,8 @@ struct FfmpegApi {
     for (auto iterator = libraries.rbegin();
          iterator != libraries.rend(); ++iterator) {
       if (!*iterator) continue;
-#ifdef _WIN32
       void* result = reinterpret_cast<void*>(
         GetProcAddress(*iterator, name));
-#else
-      void* result = dlsym(*iterator, name);
-#endif
       if (result) return result;
     }
     return nullptr;
@@ -354,15 +278,10 @@ struct FfmpegApi {
   bool loadLibrary(std::size_t index, const std::string& path)
   {
     if (path.empty()) return true;
-#ifdef _WIN32
     const std::wstring wide = utf8ToWide(path);
     if (wide.empty()) return false;
     libraries[index] = LoadLibraryExW(
       wide.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-#else
-    libraries[index] = dlopen(
-      path.c_str(), RTLD_NOW | RTLD_GLOBAL);
-#endif
     return libraries[index] != nullptr;
   }
 
@@ -430,13 +349,9 @@ double rationalToDouble(AVRational value)
 
 std::string nativeMediaPath(const std::string& path)
 {
-#ifdef _WIN32
   std::string native = path;
   std::replace(native.begin(), native.end(), '/', '\\');
   return native;
-#else
-  return path;
-#endif
 }
 
 } // namespace
@@ -637,11 +552,7 @@ struct Decoder::Impl {
 
   bool configureHardware(const AVCodec* decoder)
   {
-#ifdef _WIN32
     constexpr const char* hardwareName = "d3d11va";
-#else
-    constexpr const char* hardwareName = "videotoolbox";
-#endif
     const AVHWDeviceType deviceType =
       api.hwDeviceFindTypeByName(hardwareName);
     if (deviceType == AV_HWDEVICE_TYPE_NONE) return false;

@@ -29,10 +29,10 @@ set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
 option(VSHOOK_BUILD_TESTS "Build native VS Hook license tests" OFF)
 
-# O runtime do FFmpeg e carregado dinamicamente de
+if(WIN32)
+# No Windows, o runtime do FFmpeg e carregado dinamicamente de
 # REAPER/UserPlugins/VSHookRuntime/FFmpeg. Durante a compilacao precisamos
 # apenas dos headers da mesma serie ABI usada pelo runtime (FFmpeg 8.1.x).
-if(WIN32)
 find_path(VSHOOK_FFMPEG_INCLUDE_DIR
   NAMES libavcodec/avcodec.h
   HINTS
@@ -54,24 +54,13 @@ if(NOT VSHOOK_FFMPEG_INCLUDE_DIR)
     "${vshook_ffmpeg_headers_SOURCE_DIR}")
 endif()
 
-# A raiz do source do FFmpeg contem um arquivo texto chamado "version".
-# No macOS ele nao pode entrar como -I normal, pois passaria na frente do
-# header C++ <version> da libc++. -idirafter deixa os headers do sistema com
-# prioridade e ainda permite incluir libavcodec/*, libavformat/* etc.
 function(vshook_add_ffmpeg_headers target_name)
   target_include_directories(${target_name} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ffmpeg_compat
   )
-  if(APPLE)
-    target_compile_options(${target_name} PRIVATE
-      -idirafter
-      "${VSHOOK_FFMPEG_INCLUDE_DIR}"
-    )
-  else()
-    target_include_directories(${target_name} PRIVATE
-      "${VSHOOK_FFMPEG_INCLUDE_DIR}"
-    )
-  endif()
+  target_include_directories(${target_name} PRIVATE
+    "${VSHOOK_FFMPEG_INCLUDE_DIR}"
+  )
 endfunction()
 endif()
 

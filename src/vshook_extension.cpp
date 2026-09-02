@@ -63600,7 +63600,7 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
 
   // HALFTONE custa caro e era executado em todo ciclo de pintura, mesmo
   // quando o vídeo tinha menos FPS que a janela. COLORONCOLOR deixa a
-  // apresentação em tempo real mais leve sem mudar o decoder FFmpeg.
+  // apresentação em tempo real mais leve sem mudar o decoder de vídeo.
   const int oldStretchMode =
     SetStretchBltMode(dc, COLORONCOLOR);
   const int renderedLines = StretchDIBits(
@@ -63719,7 +63719,7 @@ static bool nativeTelepromptDrawMedia(
     }
     // Se o HDC direto recusar StretchDIBits (algo que pode ocorrer em alguns
     // monitores/driveres no Windows), continua no raster LICE abaixo usando o
-    // mesmo snapshot do FFmpeg. Nao troca de decoder nem reabre a midia; apenas
+    // mesmo snapshot do decoder. Nao troca nem reabre a midia; apenas
     // desenha o mesmo quadro por uma superficie compativel com a janela.
   }
 #endif
@@ -65208,7 +65208,7 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
         }
 #endif
         // A apresentacao acompanha os quadros realmente publicados pelo
-        // FFmpeg nas duas plataformas. Assim um video de 24/25/30 fps nao e
+        // decoder da plataforma. Assim um video de 24/25/30 fps nao e
         // repintado artificialmente a 60 Hz e um video de 60 fps continua
         // seguindo a sua propria cadencia sem acumular drift.
         const NativeTelepromptRenderState timerState =
@@ -65692,7 +65692,7 @@ static void nativeCloseAllTelepromptWindows()
 }
 
 // Janela exclusiva da pista MEDIA. Ela reutiliza o mesmo relógio, seeks,
-// loops e tratamento de item esticado do decoder FFmpeg do Teleprompt, mas não
+// loops e tratamento de item esticado do decoder do Teleprompt, mas não
 // compõe letras, cifras, preview, recados ou qualquer outra camada.
 static constexpr const char* kNativeVideoWindowSection =
   "VS_HOOK_NATIVE_VIDEO_WINDOW";
@@ -66000,7 +66000,7 @@ static void nativeVideoPaint(HWND hwnd)
 #ifdef __APPLE__
     // GetClientRect/SWELL trabalha em pontos, enquanto uma janela Retina
     // precisa de backing pixels. Sem aplicar essa escala, um monitor 2x
-    // recebia do FFmpeg um quadro com metade da resolucao fisica e o
+    // recebia do decoder um quadro com metade da resolucao fisica e o
     // CoreGraphics precisava amplia-lo para apresentar.
     const double backingScale =
       VSHookMacTelepromptBackingScale(hwnd);
