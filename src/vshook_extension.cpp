@@ -681,7 +681,7 @@ static custom_action_register_t g_videoWindowAction = {
   0, "VSHOOKNEWVIDEOWINDOW", "VS Hook: Abrir janela de vídeo", nullptr
 };
 static custom_action_register_t g_videoStretchAction = {
-  0, "VSHOOKNEWVIDEOSTRETCH", "VS Hook: Stretch da janela de vídeo", nullptr
+  0, "VSHOOKNEWVIDEOSTRETCH", "VS Hook: Stretch dos vídeos", nullptr
 };
 static custom_action_register_t g_recadosAction = {
   0, "VSHOOKNEWRECADOS",
@@ -63264,7 +63264,8 @@ static bool nativeTelepromptDrawHeldVideoFrame(
     frame.height,
     available,
     settings.mediaScale,
-    false,
+    nativeStartsWith(frame.playbackKey, "video|") &&
+      nativeVideoStretchEnabled(),
     drawX,
     drawY,
     drawWidth,
@@ -63576,7 +63577,7 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
     decoded.height,
     available,
     settings.mediaScale,
-    false,
+    nativeVideoStretchEnabled(),
     drawX,
     drawY,
     drawW,
@@ -63793,7 +63794,8 @@ static bool nativeTelepromptDrawMedia(
     static_cast<double>(availableH) / sourceH);
   const double drawScale = std::max(
     0.01, fitScale * scaleLimit);
-  const bool stretchVideo = false;
+  const bool stretchVideo =
+    mediaType == "video" && nativeVideoStretchEnabled();
   const int drawW = stretchVideo
     ? std::max(1, static_cast<int>(std::lround(
         availableW * scaleLimit)))
@@ -65769,6 +65771,17 @@ static void nativeToggleVideoStretch()
       IsWindow(g_nativeVideoWindow.hwnd)) {
     g_nativeVideoPresentedSequence = 0;
     InvalidateRect(g_nativeVideoWindow.hwnd, nullptr, FALSE);
+  }
+  for (int index = 0; index < 2; ++index) {
+    if (g_nativeTelepromptWindows[index].hwnd &&
+        IsWindow(g_nativeTelepromptWindows[index].hwnd)) {
+      g_nativeTelepromptPresentedVideoSequence[index] = 0;
+      InvalidateRect(
+        g_nativeTelepromptWindows[index].hwnd,
+        nullptr,
+        FALSE);
+      UpdateWindow(g_nativeTelepromptWindows[index].hwnd);
+    }
   }
   if (RefreshToolbar2_ptr && g_videoStretchCommandId != 0) {
     RefreshToolbar2_ptr(0, g_videoStretchCommandId);
