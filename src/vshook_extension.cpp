@@ -65996,11 +65996,7 @@ static void nativeVideoPaint(HWND hwnd)
       requestedW, requestedH,
       state.transportSampledAt, frame);
     if (rendered) {
-#ifdef __APPLE__
-      constexpr bool kFastWindowVideoScaling = false;
-#else
       constexpr bool kFastWindowVideoScaling = true;
-#endif
       rendered = nativeVideoDrawBgra(
         dc, frame.pixels, frame.width, frame.height,
         frame.stride, client, stretch, kFastWindowVideoScaling);
