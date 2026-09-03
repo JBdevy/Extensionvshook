@@ -974,7 +974,13 @@ struct Decoder::Impl {
     bool playing,
     bool forceRestart)
   {
-    (void)playing;
+    // Com o transporte parado, setas e arraste do cursor são scrubbing: cada
+    // posição deve mostrar imediatamente o quadro correspondente. Reiniciar
+    // um AVAssetReader sequencial em cada pequeno passo atrasava a imagem e
+    // fazia parecer que o vídeo não acompanhava o cursor do REAPER.
+    if (!playing && forceRestart) {
+      return decodeStillFrame(sourceTime);
+    }
     if (!sequentialUnsupported) {
       // Mantem o AVAssetReader preparado tambem quando o transporte esta
       // parado. Assim Play reutiliza o reader ja posicionado no cursor em vez
@@ -1301,6 +1307,7 @@ struct Decoder::Impl {
       request.discontinuity =
         pendingDiscontinuity ||
         identityChanged ||
+        playbackStateChanged ||
         explicitTransportJump ||
         driftNeedsCorrection ||
         stoppedPositionChanged;

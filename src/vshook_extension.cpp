@@ -63497,13 +63497,15 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
     1, static_cast<int>(available.bottom - available.top));
   const double scaleLimit = nativeTelepromptClamp(
     settings.mediaScale, 0.25, 3.0);
-  // O decoder prepara somente a resolução física que realmente será
-  // exibida. Zoom menor que 1 não precisa carregar um quadro de tela cheia.
+  // O decoder prepara somente a resolução que realmente será exibida. Zoom
+  // menor que 1 não precisa carregar um quadro de tela cheia.
   double sourceScale = scaleLimit;
-#ifdef __APPLE__
-  sourceScale *= VSHookMacTelepromptBackingScale(
-    g_nativeTelepromptWindows[index].hwnd);
-#endif
+  // A janela de vídeo pode entregar o quadro Retina diretamente a um
+  // CALayer. O Teleprompt ainda precisa compor textos, relógio, bordas e
+  // avisos no mesmo paint; decodificar também em backing pixels multiplicava
+  // por quatro a conversão e a cópia em telas 2x, fazendo a apresentação
+  // perder quadros. O CGContext Retina faz a ampliação final; o decoder usa
+  // apenas o tamanho lógico realmente ocupado pela mídia.
   const int uncappedRequestedWidth = std::max(
     1, std::min(
       65535,
@@ -64919,7 +64921,7 @@ static void nativeTelepromptToggleFullscreen(int slot)
     SetWindowLongPtr(window.hwnd, GWL_STYLE,
       window.restoreStyle
         ? window.restoreStyle
-        : (WS_POPUP | WS_THICKFRAME | WS_VISIBLE));
+        : (WS_OVERLAPPEDWINDOW | WS_VISIBLE));
     SetWindowLongPtr(window.hwnd, GWLP_HWNDPARENT,
       reinterpret_cast<LONG_PTR>(window.restoreOwner));
     window.restoreOwner = nullptr;
@@ -65134,9 +65136,18 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
     case WM_NCHITTEST:
       // O centro continua sendo cliente para preservar arraste e duplo clique.
       // Somente uma faixa estreita nas bordas vira área de resize.
+#ifdef _WIN32
+      // Na janela normal, a moldura padrão decide título, minimizar,
+      // maximizar, fechar e redimensionamento. Em fullscreen toda a área
+      // continua sendo cliente, sem barra superior.
+      return window.fullscreen
+        ? HTCLIENT
+        : DefWindowProc(hwnd, message, wParam, lParam);
+#else
       return window.fullscreen
         ? HTCLIENT
         : nativeTelepromptResizeHitTest(hwnd, lParam);
+#endif
     case WM_SETCURSOR: {
       const int hitTest = LOWORD(lParam);
       if (nativeTelepromptIsResizeHit(hitTest)) {
@@ -65532,7 +65543,7 @@ static bool nativeOpenTelepromptWindow(int slot)
   hwnd = CreateWindowExW(
     WS_EX_TOOLWINDOW,
     className, title.c_str(),
-    WS_POPUP | WS_THICKFRAME | WS_VISIBLE,
+    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
     savedX, savedY, savedW, savedH,
     GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
     nullptr, g_pluginInstance, nullptr);
@@ -66176,7 +66187,7 @@ static void nativeVideoToggleFullscreen()
     SetWindowLongPtr(window.hwnd, GWL_STYLE,
       window.restoreStyle
         ? window.restoreStyle
-        : (WS_POPUP | WS_THICKFRAME | WS_VISIBLE));
+        : (WS_OVERLAPPEDWINDOW | WS_VISIBLE));
     SetWindowLongPtr(window.hwnd, GWLP_HWNDPARENT,
       reinterpret_cast<LONG_PTR>(window.restoreOwner));
     window.restoreOwner = nullptr;
@@ -66243,8 +66254,14 @@ static LRESULT CALLBACK nativeVideoWndProc(
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_NCHITTEST:
+#ifdef _WIN32
+      return window.fullscreen
+        ? HTCLIENT
+        : DefWindowProc(hwnd, message, wParam, lParam);
+#else
       return window.fullscreen
         ? HTCLIENT : nativeTelepromptResizeHitTest(hwnd, lParam);
+#endif
     case WM_SETCURSOR: {
       const int hitTest = LOWORD(lParam);
       if (nativeTelepromptIsResizeHit(hitTest)) {
@@ -66494,7 +66511,7 @@ static bool nativeOpenVideoWindow()
   }
   hwnd = CreateWindowExW(
     WS_EX_TOOLWINDOW, className, L"VS Hook - Vídeo",
-    WS_POPUP | WS_THICKFRAME | WS_VISIBLE,
+    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
     savedX, savedY, savedW, savedH,
     GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
     nullptr, g_pluginInstance, nullptr);
