@@ -974,11 +974,13 @@ struct Decoder::Impl {
     bool playing,
     bool forceRestart)
   {
-    // Com o transporte parado, setas e arraste do cursor são scrubbing: cada
-    // posição deve mostrar imediatamente o quadro correspondente. Reiniciar
-    // um AVAssetReader sequencial em cada pequeno passo atrasava a imagem e
-    // fazia parecer que o vídeo não acompanhava o cursor do REAPER.
-    if (!playing && forceRestart) {
+    // Depois que existe um quadro, setas e arraste são scrubbing e usam o
+    // ImageGenerator: reiniciar o AVAssetReader em cada pequeno passo causa
+    // atraso. No primeiro acesso frio ainda deixamos o reader sequencial
+    // produzir o quadro inicial; ele acorda o pipeline bem mais rápido do que
+    // copyCGImageAtTime em alguns MP4 e evita quase um segundo de tela preta.
+    if (!playing && forceRestart &&
+        pixels && !pixels->empty()) {
       return decodeStillFrame(sourceTime);
     }
     if (!sequentialUnsupported) {
@@ -1278,7 +1280,7 @@ struct Decoder::Impl {
         correctionWindowOpen;
       const bool stoppedPositionChanged =
         hadActiveRequest && !playing &&
-        std::abs(request.sourceTime - safeTime) > 0.008;
+        std::abs(request.sourceTime - safeTime) > 0.000001;
       const bool synchronizeClock =
         identityChanged ||
         playbackStateChanged ||

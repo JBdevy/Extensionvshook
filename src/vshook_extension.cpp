@@ -60143,8 +60143,15 @@ static NativeTelepromptWindowState g_nativeTelepromptWindows[2] = {
   {nullptr, 1}, {nullptr, 2}
 };
 static NativeVideoRefreshTimer g_nativeTelepromptRefreshTimers[2];
-static std::chrono::steady_clock::time_point
-  g_nativeTelepromptLastForcedVideoPaint[2]{};
+struct NativeTelepromptVideoPaintSchedule {
+  bool initialized = false;
+  bool playing = false;
+  double projectPosition = 0.0;
+  std::string playbackKey;
+  std::chrono::steady_clock::time_point lastHousekeepingPaint{};
+};
+static NativeTelepromptVideoPaintSchedule
+  g_nativeTelepromptVideoPaintSchedules[2];
 static NativeVideoPollPulse g_nativeTelepromptVideoPollPulses[2];
 static int g_nativeTelepromptCreatingSlot = 1;
 static NativeTelepromptSettings g_nativeTelepromptSettings[2];
@@ -61729,6 +61736,14 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
     cache.project != project ||
     cache.projectChangeCount != projectChangeCount ||
     cache.playState != playState;
+  if (!rebuild && !livePlaying &&
+      std::abs(livePosition - cache.lastObservedPosition) > 0.000001) {
+    // O cursor parado é a fonte de tempo da janela. Reavalia a pista na
+    // própria mudança (setas, clique ou arraste), inclusive ao sair de uma
+    // área vazia e entrar no primeiro quadro de um vídeo. Esperar o refresh
+    // periódico podia conservar por alguns pulsos o estado "sem mídia".
+    rebuild = true;
+  }
   if (!rebuild) {
     const auto cacheAgeMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -64825,13 +64840,39 @@ static void nativeTelepromptPrimeVideoDecoder(
 #if defined(_WIN32) || defined(__APPLE__)
   if (!hwnd || !IsWindow(hwnd)) return;
   const int index = nativeTelepromptIndex(slot);
-  const int requestedWidth =
+  int requestedWidth =
     g_nativeTelepromptVideoRequestedWidth[index];
-  const int requestedHeight =
+  int requestedHeight =
     g_nativeTelepromptVideoRequestedHeight[index];
-  // O primeiro paint calcula a area real depois das bordas/overlays. Reusar
-  // essas dimensoes evita alternar tamanhos e reconverter o mesmo quadro.
-  if (requestedWidth <= 1 || requestedHeight <= 1) return;
+  // Não espera o primeiro WM_PAINT para acordar o vídeo. A janela principal
+  // já calcula sua área no prime; fazer o mesmo aqui elimina a tela preta que
+  // podia durar até o AppKit finalmente entregar a primeira pintura.
+  if (requestedWidth <= 1 || requestedHeight <= 1) {
+    RECT client{0, 0, 0, 0};
+    GetClientRect(hwnd, &client);
+    const int clientWidth = std::max(
+      1, static_cast<int>(client.right - client.left));
+    const int clientHeight = std::max(
+      1, static_cast<int>(client.bottom - client.top));
+    nativeTelepromptLoadSettings();
+    double mediaScale = 1.0;
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      mediaScale = nativeTelepromptClamp(
+        g_nativeTelepromptSettings[index].mediaScale, 0.25, 3.0);
+    }
+    const int uncappedWidth = std::max(
+      1, std::min(65535, static_cast<int>(std::lround(
+        static_cast<double>(clientWidth) * mediaScale))));
+    const int uncappedHeight = std::max(
+      1, std::min(65535, static_cast<int>(std::lround(
+        static_cast<double>(clientHeight) * mediaScale))));
+    nativeTelepromptClampDecodeRequest(
+      uncappedWidth, uncappedHeight,
+      requestedWidth, requestedHeight);
+    g_nativeTelepromptVideoRequestedWidth[index] = requestedWidth;
+    g_nativeTelepromptVideoRequestedHeight[index] = requestedHeight;
+  }
   const NativeTelepromptRenderState state =
     nativeTelepromptReadRenderState(slot);
   if (nativeLower(state.mediaType) != "video" ||
@@ -65109,9 +65150,9 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
-      g_nativeTelepromptLastForcedVideoPaint[
+      g_nativeTelepromptVideoPaintSchedules[
         nativeTelepromptIndex(slot)] =
-          std::chrono::steady_clock::now();
+          NativeTelepromptVideoPaintSchedule{};
       nativeResetVideoRefreshTimer(
         g_nativeTelepromptRefreshTimers[
           nativeTelepromptIndex(slot)]);
@@ -65201,6 +65242,14 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
     case WM_ERASEBKGND:
       return 1;
     case WM_PAINT:
+#ifdef __APPLE__
+      // Um frame publicado também satisfaz a atualização dos relógios e
+      // overlays. Registrar o paint aqui impede o pulso de manutenção de
+      // cair logo depois dele e duplicar trabalho no compositor do Mac.
+      g_nativeTelepromptVideoPaintSchedules[
+        nativeTelepromptIndex(slot)].lastHousekeepingPaint =
+          std::chrono::steady_clock::now();
+#endif
       nativeTelepromptPaint(hwnd, slot);
       return 0;
     case WM_TIMER:
@@ -65218,35 +65267,68 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
           VSHookMacMaintainTelepromptFullscreen(hwnd);
         }
 #endif
-        // A apresentacao acompanha os quadros realmente publicados pelo
-        // decoder da plataforma. Assim um video de 24/25/30 fps nao e
-        // repintado artificialmente a 60 Hz e um video de 60 fps continua
-        // seguindo a sua propria cadencia sem acumular drift.
+        // O relógio e o cursor são amostrados no mesmo pulso de 60 Hz da
+        // janela principal. O vídeo, porém, pinta uma vez por frame publicado
+        // pelo callback abaixo; redesenhar vídeo + overlays novamente em todo
+        // timer criava trabalho duplicado e microtravamentos no CoreGraphics.
         const NativeTelepromptRenderState timerState =
           nativeTelepromptReadRenderState(slot);
         if (nativeLower(timerState.mediaType) == "video" &&
             !timerState.mediaPath.empty()) {
-          nativeTelepromptPrimeVideoDecoder(hwnd, slot);
-          // No macOS o callback do AVFoundation já invalida e apresenta cada
-          // quadro novo imediatamente. Invalidar também a 60 Hz pelo timer
-          // duplicava pinturas completas (vídeo + todos os overlays) e fazia
-          // o Teleprompt perder quadros. Mantemos um pulso leve para relógios
-          // e textos; seek/scroll continua sendo amostrado a 60 Hz acima.
 #ifdef __APPLE__
           const int index = nativeTelepromptIndex(slot);
+          NativeTelepromptVideoPaintSchedule& schedule =
+            g_nativeTelepromptVideoPaintSchedules[index];
+          const std::string playbackKey =
+            nativeTelepromptMediaHoldKey(timerState);
+          const bool cursorMoved =
+            !timerState.playing &&
+            (!schedule.initialized ||
+             std::abs(
+               timerState.projectPosition -
+                 schedule.projectPosition) > 0.000001);
+          const bool playbackChanged =
+            !schedule.initialized ||
+            schedule.playing != timerState.playing ||
+            schedule.playbackKey != playbackKey;
+          schedule.initialized = true;
+          schedule.playing = timerState.playing;
+          schedule.projectPosition = timerState.projectPosition;
+          schedule.playbackKey = playbackKey;
+          // Scrubbing não espera callback para atualizar texto/estado e o
+          // primeiro acesso limpa imediatamente a saída anterior. O quadro
+          // correto chega pelo kNativeVideoPollMessage assim que decodificado.
+          const bool statePaintNeeded =
+            cursorMoved || playbackChanged;
+          if (statePaintNeeded) {
+            InvalidateRect(hwnd, nullptr, FALSE);
+          }
+          // prime pode consumir a invalidação acima imediatamente quando um
+          // novo frame já estiver pronto. Só depois verificamos manutenção,
+          // evitando pintar duas vezes a mesma sequência.
+          nativeTelepromptPrimeVideoDecoder(hwnd, slot);
           const auto now = std::chrono::steady_clock::now();
-          if (g_nativeTelepromptLastForcedVideoPaint[index] ==
-                std::chrono::steady_clock::time_point{} ||
-              now - g_nativeTelepromptLastForcedVideoPaint[index] >=
-                std::chrono::milliseconds(100)) {
-            g_nativeTelepromptLastForcedVideoPaint[index] = now;
+          const bool housekeepingDue =
+            schedule.lastHousekeepingPaint ==
+              std::chrono::steady_clock::time_point{} ||
+            now - schedule.lastHousekeepingPaint >=
+              std::chrono::seconds(1);
+          // Relógio local/countdown e overlays estáticos continuam recebendo
+          // uma manutenção leve quando o vídeo está pausado ou sem quadros.
+          if (!statePaintNeeded && housekeepingDue) {
+            schedule.lastHousekeepingPaint = now;
             InvalidateRect(hwnd, nullptr, FALSE);
           }
 #else
-          // No Windows a atualização agressiva continua ativa.
+          // O caminho GDI do Windows já está fluido e permanece com a
+          // atualização agressiva que havia sido validada nessa plataforma.
+          nativeTelepromptPrimeVideoDecoder(hwnd, slot);
           InvalidateRect(hwnd, nullptr, FALSE);
 #endif
         } else {
+          g_nativeTelepromptVideoPaintSchedules[
+            nativeTelepromptIndex(slot)] =
+              NativeTelepromptVideoPaintSchedule{};
           InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -65413,6 +65495,9 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       nativeResetVideoRefreshTimer(
         g_nativeTelepromptRefreshTimers[
           nativeTelepromptIndex(slot)]);
+      g_nativeTelepromptVideoPaintSchedules[
+        nativeTelepromptIndex(slot)] =
+          NativeTelepromptVideoPaintSchedule{};
       // Sem janela nao existe consumidor de video. Para o player assíncrono
       // uma unica vez; ao reabrir, o mesmo objeto recebe um estado novo.
       nativeTelepromptResetPlatformVideoPlayback(
@@ -65888,6 +65973,12 @@ static NativeTelepromptRenderState nativeVideoReadRenderState()
   bool rebuild = !cache.valid || cache.project != project ||
     cache.projectChangeCount != projectChangeCount ||
     cache.playState != playState;
+  if (!rebuild && !livePlaying &&
+      std::abs(livePosition - cache.lastObservedPosition) > 0.000001) {
+    // Mantém a janela de vídeo e os dois Teleprompts com a mesma regra de
+    // scrubbing: toda mudança real do cursor resolve o item imediatamente.
+    rebuild = true;
+  }
   if (!rebuild) {
     rebuild = !livePlaying &&
       std::chrono::duration_cast<std::chrono::milliseconds>(
