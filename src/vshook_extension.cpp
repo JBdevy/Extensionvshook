@@ -34923,6 +34923,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
       std::min(availableW, availableH), 360));
     const int left = client.left + (width - side) / 2;
     const int top = client.top + (height - side) / 2;
+    // Cada plataforma escreve os mesmos pixels BGRA na superficie ativa:
+    // no Windows via GDI, no macOS via helper Cocoa do teleprompt. Assim o
+    // SWELL nao precisa das APIs de DIB, que ele nao publica.
+#ifdef _WIN32
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     info.bmiHeader.biWidth = vshook_splash::kWidth;
@@ -34930,9 +34934,18 @@ static void nativePaintAppActivePanel(HWND hwnd)
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
+    const int oldStretchMode = SetStretchBltMode(dc, HALFTONE);
     StretchDIBits(dc, left, top, side, side,
       0, 0, vshook_splash::kWidth, vshook_splash::kHeight,
       vshook_splash::kBgra, &info, DIB_RGB_COLORS, SRCCOPY);
+    if (oldStretchMode != 0) SetStretchBltMode(dc, oldStretchMode);
+#else
+    VSHookMacDrawTelepromptBitmap(
+      dc, vshook_splash::kBgra,
+      vshook_splash::kWidth, vshook_splash::kHeight,
+      vshook_splash::kWidth, false, false,
+      left, top, side, side);
+#endif
     if (dc != paintDc) {
       g_nativeUiBackBufferHasFrame = true;
       BitBlt(paintDc, client.left, client.top,
