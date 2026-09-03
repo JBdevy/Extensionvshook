@@ -43,9 +43,7 @@
     type == NSEventTypeRightMouseDragged ||
     type == NSEventTypeOtherMouseDown ||
     type == NSEventTypeOtherMouseUp ||
-    type == NSEventTypeOtherMouseDragged ||
-    type == NSEventTypeMouseMoved ||
-    type == NSEventTypeScrollWheel;
+    type == NSEventTypeOtherMouseDragged;
   if (isMouseEvent && vshOverlayWindow) {
     if (type == NSEventTypeLeftMouseDown ||
         type == NSEventTypeRightMouseDown ||
@@ -56,6 +54,23 @@
     return;
   }
   [super sendEvent:event];
+}
+@end
+
+@interface VSHookTelepromptTitlebarBackground : NSView
+@end
+
+@implementation VSHookTelepromptTitlebarBackground
+- (BOOL)isOpaque { return YES; }
+- (NSView*)hitTest:(NSPoint)point
+{
+  (void)point;
+  return nil;
+}
+- (void)drawRect:(NSRect)dirtyRect
+{
+  [[NSColor windowBackgroundColor] setFill];
+  NSRectFill(dirtyRect);
 }
 @end
 
@@ -84,6 +99,7 @@ struct TelepromptVideoPresentation {
   NSWindow* overlayWindow = nil;
   NSWindow* videoWindow = nil;
   CALayer* videoLayer = nil;
+  NSView* titlebarBackground = nil;
   bool overlayViewWasOpaque = true;
   bool overlayWasOpaque = true;
   NSColor* overlayBackgroundColor = nil;
@@ -166,7 +182,6 @@ void synchronizeTelepromptVideoWindow(
   NSWindow* overlayWindow = [overlayView window];
   if (!overlayWindow) return;
   [overlayWindow setIgnoresMouseEvents:NO];
-  [overlayWindow setAcceptsMouseMovedEvents:YES];
   const bool hasNormalTitlebar =
     ([overlayWindow styleMask] & NSWindowStyleMaskTitled) != 0;
   if (hasNormalTitlebar &&
@@ -175,6 +190,34 @@ void synchronizeTelepromptVideoWindow(
     // pode herdar a transparencia do backing da janela nem variar de cor com
     // os frames que passam por baixo dela.
     [overlayWindow setTitlebarAppearsTransparent:NO];
+  }
+  if (hasNormalTitlebar) {
+    NSButton* closeButton = [overlayWindow
+      standardWindowButton:NSWindowCloseButton];
+    NSView* titlebarView = [closeButton superview];
+    if (titlebarView) {
+      if (!presentation.titlebarBackground) {
+        presentation.titlebarBackground =
+          [[VSHookTelepromptTitlebarBackground alloc]
+            initWithFrame:[titlebarView bounds]];
+        [presentation.titlebarBackground setAutoresizingMask:
+          NSViewWidthSizable | NSViewHeightSizable];
+      }
+      if ([presentation.titlebarBackground superview] !=
+          titlebarView) {
+        [presentation.titlebarBackground removeFromSuperview];
+        [presentation.titlebarBackground
+          setFrame:[titlebarView bounds]];
+        [titlebarView
+          addSubview:presentation.titlebarBackground
+          positioned:NSWindowBelow
+          relativeTo:nil];
+      }
+      [presentation.titlebarBackground setHidden:NO];
+      [presentation.titlebarBackground setNeedsDisplay:YES];
+    }
+  } else if (presentation.titlebarBackground) {
+    [presentation.titlebarBackground setHidden:YES];
   }
   NSWindow* currentParent =
     [presentation.videoWindow parentWindow];
@@ -255,6 +298,10 @@ ensureTelepromptVideoPresentation(void* swellWindow)
       [stale.videoWindow orderOut:nil];
       [stale.videoWindow close];
       [stale.videoWindow release];
+    }
+    if (stale.titlebarBackground) {
+      [stale.titlebarBackground removeFromSuperview];
+      [stale.titlebarBackground release];
     }
     if (stale.overlayBackgroundColor) {
       [stale.overlayBackgroundColor release];
@@ -366,7 +413,6 @@ void maintainFullscreenWindow(NSWindow* window)
 {
   if (!window) return;
   [window setIgnoresMouseEvents:NO];
-  [window setAcceptsMouseMovedEvents:YES];
   const NSInteger requiredLevel = telepromptFullscreenLevel();
   if ([window level] != requiredLevel) {
     [window setLevel:requiredLevel];
@@ -798,6 +844,10 @@ void VSHookMacClearTelepromptVideoFrame(void* swellWindow)
     [presentation.videoWindow orderOut:nil];
     [presentation.videoWindow close];
     [presentation.videoWindow release];
+  }
+  if (presentation.titlebarBackground) {
+    [presentation.titlebarBackground removeFromSuperview];
+    [presentation.titlebarBackground release];
   }
   if (presentation.overlayBackgroundColor) {
     [presentation.overlayBackgroundColor release];
