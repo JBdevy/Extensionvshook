@@ -864,6 +864,8 @@ nativeUiCurrentMainSelectedSongRow();
 
 static HWND g_nativeAppActivePanelHwnd = nullptr;
 static std::chrono::steady_clock::time_point g_nativeAppActiveSplashUntil{};
+static constexpr std::chrono::milliseconds
+  kNativeAppActiveSplashDuration{1000};
 static HWND g_nativeShortcutNoticeHwnd = nullptr;
 static RECT g_nativeShortcutNoticeCloseRect{0, 0, 0, 0};
 static RECT g_nativeShortcutNoticeSuppressRect{0, 0, 0, 0};
@@ -34917,12 +34919,28 @@ static void nativePaintAppActivePanel(HWND hwnd)
   // Windows e no macOS, sem depender de arquivos instalados ao lado do plugin.
   if (std::chrono::steady_clock::now() < g_nativeAppActiveSplashUntil) {
     nativeAppActiveFillRect(dc, client, RGB(3, 3, 4));
-    const int availableW = std::max(1, width - 40);
-    const int availableH = std::max(1, height - 40);
-    const int side = std::max(1, std::min(
-      std::min(availableW, availableH), 360));
-    const int left = client.left + (width - side) / 2;
-    const int top = client.top + (height - side) / 2;
+
+    // Progresso 0..1 pelo tempo decorrido dentro da janela da splash.
+    double splashProgress = 1.0;
+    if (kNativeAppActiveSplashDuration.count() > 0) {
+      const auto splashStart =
+        g_nativeAppActiveSplashUntil - kNativeAppActiveSplashDuration;
+      const double elapsed = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - splashStart).count();
+      splashProgress = elapsed /
+        static_cast<double>(kNativeAppActiveSplashDuration.count());
+    }
+    splashProgress = std::min(1.0, std::max(0.0, splashProgress));
+
+    // Icone compacto: fracao do menor lado do painel, com teto discreto.
+    const int splashBarH = 8;
+    const int splashGap = 24;
+    int logoSide = std::min(std::min((std::min(width, height) * 40) / 100, 140),
+      std::min(width - 48, height - 120));
+    logoSide = std::max(24, logoSide);
+    const int groupH = logoSide + splashGap + splashBarH;
+    const int logoLeft = client.left + (width - logoSide) / 2;
+    const int logoTop = client.top + std::max(16, (height - groupH) / 2);
     // Cada plataforma escreve os mesmos pixels BGRA na superficie ativa:
     // no Windows via GDI, no macOS via helper Cocoa do teleprompt. Assim o
     // SWELL nao precisa das APIs de DIB, que ele nao publica.
@@ -34935,7 +34953,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
     const int oldStretchMode = SetStretchBltMode(dc, HALFTONE);
-    StretchDIBits(dc, left, top, side, side,
+    StretchDIBits(dc, logoLeft, logoTop, logoSide, logoSide,
       0, 0, vshook_splash::kWidth, vshook_splash::kHeight,
       vshook_splash::kBgra, &info, DIB_RGB_COLORS, SRCCOPY);
     if (oldStretchMode != 0) SetStretchBltMode(dc, oldStretchMode);
@@ -34944,8 +34962,24 @@ static void nativePaintAppActivePanel(HWND hwnd)
       dc, vshook_splash::kBgra,
       vshook_splash::kWidth, vshook_splash::kHeight,
       vshook_splash::kWidth, false, false,
-      left, top, side, side);
+      logoLeft, logoTop, logoSide, logoSide);
 #endif
+
+    // Barra de progresso arredondada indo de 0% a 100% durante a abertura.
+    const int splashBarW = std::min(width - 64, std::max(140, logoSide * 2));
+    const int splashBarLeft = client.left + (width - splashBarW) / 2;
+    const int splashBarTop = logoTop + logoSide + splashGap;
+    const RECT splashTrack{splashBarLeft, splashBarTop,
+      splashBarLeft + splashBarW, splashBarTop + splashBarH};
+    nativeAppActiveFillRoundRect(dc, splashTrack,
+      RGB(26, 21, 18), RGB(44, 36, 31), splashBarH / 2);
+    const int splashFillW = std::max(splashBarH,
+      static_cast<int>(std::lround(splashBarW * splashProgress)));
+    const RECT splashFill{splashBarLeft, splashBarTop,
+      splashBarLeft + splashFillW, splashBarTop + splashBarH};
+    nativeAppActiveFillRoundRect(dc, splashFill,
+      RGB(255, 138, 42), RGB(255, 170, 90), splashBarH / 2);
+
     if (dc != paintDc) {
       g_nativeUiBackBufferHasFrame = true;
       BitBlt(paintDc, client.left, client.top,
@@ -59440,7 +59474,7 @@ static bool nativeOpenAppActivePanel()
   g_nativeAppActivePanelHwnd = hwnd;
   g_nativeAppActivePanelClosing = false;
   g_nativeAppActiveSplashUntil =
-    std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    std::chrono::steady_clock::now() + kNativeAppActiveSplashDuration;
   // Nao execute evento MIDI antigo ao reabrir a interface e nao preserve
   // latch de uma tecla cuja soltura ocorreu enquanto o painel estava fechado.
   nativeUiResetMidiRuntimeState(true);
