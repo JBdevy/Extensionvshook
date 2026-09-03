@@ -5,10 +5,12 @@
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
+#import <dispatch/dispatch.h>
 
 #include "swell/swell.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <map>
 
@@ -33,9 +35,41 @@ struct SavedWindowState {
 std::map<void*, SavedWindowState> g_fullscreenTeleprompts;
 std::map<void*, CALayer*> g_videoPresentationLayers;
 
+struct TelepromptVideoPresentation {
+  NSWindow* overlayWindow = nil;
+  NSWindow* videoWindow = nil;
+  CALayer* videoLayer = nil;
+  bool overlayViewWasOpaque = true;
+  bool overlayWasOpaque = true;
+  NSColor* overlayBackgroundColor = nil;
+  const void* presentedStorageIdentity = nullptr;
+  std::size_t presentedPixelOffset = 0;
+  int presentedWidth = 0;
+  int presentedHeight = 0;
+  int presentedRowSpanPixels = 0;
+};
+
+std::map<void*, TelepromptVideoPresentation>
+  g_telepromptVideoPresentations;
+
 struct VideoFrameProviderStorage {
   std::shared_ptr<const std::vector<std::uint8_t>> pixels;
 };
+
+struct ScheduledSwellMessage {
+  void* window = nullptr;
+  unsigned int message = 0;
+};
+
+void deliverScheduledSwellMessage(void* rawMessage)
+{
+  std::unique_ptr<ScheduledSwellMessage> scheduled(
+    static_cast<ScheduledSwellMessage*>(rawMessage));
+  if (!scheduled || !scheduled->window) return;
+  HWND window = (HWND)scheduled->window;
+  if (!IsWindow(window)) return;
+  SendMessage(window, scheduled->message, 0, 0);
+}
 
 void releaseVideoFrameProvider(
   void* info,
@@ -71,6 +105,193 @@ NSView* telepromptViewFromSwellHandle(void* swellWindow)
   return nil;
 }
 
+NSRect telepromptViewFrameOnScreen(NSView* view)
+{
+  if (!view || ![view window]) return NSZeroRect;
+  const NSRect inWindow =
+    [view convertRect:[view bounds] toView:nil];
+  return [[view window] convertRectToScreen:inWindow];
+}
+
+void synchronizeTelepromptVideoWindow(
+  TelepromptVideoPresentation& presentation,
+  NSView* overlayView)
+{
+  if (!presentation.videoWindow || !overlayView) return;
+  NSWindow* overlayWindow = [overlayView window];
+  if (!overlayWindow) return;
+  NSWindow* currentParent =
+    [presentation.videoWindow parentWindow];
+  if (currentParent != overlayWindow) {
+    if (currentParent) {
+      [currentParent removeChildWindow:presentation.videoWindow];
+    }
+    [overlayWindow addChildWindow:presentation.videoWindow
+                          ordered:NSWindowBelow];
+  }
+  const NSRect screenFrame =
+    telepromptViewFrameOnScreen(overlayView);
+  if (!NSEqualRects(
+        [presentation.videoWindow frame], screenFrame)) {
+    [presentation.videoWindow
+      setFrame:screenFrame display:NO animate:NO];
+  }
+  if ([presentation.videoWindow level] !=
+      [overlayWindow level]) {
+    [presentation.videoWindow
+      setLevel:[overlayWindow level]];
+  }
+  if ([presentation.videoWindow hidesOnDeactivate] !=
+      [overlayWindow hidesOnDeactivate]) {
+    [presentation.videoWindow setHidesOnDeactivate:
+      [overlayWindow hidesOnDeactivate]];
+  }
+  if ([presentation.videoWindow canHide] !=
+      [overlayWindow canHide]) {
+    [presentation.videoWindow setCanHide:
+      [overlayWindow canHide]];
+  }
+  const NSWindowCollectionBehavior requiredBehavior =
+    [overlayWindow collectionBehavior] |
+      NSWindowCollectionBehaviorIgnoresCycle;
+  if ([presentation.videoWindow collectionBehavior] !=
+      requiredBehavior) {
+    [presentation.videoWindow
+      setCollectionBehavior:requiredBehavior];
+  }
+  if ([overlayWindow isVisible]) {
+    if (![presentation.videoWindow isVisible]) {
+      [presentation.videoWindow
+        orderWindow:NSWindowBelow
+        relativeTo:[overlayWindow windowNumber]];
+    }
+  } else if ([presentation.videoWindow isVisible]) {
+    [presentation.videoWindow orderOut:nil];
+  }
+}
+
+TelepromptVideoPresentation*
+ensureTelepromptVideoPresentation(void* swellWindow)
+{
+  if (![NSThread isMainThread]) return nullptr;
+  NSView* overlayView =
+    telepromptViewFromSwellHandle(swellWindow);
+  NSWindow* overlayWindow = [overlayView window];
+  if (!overlayView || !overlayWindow) return nullptr;
+
+  auto existing =
+    g_telepromptVideoPresentations.find(swellWindow);
+  if (existing != g_telepromptVideoPresentations.end() &&
+      existing->second.overlayWindow != overlayWindow) {
+    TelepromptVideoPresentation stale = existing->second;
+    SetOpaque((HWND)swellWindow, stale.overlayViewWasOpaque);
+    if (stale.overlayWindow) {
+      [stale.overlayWindow
+        setOpaque:stale.overlayWasOpaque ? YES : NO];
+      [stale.overlayWindow setBackgroundColor:
+        stale.overlayBackgroundColor
+          ? stale.overlayBackgroundColor
+          : [NSColor windowBackgroundColor]];
+    }
+    if (stale.videoWindow) {
+      NSWindow* parent = [stale.videoWindow parentWindow];
+      if (parent) [parent removeChildWindow:stale.videoWindow];
+      [stale.videoWindow orderOut:nil];
+      [stale.videoWindow close];
+      [stale.videoWindow release];
+    }
+    if (stale.overlayBackgroundColor) {
+      [stale.overlayBackgroundColor release];
+    }
+    g_telepromptVideoPresentations.erase(existing);
+    existing = g_telepromptVideoPresentations.end();
+  }
+
+  if (existing == g_telepromptVideoPresentations.end()) {
+    TelepromptVideoPresentation presentation;
+    presentation.overlayWindow = overlayWindow;
+    presentation.overlayViewWasOpaque =
+      [overlayView isOpaque] != NO;
+    presentation.overlayWasOpaque =
+      [overlayWindow isOpaque] != NO;
+    presentation.overlayBackgroundColor =
+      [[overlayWindow backgroundColor] retain];
+
+    const NSRect screenFrame =
+      telepromptViewFrameOnScreen(overlayView);
+    NSScreen* screen = [overlayWindow screen];
+    presentation.videoWindow = [[NSWindow alloc]
+      initWithContentRect:screenFrame
+                styleMask:NSWindowStyleMaskBorderless
+                  backing:NSBackingStoreBuffered
+                    defer:NO
+                   screen:screen];
+    if (!presentation.videoWindow) {
+      if (presentation.overlayBackgroundColor) {
+        [presentation.overlayBackgroundColor release];
+      }
+      return nullptr;
+    }
+    [presentation.videoWindow setReleasedWhenClosed:NO];
+    [presentation.videoWindow setOpaque:YES];
+    [presentation.videoWindow
+      setBackgroundColor:[NSColor blackColor]];
+    [presentation.videoWindow setHasShadow:NO];
+    [presentation.videoWindow setIgnoresMouseEvents:YES];
+    [presentation.videoWindow setAnimationBehavior:
+      NSWindowAnimationBehaviorNone];
+    [presentation.videoWindow setHidesOnDeactivate:
+      [overlayWindow hidesOnDeactivate]];
+    [presentation.videoWindow setCanHide:
+      [overlayWindow canHide]];
+    [presentation.videoWindow setLevel:[overlayWindow level]];
+    [presentation.videoWindow setCollectionBehavior:
+      [overlayWindow collectionBehavior] |
+        NSWindowCollectionBehaviorIgnoresCycle];
+
+    NSView* videoView = [[NSView alloc]
+      initWithFrame:NSMakeRect(
+        0.0, 0.0,
+        screenFrame.size.width,
+        screenFrame.size.height)];
+    [videoView setAutoresizingMask:
+      NSViewWidthSizable | NSViewHeightSizable];
+    [videoView setWantsLayer:YES];
+    CALayer* hostLayer = [videoView layer];
+    [hostLayer setBackgroundColor:
+      CGColorGetConstantColor(kCGColorBlack)];
+    [hostLayer setMasksToBounds:YES];
+
+    presentation.videoLayer = [CALayer layer];
+    [presentation.videoLayer setBackgroundColor:
+      CGColorGetConstantColor(kCGColorBlack)];
+    [presentation.videoLayer
+      setMinificationFilter:kCAFilterLinear];
+    [presentation.videoLayer
+      setMagnificationFilter:kCAFilterLinear];
+    [hostLayer addSublayer:presentation.videoLayer];
+    [presentation.videoWindow setContentView:videoView];
+    [videoView release];
+
+    // O SWELL consulta isOpaque na propria view. Tornar somente a NSWindow
+    // transparente nao basta: o compositor ainda poderia considerar todo o
+    // backing store da view opaco e esconder a janela de video abaixo.
+    SetOpaque((HWND)swellWindow, false);
+    [overlayWindow setOpaque:NO];
+    [overlayWindow setBackgroundColor:[NSColor clearColor]];
+    [overlayWindow addChildWindow:presentation.videoWindow
+                          ordered:NSWindowBelow];
+
+    const auto inserted =
+      g_telepromptVideoPresentations.emplace(
+        swellWindow, presentation);
+    existing = inserted.first;
+  }
+
+  synchronizeTelepromptVideoWindow(existing->second, overlayView);
+  return &existing->second;
+}
+
 NSInteger telepromptFullscreenLevel()
 {
   // Esse nível permanece acima da barra de menus inclusive quando outro
@@ -99,6 +320,21 @@ void maintainFullscreenWindow(NSWindow* window)
 }
 
 } // namespace
+
+extern "C" bool VSHookMacScheduleSwellMessage(
+  void* swellWindow,
+  unsigned int message)
+{
+  if (!swellWindow || message == 0) return false;
+  auto* scheduled = new ScheduledSwellMessage;
+  scheduled->window = swellWindow;
+  scheduled->message = message;
+  dispatch_async_f(
+    dispatch_get_main_queue(),
+    scheduled,
+    deliverScheduledSwellMessage);
+  return true;
+}
 
 extern "C" bool VSHookMacSetTelepromptFullscreen(
   void* swellWindow,
@@ -324,6 +560,198 @@ void VSHookMacClearVideoFrame(void* swellWindow)
   [layer removeFromSuperlayer];
   [CATransaction commit];
   g_videoPresentationLayers.erase(existing);
+}
+
+extern "C" bool VSHookMacBeginTelepromptVideoComposition(
+  void* swellWindow,
+  void* swellDeviceContext,
+  int clientWidth,
+  int clientHeight)
+{
+  if (![NSThread isMainThread] || !swellWindow ||
+      !swellDeviceContext || clientWidth <= 0 ||
+      clientHeight <= 0 || !SWELL_GetCtxGC) {
+    return false;
+  }
+  if (!ensureTelepromptVideoPresentation(swellWindow)) {
+    return false;
+  }
+
+  CGContextRef context = (CGContextRef)(
+    SWELL_GetCtxGC((HDC)swellDeviceContext));
+  if (!context) return false;
+  CGContextSaveGState(context);
+  // A janela SWELL vira somente a camada transparente de textos. Limpar o
+  // backing store em cada paint evita conservar pixels do frame antigo; a
+  // janela filha preta/video permanece visivel imediatamente atras dela.
+  CGContextClearRect(
+    context,
+    CGRectMake(
+      0.0, 0.0,
+      static_cast<CGFloat>(clientWidth),
+      static_cast<CGFloat>(clientHeight)));
+  CGContextRestoreGState(context);
+  return true;
+}
+
+bool VSHookMacPresentTelepromptVideoFrame(
+  void* swellWindow,
+  const std::shared_ptr<const std::vector<std::uint8_t>>& storage,
+  std::size_t pixelOffset,
+  int sourceWidth,
+  int sourceHeight,
+  int sourceRowSpanPixels,
+  int destinationX,
+  int destinationY,
+  int destinationWidth,
+  int destinationHeight)
+{
+  if (![NSThread isMainThread] || !storage ||
+      sourceWidth <= 0 || sourceHeight <= 0 ||
+      sourceRowSpanPixels < sourceWidth ||
+      destinationWidth <= 0 || destinationHeight <= 0) {
+    return false;
+  }
+  const std::size_t bytesPerRow =
+    static_cast<std::size_t>(sourceRowSpanPixels) * 4u;
+  const std::size_t byteCount =
+    bytesPerRow * static_cast<std::size_t>(sourceHeight);
+  if (pixelOffset > storage->size() ||
+      byteCount > storage->size() - pixelOffset) {
+    return false;
+  }
+
+  TelepromptVideoPresentation* presentation =
+    ensureTelepromptVideoPresentation(swellWindow);
+  if (!presentation || !presentation->videoLayer ||
+      !presentation->videoWindow) {
+    return false;
+  }
+
+  NSView* videoView = [presentation->videoWindow contentView];
+  CALayer* hostLayer = [videoView layer];
+  if (!videoView || !hostLayer) return false;
+  const bool contentsChanged =
+    presentation->presentedStorageIdentity != storage.get() ||
+    presentation->presentedPixelOffset != pixelOffset ||
+    presentation->presentedWidth != sourceWidth ||
+    presentation->presentedHeight != sourceHeight ||
+    presentation->presentedRowSpanPixels != sourceRowSpanPixels;
+  CGImageRef image = nullptr;
+  if (contentsChanged) {
+    auto* providerStorage = new VideoFrameProviderStorage{storage};
+    CGDataProviderRef provider = CGDataProviderCreateWithData(
+      providerStorage,
+      storage->data() + pixelOffset,
+      byteCount,
+      releaseVideoFrameProvider);
+    if (!provider) {
+      delete providerStorage;
+      return false;
+    }
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    image = colorSpace
+      ? CGImageCreate(
+          static_cast<std::size_t>(sourceWidth),
+          static_cast<std::size_t>(sourceHeight),
+          8, 32, bytesPerRow, colorSpace,
+          kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+          provider, nullptr, false, kCGRenderingIntentDefault)
+      : nullptr;
+    if (colorSpace) CGColorSpaceRelease(colorSpace);
+    CGDataProviderRelease(provider);
+    if (!image) return false;
+  }
+
+  const CGFloat hostHeight = [hostLayer bounds].size.height;
+  // Os RECT/HDC do SWELL usam origem no canto superior esquerdo; CALayer usa
+  // a origem inferior nessa NSView comum.
+  const CGRect frame = CGRectMake(
+    static_cast<CGFloat>(destinationX),
+    hostHeight - static_cast<CGFloat>(
+      destinationY + destinationHeight),
+    static_cast<CGFloat>(destinationWidth),
+    static_cast<CGFloat>(destinationHeight));
+  const CGFloat contentsScale = std::max(
+    1.0,
+    static_cast<double>(
+      [[presentation->videoWindow screen] backingScaleFactor]));
+  if (!contentsChanged &&
+      CGRectEqualToRect(
+        [presentation->videoLayer frame], frame) &&
+      std::abs(
+        [presentation->videoLayer contentsScale] - contentsScale) <
+          0.001 &&
+      ![presentation->videoLayer isHidden]) {
+    return true;
+  }
+
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  [presentation->videoLayer setFrame:frame];
+  [presentation->videoLayer setContentsScale:contentsScale];
+  // O aspecto e o zoom ja foram resolvidos no mesmo calculo usado pelo
+  // Windows. O compositor apenas encaixa o frame na area final.
+  [presentation->videoLayer setContentsGravity:kCAGravityResize];
+  if (image) {
+    [presentation->videoLayer setContents:(id)image];
+  }
+  [presentation->videoLayer setHidden:NO];
+  [CATransaction commit];
+  if (image) {
+    presentation->presentedStorageIdentity = storage.get();
+    presentation->presentedPixelOffset = pixelOffset;
+    presentation->presentedWidth = sourceWidth;
+    presentation->presentedHeight = sourceHeight;
+    presentation->presentedRowSpanPixels = sourceRowSpanPixels;
+    CGImageRelease(image);
+  }
+  return true;
+}
+
+void VSHookMacClearTelepromptVideoFrame(void* swellWindow)
+{
+  if (![NSThread isMainThread]) return;
+  const auto existing =
+    g_telepromptVideoPresentations.find(swellWindow);
+  if (existing == g_telepromptVideoPresentations.end()) return;
+  TelepromptVideoPresentation presentation = existing->second;
+  g_telepromptVideoPresentations.erase(existing);
+
+  if (presentation.overlayWindow) {
+    SetOpaque(
+      (HWND)swellWindow,
+      presentation.overlayViewWasOpaque);
+    [presentation.overlayWindow
+      setOpaque:presentation.overlayWasOpaque ? YES : NO];
+    [presentation.overlayWindow setBackgroundColor:
+      presentation.overlayBackgroundColor
+        ? presentation.overlayBackgroundColor
+        : [NSColor windowBackgroundColor]];
+  }
+  if (presentation.videoWindow) {
+    NSWindow* parent = [presentation.videoWindow parentWindow];
+    if (parent) [parent removeChildWindow:presentation.videoWindow];
+    [presentation.videoWindow orderOut:nil];
+    [presentation.videoWindow close];
+    [presentation.videoWindow release];
+  }
+  if (presentation.overlayBackgroundColor) {
+    [presentation.overlayBackgroundColor release];
+  }
+}
+
+extern "C" void VSHookMacSynchronizeTelepromptVideoWindow(
+  void* swellWindow)
+{
+  if (![NSThread isMainThread] || !swellWindow) return;
+  const auto existing =
+    g_telepromptVideoPresentations.find(swellWindow);
+  if (existing == g_telepromptVideoPresentations.end()) return;
+  NSView* overlayView =
+    telepromptViewFromSwellHandle(swellWindow);
+  if (!overlayView) return;
+  synchronizeTelepromptVideoWindow(existing->second, overlayView);
 }
 
 extern "C" bool VSHookMacDrawTelepromptBitmap(

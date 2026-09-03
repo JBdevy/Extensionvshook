@@ -1027,10 +1027,37 @@ struct Decoder::Impl {
     }
     {
       std::lock_guard<std::mutex> lock(stateMutex);
+      const bool compatiblePublishedFrame =
+        publishedPixels &&
+        publishedPath == request.path &&
+        publishedPlaybackKey == request.playbackKey &&
+        publishedWidth == width &&
+        publishedHeight == height;
+      const bool compatibleStoppedScrubFrame =
+        hasRequest &&
+        request.serial > processed.serial &&
+        !processed.playing &&
+        !request.playing &&
+        processed.discontinuity &&
+        request.discontinuity &&
+        request.path == processed.path &&
+        processed.path == path &&
+        request.playbackKey == processed.playbackKey &&
+        request.requestedWidth == processed.requestedWidth &&
+        request.requestedHeight == processed.requestedHeight &&
+        std::abs(
+          request.playbackRate - processed.playbackRate) <= 0.001 &&
+        std::abs(
+          request.sourceTime - processed.sourceTime) > 0.000001 &&
+        (!compatiblePublishedFrame ||
+         std::abs(frameTimestamp - request.sourceTime) + 0.000001 <
+           std::abs(
+             publishedTimestamp - request.sourceTime));
       if (!hasRequest ||
           request.path != path ||
           request.playbackKey != processed.playbackKey ||
-          request.serial != processed.serial) {
+          (request.serial != processed.serial &&
+           !compatibleStoppedScrubFrame)) {
         return false;
       }
       // Cada decode cria um buffer novo. Publicar o mesmo shared_ptr elimina

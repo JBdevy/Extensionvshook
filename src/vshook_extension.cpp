@@ -1790,6 +1790,9 @@ static bool nativeVideoStretchEnabled();
 static bool nativeVideoRequestedOpen();
 static void nativeToggleVideoStretch();
 static void nativeOpenRecadosApp();
+#ifdef __APPLE__
+static void nativeTelepromptPostCursorNavigationRefresh();
+#endif
 static bool nativeBigClockWindowIsOpen(int slot = 0);
 static bool nativeOpenBigClockWindow(int slot = 0);
 static void nativeCloseBigClockWindow(int slot = 0);
@@ -2818,6 +2821,16 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
   }
 #endif
   if (targetsNativePanel) return -1;
+
+#ifdef __APPLE__
+  // No SWELL, o autorepeat das setas pode represar WM_TIMER e WM_PAINT. Este
+  // pulso nao consome a tecla: o REAPER move o cursor normalmente e, logo
+  // depois, os dois Teleprompts leem a posicao nova e acordam seus decoders.
+  if (keyDown && (vk == VK_LEFT || vk == VK_RIGHT) &&
+      !nativeMessageTargetsTextInput(msg)) {
+    nativeTelepromptPostCursorNavigationRefresh();
+  }
+#endif
 
   // Fora do foco, a extensão reserva somente R e Esc. Todas as demais
   // teclas, atalhos configuráveis e combinações pertencem integralmente ao
@@ -59612,6 +59625,8 @@ static constexpr UINT kNativeVideoPollMessage = WM_APP + 0x0561;
 // WM_APP pertence à API Win32 e não existe no SWELL do macOS. O SWELL aceita
 // mensagens de aplicação pelo mesmo intervalo numérico reservado pelo Windows.
 static constexpr UINT kNativeVideoPollMessage = 0x8000u + 0x0561u;
+static constexpr UINT kNativeTelepromptCursorPollMessage =
+  0x8000u + 0x0562u;
 #endif
 // A decodificacao e assincrona. O callback do decoder acorda a HWND assim que
 // um quadro fica pronto. A amostragem do transporte pertence ao WM_TIMER de
@@ -59655,7 +59670,17 @@ nativeMakeVideoFrameReadyCallback(
           std::memory_order_acquire)) {
       return;
     }
-    if (!PostMessage(hwnd, kNativeVideoPollMessage, 0, 0)) {
+    bool scheduled = false;
+#ifdef __APPLE__
+    // PostMessage no SWELL e drenado por um timer interno de cerca de 50 ms,
+    // o que limita o callback a aproximadamente 20 fps. A ponte AppKit entrega
+    // esta mesma mensagem na fila principal assim que o quadro fica pronto.
+    scheduled = VSHookMacScheduleSwellMessage(
+      hwnd, kNativeVideoPollMessage);
+#else
+    scheduled = PostMessage(hwnd, kNativeVideoPollMessage, 0, 0) != FALSE;
+#endif
+    if (!scheduled) {
       pulse.messagePending.store(false, std::memory_order_release);
     }
   };
@@ -60142,16 +60167,35 @@ struct NativeTelepromptRenderState {
 static NativeTelepromptWindowState g_nativeTelepromptWindows[2] = {
   {nullptr, 1}, {nullptr, 2}
 };
+#ifdef __APPLE__
+static std::atomic<bool>
+  g_nativeTelepromptCursorPollPending[2]{{false}, {false}};
+
+static void nativeTelepromptPostCursorNavigationRefresh()
+{
+  for (int index = 0; index < 2; ++index) {
+    NativeTelepromptWindowState& window =
+      g_nativeTelepromptWindows[index];
+    if (window.hwnd && IsWindow(window.hwnd)) {
+      bool expected = false;
+      if (!g_nativeTelepromptCursorPollPending[index]
+             .compare_exchange_strong(
+               expected, true,
+               std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+        continue;
+      }
+      if (!VSHookMacScheduleSwellMessage(
+            window.hwnd,
+            kNativeTelepromptCursorPollMessage)) {
+        g_nativeTelepromptCursorPollPending[index].store(
+          false, std::memory_order_release);
+      }
+    }
+  }
+}
+#endif
 static NativeVideoRefreshTimer g_nativeTelepromptRefreshTimers[2];
-struct NativeTelepromptVideoPaintSchedule {
-  bool initialized = false;
-  bool playing = false;
-  double projectPosition = 0.0;
-  std::string playbackKey;
-  std::chrono::steady_clock::time_point lastHousekeepingPaint{};
-};
-static NativeTelepromptVideoPaintSchedule
-  g_nativeTelepromptVideoPaintSchedules[2];
 static NativeVideoPollPulse g_nativeTelepromptVideoPollPulses[2];
 static int g_nativeTelepromptCreatingSlot = 1;
 static NativeTelepromptSettings g_nativeTelepromptSettings[2];
@@ -60288,6 +60332,12 @@ static int nativeTelepromptIndex(int slot)
 static void nativeTelepromptResetPlatformVideoPlayback(int index)
 {
   if (index < 0 || index >= 2) return;
+#ifdef __APPLE__
+  HWND presentationWindow = g_nativeTelepromptWindows[index].hwnd;
+  if (presentationWindow) {
+    VSHookMacClearTelepromptVideoFrame(presentationWindow);
+  }
+#endif
   g_nativeTelepromptVideoStatePresent[index] = false;
   if (g_nativeTelepromptPlatformVideoDecoder[index]) {
     g_nativeTelepromptPlatformVideoDecoder[index]->reset();
@@ -63285,9 +63335,9 @@ static bool nativeTelepromptDrawHeldVideoFrame(
     drawY,
     drawWidth,
     drawHeight);
+#ifdef _WIN32
   nativeVideoClearOutsideDrawRect(
     dc, available, drawX, drawY, drawWidth, drawHeight);
-#ifdef _WIN32
   BITMAPINFO bitmapInfo{};
   bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
   bitmapInfo.bmiHeader.biWidth = frame.width;
@@ -63308,6 +63358,27 @@ static bool nativeTelepromptDrawHeldVideoFrame(
   }
   return renderedLines > 0;
 #else
+  if (nativeStartsWith(frame.playbackKey, "video|") &&
+      frame.sharedPixels && frame.stride % 4 == 0) {
+    HWND hwnd = g_nativeTelepromptWindows[index].hwnd;
+    if (hwnd && VSHookMacPresentTelepromptVideoFrame(
+          hwnd,
+          frame.sharedPixels,
+          frame.pixelOffset,
+          frame.width,
+          frame.height,
+          frame.stride / 4,
+          drawX,
+          drawY,
+          drawWidth,
+          drawHeight)) {
+      return true;
+    }
+  }
+  // Fallback defensivo caso a composicao de janelas nao esteja disponivel.
+  // Imagens estaticas tambem continuam neste caminho normal do CGContext.
+  nativeVideoClearOutsideDrawRect(
+    dc, available, drawX, drawY, drawWidth, drawHeight);
   return frame.stride % 4 == 0 &&
     VSHookMacDrawTelepromptBitmap(
       dc, framePixels,
@@ -63515,12 +63586,13 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
   // O decoder prepara somente a resolução que realmente será exibida. Zoom
   // menor que 1 não precisa carregar um quadro de tela cheia.
   double sourceScale = scaleLimit;
-  // A janela de vídeo pode entregar o quadro Retina diretamente a um
-  // CALayer. O Teleprompt ainda precisa compor textos, relógio, bordas e
-  // avisos no mesmo paint; decodificar também em backing pixels multiplicava
-  // por quatro a conversão e a cópia em telas 2x, fazendo a apresentação
-  // perder quadros. O CGContext Retina faz a ampliação final; o decoder usa
-  // apenas o tamanho lógico realmente ocupado pela mídia.
+#ifdef __APPLE__
+  // Agora o Teleprompt tambem entrega o quadro a um CALayer. Solicitar
+  // backing pixels iguala a nitidez da janela de video principal; o teto Full
+  // HD abaixo continua protegendo duas saidas abertas ao mesmo tempo.
+  sourceScale *= VSHookMacTelepromptBackingScale(
+    g_nativeTelepromptWindows[index].hwnd);
+#endif
   const int uncappedRequestedWidth = std::max(
     1, std::min(
       65535,
@@ -63599,10 +63671,10 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
     drawY,
     drawW,
     drawH);
-  nativeVideoClearOutsideDrawRect(
-    dc, available, drawX, drawY, drawW, drawH);
 
 #ifdef _WIN32
+  nativeVideoClearOutsideDrawRect(
+    dc, available, drawX, drawY, drawW, drawH);
   BITMAPINFO bitmapInfo{};
   bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
   bitmapInfo.bmiHeader.biWidth = decoded.width;
@@ -63634,23 +63706,55 @@ static bool nativeTelepromptDrawPlatformVideoDirect(
 
   const bool rendered = renderedLines > 0;
 #else
-  // O frame AVFoundation é desenhado diretamente no CGContext Retina. Isso
-  // evita a cópia para um bitmap LICE 1x e deixa o snapshot imutável vivo
-  // durante todo o desenho.
-  const bool rendered =
-    decoded.stride % 4 == 0 &&
-    VSHookMacDrawTelepromptBitmap(
-      dc,
-      decoded.pixels,
+  std::size_t pixelOffset = 0;
+  bool storageRangeValid = false;
+  if (decoded.storage && decoded.pixels) {
+    const std::uintptr_t storageBegin =
+      reinterpret_cast<std::uintptr_t>(decoded.storage->data());
+    const std::uintptr_t storageEnd =
+      storageBegin + decoded.storage->size();
+    const std::uintptr_t frameAddress =
+      reinterpret_cast<std::uintptr_t>(decoded.pixels);
+    storageRangeValid =
+      frameAddress >= storageBegin && frameAddress <= storageEnd;
+    if (storageRangeValid) {
+      pixelOffset = static_cast<std::size_t>(
+        frameAddress - storageBegin);
+    }
+  }
+  bool rendered = decoded.stride % 4 == 0 &&
+    storageRangeValid &&
+    VSHookMacPresentTelepromptVideoFrame(
+      g_nativeTelepromptWindows[index].hwnd,
+      decoded.storage,
+      pixelOffset,
       decoded.width,
       decoded.height,
       decoded.stride / 4,
-      false,
-      true,
       drawX,
       drawY,
       drawW,
       drawH);
+  if (!rendered) {
+    // Mantem um fallback CoreGraphics para hosts antigos que nao permitam a
+    // janela de composicao transparente. O caminho normal nao copia mais o
+    // video junto com todos os overlays.
+    nativeVideoClearOutsideDrawRect(
+      dc, available, drawX, drawY, drawW, drawH);
+    rendered = decoded.stride % 4 == 0 &&
+      VSHookMacDrawTelepromptBitmap(
+        dc,
+        decoded.pixels,
+        decoded.width,
+        decoded.height,
+        decoded.stride / 4,
+        false,
+        true,
+        drawX,
+        drawY,
+        drawW,
+        drawH);
+  }
 #endif
   const int decoderStatus =
     g_nativeTelepromptPlatformVideoDecoder[index]->status();
@@ -64047,6 +64151,18 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
   const bool videoStatePresent =
     nativeLower(state.mediaType) == "video" &&
     !state.mediaPath.empty();
+#ifdef __APPLE__
+  if (videoStatePresent) {
+    // O HWND continua desenhando somente os overlays transparentes. O quadro
+    // de video fica em um CALayer de uma janela filha imediatamente atras,
+    // portanto textos/configuracoes permanecem acima sem copiar o raster do
+    // video pelo CoreGraphics em toda atualizacao.
+    VSHookMacBeginTelepromptVideoComposition(
+      hwnd, dc, clientWidth, clientHeight);
+  } else {
+    VSHookMacClearTelepromptVideoFrame(hwnd);
+  }
+#endif
   // No Windows, video e overlays precisam permanecer no mesmo backbuffer.
   // Pintar o video diretamente no HDC da janela e desenhar cronometro, bordas
   // e cifras logo depois expunha os dois estagios ao compositor: a cada quadro
@@ -64116,7 +64232,16 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     // Quando a proporção não coincide, o fundo preto completa as sobras.
     if (!nativeTelepromptDrawMedia(
           dc, slot, state, settings, client)) {
+#ifdef __APPLE__
+      // Durante video, a janela filha ja fornece o fundo preto. Cobrir o
+      // overlay transparente aqui esconderia um frame que o callback acabou
+      // de apresentar, especialmente enquanto o input das setas esta ativo.
+      if (!videoStatePresent) {
+        nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
+      }
+#else
       nativeAppActiveFillRect(dc, client, RGB(0, 0, 0));
+#endif
     }
   } else if (videoStatePresent && !technicalNoticeActive) {
     // Preview esconde a mídia. Como o caminho de vídeo pinta diretamente no
@@ -64861,6 +64986,9 @@ static void nativeTelepromptPrimeVideoDecoder(
       mediaScale = nativeTelepromptClamp(
         g_nativeTelepromptSettings[index].mediaScale, 0.25, 3.0);
     }
+#ifdef __APPLE__
+    mediaScale *= VSHookMacTelepromptBackingScale(hwnd);
+#endif
     const int uncappedWidth = std::max(
       1, std::min(65535, static_cast<int>(std::lround(
         static_cast<double>(clientWidth) * mediaScale))));
@@ -64899,6 +65027,90 @@ static void nativeTelepromptPrimeVideoDecoder(
       frame.pixels &&
       frame.sequence !=
         g_nativeTelepromptPresentedVideoSequence[index]) {
+#ifdef __APPLE__
+    bool presentedWithoutOverlayPaint = false;
+    // Entrega o quadro ao Core Animation antes de qualquer paint dos textos.
+    // Assim o video nao volta a ficar preso ao custo/layout dos overlays nem
+    // a prioridade baixa de WM_PAINT durante o autorepeat das setas.
+    RECT client{0, 0, 0, 0};
+    GetClientRect(hwnd, &client);
+    nativeTelepromptLoadSettings();
+    double mediaScale = 1.0;
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      mediaScale = nativeTelepromptClamp(
+        g_nativeTelepromptSettings[index].mediaScale, 0.25, 3.0);
+    }
+    int drawX = 0;
+    int drawY = 0;
+    int drawWidth = 1;
+    int drawHeight = 1;
+    nativeTelepromptVideoDrawRect(
+      frame.width,
+      frame.height,
+      client,
+      mediaScale,
+      nativeVideoStretchEnabled(),
+      drawX,
+      drawY,
+      drawWidth,
+      drawHeight);
+    std::size_t pixelOffset = 0;
+    bool storageRangeValid = false;
+    if (frame.storage && frame.pixels) {
+      const std::uintptr_t storageBegin =
+        reinterpret_cast<std::uintptr_t>(frame.storage->data());
+      const std::uintptr_t storageEnd =
+        storageBegin + frame.storage->size();
+      const std::uintptr_t frameAddress =
+        reinterpret_cast<std::uintptr_t>(frame.pixels);
+      storageRangeValid =
+        frameAddress >= storageBegin && frameAddress <= storageEnd;
+      if (storageRangeValid) {
+        pixelOffset = static_cast<std::size_t>(
+          frameAddress - storageBegin);
+      }
+    }
+    if (storageRangeValid && frame.stride % 4 == 0 &&
+        VSHookMacPresentTelepromptVideoFrame(
+          hwnd,
+          frame.storage,
+          pixelOffset,
+          frame.width,
+          frame.height,
+          frame.stride / 4,
+          drawX,
+          drawY,
+          drawWidth,
+          drawHeight)) {
+      g_nativeTelepromptPresentedVideoSequence[index] =
+        frame.sequence;
+      NativeTelepromptHeldVideoFrame& held =
+        g_nativeTelepromptHeldVideoFrame[index];
+      held.sharedPixels = frame.storage;
+      held.pixels.clear();
+      held.pixelOffset = pixelOffset;
+      held.width = frame.width;
+      held.height = frame.height;
+      held.stride = frame.stride;
+      held.playbackKey = nativeTelepromptMediaHoldKey(state);
+      g_nativeTelepromptHeldMediaKind[index] = 2;
+      nativeTelepromptResetHeldMediaTransition(index);
+      g_nativeTelepromptPlatformVideoStatus[index].store(
+        std::max(
+          2,
+          g_nativeTelepromptPlatformVideoDecoder[index]->status()));
+      g_nativeTelepromptMediaStatus[index].store(3);
+      presentedWithoutOverlayPaint = true;
+    }
+    // Depois do primeiro paint preparar a transparencia, cada frame pode ir
+    // direto ao CALayer. Nao bloqueia o proximo callback redesenhando todos os
+    // textos; o timer atualiza os overlays em sua propria cadencia.
+    if (presentedWithoutOverlayPaint &&
+        g_nativeTelepromptVideoStatePresent[index]) {
+      return;
+    }
+#endif
     InvalidateRect(hwnd, nullptr, FALSE);
     // Apresenta o frame enquanto a mensagem de callback esta no topo da
     // fila; WM_PAINT de baixa prioridade podia ficar atras do input do REAPER.
@@ -64918,7 +65130,16 @@ static void nativeTelepromptToggleFullscreen(int slot)
   if (!window.hwnd || !IsWindow(window.hwnd)) return;
   if (!window.fullscreen) {
     GetWindowRect(window.hwnd, &window.restoreRect);
+#ifdef _WIN32
+    // Se a tela cheia for acionada a partir do maximizado, o retangulo atual
+    // ainda e necessario para restaurar essa sessao, mas nao pode substituir
+    // a geometria normal persistida.
+    if (!IsIconic(window.hwnd) && !IsZoomed(window.hwnd)) {
+      nativeTelepromptSaveNormalRect(slot, window.restoreRect);
+    }
+#else
     nativeTelepromptSaveNormalRect(slot, window.restoreRect);
+#endif
     const std::vector<NativeTelepromptMonitor> monitors =
       nativeTelepromptEnumerateMonitors();
     const NativeTelepromptMonitor* monitor =
@@ -64953,6 +65174,7 @@ static void nativeTelepromptToggleFullscreen(int slot)
           window.hwnd, true)) {
       return;
     }
+    VSHookMacSynchronizeTelepromptVideoWindow(window.hwnd);
 #endif
     window.fullscreen = true;
     nativeTelepromptRememberFullscreen(
@@ -64976,6 +65198,7 @@ static void nativeTelepromptToggleFullscreen(int slot)
           window.hwnd, false)) {
       return;
     }
+    VSHookMacSynchronizeTelepromptVideoWindow(window.hwnd);
 #endif
     window.fullscreen = false;
     nativeTelepromptRememberFullscreen(
@@ -65150,9 +65373,11 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
-      g_nativeTelepromptVideoPaintSchedules[
-        nativeTelepromptIndex(slot)] =
-          NativeTelepromptVideoPaintSchedule{};
+#ifdef __APPLE__
+      g_nativeTelepromptCursorPollPending[
+        nativeTelepromptIndex(slot)].store(
+          false, std::memory_order_release);
+#endif
       nativeResetVideoRefreshTimer(
         g_nativeTelepromptRefreshTimers[
           nativeTelepromptIndex(slot)]);
@@ -65174,6 +65399,18 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
           false, std::memory_order_release);
       nativeTelepromptPrimeVideoDecoder(hwnd, slot);
       return 0;
+#ifdef __APPLE__
+    case kNativeTelepromptCursorPollMessage:
+      g_nativeTelepromptCursorPollPending[
+        nativeTelepromptIndex(slot)].store(
+          false, std::memory_order_release);
+      // Entra na fila principal depois de a action da seta alterar o cursor.
+      // O decoder acorda aqui e seu callback apresenta o frame diretamente;
+      // nao fazemos um paint sincrono pesado em cada evento de autorepeat.
+      nativeTelepromptPrimeVideoDecoder(hwnd, slot);
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
+#endif
     case WM_NCHITTEST:
       // O centro continua sendo cliente para preservar arraste e duplo clique.
       // Somente uma faixa estreita nas bordas vira área de resize.
@@ -65183,11 +65420,19 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       // continua sendo cliente, sem barra superior.
       return window.fullscreen
         ? HTCLIENT
-        : DefWindowProc(hwnd, message, wParam, lParam);
+        : DefWindowProcW(hwnd, message, wParam, lParam);
 #else
       return window.fullscreen
         ? HTCLIENT
         : nativeTelepromptResizeHitTest(hwnd, lParam);
+#endif
+#ifdef _WIN32
+    case WM_NCLBUTTONDBLCLK:
+      // A alternancia de tela cheia pertence somente ao duplo clique dentro
+      // da area cliente. Na barra, nem o nosso toggle nem o maximizar padrao
+      // do Windows devem disputar o mesmo gesto.
+      if (static_cast<int>(wParam) == HTCAPTION) return 0;
+      break;
 #endif
     case WM_SETCURSOR: {
       const int hitTest = LOWORD(lParam);
@@ -65218,6 +65463,20 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       }
       break;
     }
+#ifdef _WIN32
+    case WM_SYSCOMMAND: {
+      const UINT command = static_cast<UINT>(wParam) & 0xFFF0u;
+      if (!window.fullscreen &&
+          (command == SC_MINIMIZE || command == SC_MAXIMIZE) &&
+          !IsIconic(hwnd) && !IsZoomed(hwnd)) {
+        RECT normalRect{0, 0, 0, 0};
+        if (GetWindowRect(hwnd, &normalRect)) {
+          nativeTelepromptSaveNormalRect(slot, normalRect);
+        }
+      }
+      break;
+    }
+#endif
 #ifndef _WIN32
     case WM_NCLBUTTONDOWN:
       if (!window.fullscreen &&
@@ -65242,14 +65501,6 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
     case WM_ERASEBKGND:
       return 1;
     case WM_PAINT:
-#ifdef __APPLE__
-      // Um frame publicado também satisfaz a atualização dos relógios e
-      // overlays. Registrar o paint aqui impede o pulso de manutenção de
-      // cair logo depois dele e duplicar trabalho no compositor do Mac.
-      g_nativeTelepromptVideoPaintSchedules[
-        nativeTelepromptIndex(slot)].lastHousekeepingPaint =
-          std::chrono::steady_clock::now();
-#endif
       nativeTelepromptPaint(hwnd, slot);
       return 0;
     case WM_TIMER:
@@ -65267,58 +65518,21 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
           VSHookMacMaintainTelepromptFullscreen(hwnd);
         }
 #endif
-        // O relógio e o cursor são amostrados no mesmo pulso de 60 Hz da
-        // janela principal. O vídeo, porém, pinta uma vez por frame publicado
-        // pelo callback abaixo; redesenhar vídeo + overlays novamente em todo
-        // timer criava trabalho duplicado e microtravamentos no CoreGraphics.
+        // Relogio, cursor e overlays usam o mesmo pulso de 60 Hz da janela
+        // principal. No Mac, o raster do video nao participa desse paint: ele
+        // e apresentado separadamente pelo Core Animation.
         const NativeTelepromptRenderState timerState =
           nativeTelepromptReadRenderState(slot);
         if (nativeLower(timerState.mediaType) == "video" &&
             !timerState.mediaPath.empty()) {
 #ifdef __APPLE__
-          const int index = nativeTelepromptIndex(slot);
-          NativeTelepromptVideoPaintSchedule& schedule =
-            g_nativeTelepromptVideoPaintSchedules[index];
-          const std::string playbackKey =
-            nativeTelepromptMediaHoldKey(timerState);
-          const bool cursorMoved =
-            !timerState.playing &&
-            (!schedule.initialized ||
-             std::abs(
-               timerState.projectPosition -
-                 schedule.projectPosition) > 0.000001);
-          const bool playbackChanged =
-            !schedule.initialized ||
-            schedule.playing != timerState.playing ||
-            schedule.playbackKey != playbackKey;
-          schedule.initialized = true;
-          schedule.playing = timerState.playing;
-          schedule.projectPosition = timerState.projectPosition;
-          schedule.playbackKey = playbackKey;
-          // Scrubbing não espera callback para atualizar texto/estado e o
-          // primeiro acesso limpa imediatamente a saída anterior. O quadro
-          // correto chega pelo kNativeVideoPollMessage assim que decodificado.
-          const bool statePaintNeeded =
-            cursorMoved || playbackChanged;
-          if (statePaintNeeded) {
-            InvalidateRect(hwnd, nullptr, FALSE);
-          }
-          // prime pode consumir a invalidação acima imediatamente quando um
-          // novo frame já estiver pronto. Só depois verificamos manutenção,
-          // evitando pintar duas vezes a mesma sequência.
+          // O quadro novo é entregue diretamente ao CALayer pelo prime. O
+          // paint de 60 Hz atualiza somente a camada transparente de textos,
+          // relógios e barras, sem redimensionar/copiar novamente o vídeo.
+          // Isso preserva também a atualização agressiva durante edits e
+          // scrolls usada pela janela principal.
           nativeTelepromptPrimeVideoDecoder(hwnd, slot);
-          const auto now = std::chrono::steady_clock::now();
-          const bool housekeepingDue =
-            schedule.lastHousekeepingPaint ==
-              std::chrono::steady_clock::time_point{} ||
-            now - schedule.lastHousekeepingPaint >=
-              std::chrono::seconds(1);
-          // Relógio local/countdown e overlays estáticos continuam recebendo
-          // uma manutenção leve quando o vídeo está pausado ou sem quadros.
-          if (!statePaintNeeded && housekeepingDue) {
-            schedule.lastHousekeepingPaint = now;
-            InvalidateRect(hwnd, nullptr, FALSE);
-          }
+          InvalidateRect(hwnd, nullptr, FALSE);
 #else
           // O caminho GDI do Windows já está fluido e permanece com a
           // atualização agressiva que havia sido validada nessa plataforma.
@@ -65326,15 +65540,15 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
           InvalidateRect(hwnd, nullptr, FALSE);
 #endif
         } else {
-          g_nativeTelepromptVideoPaintSchedules[
-            nativeTelepromptIndex(slot)] =
-              NativeTelepromptVideoPaintSchedule{};
           InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
       }
       break;
     case WM_SIZE:
+#ifdef __APPLE__
+      VSHookMacSynchronizeTelepromptVideoWindow(hwnd);
+#endif
       InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_LBUTTONDBLCLK:
@@ -65352,7 +65566,11 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       // evita que o clique direito seja encaminhado ao grid que esta atras.
       return 0;
     case WM_LBUTTONDOWN: {
-      if (!window.fullscreen) {
+      if (!window.fullscreen
+#ifdef _WIN32
+          && !IsZoomed(hwnd)
+#endif
+          ) {
         window.dragging = true;
         GetCursorPos(&window.dragStartCursor);
         GetWindowRect(hwnd, &window.dragStartWindow);
@@ -65396,6 +65614,16 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       if (window.dragging) {
         window.dragging = false;
         if (GetCapture() == hwnd) ReleaseCapture();
+        if (!window.fullscreen
+#ifdef _WIN32
+            && !IsIconic(hwnd) && !IsZoomed(hwnd)
+#endif
+            ) {
+          RECT normalRect{0, 0, 0, 0};
+          if (GetWindowRect(hwnd, &normalRect)) {
+            nativeTelepromptSaveNormalRect(slot, normalRect);
+          }
+        }
         return 0;
       }
       break;
@@ -65409,7 +65637,7 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       return 0;
 #ifdef _WIN32
     case WM_EXITSIZEMOVE:
-      if (!window.fullscreen) {
+      if (!window.fullscreen && !IsIconic(hwnd) && !IsZoomed(hwnd)) {
         RECT rect{0, 0, 0, 0};
         if (GetWindowRect(hwnd, &rect)) {
           nativeTelepromptSaveNormalRect(slot, rect);
@@ -65495,15 +65723,15 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       nativeResetVideoRefreshTimer(
         g_nativeTelepromptRefreshTimers[
           nativeTelepromptIndex(slot)]);
-      g_nativeTelepromptVideoPaintSchedules[
-        nativeTelepromptIndex(slot)] =
-          NativeTelepromptVideoPaintSchedule{};
       // Sem janela nao existe consumidor de video. Para o player assíncrono
       // uma unica vez; ao reabrir, o mesmo objeto recebe um estado novo.
       nativeTelepromptResetPlatformVideoPlayback(
         nativeTelepromptIndex(slot));
 #ifdef __APPLE__
       VSHookMacReleaseTelepromptFullscreen(hwnd);
+      g_nativeTelepromptCursorPollPending[
+        nativeTelepromptIndex(slot)].store(
+          false, std::memory_order_release);
 #endif
       window.hwnd = nullptr;
       window.dragging = false;
@@ -65522,7 +65750,10 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       break;
   }
 #ifdef _WIN32
-  return DefWindowProc(hwnd, message, wParam, lParam);
+  // A classe foi registrada com RegisterClassExW/CreateWindowExW. Usar a
+  // variante ANSI aqui fazia WM_SETTEXT interpretar o UTF-16 como "V\0" e
+  // deixava somente a primeira letra visivel na barra do Windows.
+  return DefWindowProcW(hwnd, message, wParam, lParam);
 #else
   return 0;
 #endif
@@ -65543,8 +65774,13 @@ static bool nativeOpenTelepromptWindow(int slot)
     nativeTelepromptSetRequestedOpen(slot, true);
     g_nativeForceSnapshotBuild.store(true);
     g_nativeForceStateBuild.store(true);
-    ShowWindow(g_nativeTelepromptWindows[index].hwnd, SW_SHOW);
-    SetFocus(g_nativeTelepromptWindows[index].hwnd);
+    HWND openHwnd = g_nativeTelepromptWindows[index].hwnd;
+#ifdef _WIN32
+    ShowWindow(openHwnd, IsIconic(openHwnd) ? SW_RESTORE : SW_SHOW);
+#else
+    ShowWindow(openHwnd, SW_SHOW);
+#endif
+    SetFocus(openHwnd);
     return true;
   }
   nativeTelepromptLoadSettings();
@@ -65622,16 +65858,17 @@ static bool nativeOpenTelepromptWindow(int slot)
     wc.lpszClassName = className;
     if (!RegisterClassExW(&wc)) return false;
   }
-  const std::wstring title = slot == 1
-    ? L"VS Hook - Teleprompt 1"
-    : L"VS Hook - Teleprompt 2";
+  const wchar_t* title = slot == 1
+    ? L"Janela Teleprompt 1"
+    : L"Janela Teleprompt 2";
   hwnd = CreateWindowExW(
-    WS_EX_TOOLWINDOW,
-    className, title.c_str(),
+    0,
+    className, title,
     WS_OVERLAPPEDWINDOW | WS_VISIBLE,
     savedX, savedY, savedW, savedH,
     GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
     nullptr, g_pluginInstance, nullptr);
+  if (hwnd) SetWindowTextW(hwnd, title);
 #else
   const char* resizableWindow =
     reinterpret_cast<const char*>(
@@ -65642,8 +65879,8 @@ static bool nativeOpenTelepromptWindow(int slot)
     reinterpret_cast<DLGPROC>(nativeTelepromptWndProc), 0);
   if (hwnd) {
     SetWindowText(hwnd,
-      slot == 1 ? "VS Hook - Teleprompt 1"
-                : "VS Hook - Teleprompt 2");
+      slot == 1 ? "Janela Teleprompt 1"
+                : "Janela Teleprompt 2");
     SetWindowPos(hwnd, nullptr,
       savedX, savedY, savedW, savedH,
       SWP_NOZORDER | SWP_NOACTIVATE);
@@ -65697,8 +65934,16 @@ static void nativeCloseTelepromptWindow(
     return;
   }
   RECT rect{0, 0, 0, 0};
-  if (GetWindowRect(hwnd, &rect) &&
-      !g_nativeTelepromptWindows[index].fullscreen) {
+  bool saveVisibleNormalRect =
+    !g_nativeTelepromptWindows[index].fullscreen;
+#ifdef _WIN32
+  // GetWindowRect de uma janela minimizada devolve a posicao sentinela
+  // (-32000); maximizada devolveria o monitor inteiro. A geometria normal ja
+  // foi persistida no ultimo move/resize e nao pode ser sobrescrita aqui.
+  saveVisibleNormalRect = saveVisibleNormalRect &&
+    !IsIconic(hwnd) && !IsZoomed(hwnd);
+#endif
+  if (saveVisibleNormalRect && GetWindowRect(hwnd, &rect)) {
     nativeTelepromptSaveNormalRect(slot, rect);
   }
   DestroyWindow(hwnd);
@@ -65708,6 +65953,16 @@ static void nativeCloseTelepromptWindow(
 static void nativeToggleTelepromptWindow(int slot)
 {
   if (nativeTelepromptWindowIsOpen(slot)) {
+#ifdef _WIN32
+    HWND hwnd =
+      g_nativeTelepromptWindows[nativeTelepromptIndex(slot)].hwnd;
+    if (hwnd && IsIconic(hwnd)) {
+      ShowWindow(hwnd, SW_RESTORE);
+      SetForegroundWindow(hwnd);
+      SetFocus(hwnd);
+      return;
+    }
+#endif
     nativeCloseTelepromptWindow(slot);
   } else {
     nativeOpenTelepromptWindow(slot);
