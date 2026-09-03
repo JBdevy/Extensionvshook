@@ -167,6 +167,15 @@ void synchronizeTelepromptVideoWindow(
   if (!overlayWindow) return;
   [overlayWindow setIgnoresMouseEvents:NO];
   [overlayWindow setAcceptsMouseMovedEvents:YES];
+  const bool hasNormalTitlebar =
+    ([overlayWindow styleMask] & NSWindowStyleMaskTitled) != 0;
+  if (hasNormalTitlebar &&
+      [overlayWindow titlebarAppearsTransparent]) {
+    // Somente o client precisa revelar a camada de video. A barra normal nao
+    // pode herdar a transparencia do backing da janela nem variar de cor com
+    // os frames que passam por baixo dela.
+    [overlayWindow setTitlebarAppearsTransparent:NO];
+  }
   NSWindow* currentParent =
     [presentation.videoWindow parentWindow];
   if (currentParent != overlayWindow) {
