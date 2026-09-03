@@ -37049,9 +37049,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
       RECT rowBodyRect = rowRect;
       rowBodyRect.left = std::min(rowBodyRect.right,
         rowBodyRect.left + indexColumnW);
+      const bool revealListBackgroundImage =
+        nativeUiListPanelBackgroundIsImage(visualPrefs) &&
+        !row.block && !isDraggingSource && !isSelected &&
+        !isLiveExecuted && !stateBackgroundApplied;
       // A intensidade maior fica reservada aos estados do transporte:
       // musica tocando ou musica na fila. Os demais fundos sao discretos.
-      if (stateBackgroundApplied) {
+      if (revealListBackgroundImage) {
+        // No preset Laranja PNG, músicas em estado normal não recebem uma
+        // camada opaca: a arte do painel permanece visível. As linhas de
+        // bloco e os estados funcionais continuam com o desenho existente.
+      } else if (stateBackgroundApplied) {
         nativeAppActiveFillVerticalGradient(
           dc, rowBodyRect, rowFill);
       } else {
@@ -51784,7 +51792,13 @@ static void nativeHookControllerPaintSongs(
         g_nativeMainListDrag.sourceIndex == rowIndex));
     if (draggingSource) rowFill = RGB(122, 51, 219);
     const bool strongRowGradient = playing || queued;
-    if (strongRowGradient) {
+    const bool revealListBackgroundImage =
+      nativeUiListPanelBackgroundIsImage(visualPrefs) &&
+      !row.block && !playing && !queued && !selected &&
+      !liveExecuted && !draggingSource;
+    if (revealListBackgroundImage) {
+      // Mantém transparente somente a música neutra para revelar o PNG.
+    } else if (strongRowGradient) {
       nativeAppActiveFillVerticalGradient(dc, rowRect, rowFill);
     } else {
       nativeAppActiveFillSubtleVerticalGradient(dc, rowRect, rowFill);
