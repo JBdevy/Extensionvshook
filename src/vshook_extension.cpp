@@ -1779,6 +1779,7 @@ static void nativeCloseTelepromptWindow(
   int slot,
   bool clearRequestedState = true);
 static void nativeToggleTelepromptWindow(int slot);
+static void nativeTelepromptToggleFullscreen(int slot);
 static void nativeCloseAllTelepromptWindows();
 static void nativeRestoreTelepromptWindowsIfRequested();
 static void nativeOpenTelepromptSettings();
@@ -60167,6 +60168,7 @@ struct NativeTelepromptRenderState {
 static NativeTelepromptWindowState g_nativeTelepromptWindows[2] = {
   {nullptr, 1}, {nullptr, 2}
 };
+
 #ifdef __APPLE__
 static std::atomic<bool>
   g_nativeTelepromptCursorPollPending[2]{{false}, {false}};
@@ -65394,10 +65396,14 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
         hwnd);
       return 0;
     case kNativeVideoPollMessage:
+      nativeTelepromptPrimeVideoDecoder(hwnd, slot);
+      // Mantem o pulso marcado como pendente durante toda a apresentacao.
+      // Se o decoder concluir outro quadro neste intervalo, ele e absorvido
+      // pelo timer seguinte em vez de criar uma cadeia infinita de mensagens
+      // que impede Esc e cliques de chegarem durante o Play.
       g_nativeTelepromptVideoPollPulses[
         nativeTelepromptIndex(slot)].messagePending.store(
           false, std::memory_order_release);
-      nativeTelepromptPrimeVideoDecoder(hwnd, slot);
       return 0;
 #ifdef __APPLE__
     case kNativeTelepromptCursorPollMessage:
@@ -66564,9 +66570,9 @@ static LRESULT CALLBACK nativeVideoWndProc(
       nativeStartVideoPollPulse(g_nativeVideoPollPulse, hwnd);
       return 0;
     case kNativeVideoPollMessage:
+      nativeVideoPrimeDecoder(hwnd);
       g_nativeVideoPollPulse.messagePending.store(
         false, std::memory_order_release);
-      nativeVideoPrimeDecoder(hwnd);
       return 0;
     case WM_ERASEBKGND:
       return 1;
@@ -66603,7 +66609,7 @@ static LRESULT CALLBACK nativeVideoWndProc(
 #ifdef _WIN32
       return window.fullscreen
         ? HTCLIENT
-        : DefWindowProc(hwnd, message, wParam, lParam);
+        : DefWindowProcW(hwnd, message, wParam, lParam);
 #else
       return window.fullscreen
         ? HTCLIENT : nativeTelepromptResizeHitTest(hwnd, lParam);
@@ -66819,7 +66825,13 @@ static LRESULT CALLBACK nativeVideoWndProc(
     default:
       break;
   }
+#ifdef _WIN32
+  // Esta classe e Unicode. A variante ANSI interpreta "VS Hook - Video" em
+  // UTF-16 como "V\0" e deixa apenas a primeira letra na barra de titulo.
+  return DefWindowProcW(hwnd, message, wParam, lParam);
+#else
   return DefWindowProc(hwnd, message, wParam, lParam);
+#endif
 }
 
 static bool nativeVideoWindowIsOpen()
@@ -66861,6 +66873,7 @@ static bool nativeOpenVideoWindow()
     savedX, savedY, savedW, savedH,
     GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr,
     nullptr, g_pluginInstance, nullptr);
+  if (hwnd) SetWindowTextW(hwnd, L"VS Hook - Vídeo");
 #else
   const char* resizableWindow = reinterpret_cast<const char*>(
     static_cast<INT_PTR>(0x400001));

@@ -14,6 +14,51 @@
 #include <cstddef>
 #include <map>
 
+// A superficie de video fica atras do overlay SWELL. Se o AppKit, durante uma
+// troca de level/tela cheia, entregar o hit a ela em vez do overlay, o evento
+// deve continuar pertencendo ao Teleprompt e jamais atravessar ao REAPER.
+@interface VSHookTelepromptVideoWindow : NSWindow {
+@public
+  NSWindow* vshOverlayWindow;
+}
+@end
+
+@implementation VSHookTelepromptVideoWindow
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeMainWindow { return NO; }
+- (BOOL)acceptsFirstMouse:(NSEvent*)event
+{
+  (void)event;
+  return YES;
+}
+- (void)sendEvent:(NSEvent*)event
+{
+  const NSEventType type = [event type];
+  const bool isMouseEvent =
+    type == NSEventTypeLeftMouseDown ||
+    type == NSEventTypeLeftMouseUp ||
+    type == NSEventTypeLeftMouseDragged ||
+    type == NSEventTypeRightMouseDown ||
+    type == NSEventTypeRightMouseUp ||
+    type == NSEventTypeRightMouseDragged ||
+    type == NSEventTypeOtherMouseDown ||
+    type == NSEventTypeOtherMouseUp ||
+    type == NSEventTypeOtherMouseDragged ||
+    type == NSEventTypeMouseMoved ||
+    type == NSEventTypeScrollWheel;
+  if (isMouseEvent && vshOverlayWindow) {
+    if (type == NSEventTypeLeftMouseDown ||
+        type == NSEventTypeRightMouseDown ||
+        type == NSEventTypeOtherMouseDown) {
+      [vshOverlayWindow makeKeyWindow];
+    }
+    [vshOverlayWindow sendEvent:event];
+    return;
+  }
+  [super sendEvent:event];
+}
+@end
+
 namespace {
 
 struct SavedWindowState {
@@ -120,6 +165,8 @@ void synchronizeTelepromptVideoWindow(
   if (!presentation.videoWindow || !overlayView) return;
   NSWindow* overlayWindow = [overlayView window];
   if (!overlayWindow) return;
+  [overlayWindow setIgnoresMouseEvents:NO];
+  [overlayWindow setAcceptsMouseMovedEvents:YES];
   NSWindow* currentParent =
     [presentation.videoWindow parentWindow];
   if (currentParent != overlayWindow) {
@@ -220,7 +267,7 @@ ensureTelepromptVideoPresentation(void* swellWindow)
     const NSRect screenFrame =
       telepromptViewFrameOnScreen(overlayView);
     NSScreen* screen = [overlayWindow screen];
-    presentation.videoWindow = [[NSWindow alloc]
+    presentation.videoWindow = [[VSHookTelepromptVideoWindow alloc]
       initWithContentRect:screenFrame
                 styleMask:NSWindowStyleMaskBorderless
                   backing:NSBackingStoreBuffered
@@ -237,7 +284,12 @@ ensureTelepromptVideoPresentation(void* swellWindow)
     [presentation.videoWindow
       setBackgroundColor:[NSColor blackColor]];
     [presentation.videoWindow setHasShadow:NO];
-    [presentation.videoWindow setIgnoresMouseEvents:YES];
+    ((VSHookTelepromptVideoWindow*)presentation.videoWindow)
+      ->vshOverlayWindow = overlayWindow;
+    // A janela de baixo funciona como escudo e encaminha qualquer evento ao
+    // overlay. ignoresMouseEvents faria o clique cair no grid do REAPER caso
+    // a ordenacao variasse por um ciclo durante fullscreen/resize.
+    [presentation.videoWindow setIgnoresMouseEvents:NO];
     [presentation.videoWindow setAnimationBehavior:
       NSWindowAnimationBehaviorNone];
     [presentation.videoWindow setHidesOnDeactivate:
@@ -304,6 +356,8 @@ NSInteger telepromptFullscreenLevel()
 void maintainFullscreenWindow(NSWindow* window)
 {
   if (!window) return;
+  [window setIgnoresMouseEvents:NO];
+  [window setAcceptsMouseMovedEvents:YES];
   const NSInteger requiredLevel = telepromptFullscreenLevel();
   if ([window level] != requiredLevel) {
     [window setLevel:requiredLevel];
