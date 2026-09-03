@@ -6,6 +6,7 @@
 #include "license_validator.h"
 #include "native_static_image_decoder.h"
 #include "native_video_decoder.h"
+#include "vshook_splash_pixels.h"
 #include "wdlutf8.h"
 #include <cstdlib>
 #include <cstring>
@@ -862,6 +863,7 @@ static const NativeAppActivePanelModel::Row*
 nativeUiCurrentMainSelectedSongRow();
 
 static HWND g_nativeAppActivePanelHwnd = nullptr;
+static std::chrono::steady_clock::time_point g_nativeAppActiveSplashUntil{};
 static HWND g_nativeShortcutNoticeHwnd = nullptr;
 static RECT g_nativeShortcutNoticeCloseRect{0, 0, 0, 0};
 static RECT g_nativeShortcutNoticeSuppressRect{0, 0, 0, 0};
@@ -34910,6 +34912,36 @@ static void nativePaintAppActivePanel(HWND hwnd)
   nativeAppActiveFillRoundRect(dc, client,
     interfaceBackground, interfaceBackground, 8);
 
+  // A abertura do VS Hook mostra a identidade do produto por um segundo.
+  // Os pixels ficam incorporados no binario para funcionar igualmente no
+  // Windows e no macOS, sem depender de arquivos instalados ao lado do plugin.
+  if (std::chrono::steady_clock::now() < g_nativeAppActiveSplashUntil) {
+    nativeAppActiveFillRect(dc, client, RGB(3, 3, 4));
+    const int availableW = std::max(1, width - 40);
+    const int availableH = std::max(1, height - 40);
+    const int side = std::max(1, std::min(
+      std::min(availableW, availableH), 360));
+    const int left = client.left + (width - side) / 2;
+    const int top = client.top + (height - side) / 2;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = vshook_splash::kWidth;
+    info.bmiHeader.biHeight = -vshook_splash::kHeight;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    StretchDIBits(dc, left, top, side, side,
+      0, 0, vshook_splash::kWidth, vshook_splash::kHeight,
+      vshook_splash::kBgra, &info, DIB_RGB_COLORS, SRCCOPY);
+    if (dc != paintDc) {
+      g_nativeUiBackBufferHasFrame = true;
+      BitBlt(paintDc, client.left, client.top,
+        width, height, dc, client.left, client.top, SRCCOPY);
+    }
+    EndPaint(hwnd, &ps);
+    return;
+  }
+
   // Geometria-base literal do Lua publico em cada plataforma.
   const int pad = 5;
   const int statusGap = 4;
@@ -56841,6 +56873,12 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     g_nativeUiLastInteractionAt =
       std::chrono::steady_clock::now();
   }
+  if (std::chrono::steady_clock::now() < g_nativeAppActiveSplashUntil &&
+      (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
+       message == WM_RBUTTONDOWN || message == WM_MOUSEWHEEL ||
+       message == WM_KEYDOWN || message == WM_CHAR)) {
+    return 0;
+  }
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
@@ -56873,6 +56911,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       return 0;
     case WM_TIMER:
       if (wParam == kNativeUiFrameTimerId) {
+        const auto now = std::chrono::steady_clock::now();
         nativeUiAdvanceNavigationRepeat(hwnd);
         const bool selectionReleasedForEditing =
           nativeUiReleaseMusicSelectionForArrangeEditing();
@@ -56901,12 +56940,23 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           previousBatteryCharging != g_nativeUiBatteryCharging;
         const bool timedRefresh =
           nativeUiNeedsTimedVisualRefresh();
+        const bool splashWasScheduled =
+          g_nativeAppActiveSplashUntil.time_since_epoch().count() != 0;
+        const bool splashActive =
+          splashWasScheduled && now < g_nativeAppActiveSplashUntil;
+        const bool splashFinished =
+          splashWasScheduled && !splashActive;
+        if (splashFinished) {
+          g_nativeAppActiveSplashUntil =
+            std::chrono::steady_clock::time_point{};
+        }
         if (IsWindowVisible(hwnd) &&
             (scrollChanged || dragScrollChanged ||
              searchQueryCommitted ||
               navigationCommitted || selectionReleasedForEditing ||
               localClockChanged ||
-             batteryChanged || timedRefresh)) {
+             batteryChanged || timedRefresh || splashActive ||
+             splashFinished)) {
           InvalidateRect(hwnd, nullptr, FALSE);
           // A animação da lista não depende da fila normal de WM_PAINT:
           // no Win32 e no SWELL do macOS, cada passo continua sendo
@@ -59376,6 +59426,8 @@ static bool nativeOpenAppActivePanel()
 
   g_nativeAppActivePanelHwnd = hwnd;
   g_nativeAppActivePanelClosing = false;
+  g_nativeAppActiveSplashUntil =
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
   // Nao execute evento MIDI antigo ao reabrir a interface e nao preserve
   // latch de uma tecla cuja soltura ocorreu enquanto o painel estava fechado.
   nativeUiResetMidiRuntimeState(true);
