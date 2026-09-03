@@ -7,6 +7,7 @@
 #include "native_static_image_decoder.h"
 #include "native_video_decoder.h"
 #include "vshook_splash_pixels.h"
+#include "vshook_bg_pixels.h"
 #include "wdlutf8.h"
 #include <cstdlib>
 #include <cstring>
@@ -21286,6 +21287,7 @@ static COLORREF nativeUiInterfaceBackgroundColor(
   const std::string mode = nativeLower(
     nativeUiVisualPref(values,
       "interface_bg_mode", "medium"));
+  if (mode == "laranja_png") return RGB(28, 17, 10);
   if (mode == "black") return RGB(10, 13, 17);
   if (mode == "dark" || mode == "medium" || mode == "light" ||
       mode == "gray" || mode == "grey") {
@@ -21308,6 +21310,7 @@ static COLORREF nativeUiListPanelBackgroundColor(
   const std::string mode = nativeLower(
     nativeUiVisualPref(values,
       "list_panel_bg_mode", "default"));
+  if (mode == "laranja_png") return RGB(28, 17, 10);
   if (mode == "black") return RGB(10, 13, 17);
   if (mode == "dark" || mode == "medium" || mode == "light" ||
       mode == "gray" || mode == "grey") {
@@ -21322,6 +21325,50 @@ static COLORREF nativeUiListPanelBackgroundColor(
   if (mode == "teal") return RGB(8, 41, 43);
   if (mode == "brown") return RGB(51, 31, 13);
   return kNativeUiUnifiedDarkGray;
+}
+
+static bool nativeUiInterfaceBackgroundIsImage(
+  const std::map<std::string, std::string>& values)
+{
+  return nativeLower(nativeUiVisualPref(values,
+    "interface_bg_mode", "medium")) == "laranja_png";
+}
+
+static bool nativeUiListPanelBackgroundIsImage(
+  const std::map<std::string, std::string>& values)
+{
+  return nativeLower(nativeUiVisualPref(values,
+    "list_panel_bg_mode", "default")) == "laranja_png";
+}
+
+// Estica fundo.png (embutido em vshook_bg) para cobrir rect. Igual a splash:
+// no Windows via GDI, no macOS via helper Cocoa, sem depender das APIs de DIB
+// que o SWELL nao publica.
+static void nativeUiPaintBackgroundImage(HDC dc, const RECT& rect)
+{
+  const int w = rect.right - rect.left;
+  const int h = rect.bottom - rect.top;
+  if (!dc || w <= 0 || h <= 0) return;
+#ifdef _WIN32
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  info.bmiHeader.biWidth = vshook_bg::kWidth;
+  info.bmiHeader.biHeight = -vshook_bg::kHeight;
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+  const int oldStretchMode = SetStretchBltMode(dc, HALFTONE);
+  StretchDIBits(dc, rect.left, rect.top, w, h,
+    0, 0, vshook_bg::kWidth, vshook_bg::kHeight,
+    vshook_bg::kBgra, &info, DIB_RGB_COLORS, SRCCOPY);
+  if (oldStretchMode != 0) SetStretchBltMode(dc, oldStretchMode);
+#else
+  VSHookMacDrawTelepromptBitmap(
+    dc, vshook_bg::kBgra,
+    vshook_bg::kWidth, vshook_bg::kHeight,
+    vshook_bg::kWidth, false, false,
+    rect.left, rect.top, w, h);
+#endif
 }
 
 static COLORREF nativeUiTransportFillColor(
@@ -34913,6 +34960,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
   nativeAppActiveFillRect(dc, client, RGB(5, 5, 6));
   nativeAppActiveFillRoundRect(dc, client,
     interfaceBackground, interfaceBackground, 8);
+  if (nativeUiInterfaceBackgroundIsImage(paintVisualPrefs)) {
+    nativeUiPaintBackgroundImage(dc, client);
+  }
 
   // A abertura do VS Hook mostra a identidade do produto por um segundo.
   // Os pixels ficam incorporados no binario para funcionar igualmente no
@@ -36342,6 +36392,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
     nativeUiListPanelBackgroundColor(visualPrefs);
   nativeAppActiveFillSubtleVerticalGradient(dc, listRect,
     listPanelFill);
+  if (nativeUiListPanelBackgroundIsImage(visualPrefs)) {
+    nativeUiPaintBackgroundImage(dc, listRect);
+    nativeAppActiveDrawBlackShadow(dc, listRect);
+  }
   nativeAppActiveStrokeRoundRect(dc, listRect,
     RGB(74, 82, 89), 0);
 
@@ -42215,7 +42269,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
           {"slate", "Grafite azulado"}, {"navy", "Azul marinho"},
           {"blue", "Azul escuro"}, {"purple", "Roxo escuro"},
           {"wine", "Vinho escuro"}, {"green", "Verde escuro"},
-          {"teal", "Petroleo"}, {"brown", "Marrom escuro"}
+          {"teal", "Petroleo"}, {"brown", "Marrom escuro"},
+          {"laranja_png", "Laranja PNG"}
         };
         std::string selectedListPanel = nativeLower(
           nativeUiVisualRawValue(visual, "list_panel_bg_mode"));
@@ -42371,7 +42426,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
           {"slate", "Grafite azulado"}, {"navy", "Azul marinho"},
           {"blue", "Azul escuro"}, {"purple", "Roxo escuro"},
           {"wine", "Vinho escuro"}, {"green", "Verde escuro"},
-          {"teal", "Petroleo"}, {"brown", "Marrom escuro"}
+          {"teal", "Petroleo"}, {"brown", "Marrom escuro"},
+          {"laranja_png", "Laranja PNG"}
         };
         std::string selectedInterface = nativeLower(
           nativeUiVisualRawValue(visual, "interface_bg_mode"));
@@ -51566,6 +51622,10 @@ static void nativeHookControllerPaintSongs(
     std::max<LONG>(controlsTop, body.bottom - footerSpace)};
   nativeAppActiveFillSubtleVerticalGradient(dc, listRect,
     nativeUiListPanelBackgroundColor(visualPrefs));
+  if (nativeUiListPanelBackgroundIsImage(visualPrefs)) {
+    nativeUiPaintBackgroundImage(dc, listRect);
+    nativeAppActiveDrawBlackShadow(dc, listRect);
+  }
   nativeAppActiveStrokeRoundRect(dc, listRect,
     RGB(74, 82, 89), 0);
   RECT header{listRect.left, listRect.top, listRect.right,
@@ -52522,6 +52582,9 @@ static void nativeHookControllerPaint(HWND hwnd)
   nativeAppActiveFillRect(dc, client, RGB(5, 5, 6));
   nativeAppActiveFillRoundRect(dc, client,
     interfaceBackground, interfaceBackground, 8);
+  if (nativeUiInterfaceBackgroundIsImage(visualPrefs)) {
+    nativeUiPaintBackgroundImage(dc, client);
+  }
   g_nativeHookControllerAdjustHits.clear();
   const int padding = 5;
 #ifdef __APPLE__
