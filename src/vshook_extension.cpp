@@ -276,6 +276,7 @@ using MIDI_GetRecentInputEvent_t =
 using GetMIDIInputName_t = bool (*)(int, char*, int);
 using GetNumMIDIOutputs_t = int (*)();
 using GetMIDIOutputName_t = bool (*)(int, char*, int);
+using GetMidiOutput_t = midi_Output* (*)(int);
 using StuffMIDIMessage_t = void (*)(int, int, int, int);
 using CreateMIDIOutput_t = midi_Output* (*)(int, bool, int*);
 using format_timestr_pos_t = void (*)(double, char*, int, int);
@@ -463,6 +464,7 @@ static MIDI_GetRecentInputEvent_t
 static GetMIDIInputName_t GetMIDIInputName_ptr = nullptr;
 static GetNumMIDIOutputs_t GetNumMIDIOutputs_ptr = nullptr;
 static GetMIDIOutputName_t GetMIDIOutputName_ptr = nullptr;
+static GetMidiOutput_t GetMidiOutput_ptr = nullptr;
 static StuffMIDIMessage_t StuffMIDIMessage_ptr = nullptr;
 static CreateMIDIOutput_t CreateMIDIOutput_ptr = nullptr;
 
@@ -76343,8 +76345,7 @@ static bool nativeProjectHasTimecodeTrack(ReaProject* project)
 static bool nativeSendMtcFullFrameLocateOnMainThread(
   ReaProject* project, double position)
 {
-  if (!project || !CreateMIDIOutput_ptr ||
-      !nativeMtcFindOutputOnMainThread(false)) {
+  if (!project || !nativeMtcFindOutputOnMainThread(false)) {
     return false;
   }
 
@@ -76355,8 +76356,19 @@ static bool nativeSendMtcFullFrameLocateOnMainThread(
   const NativeMtcTimeFields fields = nativeMtcTimeFields(
     position, frameRate, dropFrame);
 
-  midi_Output* output = CreateMIDIOutput_ptr(
-    g_nativeMtcBridge.outputDevice, false, nullptr);
+  // A pista TIMECODE normalmente ja mantem essa porta aberta pelo proprio
+  // REAPER. CreateMIDIOutput nao e confiavel para dispositivos abertos nas
+  // preferencias; reutilize a instancia ativa para o Full Frame chegar pelo
+  // mesmo caminho dos Quarter Frames do Play.
+  midi_Output* output = GetMidiOutput_ptr
+    ? GetMidiOutput_ptr(g_nativeMtcBridge.outputDevice)
+    : nullptr;
+  bool ownsOutput = false;
+  if (!output && CreateMIDIOutput_ptr) {
+    output = CreateMIDIOutput_ptr(
+      g_nativeMtcBridge.outputDevice, false, nullptr);
+    ownsOutput = output != nullptr;
+  }
   if (!output) return false;
 
   // Universal Real-Time SysEx MTC Full Frame. Ele informa somente a posicao;
@@ -76380,7 +76392,7 @@ static bool nativeSendMtcFullFrameLocateOnMainThread(
   };
   std::memcpy(event.message, message, sizeof(message));
   output->SendMsg(reinterpret_cast<MIDI_event_t*>(&event), -1);
-  output->Destroy();
+  if (ownsOutput) output->Destroy();
   return true;
 }
 
@@ -78700,6 +78712,9 @@ static bool loadApi(reaper_plugin_info_t* rec)
   GetMIDIOutputName_ptr =
     reinterpret_cast<GetMIDIOutputName_t>(
       rec->GetFunc("GetMIDIOutputName"));
+  GetMidiOutput_ptr =
+    reinterpret_cast<GetMidiOutput_t>(
+      rec->GetFunc("GetMidiOutput"));
   StuffMIDIMessage_ptr =
     reinterpret_cast<StuffMIDIMessage_t>(
       rec->GetFunc("StuffMIDIMessage"));
