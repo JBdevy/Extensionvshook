@@ -7,7 +7,7 @@
 #include "native_static_image_decoder.h"
 #include "native_video_decoder.h"
 #include "vshook_splash_pixels.h"
-#include "vshook_bg_pixels.h"
+#include "vshook_background_assets.h"
 #include "wdlutf8.h"
 #include <cstdlib>
 #include <cstring>
@@ -905,6 +905,9 @@ static HFONT g_nativeUiPopupFont = nullptr;
 static std::map<std::string, HFONT> g_nativeUiConfiguredFonts;
 static std::map<std::string, HFONT> g_nativeUiCompactBlockFonts;
 static HFONT g_nativeUiButtonPaintFont = nullptr;
+static std::mutex g_nativeUiEmbeddedBackgroundMutex;
+static std::map<std::string, std::string>
+  g_nativeUiEmbeddedBackgroundPaths;
 static std::unique_ptr<WDL_WinMemBitmap> g_nativeUiBackBuffer;
 static int g_nativeUiBackBufferWidth = 0;
 static int g_nativeUiBackBufferHeight = 0;
@@ -21288,6 +21291,11 @@ static COLORREF nativeUiInterfaceBackgroundColor(
     nativeUiVisualPref(values,
       "interface_bg_mode", "medium"));
   if (mode == "laranja_png") return RGB(28, 17, 10);
+  if (mode == "cinza_escuro_png") return RGB(16, 18, 22);
+  if (mode == "azul_png") return RGB(8, 20, 43);
+  if (mode == "verde_png") return RGB(7, 31, 22);
+  if (mode == "futuristico_1_png" ||
+      mode == "futuristico_2_png") return RGB(6, 12, 25);
   if (mode == "black") return RGB(10, 13, 17);
   if (mode == "dark" || mode == "medium" || mode == "light" ||
       mode == "gray" || mode == "grey") {
@@ -21311,6 +21319,11 @@ static COLORREF nativeUiListPanelBackgroundColor(
     nativeUiVisualPref(values,
       "list_panel_bg_mode", "default"));
   if (mode == "laranja_png") return RGB(28, 17, 10);
+  if (mode == "cinza_escuro_png") return RGB(16, 18, 22);
+  if (mode == "azul_png") return RGB(8, 20, 43);
+  if (mode == "verde_png") return RGB(7, 31, 22);
+  if (mode == "futuristico_1_png" ||
+      mode == "futuristico_2_png") return RGB(6, 12, 25);
   if (mode == "black") return RGB(10, 13, 17);
   if (mode == "dark" || mode == "medium" || mode == "light" ||
       mode == "gray" || mode == "grey") {
@@ -21327,12 +21340,26 @@ static COLORREF nativeUiListPanelBackgroundColor(
   return kNativeUiUnifiedDarkGray;
 }
 
+static const vshook_background_assets::EmbeddedBackground*
+nativeUiEmbeddedBackground(const std::string& rawMode)
+{
+  const std::string mode = nativeLower(nativeTrim(rawMode));
+  for (std::size_t index = 0;
+       index < vshook_background_assets::kBackgroundCount;
+       ++index) {
+    const auto& candidate =
+      vshook_background_assets::kBackgrounds[index];
+    if (mode == candidate.mode) return &candidate;
+  }
+  return nullptr;
+}
+
 static bool nativeUiInterfaceBackgroundIsImage(
   const std::map<std::string, std::string>& values)
 {
   const std::string mode = nativeLower(nativeUiVisualPref(values,
     "interface_bg_mode", "medium"));
-  return mode == "laranja_png" || mode == "custom_image";
+  return nativeUiEmbeddedBackground(mode) != nullptr;
 }
 
 static bool nativeUiListPanelBackgroundIsImage(
@@ -21340,35 +21367,113 @@ static bool nativeUiListPanelBackgroundIsImage(
 {
   const std::string mode = nativeLower(nativeUiVisualPref(values,
     "list_panel_bg_mode", "default"));
-  return mode == "laranja_png" || mode == "custom_image";
+  return nativeUiEmbeddedBackground(mode) != nullptr;
 }
 
-static std::string nativeUiCustomBackgroundDirectory()
+static std::FILE* nativeProjectSyncOpenFile(
+  const std::string& path,
+  const char* mode);
+static bool nativeProjectSyncEnsureDirectory(
+  const std::string& rawPath,
+  std::string& errorOut);
+
+static bool nativeUiDecodeEmbeddedBase64(
+  const char* encoded,
+  std::size_t encodedSize,
+  std::vector<std::uint8_t>& decoded)
 {
-  const std::string resource = normalizeSlashes(
-    GetResourcePath_ptr ? GetResourcePath_ptr() : "");
-  return resource.empty()
-    ? std::string()
-    : joinPath(resource, "Data/VS Hook/fundos_personalizados");
+  decoded.clear();
+  if (!encoded || encodedSize == 0) return false;
+  try {
+    decoded.reserve((encodedSize / 4u) * 3u);
+    unsigned int accumulator = 0;
+    int bits = -8;
+    for (std::size_t index = 0; index < encodedSize; ++index) {
+      const unsigned char character =
+        static_cast<unsigned char>(encoded[index]);
+      if (character == '=') break;
+      int value = -1;
+      if (character >= 'A' && character <= 'Z') value = character - 'A';
+      else if (character >= 'a' && character <= 'z') value = character - 'a' + 26;
+      else if (character >= '0' && character <= '9') value = character - '0' + 52;
+      else if (character == '+') value = 62;
+      else if (character == '/') value = 63;
+      else return false;
+      accumulator = (accumulator << 6) |
+        static_cast<unsigned int>(value);
+      bits += 6;
+      if (bits >= 0) {
+        decoded.push_back(static_cast<std::uint8_t>(
+          (accumulator >> bits) & 0xffu));
+        bits -= 8;
+      }
+    }
+  } catch (...) {
+    decoded.clear();
+    return false;
+  }
+  return !decoded.empty();
 }
 
-static std::string nativeUiCustomBackgroundPath(
-  const std::map<std::string, std::string>& values,
-  const std::string& preferenceKey)
+static bool nativeUiFileHasExpectedSize(
+  const std::string& path,
+  std::size_t expectedSize)
 {
-  const std::string directory = nativeUiCustomBackgroundDirectory();
-  if (directory.empty()) return {};
-  const int preset = nativeUiVisualPresetIndex(values);
-  const std::string target = preferenceKey == "list_panel_bg_mode"
-    ? "lista" : "interface";
-  return joinPath(directory, target + "_preset_" +
-    std::to_string(preset) + ".vshookimage");
+  std::FILE* file = nativeProjectSyncOpenFile(path, "rb");
+  if (!file) return false;
+  const bool seeked = std::fseek(file, 0, SEEK_END) == 0;
+  const long size = seeked ? std::ftell(file) : -1;
+  std::fclose(file);
+  return size >= 0 &&
+    static_cast<std::size_t>(size) == expectedSize;
 }
 
-// Estica uma imagem para cobrir rect, do mesmo modo que o fundo.png atual:
-// no Windows via GDI, no macOS via helper Cocoa, sem depender das APIs de DIB
-// que o SWELL nao publica. Imagens escolhidas pelo usuario usam o decoder
-// nativo compartilhado com o Teleprompt e ficam em cache depois do 1o paint.
+static std::string nativeUiMaterializeEmbeddedBackground(
+  const std::string& mode)
+{
+  const auto* asset = nativeUiEmbeddedBackground(mode);
+  if (!asset || !GetResourcePath_ptr) return {};
+
+  std::lock_guard<std::mutex> lock(
+    g_nativeUiEmbeddedBackgroundMutex);
+  const auto cached =
+    g_nativeUiEmbeddedBackgroundPaths.find(asset->mode);
+  if (cached != g_nativeUiEmbeddedBackgroundPaths.end() &&
+      nativeUiFileHasExpectedSize(
+        cached->second, asset->binarySize)) {
+    return cached->second;
+  }
+
+  const std::string directory = joinPath(
+    normalizeSlashes(GetResourcePath_ptr()),
+    "Data/VS Hook/fundos_embutidos");
+  const std::string path = joinPath(directory, asset->fileName);
+  std::string error;
+  if (!nativeProjectSyncEnsureDirectory(directory, error)) return {};
+  if (!nativeUiFileHasExpectedSize(path, asset->binarySize)) {
+    std::vector<std::uint8_t> bytes;
+    if (!nativeUiDecodeEmbeddedBase64(
+          asset->base64, asset->base64Size, bytes) ||
+        bytes.size() != asset->binarySize) {
+      return {};
+    }
+    std::FILE* file = nativeProjectSyncOpenFile(path, "wb");
+    if (!file) return {};
+    const bool written = std::fwrite(
+      bytes.data(), 1, bytes.size(), file) == bytes.size();
+    const bool closed = std::fclose(file) == 0;
+    if (!written || !closed ||
+        !nativeUiFileHasExpectedSize(path, asset->binarySize)) {
+      return {};
+    }
+  }
+  g_nativeUiEmbeddedBackgroundPaths[asset->mode] = path;
+  return path;
+}
+
+// Desenha como CSS background-size: cover. A imagem conserva sua proporcao,
+// preenche toda a area e tem somente o excesso centralizado cortado. O decoder
+// mantem os PNGs embutidos em resolucao original e em cache depois do 1o paint.
 static bool nativeUiPaintBackgroundImage(
   HDC dc,
   const RECT& rect,
@@ -21382,25 +21487,27 @@ static bool nativeUiPaintBackgroundImage(
     values, preferenceKey,
     preferenceKey == "list_panel_bg_mode" ? "default" : "medium"));
 
-  const std::uint8_t* pixels = vshook_bg::kBgra;
-  int sourceWidth = vshook_bg::kWidth;
-  int sourceHeight = vshook_bg::kHeight;
-  int sourceStride = sourceWidth * 4;
-  vshook_static_image::DecodedImage customImage;
-  if (mode == "custom_image") {
-    const std::string path = nativeUiCustomBackgroundPath(
-      values, preferenceKey);
-    if (path.empty() ||
-        !vshook_static_image::decodeFile(path, customImage)) {
-      return false;
-    }
-    pixels = customImage.pixels;
-    sourceWidth = customImage.width;
-    sourceHeight = customImage.height;
-    sourceStride = customImage.stride;
-  } else if (mode != "laranja_png") {
-    return false;
-  }
+  const std::string path =
+    nativeUiMaterializeEmbeddedBackground(mode);
+  vshook_static_image::DecodedImage image;
+  if (path.empty() ||
+      !vshook_static_image::decodeFile(path, image)) return false;
+
+  const int sourceWidth = image.width;
+  const int sourceHeight = image.height;
+  const int sourceStride = image.stride;
+  const std::uint8_t* pixels = image.pixels;
+  const double scale = std::max(
+    static_cast<double>(w) / sourceWidth,
+    static_cast<double>(h) / sourceHeight);
+  const int drawWidth = std::max(w,
+    static_cast<int>(std::ceil(sourceWidth * scale)));
+  const int drawHeight = std::max(h,
+    static_cast<int>(std::ceil(sourceHeight * scale)));
+  const int drawLeft = rect.left + (w - drawWidth) / 2;
+  const int drawTop = rect.top + (h - drawHeight) / 2;
+  const NativeUiClipState clip = nativeUiBeginClipRect(dc, rect);
+  bool painted = false;
 #ifdef _WIN32
   BITMAPINFO info{};
   info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -21410,18 +21517,20 @@ static bool nativeUiPaintBackgroundImage(
   info.bmiHeader.biBitCount = 32;
   info.bmiHeader.biCompression = BI_RGB;
   const int oldStretchMode = SetStretchBltMode(dc, HALFTONE);
-  StretchDIBits(dc, rect.left, rect.top, w, h,
+  painted = StretchDIBits(dc,
+    drawLeft, drawTop, drawWidth, drawHeight,
     0, 0, sourceWidth, sourceHeight,
-    pixels, &info, DIB_RGB_COLORS, SRCCOPY);
+    pixels, &info, DIB_RGB_COLORS, SRCCOPY) != GDI_ERROR;
   if (oldStretchMode != 0) SetStretchBltMode(dc, oldStretchMode);
 #else
-  VSHookMacDrawTelepromptBitmap(
+  painted = VSHookMacDrawTelepromptBitmap(
     dc, pixels,
     sourceWidth, sourceHeight,
     sourceStride / 4, false, false,
-    rect.left, rect.top, w, h);
+    drawLeft, drawTop, drawWidth, drawHeight);
 #endif
-  return true;
+  nativeUiEndClipRect(dc, clip);
+  return painted;
 }
 
 static COLORREF nativeUiTransportFillColor(
@@ -27005,122 +27114,6 @@ static bool nativeProjectSyncMoveFile(
   if (!replace && fileExists(destination)) return false;
   return std::rename(source.c_str(), destination.c_str()) == 0;
 #endif
-}
-
-static bool nativeUiSameFilePath(
-  const std::string& left,
-  const std::string& right)
-{
-  std::string normalizedLeft = normalizeSlashes(left);
-  std::string normalizedRight = normalizeSlashes(right);
-#ifdef _WIN32
-  normalizedLeft = nativeLower(normalizedLeft);
-  normalizedRight = nativeLower(normalizedRight);
-#endif
-  return normalizedLeft == normalizedRight;
-}
-
-static bool nativeUiCopyCustomBackgroundFile(
-  const std::string& source,
-  const std::string& destination,
-  std::string& errorOut)
-{
-  if (nativeUiSameFilePath(source, destination)) return true;
-  const std::string temporary = destination + ".tmp";
-  nativeProjectSyncRemoveOwnFile(temporary);
-#ifdef _WIN32
-  const std::wstring wideSource = utf8ToWide(source);
-  const std::wstring wideTemporary = utf8ToWide(temporary);
-  if (wideSource.empty() || wideTemporary.empty() ||
-      !CopyFileW(wideSource.c_str(), wideTemporary.c_str(), FALSE)) {
-    errorOut = "Nao foi possivel copiar a imagem escolhida.";
-    nativeProjectSyncRemoveOwnFile(temporary);
-    return false;
-  }
-#else
-  std::ifstream input(source, std::ios::binary);
-  std::ofstream output(temporary,
-    std::ios::binary | std::ios::trunc);
-  if (!input || !output) {
-    errorOut = "Nao foi possivel copiar a imagem escolhida.";
-    nativeProjectSyncRemoveOwnFile(temporary);
-    return false;
-  }
-  output << input.rdbuf();
-  output.flush();
-  if (input.bad() || !output) {
-    errorOut = "Falha durante a copia da imagem escolhida.";
-    input.close();
-    output.close();
-    nativeProjectSyncRemoveOwnFile(temporary);
-    return false;
-  }
-  input.close();
-  output.close();
-#endif
-  if (!nativeProjectSyncMoveFile(temporary, destination, true)) {
-    errorOut = "Nao foi possivel salvar a imagem no VS Hook.";
-    nativeProjectSyncRemoveOwnFile(temporary);
-    return false;
-  }
-  return true;
-}
-
-static void nativeUiChooseCustomBackgroundImage(
-  const std::string& preferenceKey)
-{
-  if (preferenceKey != "list_panel_bg_mode" &&
-      preferenceKey != "interface_bg_mode") {
-    return;
-  }
-  const auto visual = nativeUiReadVisualPrefs();
-  if (nativeUiVisualPresetIndex(visual) == 0) {
-    nativeUiShowTemporaryPopup("Escolha um preset", 1.2);
-    return;
-  }
-
-  char selected[8192] = "";
-  static const char filters[] =
-    "Imagens (*.png;*.jpg;*.jpeg;*.bmp;*.gif)\0"
-    "*.png;*.jpg;*.jpeg;*.bmp;*.gif\0"
-    "Todos os arquivos (*.*)\0*.*\0\0";
-  const std::string initialDirectory = nativeUiBackupDefaultDirectory();
-  if (!vshook_jsapi::browseForOpenFile(
-        "Escolher imagem de fundo",
-        initialDirectory.c_str(), "", filters,
-        selected, static_cast<int>(sizeof(selected)))) {
-    return;
-  }
-
-  vshook_static_image::DecodedImage selectedImage;
-  if (!vshook_static_image::decodeFile(selected, selectedImage)) {
-    nativeUiOpenMessage(
-      "A imagem escolhida nao pode ser aberta. Use PNG, JPG, BMP ou GIF.");
-    return;
-  }
-
-  const std::string directory = nativeUiCustomBackgroundDirectory();
-  const std::string destination = nativeUiCustomBackgroundPath(
-    visual, preferenceKey);
-  std::string error;
-  if (directory.empty() || destination.empty() ||
-      !nativeProjectSyncEnsureDirectory(directory, error) ||
-      !nativeUiCopyCustomBackgroundFile(selected, destination, error)) {
-    nativeUiOpenMessage(error.empty()
-      ? "Nao foi possivel salvar a imagem escolhida." : error);
-    return;
-  }
-
-  vshook_static_image::invalidate(destination);
-  vshook_static_image::DecodedImage savedImage;
-  if (!vshook_static_image::decodeFile(destination, savedImage)) {
-    nativeUiOpenMessage(
-      "A imagem foi copiada, mas nao pode ser carregada pelo VS Hook.");
-    return;
-  }
-  if (nativeUiSetVisualValue(preferenceKey, "custom_image")) {
-    nativeUiShowTemporaryPopup("Imagem de fundo aplicada", 1.3);
-  }
 }
 
 static bool nativeProjectSyncRemoveOwnedTree(
@@ -35152,13 +35145,17 @@ static void nativePaintAppActivePanel(HWND hwnd)
     }
     splashProgress = std::min(1.0, std::max(0.0, splashProgress));
 
-    // Icone compacto: fracao do menor lado do painel, com teto discreto.
+    // Icone compacto, assinatura do produto e barra formam um unico grupo.
     const int splashBarH = 8;
-    const int splashGap = 24;
+    const int splashLogoTitleGap = 8;
+    const int splashTitleBarGap = 12;
     int logoSide = std::min(std::min((std::min(width, height) * 40) / 100, 140),
-      std::min(width - 48, height - 120));
+      std::min(width - 48, height - 170));
     logoSide = std::max(24, logoSide);
-    const int groupH = logoSide + splashGap + splashBarH;
+    const int splashTitleH = std::max(22,
+      std::min(42, logoSide / 3));
+    const int groupH = logoSide + splashLogoTitleGap +
+      splashTitleH + splashTitleBarGap + splashBarH;
     const int logoLeft = client.left + (width - logoSide) / 2;
     const int logoTop = client.top + std::max(16, (height - groupH) / 2);
     // Cada plataforma escreve os mesmos pixels BGRA na superficie ativa:
@@ -35185,10 +35182,43 @@ static void nativePaintAppActivePanel(HWND hwnd)
       logoLeft, logoTop, logoSide, logoSide);
 #endif
 
+    // Nome entre o icone e a barra. Bahnschrift/Avenir Next entregam a mesma
+    // identidade geometrica e futurista nas duas plataformas, com fallback
+    // automatico da API caso a familia nao esteja disponivel.
+    const RECT splashTitleRect{
+      client.left + 20,
+      logoTop + logoSide + splashLogoTitleGap,
+      client.right - 20,
+      logoTop + logoSide + splashLogoTitleGap + splashTitleH};
+    const int splashTitleFontSize = std::max(18,
+      std::min(34, splashTitleH - 3));
+    HFONT splashTitleFont = CreateFont(
+      -splashTitleFontSize, 0, 0, 0, FW_SEMIBOLD,
+      FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+      DEFAULT_QUALITY, DEFAULT_PITCH,
+#ifdef __APPLE__
+      "Avenir Next"
+#else
+      "Bahnschrift"
+#endif
+    );
+    const HFONT splashFont = splashTitleFont
+      ? splashTitleFont : nativeUiSharedFont();
+    RECT splashTitleShadow = splashTitleRect;
+    OffsetRect(&splashTitleShadow, 0, 2);
+    nativeAppActiveDrawText(dc, "VS Hook", splashTitleShadow,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      RGB(83, 40, 16), splashFont);
+    nativeAppActiveDrawText(dc, "VS Hook", splashTitleRect,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      RGB(246, 249, 255), splashFont);
+    if (splashTitleFont) DeleteObject(splashTitleFont);
+
     // Barra de progresso arredondada indo de 0% a 100% durante a abertura.
     const int splashBarW = std::min(width - 64, std::max(140, logoSide * 2));
     const int splashBarLeft = client.left + (width - splashBarW) / 2;
-    const int splashBarTop = logoTop + logoSide + splashGap;
+    const int splashBarTop = splashTitleRect.bottom + splashTitleBarGap;
     const RECT splashTrack{splashBarLeft, splashBarTop,
       splashBarLeft + splashBarW, splashBarTop + splashBarH};
     nativeAppActiveFillRoundRect(dc, splashTrack,
@@ -42465,11 +42495,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
           {"default", "Cinza escuro"},
           {"black", "Preto profundo"},
           {"slate", "Grafite azulado"}, {"navy", "Azul marinho"},
-          {"blue", "Azul escuro"}, {"purple", "Roxo escuro"},
-          {"wine", "Vinho escuro"}, {"green", "Verde escuro"},
-          {"teal", "Petroleo"}, {"brown", "Marrom escuro"},
-          {"laranja_png", "Laranja PNG"},
-          {"custom_image", "Sua imagem"}
+           {"blue", "Azul escuro"}, {"purple", "Roxo escuro"},
+           {"wine", "Vinho escuro"}, {"green", "Verde escuro"},
+           {"teal", "Petroleo"}, {"brown", "Marrom escuro"},
+           {"laranja_png", "Laranja PNG"},
+           {"cinza_escuro_png", "Cinza escuro PNG"},
+           {"azul_png", "Azul PNG"},
+           {"verde_png", "Verde PNG"},
+           {"futuristico_1_png", "Futuristico 1 PNG"},
+           {"futuristico_2_png", "Futuristico 2 PNG"}
         };
         std::string selectedListPanel = nativeLower(
           nativeUiVisualRawValue(visual, "list_panel_bg_mode"));
@@ -42623,11 +42657,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
         const std::vector<std::pair<std::string, std::string>> options = {
           {"black", "Preto profundo"}, {"medium", "Cinza escuro"},
           {"slate", "Grafite azulado"}, {"navy", "Azul marinho"},
-          {"blue", "Azul escuro"}, {"purple", "Roxo escuro"},
-          {"wine", "Vinho escuro"}, {"green", "Verde escuro"},
-          {"teal", "Petroleo"}, {"brown", "Marrom escuro"},
-          {"laranja_png", "Laranja PNG"},
-          {"custom_image", "Sua imagem"}
+           {"blue", "Azul escuro"}, {"purple", "Roxo escuro"},
+           {"wine", "Vinho escuro"}, {"green", "Verde escuro"},
+           {"teal", "Petroleo"}, {"brown", "Marrom escuro"},
+           {"laranja_png", "Laranja PNG"},
+           {"cinza_escuro_png", "Cinza escuro PNG"},
+           {"azul_png", "Azul PNG"},
+           {"verde_png", "Verde PNG"},
+           {"futuristico_1_png", "Futuristico 1 PNG"},
+           {"futuristico_2_png", "Futuristico 2 PNG"}
         };
         std::string selectedInterface = nativeLower(
           nativeUiVisualRawValue(visual, "interface_bg_mode"));
@@ -55084,11 +55122,7 @@ static bool nativeMainHandleModalClick(
                "custom_set|")) {
     const auto fields = nativeSplit(action, '|');
     if (fields.size() >= 3) {
-      if (fields[2] == "custom_image" &&
-          (fields[1] == "list_panel_bg_mode" ||
-           fields[1] == "interface_bg_mode")) {
-        nativeUiChooseCustomBackgroundImage(fields[1]);
-      } else if (!nativeUiSetVisualValue(fields[1], fields[2])) {
+      if (!nativeUiSetVisualValue(fields[1], fields[2])) {
         nativeUiShowTemporaryPopup("Escolha um preset", 1.2);
       }
     }
