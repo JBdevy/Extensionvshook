@@ -63822,12 +63822,19 @@ static bool nativeTelepromptDrawHeldImageFrame(
   const double drawScale = std::max(
     0.01, fitScale * nativeTelepromptClamp(
       settings.mediaScale, 0.25, 3.0));
-  const int drawWidth = std::max(
-    1, static_cast<int>(std::lround(
-      sourceWidth * drawScale)));
-  const int drawHeight = std::max(
-    1, static_cast<int>(std::lround(
-      sourceHeight * drawScale)));
+  const bool stretchMedia = nativeVideoStretchEnabled();
+  const double safeScale = nativeTelepromptClamp(
+    settings.mediaScale, 0.25, 3.0);
+  const int drawWidth = stretchMedia
+    ? std::max(1, static_cast<int>(std::lround(
+        availableWidth * safeScale)))
+    : std::max(1, static_cast<int>(std::lround(
+        sourceWidth * drawScale)));
+  const int drawHeight = stretchMedia
+    ? std::max(1, static_cast<int>(std::lround(
+        availableHeight * safeScale)))
+    : std::max(1, static_cast<int>(std::lround(
+        sourceHeight * drawScale)));
   const int drawX = available.left +
     (availableWidth - drawWidth) / 2;
   const int drawY = available.top +
@@ -63972,8 +63979,7 @@ static bool nativeTelepromptDrawHeldVideoFrame(
     frame.height,
     available,
     settings.mediaScale,
-    nativeStartsWith(frame.playbackKey, "video|") &&
-      nativeVideoStretchEnabled(),
+    nativeVideoStretchEnabled(),
     drawX,
     drawY,
     drawWidth,
@@ -64558,14 +64564,13 @@ static bool nativeTelepromptDrawMedia(
     static_cast<double>(availableH) / sourceH);
   const double drawScale = std::max(
     0.01, fitScale * scaleLimit);
-  const bool stretchVideo =
-    mediaType == "video" && nativeVideoStretchEnabled();
-  const int drawW = stretchVideo
+  const bool stretchMedia = nativeVideoStretchEnabled();
+  const int drawW = stretchMedia
     ? std::max(1, static_cast<int>(std::lround(
         availableW * scaleLimit)))
     : std::max(1, static_cast<int>(
         std::lround(sourceW * drawScale)));
-  const int drawH = stretchVideo
+  const int drawH = stretchMedia
     ? std::max(1, static_cast<int>(std::lround(
         availableH * scaleLimit)))
     : std::max(1, static_cast<int>(
