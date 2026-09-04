@@ -660,6 +660,9 @@ static custom_action_register_t g_timecodeTransmitterAction = {
 static custom_action_register_t g_addTimecodeAction = {
   0, "VSHOOKNEWADDTIMECODE", "VS Hook: Add Timecode", nullptr
 };
+static custom_action_register_t g_resolumeMapAction = {
+  0, "VSHOOKRESOLUMEMAP", "VS Hook: Mapa Resolume", nullptr
+};
 static custom_action_register_t g_projectSyncAction = {
   0, "VSHOOKNEWPROJECTSYNC", "VS Hook: Sync to project", nullptr
 };
@@ -704,6 +707,7 @@ static custom_action_register_t g_extensionBypassAction = {
 static int g_timecodeReceiveCommandId = 0;
 static int g_timecodeTransmitterCommandId = 0;
 static int g_addTimecodeCommandId = 0;
+static int g_resolumeMapCommandId = 0;
 static int g_projectSyncCommandId = 0;
 static int g_exportProjectCommandId = 0;
 static int g_convertMp3CommandId = 0;
@@ -3661,16 +3665,8 @@ static MediaTrack* findOrCreateTimecodeTrack(
     GetSetMediaTrackInfo_String_ptr(
       track, "P_NAME", name, false);
     if (timecodeAsciiLower(name) == "timecode") {
-      if (index > 0) {
-        if (!SetOnlyTrackSelected_ptr || !ReorderSelectedTracks_ptr) {
-          return nullptr;
-        }
-        SetOnlyTrackSelected_ptr(track);
-        if (!ReorderSelectedTracks_ptr(0, 0) ||
-            GetTrack_ptr(project, 0) != track) {
-          return nullptr;
-        }
-      }
+      // Uma faixa TIMECODE existente pertence ao projeto do usuario. O
+      // comando Add Timecode nao deve move-la nem recria-la.
       return track;
     }
   }
@@ -3687,9 +3683,11 @@ static MediaTrack* findOrCreateTimecodeTrack(
   return track;
 }
 
-static bool isVsHookGeneratedTimecodeItem(MediaItem* item)
+static bool getVsHookTimecodeRegionIndex(
+  MediaItem* item, int& regionIndexOut)
 {
   static const char* kGeneratedPrefix = "VS HOOK TIMECODE |";
+  regionIndexOut = 0;
   if (!item || !GetActiveTake_ptr ||
       !GetSetMediaItemTakeInfo_String_ptr) {
     return false;
@@ -3699,8 +3697,26 @@ static bool isVsHookGeneratedTimecodeItem(MediaItem* item)
   char takeName[1024] = "";
   GetSetMediaItemTakeInfo_String_ptr(
     take, "P_NAME", takeName, false);
-  return std::strncmp(takeName, kGeneratedPrefix,
-    std::strlen(kGeneratedPrefix)) == 0;
+  const size_t prefixLength = std::strlen(kGeneratedPrefix);
+  if (std::strncmp(takeName, kGeneratedPrefix, prefixLength) != 0) {
+    return false;
+  }
+
+  const char* cursor = takeName + prefixLength;
+  while (*cursor && std::isspace(static_cast<unsigned char>(*cursor))) {
+    ++cursor;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const long parsed = std::strtol(cursor, &end, 10);
+  if (errno != 0 || end == cursor || parsed < 0 ||
+      parsed > std::numeric_limits<int>::max()) {
+    return false;
+  }
+  while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+  if (*end != '\0' && *end != '|') return false;
+  regionIndexOut = static_cast<int>(parsed);
+  return true;
 }
 
 static void setVsHookTimecodeItemName(
@@ -3834,7 +3850,6 @@ static void addTimecodeForEveryRegion()
       !GetSetMediaItemTakeInfo_String_ptr ||
       !GetItemStateChunk_ptr || !SetItemStateChunk_ptr ||
       !SetMediaItemInfo_Value_ptr || !SetOnlyTrackSelected_ptr ||
-      !ReorderSelectedTracks_ptr ||
       !GetMediaTrackInfo_Value_ptr || !SetMediaTrackInfo_Value_ptr ||
       !GetCursorPositionEx_ptr || !SetEditCurPos2_ptr ||
       !GetSet_LoopTimeRange2_ptr || !SelectAllMediaItems_ptr ||
@@ -3901,29 +3916,39 @@ static void addTimecodeForEveryRegion()
   if (Undo_BeginBlock2_ptr) Undo_BeginBlock2_ptr(project);
   if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(1);
 
+  bool timecodeTrackCreated = false;
   MediaTrack* timecodeTrack =
-    findOrCreateTimecodeTrack(project, nullptr);
+    findOrCreateTimecodeTrack(project, &timecodeTrackCreated);
   bool succeeded = timecodeTrack != nullptr;
-  std::vector<MediaItem*> previousGeneratedItems;
   std::vector<MediaItem*> newGeneratedItems;
+  std::set<int> regionsWithTimecode;
 
   if (timecodeTrack) {
-    const int nativeBlack = ColorToNative_ptr
-      ? ColorToNative_ptr(0, 0, 0)
-      : RGB(0, 0, 0);
-    SetMediaTrackInfo_Value_ptr(timecodeTrack, "I_CUSTOMCOLOR",
-      static_cast<double>(nativeBlack | 0x1000000));
+    if (timecodeTrackCreated) {
+      const int nativeBlack = ColorToNative_ptr
+        ? ColorToNative_ptr(0, 0, 0)
+        : RGB(0, 0, 0);
+      SetMediaTrackInfo_Value_ptr(timecodeTrack, "I_CUSTOMCOLOR",
+        static_cast<double>(nativeBlack | 0x1000000));
+    }
 
     const int itemCount = GetTrackNumMediaItems_ptr(timecodeTrack);
     for (int index = 0; index < itemCount; ++index) {
       MediaItem* item = GetTrackMediaItem_ptr(timecodeTrack, index);
-      if (isVsHookGeneratedTimecodeItem(item)) {
-        previousGeneratedItems.push_back(item);
+      int regionIndex = 0;
+      if (getVsHookTimecodeRegionIndex(item, regionIndex)) {
+        regionsWithTimecode.insert(regionIndex);
       }
     }
 
     SetOnlyTrackSelected_ptr(timecodeTrack);
     for (const TimecodeRegionRange& region : regions) {
+      // O item existente fica completamente intocado, inclusive STARTTIME,
+      // posicao e duracao. Cria somente o que ainda nao existe.
+      if (regionsWithTimecode.find(region.indexNumber) !=
+          regionsWithTimecode.end()) {
+        continue;
+      }
       const int beforeCount =
         GetTrackNumMediaItems_ptr(timecodeTrack);
       std::set<MediaItem*> beforeItems;
@@ -3968,13 +3993,14 @@ static void addTimecodeForEveryRegion()
         succeeded = false;
         break;
       }
+      regionsWithTimecode.insert(region.indexNumber);
     }
   }
 
-  if (DeleteTrackMediaItem_ptr && timecodeTrack) {
-    const std::vector<MediaItem*>& itemsToDelete =
-      succeeded ? previousGeneratedItems : newGeneratedItems;
-    for (MediaItem* item : itemsToDelete) {
+  if (!succeeded && DeleteTrackMediaItem_ptr && timecodeTrack) {
+    // Em caso de falha, desfaz apenas os itens novos desta tentativa. Os
+    // timecodes que ja existiam nunca sao apagados ou alterados.
+    for (MediaItem* item : newGeneratedItems) {
       if (!ValidatePtr2_ptr ||
           ValidatePtr2_ptr(project, item, "MediaItem*")) {
         DeleteTrackMediaItem_ptr(timecodeTrack, item);
@@ -4016,7 +4042,7 @@ static void addTimecodeForEveryRegion()
     }
   }
 
-  if (succeeded && MarkProjectDirty_ptr) {
+  if (succeeded && !newGeneratedItems.empty() && MarkProjectDirty_ptr) {
     MarkProjectDirty_ptr(project);
   }
   if (PreventUIRefresh_ptr) PreventUIRefresh_ptr(-1);
@@ -4025,7 +4051,7 @@ static void addTimecodeForEveryRegion()
   if (Undo_EndBlock2_ptr) {
     Undo_EndBlock2_ptr(project,
       succeeded
-        ? "VS Hook: criar timecode SMPTE por regiao"
+        ? "VS Hook: adicionar timecodes SMPTE ausentes"
         : "VS Hook: falha ao criar timecode SMPTE",
       -1);
   }
@@ -4034,6 +4060,185 @@ static void addTimecodeForEveryRegion()
     showDiagnostic(
       "Nao foi possivel criar o item SMPTE em todas as regioes.");
   }
+}
+
+struct ResolumeMapEntry {
+  int commandId = 0;
+  int column = 0;
+  int sourceNumber = 0;
+  int regionIndex = -1;
+  double position = 0.0;
+  bool regionStart = false;
+  std::string name;
+};
+
+static void showResolumeColumnMap()
+{
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project || !CountProjectMarkers_ptr || !EnumProjectMarkers3_ptr) {
+    showDiagnostic(
+      "O REAPER nao entregou os marcadores para montar o Mapa Resolume.");
+    return;
+  }
+
+  const std::vector<TimecodeRegionRange> regions =
+    collectTimecodeRegionRanges(project);
+  std::vector<ResolumeMapEntry> entries;
+  entries.reserve(regions.size() + 32);
+  for (const TimecodeRegionRange& region : regions) {
+    ResolumeMapEntry entry;
+    entry.sourceNumber = region.indexNumber;
+    entry.regionIndex = region.indexNumber;
+    entry.position = region.start;
+    entry.regionStart = true;
+    entry.name = region.name.empty()
+      ? "Regiao " + std::to_string(region.indexNumber)
+      : region.name;
+    entries.push_back(std::move(entry));
+  }
+
+  int markerCount = 0;
+  int regionCount = 0;
+  const int total = CountProjectMarkers_ptr(
+    project, &markerCount, &regionCount);
+  for (int index = 0; index < total; ++index) {
+    bool isRegion = false;
+    double position = 0.0;
+    double end = 0.0;
+    const char* rawName = nullptr;
+    int sourceNumber = 0;
+    int color = 0;
+    if (EnumProjectMarkers3_ptr(project, index, &isRegion, &position,
+          &end, &rawName, &sourceNumber, &color) == 0 || isRegion) {
+      continue;
+    }
+    bool duplicatesRegionStart = false;
+    int containingRegion = -1;
+    for (const TimecodeRegionRange& region : regions) {
+      if (std::fabs(position - region.start) <= 0.0005) {
+        duplicatesRegionStart = true;
+        break;
+      }
+      if (containingRegion < 0 &&
+          position > region.start + 0.0005 &&
+          position < region.end - 0.0005) {
+        containingRegion = region.indexNumber;
+      }
+    }
+    if (duplicatesRegionStart) continue;
+
+    ResolumeMapEntry entry;
+    entry.sourceNumber = sourceNumber;
+    entry.regionIndex = containingRegion;
+    entry.position = std::max(0.0, position);
+    entry.name = rawName && *rawName
+      ? rawName
+      : "Marcador " + std::to_string(sourceNumber);
+    entries.push_back(std::move(entry));
+  }
+
+  std::sort(entries.begin(), entries.end(),
+    [](const ResolumeMapEntry& lhs, const ResolumeMapEntry& rhs) {
+      if (lhs.position != rhs.position) return lhs.position < rhs.position;
+      if (lhs.regionStart != rhs.regionStart) return lhs.regionStart;
+      return lhs.sourceNumber < rhs.sourceNumber;
+    });
+  if (entries.empty()) {
+    showDiagnostic(
+      "Nao existem regioes ou marcadores para montar o Mapa Resolume.");
+    return;
+  }
+  constexpr int kFirstMapCommand = 20000;
+  for (size_t index = 0; index < entries.size(); ++index) {
+    entries[index].column = static_cast<int>(index) + 1;
+    entries[index].commandId = kFirstMapCommand + static_cast<int>(index);
+  }
+
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return;
+  const auto appendText = [](HMENU target, UINT flags,
+      UINT_PTR id, const std::string& text) {
+#ifdef _WIN32
+    const std::wstring wide = utf8ToWide(text);
+    AppendMenuW(target, flags, id, wide.c_str());
+#else
+    InsertMenu(target, GetMenuItemCount(target),
+      MF_BYPOSITION | flags, id, text.c_str());
+#endif
+  };
+  const auto appendSubMenu = [&](HMENU target, HMENU child,
+      const std::string& text) {
+    appendText(target, MF_POPUP,
+      reinterpret_cast<UINT_PTR>(child), text);
+  };
+
+  appendText(menu, MF_STRING | MF_GRAYED, 0,
+    "Total necessario no Resolume: " +
+      std::to_string(entries.size()) + " colunas");
+  appendText(menu, MF_SEPARATOR, 0, "");
+
+  for (const TimecodeRegionRange& region : regions) {
+    HMENU regionMenu = CreatePopupMenu();
+    if (!regionMenu) continue;
+    int regionEntryCount = 0;
+    for (const ResolumeMapEntry& entry : entries) {
+      if (entry.regionIndex != region.indexNumber) continue;
+      const std::string label = "Coluna " +
+        std::to_string(entry.column) + " - " +
+        (entry.regionStart ? "Inicio da regiao: " : "Marcador: ") +
+        entry.name;
+      appendText(regionMenu, MF_STRING,
+        static_cast<UINT_PTR>(entry.commandId), label);
+      ++regionEntryCount;
+    }
+    if (regionEntryCount == 0) {
+      DestroyMenu(regionMenu);
+      continue;
+    }
+    const std::string regionName = region.name.empty()
+      ? "Regiao " + std::to_string(region.indexNumber)
+      : region.name;
+    appendSubMenu(menu, regionMenu,
+      regionName + " (" + std::to_string(regionEntryCount) +
+      (regionEntryCount == 1 ? " coluna)" : " colunas)"));
+  }
+
+  HMENU outsideMenu = nullptr;
+  for (const ResolumeMapEntry& entry : entries) {
+    if (entry.regionIndex >= 0) continue;
+    if (!outsideMenu) outsideMenu = CreatePopupMenu();
+    if (!outsideMenu) break;
+    appendText(outsideMenu, MF_STRING,
+      static_cast<UINT_PTR>(entry.commandId),
+      "Coluna " + std::to_string(entry.column) +
+        " - Marcador: " + entry.name);
+  }
+  if (outsideMenu) {
+    appendSubMenu(menu, outsideMenu, "Marcadores fora das regioes");
+  }
+
+  POINT cursor{100, 100};
+#ifdef _WIN32
+  GetCursorPos(&cursor);
+#else
+  GetCursorPos(&cursor);
+#endif
+  HWND owner = GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
+  const int choice = TrackPopupMenu(menu,
+    TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+    cursor.x, cursor.y, 0, owner, nullptr);
+  DestroyMenu(menu);
+  if (choice < kFirstMapCommand) return;
+  const size_t selectedIndex =
+    static_cast<size_t>(choice - kFirstMapCommand);
+  if (selectedIndex >= entries.size()) return;
+  const ResolumeMapEntry& selected = entries[selectedIndex];
+  showDiagnostic(
+    "Coluna " + std::to_string(selected.column) +
+    " no Resolume\n\n" +
+    (selected.regionStart ? "Inicio da regiao: " : "Marcador: ") +
+    selected.name + "\n\nTotal necessario: " +
+    std::to_string(entries.size()) + " colunas.");
 }
 
 static bool getProjectSyncEnabled()
@@ -4800,13 +5005,14 @@ static bool nativeCommandStartsProjectTransition(int command)
 static bool nativeIsRegisteredExtensionCommand(int command)
 {
   if (command <= 0) return false;
-  const std::array<int, 17> fixedCommands = {
+  const std::array<int, 18> fixedCommands = {
     g_nativeInterfaceCommandId,
     g_hookControllerCommandId,
     g_extensionBypassCommandId,
     g_timecodeReceiveCommandId,
     g_timecodeTransmitterCommandId,
     g_addTimecodeCommandId,
+    g_resolumeMapCommandId,
     g_projectSyncCommandId,
     g_exportProjectCommandId,
     g_convertMp3CommandId,
@@ -4904,6 +5110,11 @@ static bool hookCommand(int command, int flag)
   }
   if (g_addTimecodeCommandId != 0 && command == g_addTimecodeCommandId) {
     addTimecodeForEveryRegion();
+    return true;
+  }
+  if (g_resolumeMapCommandId != 0 &&
+      command == g_resolumeMapCommandId) {
+    showResolumeColumnMap();
     return true;
   }
   if (g_projectSyncCommandId != 0 && command == g_projectSyncCommandId) {
@@ -5054,6 +5265,11 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   }
   if (g_addTimecodeCommandId != 0 && command == g_addTimecodeCommandId) {
     addTimecodeForEveryRegion();
+    return true;
+  }
+  if (g_resolumeMapCommandId != 0 &&
+      command == g_resolumeMapCommandId) {
+    showResolumeColumnMap();
     return true;
   }
   if (g_projectSyncCommandId != 0 && command == g_projectSyncCommandId) {
@@ -5428,6 +5644,8 @@ static void menuHook(const char* menustr, HMENU hMenu, int flag)
     timecodeMode == "transmitter" ||
     parallelTimecodeMode == "transmitter");
   appendMenuString(timecodeMenu, "Add Timecode", g_addTimecodeCommandId, false);
+  appendMenuString(timecodeMenu, "Mapa Resolume",
+    g_resolumeMapCommandId, false);
   insertMenuSubMenu(vsHookMenu, timecodeMenu, "Timecode", -1);
 
   appendMenuString(projectSyncMenu, "Sync to project", g_projectSyncCommandId, getProjectSyncEnabled());
@@ -78433,6 +78651,11 @@ static bool initialize()
   if (g_addTimecodeCommandId != 0) {
     hasRegisteredAction = true;
   }
+  g_resolumeMapCommandId =
+    plugin_register_ptr("custom_action", (void*)&g_resolumeMapAction);
+  if (g_resolumeMapCommandId != 0) {
+    hasRegisteredAction = true;
+  }
   g_projectSyncCommandId = plugin_register_ptr("custom_action", (void*)&g_projectSyncAction);
   if (g_projectSyncCommandId != 0) {
     hasRegisteredAction = true;
@@ -78689,6 +78912,10 @@ static void shutdown()
   if (g_addTimecodeCommandId != 0) {
     plugin_register_ptr("-custom_action", (void*)&g_addTimecodeAction);
     g_addTimecodeCommandId = 0;
+  }
+  if (g_resolumeMapCommandId != 0) {
+    plugin_register_ptr("-custom_action", (void*)&g_resolumeMapAction);
+    g_resolumeMapCommandId = 0;
   }
   if (g_projectSyncCommandId != 0) {
     plugin_register_ptr("-custom_action", (void*)&g_projectSyncAction);
