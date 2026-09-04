@@ -277,6 +277,7 @@ using GetMIDIInputName_t = bool (*)(int, char*, int);
 using GetNumMIDIOutputs_t = int (*)();
 using GetMIDIOutputName_t = bool (*)(int, char*, int);
 using StuffMIDIMessage_t = void (*)(int, int, int, int);
+using CreateMIDIOutput_t = midi_Output* (*)(int, bool, int*);
 using format_timestr_pos_t = void (*)(double, char*, int, int);
 using GR_SelectColor_t = int (*)(HWND, int*);
 using TimeMap_curFrameRate_t = double (*)(ReaProject*, bool*);
@@ -463,6 +464,7 @@ static GetMIDIInputName_t GetMIDIInputName_ptr = nullptr;
 static GetNumMIDIOutputs_t GetNumMIDIOutputs_ptr = nullptr;
 static GetMIDIOutputName_t GetMIDIOutputName_ptr = nullptr;
 static StuffMIDIMessage_t StuffMIDIMessage_ptr = nullptr;
+static CreateMIDIOutput_t CreateMIDIOutput_ptr = nullptr;
 
 static ReaProject* getCurrentProject(char* pathOut, int pathOutSize);
 static std::string nativeTrim(std::string value);
@@ -5942,6 +5944,17 @@ struct NativeMtcBridgeState {
   std::string activeSource;
 };
 
+struct NativeStoppedMtcLocateState {
+  ReaProject* project = nullptr;
+  double cursorPosition = 0.0;
+  int playState = 0;
+  int timecodePresenceChangeCount = -1;
+  bool timecodePresenceKnown = false;
+  bool hasTimecodeTrack = false;
+  std::chrono::steady_clock::time_point nextTimecodePresenceScan;
+  bool initialized = false;
+};
+
 // O relogio de parede dos dois computadores pode ter qualquer diferenca. Para
 // estimar somente a idade de cada pulso, o receptor aprende o menor offset de
 // chegada observado na sessao. Assim uma amostra de transporte repetida por
@@ -6135,6 +6148,7 @@ static NativeTimecodeLanTransport g_nativeTimecodeLanTransport;
 static NativeTimecodeLanRemoteClock g_nativeTimecodeLanRemoteClock;
 static NativeTimecodeLanRemoteClock g_nativeParallelTimecodeLanRemoteClock;
 static NativeMtcBridgeState g_nativeMtcBridge;
+static NativeStoppedMtcLocateState g_nativeStoppedMtcLocate;
 static bool g_nativeTimecodeLanPeerConnected = false;
 static std::string g_nativeTimecodeLanPeerName;
 // Comandos recebidos do outro computador nao podem voltar para a outbox e
@@ -76303,6 +76317,122 @@ static NativeMtcTimeFields nativeMtcTimeFields(double rawSeconds,
   return fields;
 }
 
+static bool nativeProjectHasTimecodeTrack(ReaProject* project)
+{
+  if (!project || !CountTracks_ptr || !GetTrack_ptr || !GetTrackName_ptr) {
+    return false;
+  }
+  const int trackCount = CountTracks_ptr(project);
+  for (int trackIndex = 0; trackIndex < trackCount; ++trackIndex) {
+    MediaTrack* track = GetTrack_ptr(project, trackIndex);
+    if (!track) continue;
+    char name[512] = "";
+    if (GetTrackName_ptr(track, name, static_cast<int>(sizeof(name))) &&
+        timecodeAsciiLower(nativeTrim(name)) == "timecode") {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool nativeSendMtcFullFrameLocateOnMainThread(
+  ReaProject* project, double position)
+{
+  if (!project || !CreateMIDIOutput_ptr ||
+      !nativeMtcFindOutputOnMainThread(false)) {
+    return false;
+  }
+
+  bool dropFrame = false;
+  const double frameRate = TimeMap_curFrameRate_ptr
+    ? TimeMap_curFrameRate_ptr(project, &dropFrame)
+    : 30.0;
+  const NativeMtcTimeFields fields = nativeMtcTimeFields(
+    position, frameRate, dropFrame);
+
+  midi_Output* output = CreateMIDIOutput_ptr(
+    g_nativeMtcBridge.outputDevice, false, nullptr);
+  if (!output) return false;
+
+  // Universal Real-Time SysEx MTC Full Frame. Ele informa somente a posicao;
+  // o transporte passa a ser considerado em movimento quando chegam os
+  // quarter-frames do Play normal do REAPER.
+  struct FullFrameEvent {
+    int frameOffset;
+    int size;
+    unsigned char message[10];
+  } event{};
+  event.frameOffset = 0;
+  event.size = 10;
+  const unsigned char message[10] = {
+    0xf0, 0x7f, 0x7f, 0x01, 0x01,
+    static_cast<unsigned char>(
+      ((fields.rateCode & 0x03) << 5) | (fields.hour & 0x1f)),
+    static_cast<unsigned char>(fields.minute & 0x3f),
+    static_cast<unsigned char>(fields.second & 0x3f),
+    static_cast<unsigned char>(fields.frame & 0x1f),
+    0xf7
+  };
+  std::memcpy(event.message, message, sizeof(message));
+  output->SendMsg(reinterpret_cast<MIDI_event_t*>(&event), -1);
+  output->Destroy();
+  return true;
+}
+
+static void nativeMtcStoppedLocateTickOnMainThread()
+{
+  if (!GetPlayStateEx_ptr || !GetCursorPositionEx_ptr) return;
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project) {
+    g_nativeStoppedMtcLocate = NativeStoppedMtcLocateState{};
+    return;
+  }
+
+  const int playState = GetPlayStateEx_ptr(project);
+  const double cursorPosition = std::max(
+    0.0, GetCursorPositionEx_ptr(project));
+  NativeStoppedMtcLocateState& state = g_nativeStoppedMtcLocate;
+  if (!state.initialized || state.project != project) {
+    state = NativeStoppedMtcLocateState{};
+    state.project = project;
+    state.cursorPosition = cursorPosition;
+    state.playState = playState;
+    state.initialized = true;
+    return;
+  }
+
+  const bool wasStopped = state.playState == 0;
+  const bool isStopped = playState == 0;
+  const bool cursorMoved =
+    std::fabs(cursorPosition - state.cursorPosition) > 0.0005;
+  state.cursorPosition = cursorPosition;
+  state.playState = playState;
+
+  // Atualiza continuamente a baseline durante Play/Pause. Assim um seek da
+  // fila ou de Parts nunca fica pendente para ser enviado depois do Stop.
+  // A transicao Play -> Stop tambem nao envia nada: somente um movimento novo,
+  // ocorrido enquanto o transporte ja estava parado, prepara o Slot MTC.
+  if (!wasStopped || !isStopped || !cursorMoved) return;
+
+  const int changeCount = GetProjectStateChangeCount_ptr
+    ? GetProjectStateChangeCount_ptr(project)
+    : -1;
+  const auto now = std::chrono::steady_clock::now();
+  const bool projectMayHaveChanged =
+    changeCount != state.timecodePresenceChangeCount;
+  if (!state.timecodePresenceKnown ||
+      (projectMayHaveChanged &&
+       (state.nextTimecodePresenceScan.time_since_epoch().count() == 0 ||
+        now >= state.nextTimecodePresenceScan))) {
+    state.hasTimecodeTrack = nativeProjectHasTimecodeTrack(project);
+    state.timecodePresenceKnown = true;
+    state.timecodePresenceChangeCount = changeCount;
+    state.nextTimecodePresenceScan = now + std::chrono::seconds(2);
+  }
+  if (!state.hasTimecodeTrack) return;
+  nativeSendMtcFullFrameLocateOnMainThread(project, cursorPosition);
+}
+
 static int nativeMtcQuarterFrameData(const NativeMtcTimeFields& fields,
   int quarterFrameIndex)
 {
@@ -78149,6 +78279,7 @@ static void startupTimer()
   // director_enter que acorda a extensao tambem chega por essa fila.
   nativeProcessHttpCommandsOnMainThread();
   nativeMtcBridgeTickOnMainThread();
+  nativeMtcStoppedLocateTickOnMainThread();
   nativeRestoreTransportEditCursorOnMainThread();
   nativeTimecodeLanPollEditCursorOnMainThread();
   // Project Sync observa tambem alteracoes feitas diretamente no TCP/MCP do
@@ -78567,6 +78698,9 @@ static bool loadApi(reaper_plugin_info_t* rec)
   StuffMIDIMessage_ptr =
     reinterpret_cast<StuffMIDIMessage_t>(
       rec->GetFunc("StuffMIDIMessage"));
+  CreateMIDIOutput_ptr =
+    reinterpret_cast<CreateMIDIOutput_t>(
+      rec->GetFunc("CreateMIDIOutput"));
 
   if (!plugin_register_ptr) {
     showDiagnostic("VS Hook Loader nao carregou: plugin_register indisponivel.");
