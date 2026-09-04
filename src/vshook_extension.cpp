@@ -558,6 +558,10 @@ static void nativeUiClearMainRowSelection();
 static void nativeTelepromptReloadSettingsAfterBackup();
 static void nativeTimecodeLanMarkPendingTransportIntent(int command);
 static bool nativeTimecodeReceiveBlocksLocalSpace();
+static void nativeMtcPrimeLocalPlayOnMainThread(
+  int command, ReaProject* project, int playState, double position);
+static bool nativeMtcPrimePlaybackOnMainThread(
+  ReaProject* project, double position);
 
 static bool handleTransportQueueStopCommand(int command)
 {
@@ -7244,6 +7248,11 @@ static void nativeTimecodeLanMarkPendingTransportIntent(int command)
   g_nativeTimecodeLanPendingTransportIntent.markedAt = now;
   g_nativeTimecodeLanPendingTransportIntent.expiresAt =
     now + std::chrono::milliseconds(900);
+  // O hook roda antes de o REAPER iniciar o transporte. Aproveita esse ponto
+  // para entregar ao receptor a posicao e um ciclo MTC completo sem esperar o
+  // primeiro bloco de audio do gerador nativo.
+  nativeMtcPrimeLocalPlayOnMainThread(
+    command, project, playState, position);
 }
 
 static int64_t nativeSystemNowMs()
@@ -76270,7 +76279,7 @@ struct NativeMtcTimeFields {
 };
 
 static NativeMtcTimeFields nativeMtcTimeFields(double rawSeconds,
-  double rawFrameRate, bool dropFrame)
+  double rawFrameRate, bool dropFrame, bool roundToNearestFrame = false)
 {
   NativeMtcTimeFields fields;
   const double seconds = std::max(0.0, rawSeconds);
@@ -76299,8 +76308,14 @@ static NativeMtcTimeFields nativeMtcTimeFields(double rawSeconds,
     dropFrame = false;
   }
 
-  int64_t frameNumber = static_cast<int64_t>(
-    std::floor(seconds * frameRate + 0.000001));
+  // Durante reproducao o relogio nunca pode adiantar, portanto usa floor.
+  // Um locate parado, por outro lado, representa o quadro exibido pelo
+  // cursor. Arredondar nesse caso elimina valores binarios como 469.999999
+  // virando indevidamente 07:49:59:29 em vez de 07:50:00:00.
+  const double exactFrame = seconds * frameRate;
+  int64_t frameNumber = roundToNearestFrame
+    ? static_cast<int64_t>(std::llround(exactFrame))
+    : static_cast<int64_t>(std::floor(exactFrame + 0.000001));
   if (dropFrame) {
     // SMPTE 29.97 DF remove os numeros 00 e 01 no inicio de cada minuto,
     // exceto nos minutos divisiveis por dez.
@@ -76354,7 +76369,7 @@ static bool nativeSendMtcFullFrameLocateOnMainThread(
     ? TimeMap_curFrameRate_ptr(project, &dropFrame)
     : 30.0;
   const NativeMtcTimeFields fields = nativeMtcTimeFields(
-    position, frameRate, dropFrame);
+    position, frameRate, dropFrame, true);
 
   // A pista TIMECODE normalmente ja mantem essa porta aberta pelo proprio
   // REAPER. CreateMIDIOutput nao e confiavel para dispositivos abertos nas
@@ -76418,12 +76433,28 @@ static void nativeMtcStoppedLocateTickOnMainThread()
     return;
   }
 
-  const bool wasStopped = state.playState == 0;
+  const int previousPlayState = state.playState;
+  const bool wasStopped = previousPlayState == 0;
   const bool isStopped = playState == 0;
+  const bool wasRunning = (previousPlayState & 1) == 1 ||
+    (previousPlayState & 4) == 4;
+  const bool isRunning = (playState & 1) == 1 ||
+    (playState & 4) == 4;
+  const bool wasPaused = (previousPlayState & 2) == 2;
   const bool cursorMoved =
     std::fabs(cursorPosition - state.cursorPosition) > 0.0005;
   state.cursorPosition = cursorPosition;
   state.playState = playState;
+
+  // Cobre inicios vindos de superfícies que nao atravessam hookcommand. O
+  // caminho antecipado do hook ja tera feito o prime e a deduplicacao impede
+  // um segundo lote no tick seguinte.
+  if ((!wasRunning && isRunning) || (wasPaused && isRunning)) {
+    const double playPosition = GetPlayPositionEx_ptr
+      ? GetPlayPositionEx_ptr(project) : cursorPosition;
+    nativeMtcPrimePlaybackOnMainThread(project, playPosition);
+    return;
+  }
 
   // Atualiza continuamente a baseline durante Play/Pause. Assim um seek da
   // fila ou de Parts nunca fica pendente para ser enviado depois do Stop.
@@ -76469,6 +76500,65 @@ static int nativeMtcQuarterFrameData(const NativeMtcTimeFields& fields,
       break;
   }
   return (index << 4) | nibble;
+}
+
+static bool nativeMtcPrimePlaybackOnMainThread(
+  ReaProject* project, double position)
+{
+  if (!project || !StuffMIDIMessage_ptr ||
+      !nativeProjectHasTimecodeTrack(project)) {
+    return false;
+  }
+
+  static ReaProject* lastProject = nullptr;
+  static double lastPosition = -1.0;
+  static std::chrono::steady_clock::time_point lastPrimeAt;
+  const auto now = std::chrono::steady_clock::now();
+  if (lastProject == project &&
+      lastPrimeAt.time_since_epoch().count() != 0 &&
+      now - lastPrimeAt < std::chrono::milliseconds(180) &&
+      std::fabs(lastPosition - position) < 0.150) {
+    return true;
+  }
+
+  if (!nativeSendMtcFullFrameLocateOnMainThread(project, position)) {
+    return false;
+  }
+
+  bool dropFrame = false;
+  const double frameRate = TimeMap_curFrameRate_ptr
+    ? TimeMap_curFrameRate_ptr(project, &dropFrame)
+    : 30.0;
+  const NativeMtcTimeFields fields = nativeMtcTimeFields(
+    position, frameRate, dropFrame, true);
+
+  // Full Frame posiciona o Slot; os oito Quarter Frames abaixo informam
+  // imediatamente que o relogio entrou em movimento. O gerador nativo do
+  // REAPER assume a sequencia continua logo depois, sem aguardar um ciclo
+  // inteiro para o grandMA2 liberar o AutoStart.
+  for (int quarterFrame = 0; quarterFrame < 8; ++quarterFrame) {
+    const int data = nativeMtcQuarterFrameData(fields, quarterFrame);
+    StuffMIDIMessage_ptr(16 + g_nativeMtcBridge.outputDevice,
+      0xf1, data, 0);
+  }
+  lastProject = project;
+  lastPosition = position;
+  lastPrimeAt = now;
+  return true;
+}
+
+static void nativeMtcPrimeLocalPlayOnMainThread(
+  int command, ReaProject* project, int playState, double position)
+{
+  const bool running = (playState & 1) == 1 || (playState & 4) == 4;
+  const bool paused = (playState & 2) == 2;
+  const bool startsPlayback =
+    (command == kReaperTransportPlayCommandId && (!running || paused)) ||
+    (command == kReaperTransportPlayStopCommandId && !running && !paused) ||
+    (command == kReaperTransportPauseCommandId && paused) ||
+    (command == kReaperTransportRecordCommandId && !running);
+  if (!startsPlayback) return;
+  nativeMtcPrimePlaybackOnMainThread(project, position);
 }
 
 static bool nativeMtcAcceptTransportOnMainThread(
