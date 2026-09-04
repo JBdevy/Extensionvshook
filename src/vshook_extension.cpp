@@ -75469,12 +75469,20 @@ static bool nativeApplyMarkerCommand(const std::string& commandBody)
       const int playState = GetPlayStateEx_ptr ? GetPlayStateEx_ptr(project) : 0;
       const bool playingNow = (playState & 1) == 1 || (playState & 4) == 4;
       if (playingNow) {
+        // Enquanto um Parts ja esta engatilhado, qualquer novo marker apenas
+        // substitui o destino do Smooth Seek. O ponto em que esse seek sera
+        // executado continua sendo o mesmo; por isso a barra de regresso deve
+        // preservar a origem e continuar correndo, sem voltar a ficar cheia.
+        const bool hasArmedTarget = !g_nativeArmedMarkerId.empty() &&
+          g_nativeArmedMarkerSetAt.time_since_epoch().count() != 0;
         g_nativeArmedMarkerId = markerId;
         g_nativeArmedMarkerLabel = markerLabel;
-        g_nativeArmedMarkerSetAt = std::chrono::steady_clock::now();
-        g_nativeArmedMarkerStartPlayPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : 0.0;
-        g_nativeArmedMarkerLastPlayPos =
-          g_nativeArmedMarkerStartPlayPos;
+        if (!hasArmedTarget) {
+          g_nativeArmedMarkerSetAt = std::chrono::steady_clock::now();
+          g_nativeArmedMarkerStartPlayPos = GetPlayPositionEx_ptr ? GetPlayPositionEx_ptr(project) : 0.0;
+          g_nativeArmedMarkerLastPlayPos =
+            g_nativeArmedMarkerStartPlayPos;
+        }
         // Parts ganha do Smooth Seek da fila. A fila continua armazenada em
         // standby e recupera seu proprio seek depois da chegada ao marker.
         g_nativeQueuedSeekSignature.clear();
