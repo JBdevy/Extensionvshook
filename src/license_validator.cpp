@@ -26,8 +26,10 @@
   #include <CoreFoundation/CoreFoundation.h>
   #include <Security/Security.h>
   #include <sys/stat.h>
+  #include <unistd.h>
 #else
   #include <sys/stat.h>
+  #include <unistd.h>
 #endif
 
 namespace vshook_license {
@@ -35,6 +37,9 @@ namespace {
 
 constexpr const char* kProduct = "VSLIVE";
 constexpr const char* kFingerprintPrefix = "VSHOOK_DEVICE_V1";
+constexpr const char* kClockDigestPrefix = "VSHOOK_CLOCK_V1_GUARD_2026";
+constexpr int64_t kClockRollbackToleranceSeconds = 10 * 60;
+constexpr int64_t kClockWriteIntervalSeconds = 5 * 60;
 
 std::string trim(std::string value)
 {
@@ -90,6 +95,40 @@ std::string readFile(const std::string& path)
   return out.str();
 }
 
+bool replaceFile(const std::string& path, const std::string& content)
+{
+#ifdef _WIN32
+  const std::string processId = std::to_string(GetCurrentProcessId());
+#else
+  const std::string processId = std::to_string(static_cast<long long>(getpid()));
+#endif
+  const std::string temporary = path + ".tmp-" + processId;
+  {
+    std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+    if (!file) return false;
+    file << content;
+    file.flush();
+    if (!file) {
+      file.close();
+      std::remove(temporary.c_str());
+      return false;
+    }
+  }
+#ifdef _WIN32
+  if (!MoveFileExA(temporary.c_str(), path.c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    std::remove(temporary.c_str());
+    return false;
+  }
+#else
+  if (std::rename(temporary.c_str(), path.c_str()) != 0) {
+    std::remove(temporary.c_str());
+    return false;
+  }
+#endif
+  return true;
+}
+
 std::string sharedDirectory()
 {
 #ifdef _WIN32
@@ -107,6 +146,15 @@ std::string sharedDirectory()
 std::string machineIdPath()
 {
   return joinPath(sharedDirectory(), "vslive_machine_id.dat");
+}
+
+std::string clockStatePath()
+{
+#ifdef _WIN32
+  return joinPath(sharedDirectory(), "vshook_license_clock_v1.dat");
+#else
+  return joinPath(sharedDirectory(), ".vshook_license_clock_v1.dat");
+#endif
 }
 
 std::string legacyMachineIdPath()
@@ -232,6 +280,59 @@ std::string hexUpper(const unsigned char* data, size_t size)
     out[i * 2 + 1] = hex[data[i] & 0x0F];
   }
   return out;
+}
+
+std::string clockDigest(int64_t highWatermark,
+                        const std::string& machine,
+                        const std::string& fingerprint)
+{
+  const std::string input = std::string(kClockDigestPrefix) + "|1|" +
+    std::to_string(highWatermark) + "|" + machine + "|" + fingerprint;
+  std::array<unsigned char, 32> digest{};
+  if (!sha256(reinterpret_cast<const unsigned char*>(input.data()),
+              input.size(), digest)) return {};
+  return hexUpper(digest.data(), digest.size());
+}
+
+bool readClockState(const std::string& machine,
+                    const std::string& fingerprint,
+                    int64_t& highWatermark)
+{
+  std::istringstream input(readFile(clockStatePath()));
+  std::string version;
+  std::string timestamp;
+  std::string storedMachine;
+  std::string storedFingerprint;
+  std::string storedDigest;
+  if (!std::getline(input, version) ||
+      !std::getline(input, timestamp) ||
+      !std::getline(input, storedMachine) ||
+      !std::getline(input, storedFingerprint) ||
+      !std::getline(input, storedDigest)) return false;
+  if (trim(version) != "1") return false;
+  const std::string cleanTimestamp = trim(timestamp);
+  char* end = nullptr;
+  const long long parsed = std::strtoll(cleanTimestamp.c_str(), &end, 10);
+  if (!end || *end != '\0' || parsed <= 0) return false;
+  const std::string cleanMachine = normalize(storedMachine);
+  const std::string cleanFingerprint = normalize(storedFingerprint);
+  const std::string cleanDigest = normalize(storedDigest);
+  if (cleanMachine != machine || cleanFingerprint != fingerprint) return false;
+  const std::string expected = clockDigest(static_cast<int64_t>(parsed), machine, fingerprint);
+  if (expected.empty() || cleanDigest != expected) return false;
+  highWatermark = static_cast<int64_t>(parsed);
+  return true;
+}
+
+bool writeClockState(int64_t highWatermark,
+                     const std::string& machine,
+                     const std::string& fingerprint)
+{
+  const std::string digest = clockDigest(highWatermark, machine, fingerprint);
+  if (digest.empty()) return false;
+  const std::string content = "1\n" + std::to_string(highWatermark) + "\n" +
+    machine + "\n" + fingerprint + "\n" + digest + "\n";
+  return replaceFile(clockStatePath(), content);
 }
 
 std::string deviceFingerprint()
@@ -515,23 +616,47 @@ Result validateInstalledLicense()
       jsonString(payload, "p") != kProduct) {
     return {false, Failure::Invalid};
   }
-  if (normalize(jsonString(payload, "m")) != machineId()) {
+  const std::string localMachine = machineId();
+  const std::string localFingerprint = deviceFingerprint();
+  if (normalize(jsonString(payload, "m")) != localMachine) {
     return {false, Failure::Machine};
   }
-  if (normalize(jsonString(payload, "f")) != deviceFingerprint()) {
+  if (normalize(jsonString(payload, "f")) != localFingerprint) {
     return {false, Failure::Hardware};
   }
 
   bool nbfFound = false;
   bool expFound = false;
+  bool iatFound = false;
+  bool clockVersionFound = false;
   const int64_t notBefore = jsonInteger(payload, "nbf", nbfFound);
   const int64_t expiresAt = jsonInteger(payload, "exp", expFound);
+  const int64_t issuedAt = jsonInteger(payload, "iat", iatFound);
+  const int64_t clockVersion = jsonInteger(payload, "ct", clockVersionFound);
   const int64_t now = static_cast<int64_t>(std::time(nullptr));
   if (!nbfFound || !expFound || expiresAt <= 0) {
     return {false, Failure::Invalid};
   }
   if (notBefore > now + 300) return {false, Failure::NotYetValid};
   if (expiresAt <= now) return {false, Failure::Expired};
+  if (clockVersionFound && clockVersion != 1) {
+    return {false, Failure::Invalid};
+  }
+  if (clockVersionFound && clockVersion == 1) {
+    int64_t highWatermark = 0;
+    if (!iatFound || issuedAt <= 0 ||
+        !readClockState(localMachine, localFingerprint, highWatermark) ||
+        highWatermark + 300 < issuedAt) {
+      return {false, Failure::Clock};
+    }
+    if (now + kClockRollbackToleranceSeconds < highWatermark) {
+      return {false, Failure::Clock};
+    }
+    if (now >= highWatermark + kClockWriteIntervalSeconds &&
+        !writeClockState(now, localMachine, localFingerprint)) {
+      return {false, Failure::Clock};
+    }
+  }
   return {true, Failure::None};
 }
 

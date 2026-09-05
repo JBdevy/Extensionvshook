@@ -12,7 +12,8 @@ enum class Failure {
   Machine,
   Hardware,
   NotYetValid,
-  Expired
+  Expired,
+  Clock
 };
 
 struct Result {

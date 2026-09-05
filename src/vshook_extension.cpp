@@ -2332,6 +2332,13 @@ static bool nativeEnsurePluginLicense()
         "Abra a Hook Center conectado a internet para renovar a licenca e "
         "depois abra o REAPER novamente.";
       break;
+    case vshook_license::Failure::Clock:
+      message =
+        "A data ou hora deste computador foi retrocedida, ou o estado de "
+        "seguranca da licenca foi alterado.\n\n"
+        "Corrija o relogio e abra a Hook Center conectado a internet para "
+        "renovar a licenca.";
+      break;
     case vshook_license::Failure::Machine:
     case vshook_license::Failure::Hardware:
       message =
@@ -55515,7 +55522,10 @@ static bool nativeMainHandleModalClick(
     g_nativeUiMidiInfo.clear();
     g_nativeMainModalKind =
       NativeMainModalKind::PreviewBinding;
-  } else if (action == "tuner_keyboard") {
+  }
+  // Mantem a cadeia de acoes abaixo do limite de aninhamento do MSVC.
+  // Os identificadores de acao sao mutuamente exclusivos.
+  if (action == "tuner_keyboard") {
     g_nativeUiCaptureStartedAt =
       std::chrono::steady_clock::now();
     g_nativeMainModalKind =

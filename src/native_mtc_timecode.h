@@ -23,19 +23,19 @@ inline NativeMtcFrameRate nativeMtcFrameRate(double rawRate, bool dropFrame)
     return rate;
   }
   if (rawRate >= 47.0) rawRate /= 2.0;
-  const auto near = [rawRate](double expected) {
+  const auto nearRate = [rawRate](double expected) {
     return std::fabs(rawRate - expected) < 0.01;
   };
-  if (near(24.0) || near(24000.0 / 1001.0)) {
-    rate.framesPerSecond = near(24.0) ? 24.0 : 24000.0 / 1001.0;
+  if (nearRate(24.0) || nearRate(24000.0 / 1001.0)) {
+    rate.framesPerSecond = nearRate(24.0) ? 24.0 : 24000.0 / 1001.0;
     rate.nominalRate = 24;
     rate.rateCode = 0;
-  } else if (near(25.0)) {
+  } else if (nearRate(25.0)) {
     rate.framesPerSecond = 25.0;
     rate.nominalRate = 25;
     rate.rateCode = 1;
-  } else if (near(30.0) || near(30000.0 / 1001.0)) {
-    rate.framesPerSecond = dropFrame || !near(30.0)
+  } else if (nearRate(30.0) || nearRate(30000.0 / 1001.0)) {
+    rate.framesPerSecond = dropFrame || !nearRate(30.0)
       ? 30000.0 / 1001.0 : 30.0;
     rate.dropFrame = dropFrame;
     rate.rateCode = dropFrame ? 2 : 3;
