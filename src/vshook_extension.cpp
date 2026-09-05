@@ -61454,6 +61454,7 @@ static bool nativeTelepromptPreviewTargetMatches(
 // concentrada aqui para TP1, TP2 e apps nunca divergirem visualmente.
 static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
   const std::vector<NativeSongWindow>& playlistItems,
+  const std::vector<NativeSongWindow>& projectSongs,
   int previewMode,
   bool transportPlaying,
   const std::string& playingId,
@@ -61488,6 +61489,68 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
 
   std::vector<NativeTelepromptPreviewBlock> allBlocks;
   NativeTelepromptPreviewBlock* current = nullptr;
+
+  const auto isFamilyChild = [](const NativeSongWindow& item) {
+    return item.isHashChild || item.isRegionChild;
+  };
+  std::set<std::string> listedParentIds;
+  std::map<std::string, std::vector<const NativeSongWindow*>>
+    storedChildrenByParent;
+  std::map<std::string, std::vector<const NativeSongWindow*>>
+    projectChildrenByParent;
+  for (const auto& item : playlistItems) {
+    if (item.isHashParent && !item.id.empty()) {
+      listedParentIds.insert(item.id);
+    }
+  }
+  for (const auto& item : playlistItems) {
+    if (isFamilyChild(item) && !item.parentId.empty() &&
+        listedParentIds.find(item.parentId) != listedParentIds.end()) {
+      storedChildrenByParent[item.parentId].push_back(&item);
+    }
+  }
+  for (const auto& item : projectSongs) {
+    if (isFamilyChild(item) && !item.parentId.empty()) {
+      projectChildrenByParent[item.parentId].push_back(&item);
+    }
+  }
+  const auto sortChildren = [](auto& childrenByParent) {
+    for (auto& family : childrenByParent) {
+      std::stable_sort(family.second.begin(), family.second.end(),
+        [](const NativeSongWindow* left,
+           const NativeSongWindow* right) {
+          if (!left || !right) return left != nullptr;
+          if (std::fabs(left->start - right->start) > 0.000001) {
+            return left->start < right->start;
+          }
+          return left->sourceNumber < right->sourceNumber;
+        });
+    }
+  };
+  sortChildren(storedChildrenByParent);
+  sortChildren(projectChildrenByParent);
+
+  size_t previewSongIndex = 0;
+  const auto appendPreviewSong = [&](const NativeSongWindow& item) {
+    if (!current) return;
+    const std::string name = nativeTrim(item.name);
+    if (name.empty()) return;
+    const bool playing = transportPlaying &&
+      nativeTelepromptPreviewTargetMatches(
+        item, playingId, playingStart, playingEnd);
+    const bool queued = nativeTelepromptPreviewTargetMatches(
+      item, queuedId, queuedStart, queuedEnd);
+
+    NativeTelepromptPreviewSong song;
+    song.id = nativeTelepromptPreviewItemId(
+      item, "song-", previewSongIndex++);
+    song.name = name;
+    song.durationSec = std::max(0.0, nativeRawDurationSec(item));
+    song.colorHex = current->colorHex;
+    song.playing = playing;
+    song.queued = queued;
+    current->songs.push_back(std::move(song));
+  };
 
   for (size_t itemIndex = 0;
        itemIndex < playlistItems.size(); ++itemIndex) {
@@ -61537,30 +61600,30 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
       current = &allBlocks.back();
     }
 
-    const std::string name = nativeTrim(item.name);
-    if (name.empty()) continue;
-
-    const bool playing = transportPlaying &&
-      nativeTelepromptPreviewTargetMatches(
-        item, playingId, playingStart, playingEnd);
-    const bool queued = nativeTelepromptPreviewTargetMatches(
-      item, queuedId, queuedStart, queuedEnd);
     // O Preview representa o conteúdo efetivamente reproduzível da família.
-    // A região-pai é apenas o contêiner no grid; os filhos devem aparecer
-    // sempre, independentemente de a gaveta estar aberta na lista principal.
-    if (item.isHashParent) continue;
-
-    NativeTelepromptPreviewSong song;
-    song.id = nativeTelepromptPreviewItemId(
-      item, "song-", itemIndex);
-    song.name = name;
-    song.durationSec = std::max(0.0, nativeRawDurationSec(item));
-    // Dentro do Preview todas as músicas herdam deliberadamente a cor do
-    // contorno/nome do bloco, inclusive durante Tocando e Fila.
-    song.colorHex = current->colorHex;
-    song.playing = playing;
-    song.queued = queued;
-    current->songs.push_back(std::move(song));
+    // O repertório costuma persistir somente o pai, então os filhos reais são
+    // expandidos a partir do projeto. Se um formato antigo já os persistiu,
+    // essas cópias mantêm seus IDs de entrada e não são duplicadas.
+    if (item.isHashParent) {
+      const auto stored = storedChildrenByParent.find(item.id);
+      const auto project = projectChildrenByParent.find(item.id);
+      const auto* children = stored != storedChildrenByParent.end() &&
+          !stored->second.empty()
+        ? &stored->second
+        : (project != projectChildrenByParent.end()
+            ? &project->second : nullptr);
+      if (children) {
+        for (const NativeSongWindow* child : *children) {
+          if (child) appendPreviewSong(*child);
+        }
+      }
+      continue;
+    }
+    if (isFamilyChild(item) &&
+        listedParentIds.find(item.parentId) != listedParentIds.end()) {
+      continue;
+    }
+    appendPreviewSong(item);
   }
 
   state.totalBlocks = static_cast<int>(allBlocks.size());
@@ -63280,6 +63343,7 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
 
   state.preview = nativeTelepromptBuildPreviewState(
     playlistItems,
+    songs,
     previewMode,
     transportPlaying,
     playingId,
@@ -71472,6 +71536,7 @@ static void nativeRebuildState(bool forceSnapshot)
   const NativeTelepromptPreviewState telepromptPreview =
     nativeTelepromptBuildPreviewState(
       activePlaylistItems,
+      songs,
       previewModeForState,
       playing,
       playingId,
