@@ -36,6 +36,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <utility>
 
@@ -494,6 +495,10 @@ static const char* kResolumeMapAssignmentsRegionsOnlyKey =
   "RESOLUME_MAP_ASSIGNMENTS_REGIONS_ONLY_V1";
 static const char* kResolumeMapFirstColumnKey =
   "RESOLUME_MAP_FIRST_COLUMN_V1";
+static const char* kGrandMa2MapAssignmentsKey =
+  "GRANDMA2_MAP_ASSIGNMENTS_V1";
+static const char* kGrandMa2MapSettingsKey =
+  "GRANDMA2_MAP_SETTINGS_V1";
 static const char* kAutoOpenBigClockOneKey =
   "AUTO_OPEN_BIG_CLOCK_1_V1";
 static const char* kAutoOpenBigClockTwoKey =
@@ -10777,6 +10782,14 @@ static void nativePublishStandbyDiscoveryState()
     ? nativeGetProjExtStateString(activeProject, kExtStateSection,
         kResolumeMapAssignmentsRegionsOnlyKey)
     : std::string();
+  const std::string grandMa2Assignments = activeProject
+    ? nativeGetProjExtStateString(activeProject, kExtStateSection,
+        kGrandMa2MapAssignmentsKey)
+    : std::string();
+  const std::string grandMa2Settings = activeProject
+    ? nativeGetProjExtStateString(activeProject, kExtStateSection,
+        kGrandMa2MapSettingsKey)
+    : std::string();
 
   const std::string directorPassword = nativeReadDirectorPassword();
   const std::string directorAuthHash = nativeDirectorPasswordHash(directorPassword);
@@ -10836,6 +10849,10 @@ static void nativePublishStandbyDiscoveryState()
        << nativeJsonString(resolumeAssignmentsWithMarkers) << ",";
   json << "\"resolumeMapAssignmentsRegionsOnly\":"
        << nativeJsonString(resolumeAssignmentsRegionsOnly) << ",";
+  json << "\"grandMa2MapAssignments\":"
+       << nativeJsonString(grandMa2Assignments) << ",";
+  json << "\"grandMa2MapSettings\":"
+       << nativeJsonString(grandMa2Settings) << ",";
   json << "\"projectMediaPath\":"
        << nativeJsonString(activeProjectMediaPath) << ",";
   json << "\"projectDirty\":"
@@ -61433,7 +61450,7 @@ static bool nativeTelepromptPreviewTargetMatches(
 }
 
 // Constrói uma única representação do Preview para o desenho nativo e
-// para o bridge. Toda decisão sobre gavetas, paginação, fila e cores fica
+// para o bridge. Toda decisão sobre famílias, paginação, fila e cores fica
 // concentrada aqui para TP1, TP2 e apps nunca divergirem visualmente.
 static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
   const std::vector<NativeSongWindow>& playlistItems,
@@ -61444,8 +61461,7 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
   double playingEnd,
   const std::string& queuedId,
   double queuedStart,
-  double queuedEnd,
-  const std::map<std::string, bool>& openFamilyDrawers)
+  double queuedEnd)
 {
   NativeTelepromptPreviewState state;
   state.mode = previewMode >= 1 && previewMode <= 6
@@ -61472,9 +61488,6 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
 
   std::vector<NativeTelepromptPreviewBlock> allBlocks;
   NativeTelepromptPreviewBlock* current = nullptr;
-  std::string visibleFamilyParentId;
-  size_t visibleFamilyParentSongIndex =
-    std::numeric_limits<size_t>::max();
 
   for (size_t itemIndex = 0;
        itemIndex < playlistItems.size(); ++itemIndex) {
@@ -61510,9 +61523,6 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
       }
       allBlocks.push_back(std::move(block));
       current = &allBlocks.back();
-      visibleFamilyParentId.clear();
-      visibleFamilyParentSongIndex =
-        std::numeric_limits<size_t>::max();
       continue;
     }
 
@@ -61535,27 +61545,10 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
         item, playingId, playingStart, playingEnd);
     const bool queued = nativeTelepromptPreviewTargetMatches(
       item, queuedId, queuedStart, queuedEnd);
-    if (item.isHashChild) {
-      const auto drawer =
-        openFamilyDrawers.find(item.parentId);
-      const bool drawerOpen =
-        !item.parentId.empty() &&
-        drawer != openFamilyDrawers.end() &&
-        drawer->second;
-      if (!drawerOpen) {
-        // Com a gaveta fechada, o pai representa visualmente a família e
-        // recebe também Tocando/Fila de qualquer filho oculto.
-        if (item.parentId == visibleFamilyParentId &&
-            visibleFamilyParentSongIndex <
-              current->songs.size()) {
-          auto& parentSong =
-            current->songs[visibleFamilyParentSongIndex];
-          parentSong.playing = parentSong.playing || playing;
-          parentSong.queued = parentSong.queued || queued;
-        }
-        continue;
-      }
-    }
+    // O Preview representa o conteúdo efetivamente reproduzível da família.
+    // A região-pai é apenas o contêiner no grid; os filhos devem aparecer
+    // sempre, independentemente de a gaveta estar aberta na lista principal.
+    if (item.isHashParent) continue;
 
     NativeTelepromptPreviewSong song;
     song.id = nativeTelepromptPreviewItemId(
@@ -61568,15 +61561,6 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
     song.playing = playing;
     song.queued = queued;
     current->songs.push_back(std::move(song));
-    if (item.isHashParent) {
-      visibleFamilyParentId = item.id;
-      visibleFamilyParentSongIndex =
-        current->songs.size() - 1;
-    } else if (!item.isHashChild) {
-      visibleFamilyParentId.clear();
-      visibleFamilyParentSongIndex =
-        std::numeric_limits<size_t>::max();
-    }
   }
 
   state.totalBlocks = static_cast<int>(allBlocks.size());
@@ -61877,6 +61861,7 @@ struct NativeTelepromptRenderStateCache {
   ReaProject* project = nullptr;
   int projectChangeCount = -1;
   int playState = -1;
+  std::string previewContextSignature;
   double lastObservedPosition = 0.0;
   std::chrono::steady_clock::time_point builtAt{};
   NativeTelepromptRenderState state;
@@ -63078,7 +63063,6 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
   double queuedEnd = 0.0;
   bool transportPlaying = false;
   int previewMode = 0;
-  std::map<std::string, bool> openFamilyDrawers;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     snapshot = g_nativeStateJson;
@@ -63096,7 +63080,6 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
       : g_nativeQueuedSongId;
     queuedStart = g_nativeQueuedStart;
     queuedEnd = g_nativeQueuedEnd;
-    openFamilyDrawers = g_nativeDirectorOpenFamilyDrawers;
   }
   const std::string prefix = slot == 2 ? "tp2" : "tp1";
   const std::string telepromptPrefix =
@@ -63304,8 +63287,7 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
     playingEnd,
     queuedId,
     queuedStart,
-    queuedEnd,
-    openFamilyDrawers);
+    queuedEnd);
   return state;
 }
 
@@ -63341,11 +63323,33 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
   }
   const auto transportSampledAt = std::chrono::steady_clock::now();
 
+  // A leitura de mídia pode permanecer em cache durante o Play, mas as
+  // tarjas do Preview dependem de um contexto muito menor e mutável: música
+  // atual e fila. Antes, se o primeiro repaint do Play acontecesse
+  // um instante antes da atualização desses campos, o Preview preservava o
+  // estado sem vermelho/laranja durante toda a música.
+  std::string previewContextSignature;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    std::ostringstream signature;
+    signature << (g_nativeCurrentTransportPlaying ? '1' : '0') << '|'
+              << g_nativeCurrentPlayingId << '|'
+              << nativeNumber(g_nativeCurrentSongStart, 6) << '|'
+              << nativeNumber(g_nativeCurrentSongEnd, 6) << '|'
+              << g_nativeQueuedSongId << '|'
+              << g_nativeQueuedPlaylistSongId << '|'
+              << nativeNumber(g_nativeQueuedStart, 6) << '|'
+              << nativeNumber(g_nativeQueuedEnd, 6) << '|'
+              << g_nativePreviewMode;
+    previewContextSignature = signature.str();
+  }
+
   bool rebuild =
     !cache.valid ||
     cache.project != project ||
     cache.projectChangeCount != projectChangeCount ||
-    cache.playState != playState;
+    cache.playState != playState ||
+    cache.previewContextSignature != previewContextSignature;
   if (!rebuild && !livePlaying &&
       std::abs(livePosition - cache.lastObservedPosition) > 0.000001) {
     // O cursor parado é a fonte de tempo da janela. Reavalia a pista na
@@ -63384,6 +63388,7 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
     cache.project = project;
     cache.projectChangeCount = projectChangeCount;
     cache.playState = playState;
+    cache.previewContextSignature = previewContextSignature;
     cache.builtAt = now;
   }
 
@@ -63616,8 +63621,9 @@ static void nativeTelepromptDrawPreview(
   const int areaH = std::max(
     1, static_cast<int>(area.bottom - area.top));
   // Testa todas as quantidades de colunas possíveis e escolhe a que permite
-  // a maior fonte. Os blocos são colocados na coluna menos ocupada, portanto
-  // o Preview não fica preso ao antigo arranjo 4 em cima + 4 embaixo.
+  // a maior fonte. A distribuição é sempre sequencial, da esquerda para a
+  // direita e depois na linha seguinte. O tamanho dos blocos nunca pode
+  // alterar a ordem definida no repertório.
   int columns = 1;
   int cardW = areaW;
   int bestEstimatedFont = 0;
@@ -63665,31 +63671,13 @@ static void nativeTelepromptDrawPreview(
       static_cast<size_t>(candidateColumns), 0);
     std::vector<int> candidateBlockColumns(
       static_cast<size_t>(blockCount), 0);
-    std::vector<std::pair<double, int>> weightedBlocks;
-    weightedBlocks.reserve(static_cast<size_t>(blockCount));
     for (int index = 0; index < blockCount; ++index) {
-      weightedBlocks.push_back({
-        estimatedBlockUnits(
-          state.preview.blocks[static_cast<size_t>(index)],
-          candidateCardW),
-        index});
-    }
-    std::stable_sort(weightedBlocks.begin(), weightedBlocks.end(),
-      [](const auto& left, const auto& right) {
-        return left.first > right.first;
-      });
-    for (const auto& weightedBlock : weightedBlocks) {
-      const int index = weightedBlock.second;
-      int targetColumn = 0;
-      for (int column = 1; column < candidateColumns; ++column) {
-        if (columnUnits[static_cast<size_t>(column)] <
-            columnUnits[static_cast<size_t>(targetColumn)]) {
-          targetColumn = column;
-        }
-      }
+      const int targetColumn = index % candidateColumns;
       candidateBlockColumns[static_cast<size_t>(index)] = targetColumn;
       columnUnits[static_cast<size_t>(targetColumn)] +=
-        weightedBlock.first;
+        estimatedBlockUnits(
+          state.preview.blocks[static_cast<size_t>(index)],
+          candidateCardW);
       ++columnBlocks[static_cast<size_t>(targetColumn)];
     }
     double busiestUnits = 1.0;
@@ -63849,8 +63837,44 @@ static void nativeTelepromptDrawPreview(
         remainingGrowth - std::max(0, naturalHeight - minimumHeight));
     }
   }
-  std::vector<int> columnTops(
-    static_cast<size_t>(columns), area.top);
+  const int rowCount = (blockCount + columns - 1) / columns;
+  std::vector<int> rowHeights(static_cast<size_t>(rowCount), 0);
+  const auto rebuildRowHeights = [&]() {
+    std::fill(rowHeights.begin(), rowHeights.end(), 0);
+    for (int index = 0; index < blockCount; ++index) {
+      const int row = index / columns;
+      rowHeights[static_cast<size_t>(row)] = std::max(
+        rowHeights[static_cast<size_t>(row)],
+        measureBlockHeight(
+          index, blockFontSizes[static_cast<size_t>(index)]));
+    }
+  };
+  const auto totalRowsHeight = [&]() {
+    return std::accumulate(
+      rowHeights.begin(), rowHeights.end(), 0) +
+      gap * std::max(0, rowCount - 1);
+  };
+  rebuildRowHeights();
+  // Linhas alinhadas deixam a leitura inequivocamente sequencial. Se essa
+  // organização precisar de mais altura que o mosaico antigo, reduza as
+  // fontes antes de permitir qualquer corte no último bloco.
+  while (totalRowsHeight() > areaH) {
+    bool changedFont = false;
+    for (int index = 0; index < blockCount; ++index) {
+      int& fontSize = blockFontSizes[static_cast<size_t>(index)];
+      if (fontSize <= minimumSongFont) continue;
+      --fontSize;
+      changedFont = true;
+    }
+    if (!changedFont) break;
+    rebuildRowHeights();
+  }
+  std::vector<int> rowTops(static_cast<size_t>(rowCount), area.top);
+  for (int row = 1; row < rowCount; ++row) {
+    rowTops[static_cast<size_t>(row)] =
+      rowTops[static_cast<size_t>(row - 1)] +
+      rowHeights[static_cast<size_t>(row - 1)] + gap;
+  }
 
   for (size_t index = 0;
        index < state.preview.blocks.size() &&
@@ -63858,9 +63882,10 @@ static void nativeTelepromptDrawPreview(
     const NativeTelepromptPreviewBlock& block =
       state.preview.blocks[index];
     const int column = blockColumns[index];
+    const int row = static_cast<int>(index) / columns;
     const int left = area.left +
       column * (cardW + gap);
-    const int top = columnTops[static_cast<size_t>(column)];
+    const int top = rowTops[static_cast<size_t>(row)];
     if (top >= area.bottom) continue;
     const int right = column == columns - 1
       ? area.right : left + cardW;
@@ -64017,7 +64042,6 @@ static void nativeTelepromptDrawPreview(
         settings.previewUnderlineEnabled && !song.playing);
       songTop += songHeight + songGap;
     }
-    columnTops[static_cast<size_t>(column)] = card.bottom + gap;
   }
 }
 
@@ -70973,6 +70997,14 @@ static void nativeRebuildState(bool forceSnapshot)
     ? nativeGetProjExtStateString(activeProject, kExtStateSection,
         kResolumeMapAssignmentsRegionsOnlyKey)
     : std::string();
+  const std::string grandMa2Assignments = activeProject
+    ? nativeGetProjExtStateString(activeProject, kExtStateSection,
+        kGrandMa2MapAssignmentsKey)
+    : std::string();
+  const std::string grandMa2Settings = activeProject
+    ? nativeGetProjExtStateString(activeProject, kExtStateSection,
+        kGrandMa2MapSettingsKey)
+    : std::string();
 
   // O estado vivo continua em 220 ms, mas a estrutura pesada so e refeita
   // quando o projeto realmente muda ou um comando pede atualizacao. Isso evita
@@ -71382,7 +71414,6 @@ static void nativeRebuildState(bool forceSnapshot)
   bool autoStopEnabled = true;
   std::string sharedActivePage = "playlist";
   int previewModeForState = 0;
-  std::map<std::string, bool> previewOpenFamilyDrawers;
   bool timerRunning = false;
   std::string timerMode = "progressive";
   double timerStartedAtMs = 0.0;
@@ -71421,8 +71452,6 @@ static void nativeRebuildState(bool forceSnapshot)
     previewModeForState =
       g_nativePreviewMode >= 1 && g_nativePreviewMode <= 6
         ? g_nativePreviewMode : 0;
-    previewOpenFamilyDrawers =
-      g_nativeDirectorOpenFamilyDrawers;
     timerRunning = g_nativeTimerRunning;
     timerMode = g_nativeTimerMode;
     timerStartedAtMs = timerRunning ? nativeTimerEpochMs(g_nativeTimerStartedAtSystem) : 0.0;
@@ -71451,8 +71480,7 @@ static void nativeRebuildState(bool forceSnapshot)
       queuedPlaylistSongId.empty()
         ? queuedSongId : queuedPlaylistSongId,
       queuedStart,
-      queuedEnd,
-      previewOpenFamilyDrawers);
+      queuedEnd);
   const std::string telepromptPreviewJson =
     nativeTelepromptPreviewStateJson(telepromptPreview);
   nativeTelepromptLoadSettings();
@@ -71737,6 +71765,10 @@ static void nativeRebuildState(bool forceSnapshot)
        << nativeJsonString(resolumeAssignmentsWithMarkers) << ",";
   json << "\"resolumeMapAssignmentsRegionsOnly\":"
        << nativeJsonString(resolumeAssignmentsRegionsOnly) << ",";
+  json << "\"grandMa2MapAssignments\":"
+       << nativeJsonString(grandMa2Assignments) << ",";
+  json << "\"grandMa2MapSettings\":"
+       << nativeJsonString(grandMa2Settings) << ",";
   json << "\"projectMediaPath\":"
        << nativeJsonString(activeProjectMediaPath) << ",";
   json << "\"projectDirty\":"
@@ -77988,6 +78020,64 @@ static bool nativeApplyResolumeMapCommand(
   return true;
 }
 
+static bool nativeApplyGrandMa2MapCommand(
+  const std::string& commandBody)
+{
+  const std::string type = nativeLower(nativeTrim(
+    nativeJsonExtractString(commandBody, "type")));
+  if (type != "grandma2_map_update") return false;
+
+  char currentPathBuffer[4096] = "";
+  ReaProject* project = getCurrentProject(
+    currentPathBuffer, static_cast<int>(sizeof(currentPathBuffer)));
+  if (!project || !SetProjExtState_ptr) return true;
+
+  const auto normalizedPath = [](std::string value) {
+    value = nativeTrim(value);
+#ifdef _WIN32
+    value = nativeLower(value);
+#endif
+    std::replace(value.begin(), value.end(), '\\', '/');
+    while (value.size() > 1 && value.back() == '/') value.pop_back();
+    return value;
+  };
+  const std::string expectedPath = normalizedPath(
+    nativeJsonExtractString(commandBody, "projectPath"));
+  const std::string currentPath = normalizedPath(currentPathBuffer);
+  if (!expectedPath.empty() && !currentPath.empty() &&
+      expectedPath != currentPath) {
+    return true;
+  }
+
+  const std::string assignments = nativeTrim(
+    nativeJsonExtractRawValue(commandBody, "assignments"));
+  const std::string settings = nativeTrim(
+    nativeJsonExtractRawValue(commandBody, "settings"));
+  const bool validAssignments = assignments.size() >= 2 &&
+    assignments.size() <= 512 * 1024 &&
+    assignments.front() == '{' && assignments.back() == '}';
+  const bool validSettings = settings.size() >= 2 &&
+    settings.size() <= 4096 &&
+    settings.front() == '{' && settings.back() == '}';
+  if (!validAssignments || !validSettings) return true;
+  const bool changed = nativeGetProjExtStateString(
+      project, kExtStateSection, kGrandMa2MapAssignmentsKey) !=
+        assignments ||
+    nativeGetProjExtStateString(
+      project, kExtStateSection, kGrandMa2MapSettingsKey) != settings;
+  if (!changed) {
+    return true;
+  }
+
+  SetProjExtState_ptr(project, kExtStateSection,
+    kGrandMa2MapAssignmentsKey, assignments.c_str());
+  SetProjExtState_ptr(project, kExtStateSection,
+    kGrandMa2MapSettingsKey, settings.c_str());
+  if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+  g_nativeForceStateBuild.store(true);
+  return true;
+}
+
 static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
 {
   if (commandBody.empty()) return;
@@ -78102,6 +78192,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
 
   const bool handledByNative =
     nativeApplyResolumeMapCommand(commandBody) ||
+    nativeApplyGrandMa2MapCommand(commandBody) ||
     nativeApplyTimecodeLanCommand(commandBody) ||
     nativeApplyProjectSyncCommand(commandBody) ||
     handledAccessControlCommand ||
