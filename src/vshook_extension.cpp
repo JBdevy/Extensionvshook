@@ -488,6 +488,10 @@ static const char* kLegacyAutoOpenKey = "AUTO_OPEN_VSHOOK";
 static const char* kProjectAutoOpenModeKey = "PROJECT_AUTO_OPEN_VSHOOK_MODE";
 static const char* kResolumeMapAssignmentsKey =
   "RESOLUME_MAP_ASSIGNMENTS_V1";
+static const char* kResolumeMapAssignmentsWithMarkersKey =
+  "RESOLUME_MAP_ASSIGNMENTS_WITH_MARKERS_V1";
+static const char* kResolumeMapAssignmentsRegionsOnlyKey =
+  "RESOLUME_MAP_ASSIGNMENTS_REGIONS_ONLY_V1";
 static const char* kResolumeMapFirstColumnKey =
   "RESOLUME_MAP_FIRST_COLUMN_V1";
 static const char* kAutoOpenBigClockOneKey =
@@ -1440,11 +1444,15 @@ enum class NativeMainModalKind {
   MixerBulkKeyboardCapture,
   MixerBulkMidiCapture,
   ProjectSyncDiff,
+  ResolumeMapQuestion,
+  ResolumeMapResult,
   Message
 };
 
 static NativeMainModalKind g_nativeMainModalKind = NativeMainModalKind::None;
 static std::string g_nativeMainModalMessage;
+static bool g_nativeUiResolumeMapFromRename = false;
+static bool g_nativeUiResolumeMapIncludeMarkers = true;
 static int g_nativeMainModalPreviewSlot = 0;
 static std::string g_nativeUiTemporaryPopupText;
 static std::string g_nativeUiTemporaryPopupColorMode;
@@ -1800,6 +1808,8 @@ static double g_nativePartsRenamePosition = 0.0;
 static bool resumePcAccessFromAppActiveScreen();
 static bool nativeAppActivePanelIsOpen();
 static bool nativeOpenAppActivePanel();
+static void nativeUiOpenResolumeMapQuestion(bool fromRename);
+static void nativeUiShowResolumeMapResult(bool includeMarkers);
 static void nativeCloseAppActivePanel();
 static void nativePreparePanelForProjectTransition();
 static bool nativeTelepromptWindowIsOpen(int slot);
@@ -5442,7 +5452,7 @@ static bool hookCommand(int command, int flag)
   }
   if (g_resolumeMapCommandId != 0 &&
       command == g_resolumeMapCommandId) {
-    showResolumeColumnMap();
+    nativeUiOpenResolumeMapQuestion(false);
     return true;
   }
   if (g_projectSyncCommandId != 0 && command == g_projectSyncCommandId) {
@@ -5597,7 +5607,7 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
   }
   if (g_resolumeMapCommandId != 0 &&
       command == g_resolumeMapCommandId) {
-    showResolumeColumnMap();
+    nativeUiOpenResolumeMapQuestion(false);
     return true;
   }
   if (g_projectSyncCommandId != 0 && command == g_projectSyncCommandId) {
@@ -11300,6 +11310,256 @@ static void showResolumeColumnCountForProject()
             << "para sincronizar a numeracao exata.";
   }
   showDiagnostic(message.str());
+}
+
+static bool nativeBuildResolumeMapForChoice(
+  ReaProject* project,
+  bool includeMarkers,
+  std::vector<ResolumeMapEntry>& entries,
+  int& highestColumn)
+{
+  entries.clear();
+  highestColumn = -1;
+  if (!project || !CountProjectMarkers_ptr ||
+      !EnumProjectMarkers3_ptr) {
+    return false;
+  }
+
+  const std::vector<TimecodeRegionRange> allRegions =
+    collectTimecodeRegionRanges(project);
+  std::vector<TimecodeRegionRange> regions;
+  regions.reserve(allRegions.size());
+  for (const TimecodeRegionRange& region : allRegions) {
+    if (!isTimecodeRegionFamilyParent(region, allRegions)) {
+      regions.push_back(region);
+      ResolumeMapEntry entry;
+      entry.sourceNumber = region.indexNumber;
+      entry.regionIndex = region.indexNumber;
+      entry.position = region.start;
+      entry.regionStart = true;
+      entry.name = region.name.empty()
+        ? "Regiao " + std::to_string(region.indexNumber)
+        : region.name;
+      entry.sourceKey = "region:" +
+        std::to_string(region.indexNumber);
+      entries.push_back(std::move(entry));
+    }
+  }
+
+  if (includeMarkers) {
+    int markerCount = 0;
+    int regionCount = 0;
+    const int total = CountProjectMarkers_ptr(
+      project, &markerCount, &regionCount);
+    for (int index = 0; index < total; ++index) {
+      bool isRegion = false;
+      double position = 0.0;
+      double end = 0.0;
+      const char* rawName = nullptr;
+      int sourceNumber = 0;
+      int color = 0;
+      if (EnumProjectMarkers3_ptr(project, index, &isRegion,
+            &position, &end, &rawName, &sourceNumber, &color) == 0 ||
+          isRegion) {
+        continue;
+      }
+      const std::string markerName = rawName ? rawName : "";
+      if (markerName.rfind("!", 0) == 0) continue;
+
+      bool duplicatesRegionStart = false;
+      int containingRegion = -1;
+      double containingLength =
+        std::numeric_limits<double>::max();
+      for (const TimecodeRegionRange& region : regions) {
+        if (std::fabs(position - region.start) <= 0.0005) {
+          duplicatesRegionStart = true;
+          break;
+        }
+        const double length = region.end - region.start;
+        if (position > region.start + 0.0005 &&
+            position < region.end - 0.0005 &&
+            length < containingLength) {
+          containingRegion = region.indexNumber;
+          containingLength = length;
+        }
+      }
+      if (duplicatesRegionStart || containingRegion < 0) continue;
+
+      ResolumeMapEntry entry;
+      entry.sourceNumber = sourceNumber;
+      entry.regionIndex = containingRegion;
+      entry.position = std::max(0.0, position);
+      entry.name = markerName.empty()
+        ? "Marcador " + std::to_string(sourceNumber)
+        : markerName;
+      entry.sourceKey = "marker:m" +
+        std::to_string(sourceNumber);
+      entries.push_back(std::move(entry));
+    }
+  }
+
+  std::sort(entries.begin(), entries.end(),
+    [](const ResolumeMapEntry& lhs,
+       const ResolumeMapEntry& rhs) {
+      if (lhs.position != rhs.position) {
+        return lhs.position < rhs.position;
+      }
+      if (lhs.regionStart != rhs.regionStart) {
+        return lhs.regionStart;
+      }
+      return lhs.sourceNumber < rhs.sourceNumber;
+    });
+
+  const std::string savedFirstColumn = nativeGetProjExtStateString(
+    project, kExtStateSection, kResolumeMapFirstColumnKey);
+  char* firstColumnEnd = nullptr;
+  const long parsedFirstColumn = std::strtol(
+    savedFirstColumn.c_str(), &firstColumnEnd, 10);
+  const int firstColumn = firstColumnEnd &&
+      firstColumnEnd != savedFirstColumn.c_str() &&
+      *firstColumnEnd == '\0' && parsedFirstColumn >= 1 &&
+      parsedFirstColumn <= 99999
+    ? static_cast<int>(parsedFirstColumn) : 1;
+
+  const char* choiceKey = includeMarkers
+    ? kResolumeMapAssignmentsWithMarkersKey
+    : kResolumeMapAssignmentsRegionsOnlyKey;
+  std::string assignments = nativeGetProjExtStateString(
+    project, kExtStateSection, choiceKey);
+  const auto validAssignmentsJson = [](const std::string& value) {
+    return value.size() >= 2 && value.front() == '{' &&
+      value.back() == '}';
+  };
+  const bool hasAssignments = validAssignmentsJson(assignments);
+  if (!hasAssignments) {
+    // Abrir o modal, atualizar a interface ou consultar uma música nunca cria
+    // colunas implicitamente. O mapa nasce apenas no botão Criar mapa da
+    // Hook Center e chega aqui pelo ProjExtState do próprio projeto.
+    entries.clear();
+    return true;
+  }
+
+  std::vector<ResolumeMapEntry> mappedEntries;
+  mappedEntries.reserve(entries.size());
+  std::vector<int> usedColumns;
+  for (ResolumeMapEntry& entry : entries) {
+    const std::string raw = nativeJsonExtractString(
+      assignments, entry.sourceKey);
+    if (raw.empty()) continue;
+    char* end = nullptr;
+    const long parsed = std::strtol(raw.c_str(), &end, 10);
+    if (!end || end == raw.c_str() || *end != '\0' ||
+        parsed < 0 || parsed >= 99999 ||
+        parsed + firstColumn > 99999) {
+      continue;
+    }
+    const int column = firstColumn + static_cast<int>(parsed);
+    if (std::find(usedColumns.begin(), usedColumns.end(), column) !=
+        usedColumns.end()) {
+      continue;
+    }
+    usedColumns.push_back(column);
+    entry.column = column;
+    highestColumn = std::max(highestColumn, column);
+    mappedEntries.push_back(std::move(entry));
+  }
+  entries = std::move(mappedEntries);
+  if (highestColumn < 0) highestColumn = 0;
+  return true;
+}
+
+static void nativeUiOpenResolumeMapQuestion(bool fromRename)
+{
+  g_nativeUiResolumeMapFromRename = fromRename;
+  g_nativeUiResolumeMapIncludeMarkers = true;
+  g_nativeMainModalMessage.clear();
+  g_nativeMainModalKind = NativeMainModalKind::ResolumeMapQuestion;
+  if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
+  if (nativeAppActivePanelIsOpen()) {
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
+}
+
+static void nativeUiShowResolumeMapResult(bool includeMarkers)
+{
+  g_nativeUiResolumeMapIncludeMarkers = includeMarkers;
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  std::vector<ResolumeMapEntry> entries;
+  int highestColumn = 0;
+  std::ostringstream message;
+  if (!nativeBuildResolumeMapForChoice(
+        project, includeMarkers, entries, highestColumn)) {
+    message << "O REAPER nao entregou os dados do projeto para montar o mapa.";
+  } else if (highestColumn < 0) {
+    message << "O Mapa Resolume ainda nao foi criado.\n\n"
+            << "Abra Hook Center > Resolume e clique em Criar mapa.";
+  } else if (entries.empty()) {
+    message << "Nenhuma regiao ou marcador atual faz parte do mapa salvo.\n\n"
+            << "Abra Hook Center > Resolume e clique em Criar mapa para atualiza-lo.";
+  } else if (g_nativeUiResolumeMapFromRename) {
+    const std::string songId = !g_nativeUiRenameId.empty()
+      ? g_nativeUiRenameId
+      : std::to_string(g_nativeUiRenameSourceNumber);
+    const std::string songKey = "region:" + songId;
+    const ResolumeMapEntry* songEntry = nullptr;
+    int songColumnCount = 0;
+    int songHighestColumn = 0;
+    for (const ResolumeMapEntry& entry : entries) {
+      if (entry.sourceKey == songKey) songEntry = &entry;
+      if (entry.sourceKey == songKey ||
+          (!entry.regionStart &&
+           entry.regionIndex == g_nativeUiRenameSourceNumber)) {
+        ++songColumnCount;
+        songHighestColumn = std::max(
+          songHighestColumn, entry.column);
+      }
+    }
+    if (!songEntry) {
+      message << "Esta musica ainda nao faz parte do Mapa Resolume.\n\n"
+              << "Abra Hook Center > Resolume e clique em Criar mapa.";
+    } else {
+      const std::string songName = nativeTrim(
+        g_nativeUiRenameInput).empty()
+        ? g_nativeUiRenameOriginalName
+        : g_nativeUiRenameInput;
+      message << "Musica: "
+              << (songName.empty() ? songEntry->name : songName)
+              << "\n\nInicio da musica: coluna "
+              << songEntry->column
+              << "\nConsiderar marcadores: "
+              << (includeMarkers ? "Sim" : "Nao")
+              << "\nColunas usadas por esta musica: "
+              << songColumnCount;
+      if (includeMarkers && songColumnCount > 1) {
+        message << "\nUltima coluna desta musica: "
+                << songHighestColumn;
+      }
+      message << "\n\nProjeto completo: crie ate a coluna "
+              << highestColumn << " no Resolume.";
+    }
+  } else {
+    int songColumns = 0;
+    int markerColumns = 0;
+    for (const ResolumeMapEntry& entry : entries) {
+      if (entry.regionStart) ++songColumns;
+      else ++markerColumns;
+    }
+    message << "Musicas: " << songColumns
+            << "\nConsiderar marcadores: "
+            << (includeMarkers ? "Sim" : "Nao");
+    if (includeMarkers) {
+      message << "\nMarcadores internos: " << markerColumns;
+    }
+    message << "\n\nTotal de colunas necessarias: "
+            << entries.size()
+            << "\nNo Resolume, crie ate a coluna "
+            << highestColumn << ".";
+  }
+  g_nativeMainModalMessage = message.str();
+  g_nativeMainModalKind = NativeMainModalKind::ResolumeMapResult;
+  if (nativeAppActivePanelIsOpen()) {
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
 }
 
 
@@ -38892,6 +39152,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
       g_nativeMainModalKind == NativeMainModalKind::BpmScanResults;
     const bool projectSyncDiffModal =
       g_nativeMainModalKind == NativeMainModalKind::ProjectSyncDiff;
+    const bool resolumeMapQuestionModal =
+      g_nativeMainModalKind == NativeMainModalKind::ResolumeMapQuestion;
+    const bool resolumeMapResultModal =
+      g_nativeMainModalKind == NativeMainModalKind::ResolumeMapResult;
     int modalW = std::max(280,
       static_cast<int>(std::floor(width * 0.82)));
     modalW = std::min(modalW, std::max(280, width - 20));
@@ -38929,6 +39193,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
     } else if (configAccessModal) {
       modalW = std::min(520, std::max(300, width - 20));
       requestedH = std::min(250, std::max(220, height - 20));
+    } else if (resolumeMapQuestionModal) {
+      modalW = std::min(500, std::max(300, width - 20));
+      requestedH = std::min(230, std::max(200, height - 20));
+    } else if (resolumeMapResultModal) {
+      modalW = std::min(560, std::max(320, width - 20));
+      requestedH = std::min(300, std::max(250, height - 20));
     } else if (mixerBulkConfigModal) {
       modalW = std::min(460, std::max(238, width - 20));
       requestedH =
@@ -45959,6 +46229,74 @@ static void nativePaintAppActivePanel(HWND hwnd)
           modal.bottom - 28,
           modal.right - 10,
           modal.bottom - 10},
+        "clear_playlist", true);
+    } else if (g_nativeMainModalKind ==
+               NativeMainModalKind::ResolumeMapQuestion) {
+      RECT title{modal.left + 14, modal.top + 10,
+        modal.right - 14, modal.top + 34};
+      nativeAppActiveDrawText(dc, "Mapa Resolume", title,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(250, 204, 21), nameFont);
+      RECT version{modal.right - 130, modal.top + 10,
+        modal.right - 14, modal.top + 34};
+      nativeAppActiveDrawText(dc, "Resolume 7.22+", version,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(148, 163, 184), statusFont);
+      RECT question{modal.left + 14, modal.top + 54,
+        modal.right - 14, modal.top + 82};
+      nativeAppActiveDrawText(dc, "Considerar marcadores?", question,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(248, 250, 252), nameFont);
+      RECT hint{modal.left + 22, modal.top + 88,
+        modal.right - 22, modal.bottom - 54};
+      nativeAppActiveDrawText(dc,
+        g_nativeUiResolumeMapFromRename
+          ? "Sim inclui os marcadores internos desta musica. Nao calcula apenas a coluna do inicio da regiao."
+          : "Sim soma os marcadores internos ao total. Nao conta somente o inicio das regioes de musica.",
+        hint, DT_CENTER | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
+        RGB(168, 179, 189), statusFont);
+      const int gap = 6;
+      const int buttonY = modal.bottom - 36;
+      const int buttonW = std::max(72,
+        (static_cast<int>(modal.right - modal.left) - 40 - gap * 2) / 3);
+      addModalButton("resolume_map_yes", "SIM",
+        RECT{modal.left + 14, buttonY,
+          modal.left + 14 + buttonW, buttonY + 22},
+        "play", true);
+      addModalButton("resolume_map_no", "NAO",
+        RECT{modal.left + 14 + buttonW + gap, buttonY,
+          modal.left + 14 + buttonW * 2 + gap, buttonY + 22},
+        "page", true);
+      addModalButton("resolume_map_cancel", "Cancelar",
+        RECT{modal.right - 14 - buttonW, buttonY,
+          modal.right - 14, buttonY + 22},
+        "clear_playlist", true);
+    } else if (g_nativeMainModalKind ==
+               NativeMainModalKind::ResolumeMapResult) {
+      RECT title{modal.left + 14, modal.top + 10,
+        modal.right - 14, modal.top + 34};
+      nativeAppActiveDrawText(dc, "Mapa Resolume", title,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(250, 204, 21), nameFont);
+      RECT mode{modal.right - 190, modal.top + 10,
+        modal.right - 14, modal.top + 34};
+      nativeAppActiveDrawText(dc,
+        g_nativeUiResolumeMapIncludeMarkers
+          ? "Com marcadores" : "Somente regioes",
+        mode, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        RGB(148, 163, 184), statusFont);
+      RECT messageRect{modal.left + 18, modal.top + 48,
+        modal.right - 18, modal.bottom - 54};
+      nativeAppActiveDrawText(dc, g_nativeMainModalMessage, messageRect,
+        DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
+        RGB(226, 232, 240), labelFont);
+      addModalButton("resolume_map_back", "Voltar",
+        RECT{modal.left + 14, modal.bottom - 36,
+          modal.left + 104, modal.bottom - 14},
+        "page", true);
+      addModalButton("close", "Fechar",
+        RECT{modal.right - 104, modal.bottom - 36,
+          modal.right - 14, modal.bottom - 14},
         "clear_playlist", true);
     } else {
       RECT title{modal.left + 10, modal.top + 8, modal.right - 10,
@@ -55088,7 +55426,30 @@ static bool nativeMainHandleModalClick(
     return true;
   }
   if (action == "config_resolume_map") {
-    showResolumeColumnCountForProject();
+    nativeUiOpenResolumeMapQuestion(false);
+    return true;
+  }
+  if (action == "resolume_map_yes" ||
+      action == "resolume_map_no") {
+    nativeUiShowResolumeMapResult(
+      action == "resolume_map_yes");
+    return true;
+  }
+  if (action == "resolume_map_back") {
+    g_nativeMainModalKind =
+      NativeMainModalKind::ResolumeMapQuestion;
+    if (nativeAppActivePanelIsOpen()) {
+      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    }
+    return true;
+  }
+  if (action == "resolume_map_cancel") {
+    g_nativeMainModalKind = g_nativeUiResolumeMapFromRename
+      ? NativeMainModalKind::RenameRow
+      : NativeMainModalKind::Config;
+    if (nativeAppActivePanelIsOpen()) {
+      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    }
     return true;
   }
 
@@ -55297,7 +55658,7 @@ static bool nativeMainHandleModalClick(
   } else if (action == "rename_premix") {
     nativeUiOpenPremixFromRename();
   } else if (action == "rename_resolume_map") {
-    showResolumeColumnMapForRenameTarget();
+    nativeUiOpenResolumeMapQuestion(true);
   } else if (action == "rename_block_midi") {
     nativeUiOpenBlockMidiCapture();
   } else if (action == "rename_block_color") {
@@ -77480,12 +77841,29 @@ static bool nativeApplyResolumeMapCommand(
 
   const std::string assignments = nativeTrim(
     nativeJsonExtractRawValue(commandBody, "assignments"));
+  std::string assignmentsWithMarkers = nativeTrim(
+    nativeJsonExtractRawValue(
+      commandBody, "assignmentsWithMarkers"));
+  std::string assignmentsRegionsOnly = nativeTrim(
+    nativeJsonExtractRawValue(
+      commandBody, "assignmentsRegionsOnly"));
   const int64_t firstColumn = nativeJsonInt64(
     commandBody, "firstColumn", 1);
-  if (assignments.size() < 2 || assignments.size() > 512 * 1024 ||
-      assignments.front() != '{' || assignments.back() != '}' ||
+  const auto validAssignments = [](const std::string& value) {
+    return value.size() >= 2 && value.size() <= 512 * 1024 &&
+      value.front() == '{' && value.back() == '}';
+  };
+  if (!validAssignments(assignments) ||
       firstColumn < 1 || firstColumn > 99999) {
     return true;
+  }
+  // Compatibilidade com uma Hook Center anterior: quando os dois mapas ainda
+  // não vêm no comando, o mapa ativo continua servindo como fallback.
+  if (!validAssignments(assignmentsWithMarkers)) {
+    assignmentsWithMarkers = assignments;
+  }
+  if (!validAssignments(assignmentsRegionsOnly)) {
+    assignmentsRegionsOnly = assignments;
   }
 
   const std::string firstColumnText = std::to_string(firstColumn);
@@ -77493,11 +77871,23 @@ static bool nativeApplyResolumeMapCommand(
     nativeGetProjExtStateString(project, kExtStateSection,
       kResolumeMapAssignmentsKey) != assignments ||
     nativeGetProjExtStateString(project, kExtStateSection,
+      kResolumeMapAssignmentsWithMarkersKey) !=
+        assignmentsWithMarkers ||
+    nativeGetProjExtStateString(project, kExtStateSection,
+      kResolumeMapAssignmentsRegionsOnlyKey) !=
+        assignmentsRegionsOnly ||
+    nativeGetProjExtStateString(project, kExtStateSection,
       kResolumeMapFirstColumnKey) != firstColumnText;
   if (!changed) return true;
 
   SetProjExtState_ptr(project, kExtStateSection,
     kResolumeMapAssignmentsKey, assignments.c_str());
+  SetProjExtState_ptr(project, kExtStateSection,
+    kResolumeMapAssignmentsWithMarkersKey,
+    assignmentsWithMarkers.c_str());
+  SetProjExtState_ptr(project, kExtStateSection,
+    kResolumeMapAssignmentsRegionsOnlyKey,
+    assignmentsRegionsOnly.c_str());
   SetProjExtState_ptr(project, kExtStateSection,
     kResolumeMapFirstColumnKey, firstColumnText.c_str());
   if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
