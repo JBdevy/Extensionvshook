@@ -3608,8 +3608,13 @@ struct TimecodeRegionRange {
   double start = 0.0;
   double end = 0.0;
   int indexNumber = 0;
+  int enumIndex = -1;
+  int rulerLane = -1;
   std::string name;
 };
+
+static int nativeGetRegionRulerLaneNumber(
+  ReaProject* project, int enumIndex);
 
 static std::string timecodeAsciiLower(std::string value)
 {
@@ -3658,6 +3663,8 @@ static std::vector<TimecodeRegionRange> collectTimecodeRegionRanges(
     range.start = start;
     range.end = end;
     range.indexNumber = indexNumber;
+    range.enumIndex = index;
+    range.rulerLane = nativeGetRegionRulerLaneNumber(project, index);
     range.name = name ? name : "";
     regions.push_back(std::move(range));
   }
@@ -3670,6 +3677,29 @@ static std::vector<TimecodeRegionRange> collectTimecodeRegionRanges(
       return lhs.indexNumber < rhs.indexNumber;
     });
   return regions;
+}
+
+static bool isTimecodeRegionFamilyParent(
+  const TimecodeRegionRange& candidate,
+  const std::vector<TimecodeRegionRange>& regions)
+{
+  constexpr double kFamilyEpsilon = 0.0005;
+  if (candidate.rulerLane != 0) return false;
+  for (const TimecodeRegionRange& child : regions) {
+    if (child.enumIndex == candidate.enumIndex || child.rulerLane != 1) {
+      continue;
+    }
+    const double childLength = child.end - child.start;
+    if (childLength <= kFamilyEpsilon) continue;
+    const double overlap =
+      std::min(child.end, candidate.end) -
+      std::max(child.start, candidate.start);
+    if (overlap > kFamilyEpsilon &&
+        (overlap / childLength) >= 0.50) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static MediaTrack* findOrCreateTimecodeTrack(
@@ -3872,6 +3902,7 @@ static void addTimecodeForEveryRegion()
       !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr ||
       !DeleteTrackMediaItem_ptr || !GetActiveTake_ptr ||
       !GetSetMediaItemTakeInfo_String_ptr ||
+      !GetRegionOrMarker_ptr || !GetRegionOrMarkerInfo_Value_ptr ||
       !GetItemStateChunk_ptr || !SetItemStateChunk_ptr ||
       !SetMediaItemInfo_Value_ptr || !SetOnlyTrackSelected_ptr ||
       !GetMediaTrackInfo_Value_ptr || !SetMediaTrackInfo_Value_ptr ||
@@ -3885,10 +3916,22 @@ static void addTimecodeForEveryRegion()
 
   ReaProject* project = getCurrentProject(nullptr, 0);
   if (!project) return;
-  const std::vector<TimecodeRegionRange> regions =
+  const std::vector<TimecodeRegionRange> allRegions =
     collectTimecodeRegionRanges(project);
+  std::vector<TimecodeRegionRange> regions;
+  regions.reserve(allRegions.size());
+  for (const TimecodeRegionRange& region : allRegions) {
+    // A regiao-pai e somente o agrupador visual. Criar MTC nela e tambem nos
+    // filhos envia dois fluxos simultaneos durante o Play. Pais legados cujos
+    // filhos sao marcadores continuam aceitos, pois nao possuem regioes na
+    // faixa Musicas/Filhos e portanto nao geram sobreposicao.
+    if (!isTimecodeRegionFamilyParent(region, allRegions)) {
+      regions.push_back(region);
+    }
+  }
   if (regions.empty()) {
-    showDiagnostic("Nao existem regioes neste projeto para criar o timecode.");
+    showDiagnostic(
+      "Nao existem musicas ou musicas-filho neste projeto para criar o timecode.");
     return;
   }
 
@@ -4106,8 +4149,15 @@ static void showResolumeColumnMap()
     return;
   }
 
-  const std::vector<TimecodeRegionRange> regions =
+  const std::vector<TimecodeRegionRange> allRegions =
     collectTimecodeRegionRanges(project);
+  std::vector<TimecodeRegionRange> regions;
+  regions.reserve(allRegions.size());
+  for (const TimecodeRegionRange& region : allRegions) {
+    if (!isTimecodeRegionFamilyParent(region, allRegions)) {
+      regions.push_back(region);
+    }
+  }
   const std::string savedAssignments = nativeGetProjExtStateString(
     project, kExtStateSection, kResolumeMapAssignmentsKey);
   const std::string savedFirstColumn = nativeGetProjExtStateString(
@@ -4169,6 +4219,7 @@ static void showResolumeColumnMap()
           &end, &rawName, &sourceNumber, &color) == 0 || isRegion) {
       continue;
     }
+    if (rawName && rawName[0] == '!') continue;
     bool duplicatesRegionStart = false;
     int containingRegion = -1;
     double containingRegionLength = std::numeric_limits<double>::max();
@@ -4197,6 +4248,8 @@ static void showResolumeColumnMap()
       }
     }
     if (duplicatesRegionStart) continue;
+    // Marcadores fora de uma musica normal ou musica-filho nao ocupam coluna.
+    if (containingRegion < 0) continue;
 
     ResolumeMapEntry entry;
     entry.sourceNumber = sourceNumber;
@@ -4292,20 +4345,6 @@ static void showResolumeColumnMap()
     appendSubMenu(menu, regionMenu,
       regionName + " (" + std::to_string(regionEntryCount) +
       (regionEntryCount == 1 ? " coluna)" : " colunas)"));
-  }
-
-  HMENU outsideMenu = nullptr;
-  for (const ResolumeMapEntry& entry : entries) {
-    if (entry.regionIndex >= 0) continue;
-    if (!outsideMenu) outsideMenu = CreatePopupMenu();
-    if (!outsideMenu) break;
-    appendText(outsideMenu, MF_STRING,
-      static_cast<UINT_PTR>(entry.commandId),
-      "Coluna " + std::to_string(entry.column) +
-        " - Marcador: " + entry.name);
-  }
-  if (outsideMenu) {
-    appendSubMenu(menu, outsideMenu, "Marcadores fora das regioes");
   }
 
   POINT cursor{100, 100};
