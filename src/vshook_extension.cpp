@@ -40141,7 +40141,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
         addModalButton("rename_premix", "Premix",
           footerRect(2), "yellow_reset", true);
         if (!g_nativeUiRenameFamilyParent) {
-          const int resolumeButtonW = std::max(96, footerButtonW);
+          // "Mapa Resolume" precisa de um pouco mais de largura que os
+          // demais atalhos para não perder o "e" final em DPI alto.
+          const int resolumeButtonW = std::max(116, footerButtonW);
           addModalButton("rename_resolume_map", "Mapa Resolume",
             RECT{std::max(footerLeft,
                    footerRight - resolumeButtonW),
