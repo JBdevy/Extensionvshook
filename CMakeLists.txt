@@ -27,7 +27,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
-option(VSHOOK_BUILD_TESTS "Build native VS Hook license tests" OFF)
+option(VSHOOK_BUILD_TESTS "Build native VS Hook tests" OFF)
 
 if(WIN32)
 # No Windows, o runtime do FFmpeg e carregado dinamicamente de
@@ -69,6 +69,10 @@ if(APPLE)
 endif()
 
 if(VSHOOK_BUILD_TESTS)
+  add_executable(vshook_mtc_timecode_test tests/native_mtc_timecode_test.cpp)
+  target_include_directories(vshook_mtc_timecode_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
   add_executable(vshook_license_test
     src/license_validator.cpp
     tests/license_validator_test.cpp
