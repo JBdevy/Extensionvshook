@@ -4141,6 +4141,7 @@ static void addTimecodeForEveryRegion()
 
 struct ResolumeMapEntry {
   int commandId = 0;
+  int deck = 0;
   int column = 0;
   int sourceNumber = 0;
   int regionIndex = -1;
@@ -10765,6 +10766,17 @@ static void nativePublishStandbyDiscoveryState()
   const std::string activeProjectMediaPath = activeProject
     ? nativeTelepromptProjectMediaDirectory(activeProject)
     : std::string();
+  // O RPP é a fonte persistente do Mapa Resolume. Publicar os dois mapas no
+  // snapshot permite que a Hook Center os recupere mesmo se o projeto mudar
+  // de pasta ou for aberto em outro computador.
+  const std::string resolumeAssignmentsWithMarkers = activeProject
+    ? nativeGetProjExtStateString(activeProject, kExtStateSection,
+        kResolumeMapAssignmentsWithMarkersKey)
+    : std::string();
+  const std::string resolumeAssignmentsRegionsOnly = activeProject
+    ? nativeGetProjExtStateString(activeProject, kExtStateSection,
+        kResolumeMapAssignmentsRegionsOnlyKey)
+    : std::string();
 
   const std::string directorPassword = nativeReadDirectorPassword();
   const std::string directorAuthHash = nativeDirectorPasswordHash(directorPassword);
@@ -10820,6 +10832,10 @@ static void nativePublishStandbyDiscoveryState()
   json << "\"projectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"currentProjectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"projectPath\":" << nativeJsonString(activeProjectPath) << ",";
+  json << "\"resolumeMapAssignmentsWithMarkers\":"
+       << nativeJsonString(resolumeAssignmentsWithMarkers) << ",";
+  json << "\"resolumeMapAssignmentsRegionsOnly\":"
+       << nativeJsonString(resolumeAssignmentsRegionsOnly) << ",";
   json << "\"projectMediaPath\":"
        << nativeJsonString(activeProjectMediaPath) << ",";
   json << "\"projectDirty\":"
@@ -11410,17 +11426,6 @@ static bool nativeBuildResolumeMapForChoice(
       return lhs.sourceNumber < rhs.sourceNumber;
     });
 
-  const std::string savedFirstColumn = nativeGetProjExtStateString(
-    project, kExtStateSection, kResolumeMapFirstColumnKey);
-  char* firstColumnEnd = nullptr;
-  const long parsedFirstColumn = std::strtol(
-    savedFirstColumn.c_str(), &firstColumnEnd, 10);
-  const int firstColumn = firstColumnEnd &&
-      firstColumnEnd != savedFirstColumn.c_str() &&
-      *firstColumnEnd == '\0' && parsedFirstColumn >= 1 &&
-      parsedFirstColumn <= 99999
-    ? static_cast<int>(parsedFirstColumn) : 1;
-
   const char* choiceKey = includeMarkers
     ? kResolumeMapAssignmentsWithMarkersKey
     : kResolumeMapAssignmentsRegionsOnlyKey;
@@ -11441,24 +11446,39 @@ static bool nativeBuildResolumeMapForChoice(
 
   std::vector<ResolumeMapEntry> mappedEntries;
   mappedEntries.reserve(entries.size());
-  std::vector<int> usedColumns;
+  std::vector<std::pair<int, int>> usedSlots;
   for (ResolumeMapEntry& entry : entries) {
     const std::string raw = nativeJsonExtractString(
       assignments, entry.sourceKey);
     if (raw.empty()) continue;
-    char* end = nullptr;
-    const long parsed = std::strtol(raw.c_str(), &end, 10);
-    if (!end || end == raw.c_str() || *end != '\0' ||
-        parsed < 0 || parsed >= 99999 ||
-        parsed + firstColumn > 99999) {
+    const size_t separator = raw.find(':');
+    if (separator == std::string::npos || separator == 0 ||
+        separator + 1 >= raw.size()) {
       continue;
     }
-    const int column = firstColumn + static_cast<int>(parsed);
-    if (std::find(usedColumns.begin(), usedColumns.end(), column) !=
-        usedColumns.end()) {
+    const std::string rawDeck = raw.substr(0, separator);
+    const std::string rawColumn = raw.substr(separator + 1);
+    char* deckEnd = nullptr;
+    char* columnEnd = nullptr;
+    const long parsedDeck = std::strtol(
+      rawDeck.c_str(), &deckEnd, 10);
+    const long parsedColumn = std::strtol(
+      rawColumn.c_str(), &columnEnd, 10);
+    if (!deckEnd || deckEnd == rawDeck.c_str() || *deckEnd != '\0' ||
+        !columnEnd || columnEnd == rawColumn.c_str() ||
+        *columnEnd != '\0' || parsedDeck < 0 || parsedDeck >= 99999 ||
+        parsedColumn < 0 || parsedColumn >= 99999) {
       continue;
     }
-    usedColumns.push_back(column);
+    const int deck = static_cast<int>(parsedDeck) + 1;
+    const int column = static_cast<int>(parsedColumn) + 1;
+    const std::pair<int, int> slot = {deck, column};
+    if (std::find(usedSlots.begin(), usedSlots.end(), slot) !=
+        usedSlots.end()) {
+      continue;
+    }
+    usedSlots.push_back(slot);
+    entry.deck = deck;
     entry.column = column;
     highestColumn = std::max(highestColumn, column);
     mappedEntries.push_back(std::move(entry));
@@ -11524,7 +11544,8 @@ static void nativeUiShowResolumeMapResult(bool includeMarkers)
         : g_nativeUiRenameInput;
       message << "Musica: "
               << (songName.empty() ? songEntry->name : songName)
-              << "\n\nInicio da musica: coluna "
+              << "\n\nDeck: " << songEntry->deck
+              << "\nInicio da musica: coluna "
               << songEntry->column
               << "\nConsiderar marcadores: "
               << (includeMarkers ? "Sim" : "Nao")
@@ -11534,15 +11555,17 @@ static void nativeUiShowResolumeMapResult(bool includeMarkers)
         message << "\nUltima coluna desta musica: "
                 << songHighestColumn;
       }
-      message << "\n\nProjeto completo: crie ate a coluna "
-              << highestColumn << " no Resolume.";
+      message << "\n\nOrganize esta musica no deck "
+              << songEntry->deck << ".";
     }
   } else {
     int songColumns = 0;
     int markerColumns = 0;
+    int requiredDecks = 0;
     for (const ResolumeMapEntry& entry : entries) {
       if (entry.regionStart) ++songColumns;
       else ++markerColumns;
+      requiredDecks = std::max(requiredDecks, entry.deck);
     }
     message << "Musicas: " << songColumns
             << "\nConsiderar marcadores: "
@@ -11550,9 +11573,8 @@ static void nativeUiShowResolumeMapResult(bool includeMarkers)
     if (includeMarkers) {
       message << "\nMarcadores internos: " << markerColumns;
     }
-    message << "\n\nTotal de colunas necessarias: "
-            << entries.size()
-            << "\nNo Resolume, crie ate a coluna "
+    message << "\n\nDecks necessarios: " << requiredDecks
+            << "\nMaior quantidade de colunas em um deck: "
             << highestColumn << ".";
   }
   g_nativeMainModalMessage = message.str();
@@ -52107,6 +52129,68 @@ static NativeMixerAreaLayout g_nativeHookControllerMixerGroupsLayout;
 static NativeMixerAreaLayout g_nativeHookControllerMixerTracksLayout;
 static RECT g_nativeHookControllerMixerGroupsRect{0, 0, 0, 0};
 static RECT g_nativeHookControllerMixerTracksRect{0, 0, 0, 0};
+
+static bool nativeUiResetRegionsToGridOrder()
+{
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(
+    pathBuf, static_cast<int>(sizeof(pathBuf)));
+  if (!project || !SetProjExtState_ptr) return false;
+
+  const std::string savedOrder = nativeGetProjExtStateString(
+    project, kPlaylistExtSection, kRegionOrderExtKey);
+  SetProjExtState_ptr(project, kPlaylistExtSection,
+    kRegionOrderExtKey, "");
+
+  std::vector<NativeSongWindow> songs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    songs = g_nativeSongWindows;
+  }
+  std::stable_sort(songs.begin(), songs.end(),
+    [](const NativeSongWindow& left,
+       const NativeSongWindow& right) {
+      if (std::fabs(left.start - right.start) > 0.0000005) {
+        return left.start < right.start;
+      }
+      if (left.isHashParent != right.isHashParent) {
+        return left.isHashParent;
+      }
+      if (left.isHashChild != right.isHashChild) {
+        return !left.isHashChild;
+      }
+      if (std::fabs(left.end - right.end) > 0.0000005) {
+        return left.end < right.end;
+      }
+      return left.sourceNumber < right.sourceNumber;
+    });
+  nativeNormalizeRegionFamilies(songs);
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativeSongWindows = std::move(songs);
+  }
+
+  g_nativeRegionsSortMode = 0;
+  g_nativeAppActiveListScrollPixels = 0;
+  g_nativeHookControllerScroll = 0;
+  nativeUiClearMainRowSelectionForPage(true);
+  g_nativeUiRowsSourceSignatureValid = false;
+  g_nativeUiLastModelRefreshAt =
+    std::chrono::steady_clock::time_point{};
+  nativeRefreshAppActivePanelModel();
+  if (!savedOrder.empty() && MarkProjectDirty_ptr) {
+    MarkProjectDirty_ptr(project);
+  }
+  g_nativeForceSnapshotBuild.store(true);
+  g_nativeForceStateBuild.store(true);
+  if (nativeAppActivePanelIsOpen()) {
+    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  }
+  if (g_nativeHookControllerHwnd) {
+    InvalidateRect(g_nativeHookControllerHwnd, nullptr, FALSE);
+  }
+  return true;
+}
 static NativeHookControllerPartsState
   g_nativeHookControllerPartsState[2];
 static constexpr UINT_PTR kNativeHookControllerTimerId = 0x56484354;
@@ -54336,8 +54420,7 @@ static void nativeHookControllerHandleClick(
               "Restaurar a ordem original das músicas?",
               "VS Hook - Restaurar")) {
           g_nativeRegionsRetrySortMode = g_nativeRegionsSortMode;
-          g_nativeRegionsSortMode = 0;
-          g_nativeHookControllerScroll = 0;
+          nativeUiResetRegionsToGridOrder();
         }
       }
       g_nativeForceStateBuild.store(true);
@@ -55621,8 +55704,7 @@ static bool nativeMainHandleModalClick(
     }
   } else if (action == "confirm_reset_regions") {
     g_nativeRegionsRetrySortMode = g_nativeRegionsSortMode;
-    g_nativeRegionsSortMode = 0;
-    g_nativeAppActiveListScrollPixels = 0;
+    nativeUiResetRegionsToGridOrder();
     nativeUiCloseMainModal();
   } else if (action == "confirm_tuner_reset") {
     const bool changed = nativeApplyTunerCommand(
@@ -59765,8 +59847,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             } else if (g_nativeMainModalKind ==
                        NativeMainModalKind::ConfirmResetRegions) {
               g_nativeRegionsRetrySortMode = g_nativeRegionsSortMode;
-              g_nativeRegionsSortMode = 0;
-              g_nativeAppActiveListScrollPixels = 0;
+              nativeUiResetRegionsToGridOrder();
               nativeUiCloseMainModal();
             } else if (g_nativeMainModalKind ==
                        NativeMainModalKind::ConfirmTunerReset) {
@@ -70884,6 +70965,14 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string activeProjectMediaPath = activeProject
     ? nativeTelepromptProjectMediaDirectory(activeProject)
     : std::string();
+  const std::string resolumeAssignmentsWithMarkers = activeProject
+    ? nativeGetProjExtStateString(activeProject, kExtStateSection,
+        kResolumeMapAssignmentsWithMarkersKey)
+    : std::string();
+  const std::string resolumeAssignmentsRegionsOnly = activeProject
+    ? nativeGetProjExtStateString(activeProject, kExtStateSection,
+        kResolumeMapAssignmentsRegionsOnlyKey)
+    : std::string();
 
   // O estado vivo continua em 220 ms, mas a estrutura pesada so e refeita
   // quando o projeto realmente muda ou um comando pede atualizacao. Isso evita
@@ -71644,6 +71733,10 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"projectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"currentProjectName\":" << nativeJsonString(activeProjectName) << ",";
   json << "\"projectPath\":" << nativeJsonString(activeProjectPath) << ",";
+  json << "\"resolumeMapAssignmentsWithMarkers\":"
+       << nativeJsonString(resolumeAssignmentsWithMarkers) << ",";
+  json << "\"resolumeMapAssignmentsRegionsOnly\":"
+       << nativeJsonString(resolumeAssignmentsRegionsOnly) << ",";
   json << "\"projectMediaPath\":"
        << nativeJsonString(activeProjectMediaPath) << ",";
   json << "\"projectDirty\":"
@@ -77891,6 +77984,7 @@ static bool nativeApplyResolumeMapCommand(
   SetProjExtState_ptr(project, kExtStateSection,
     kResolumeMapFirstColumnKey, firstColumnText.c_str());
   if (MarkProjectDirty_ptr) MarkProjectDirty_ptr(project);
+  g_nativeForceStateBuild.store(true);
   return true;
 }
 
