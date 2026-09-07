@@ -69,6 +69,7 @@
 // Framebuffer nativo cross-platform. No Windows usa bitmap/HDC compatível;
 // no macOS usa SWELL_CreateMemContext, o caminho suportado pelo REAPER.
 #include "wingui/membitmap.h"
+#include "native_ui_damage.h"
 
 class LICE_IBitmap;
 class AudioAccessor;
@@ -942,6 +943,10 @@ static std::unique_ptr<WDL_WinMemBitmap> g_nativeUiBackBuffer;
 static int g_nativeUiBackBufferWidth = 0;
 static int g_nativeUiBackBufferHeight = 0;
 static bool g_nativeUiBackBufferHasFrame = false;
+// Rebuilt with the hit-test geometry, including off-damage rows. Repainting
+// fewer pixels must never remove click targets from the rest of the panel.
+static std::vector<RECT> g_nativeUiProgressDamageRects;
+static RECT g_nativeUiInfoDamageRect{};
 static std::map<COLORREF, HBRUSH> g_nativeUiBrushCache;
 static std::map<uint64_t, HPEN> g_nativeUiPenCache;
 static std::map<std::pair<uintptr_t, std::string>, int>
@@ -13453,6 +13458,90 @@ static std::string nativeFindSongNameAtPosition(const std::vector<NativeSongWind
   return fallback;
 }
 
+struct NativeTelepromptScanItem {
+  MediaItem* item = nullptr;
+  MediaItem_Take* take = nullptr;
+  int index = -1;
+  double start = 0.0;
+  double end = 0.0;
+  std::string sourcePath;
+  std::string mediaPath;
+  std::string mediaType;
+  int priority = 0;
+};
+
+struct NativeTelepromptTrackScan {
+  ReaProject* project = nullptr;
+  MediaTrack* track = nullptr;
+  int trackIndex = -1;
+  int changeCount = -1;
+  std::string projectDirectory;
+  std::string mediaDirectory;
+  std::chrono::steady_clock::time_point builtAt{};
+  std::vector<NativeTelepromptScanItem> items;
+};
+
+static const NativeTelepromptTrackScan& nativeTelepromptTrackScan(
+  ReaProject* project, const std::string& trackName)
+{
+  // Somente a thread principal acessa este cache. As janelas e o bridge
+  // compartilham as mesmas leituras, sem repetir consultas de arquivo por item.
+  static std::map<std::string, NativeTelepromptTrackScan> scans;
+  if (scans.size() >= 8 && scans.find(trackName) == scans.end()) scans.clear();
+  auto& cached = scans[trackName];
+  const auto now = std::chrono::steady_clock::now();
+  const int changeCount = project && GetProjectStateChangeCount_ptr
+    ? GetProjectStateChangeCount_ptr(project) : -1;
+  const std::string projectDirectory = nativeTelepromptProjectFileDirectory(project);
+  const std::string mediaDirectory = nativeTelepromptProjectMediaDirectory(project);
+  if (cached.builtAt.time_since_epoch().count() != 0 &&
+      cached.project == project && cached.changeCount == changeCount &&
+      cached.projectDirectory == projectDirectory &&
+      cached.mediaDirectory == mediaDirectory &&
+      GetProjectStateChangeCount_ptr &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - cached.builtAt).count() < 1000) {
+    return cached;
+  }
+
+  NativeTelepromptTrackScan next;
+  next.project = project;
+  next.changeCount = changeCount;
+  next.projectDirectory = projectDirectory;
+  next.mediaDirectory = mediaDirectory;
+  next.builtAt = now;
+  next.track = nativeFindTrackByExactName(project, trackName, &next.trackIndex);
+  if (next.track && GetTrackNumMediaItems_ptr && GetTrackMediaItem_ptr &&
+      GetMediaItemInfo_Value_ptr) {
+    const int count = GetTrackNumMediaItems_ptr(next.track);
+    next.items.reserve(std::max(0, count));
+    for (int index = 0; index < count; ++index) {
+      NativeTelepromptScanItem entry;
+      entry.item = GetTrackMediaItem_ptr(next.track, index);
+      if (!entry.item) continue;
+      entry.index = index;
+      entry.start = GetMediaItemInfo_Value_ptr(entry.item, "D_POSITION");
+      entry.end = entry.start + std::max(0.0,
+        GetMediaItemInfo_Value_ptr(entry.item, "D_LENGTH"));
+      entry.take = GetActiveTake_ptr ? GetActiveTake_ptr(entry.item) : nullptr;
+      entry.sourcePath = nativeReadTakeSourcePath(entry.take);
+      if (entry.sourcePath.empty()) {
+        const std::string label = nativeReadTakeText(entry.take);
+        if (nativeTelepromptLabelLooksLikeMediaPath(label)) entry.sourcePath = label;
+      }
+      entry.mediaPath = nativeResolveTelepromptMediaPath(
+        entry.sourcePath, projectDirectory, mediaDirectory);
+      entry.mediaType = entry.mediaPath.empty() ? "text"
+        : nativeDetectTelepromptMediaType(entry.mediaPath);
+      entry.priority = entry.mediaType == "video" ? 2
+        : (entry.mediaType == "image" ? 1 : 0);
+      next.items.push_back(std::move(entry));
+    }
+  }
+  cached = std::move(next);
+  return cached;
+}
+
 static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std::vector<NativeSongWindow>& songs, int slot, const std::string& trackName, bool transportPlaying, double playPos, const std::string& playingName)
 {
   const double pos = (transportPlaying && GetPlayPositionEx_ptr) ? playPos : (GetCursorPositionEx_ptr ? GetCursorPositionEx_ptr(project) : playPos);
@@ -13470,8 +13559,9 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
     rememberNextChange(song.start);
     rememberNextChange(song.end);
   }
-  int trackIndex = -1;
-  MediaTrack* track = nativeFindTrackByExactName(project, trackName, &trackIndex);
+  const auto& trackScan = nativeTelepromptTrackScan(project, trackName);
+  const int trackIndex = trackScan.trackIndex;
+  MediaTrack* track = trackScan.track;
 
   // FIX105: resolve todos os itens ativos na mesma posição da pista TELEPROMPT.
   // Regra de prioridade na mesma posição:
@@ -13509,14 +13599,6 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   std::string nextMediaType = "text";
   std::string nextMediaExt;
 
-  // GetMediaSourceFileName pode devolver exatamente o valor relativo salvo no
-  // RPP. Resolve uma vez contra o diretorio do projeto para que decoder, cache
-  // e /media nao dependam do current working directory do processo do REAPER.
-  const std::string projectFileDirectory =
-    nativeTelepromptProjectFileDirectory(project);
-  const std::string projectMediaDirectory =
-    nativeTelepromptProjectMediaDirectory(project);
-
   std::vector<std::string> textParts;
   int chosenTextIndex = -1;
   std::string chosenTextGuid;
@@ -13533,33 +13615,18 @@ static std::string nativeBuildTelepromptStateJson(ReaProject* project, const std
   };
 
   if (track && GetTrackNumMediaItems_ptr && GetTrackMediaItem_ptr && GetMediaItemInfo_Value_ptr) {
-    const int count = GetTrackNumMediaItems_ptr(track);
-    for (int i = 0; i < count; ++i) {
-      MediaItem* currentItem = GetTrackMediaItem_ptr(track, i);
-      if (!currentItem) continue;
-      const double itemStart = GetMediaItemInfo_Value_ptr(currentItem, "D_POSITION");
-      const double itemLen = std::max(0.0, GetMediaItemInfo_Value_ptr(currentItem, "D_LENGTH"));
-      const double itemEnd = itemStart + itemLen;
+    for (const auto& entry : trackScan.items) {
+      const int i = entry.index;
+      MediaItem* currentItem = entry.item;
+      const double itemStart = entry.start;
+      const double itemEnd = entry.end;
       rememberNextChange(itemStart);
       rememberNextChange(itemEnd);
-
-      MediaItem_Take* currentTake = currentItem && GetActiveTake_ptr ? GetActiveTake_ptr(currentItem) : nullptr;
-      std::string currentMediaSourcePath =
-        nativeReadTakeSourcePath(currentTake);
-      const std::string takeLabel = nativeReadTakeText(currentTake);
-      if (currentMediaSourcePath.empty() &&
-          nativeTelepromptLabelLooksLikeMediaPath(takeLabel)) {
-        currentMediaSourcePath = takeLabel;
-      }
-
-      const std::string currentMediaPath =
-        nativeResolveTelepromptMediaPath(
-          currentMediaSourcePath,
-          projectFileDirectory,
-          projectMediaDirectory);
-
-      const std::string currentMediaType = currentMediaPath.empty() ? std::string("text") : nativeDetectTelepromptMediaType(currentMediaPath);
-      const int currentPriority = currentMediaType == "video" ? 2 : (currentMediaType == "image" ? 1 : 0);
+      MediaItem_Take* currentTake = entry.take;
+      const std::string& currentMediaSourcePath = entry.sourcePath;
+      const std::string& currentMediaPath = entry.mediaPath;
+      const std::string& currentMediaType = entry.mediaType;
+      const int currentPriority = entry.priority;
 
       // Publica também a próxima mídia da pista. O app pode começar o
       // download enquanto a mídia atual ainda está tocando e apenas revelar o
@@ -17457,6 +17524,7 @@ static RECT nativeUiCustomizePaintRect(
 static void nativeAppActiveFillRoundRect(HDC dc, const RECT& rect, COLORREF fill, COLORREF border, int radius)
 {
   const RECT paintRect = nativeUiCustomizePaintRect(rect);
+  if (!NativeUiDamage::visible(dc, paintRect)) return;
   if (!dc || paintRect.right <= paintRect.left ||
       paintRect.bottom <= paintRect.top) return;
   // Paineis e a superficie principal conservam seus proprios raios. A
@@ -17508,6 +17576,7 @@ static void nativeAppActiveStrokeRoundRect(
   int cornerRadius)
 {
   const RECT paintRect = nativeUiCustomizePaintRect(rect);
+  if (!NativeUiDamage::visible(dc, paintRect)) return;
   if (!dc || paintRect.right <= paintRect.left ||
       paintRect.bottom <= paintRect.top) return;
   if (cornerRadius > 0) {
@@ -17547,6 +17616,7 @@ static void nativeAppActiveStrokeRoundRect(
 static void nativeAppActiveFillRect(HDC dc, const RECT& rect, COLORREF fill)
 {
   const RECT paintRect = nativeUiCustomizePaintRect(rect);
+  if (!NativeUiDamage::visible(dc, paintRect)) return;
   const NativeUiBrushRef brush = nativeUiBrush(fill);
   if (!brush.handle) return;
   FillRect(dc, &paintRect, brush.handle);
@@ -18030,6 +18100,8 @@ static void nativeUiReleaseBackBuffer()
   g_nativeUiBackBufferWidth = 0;
   g_nativeUiBackBufferHeight = 0;
   g_nativeUiBackBufferHasFrame = false;
+  g_nativeUiProgressDamageRects.clear();
+  g_nativeUiInfoDamageRect = RECT{};
 }
 
 static HDC nativeUiBackBuffer(
@@ -18149,6 +18221,10 @@ static void nativeAppActiveDrawBlackShadow(HDC dc, const RECT& rect)
 static void nativeAppActiveDrawText(HDC dc, const std::string& text, RECT rect, UINT flags, COLORREF color, HFONT font)
 {
   rect = nativeUiCustomizePaintRect(rect);
+  // DT_NOCLIP may draw outside its layout rectangle; measurement calls also
+  // must not depend on which pixels happened to need painting this frame.
+  if (!(flags & (DT_NOCLIP | DT_CALCRECT)) &&
+      !NativeUiDamage::visible(dc, rect)) return;
   HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
   SetBkMode(dc, TRANSPARENT);
   SetTextColor(dc, color);
@@ -18586,7 +18662,8 @@ static bool nativeAppActivePartRowsEqual(
 
 static bool nativeAppActivePartColumnsEqual(
   const NativeAppActivePanelModel::PartColumn& left,
-  const NativeAppActivePanelModel::PartColumn& right)
+  const NativeAppActivePanelModel::PartColumn& right,
+  bool compareProgress = true)
 {
   return left.hasSource == right.hasSource &&
     left.sourceId == right.sourceId &&
@@ -18598,7 +18675,8 @@ static bool nativeAppActivePartColumnsEqual(
     std::fabs(left.regressEnd - right.regressEnd) <= 0.000001 &&
     // O Lua redesenha o regresso em cada ciclo. Uma tolerancia de 0.001 fazia
     // a barra andar em saltos perceptiveis quando o intervalo era longo.
-    std::fabs(left.regressRatio - right.regressRatio) <= 0.000001 &&
+    (!compareProgress ||
+      std::fabs(left.regressRatio - right.regressRatio) <= 0.000001) &&
     nativeAppActivePartRowsEqual(left.rows, right.rows);
 }
 
@@ -22474,9 +22552,37 @@ static bool nativeUiPaintBackgroundImage(
 
   const std::string path =
     nativeUiMaterializeEmbeddedBackground(mode);
+  if (path.empty()) return false;
+  struct BackgroundSurface {
+    std::unique_ptr<WDL_WinMemBitmap> bitmap;
+    std::string path;
+    int width = 0;
+    int height = 0;
+  };
+  // Os fundos embutidos são imutáveis. Reescala apenas ao trocar a imagem ou
+  // redimensionar a área; barras e relógios reutilizam a superfície pronta.
+  static std::map<std::string, BackgroundSurface> surfaces;
+  auto& surface = surfaces[preferenceKey];
+  if (surface.bitmap && surface.path == path &&
+      surface.width == w && surface.height == h) {
+#ifdef _WIN32
+    return BitBlt(dc, rect.left, rect.top, w, h,
+      surface.bitmap->GetDC(), 0, 0, SRCCOPY) != FALSE;
+#else
+    BitBlt(dc, rect.left, rect.top, w, h,
+      surface.bitmap->GetDC(), 0, 0, SRCCOPY);
+    return true;
+#endif
+  }
   vshook_static_image::DecodedImage image;
-  if (path.empty() ||
-      !vshook_static_image::decodeFile(path, image)) return false;
+  if (!vshook_static_image::decodeFile(path, image)) return false;
+
+  HDC destinationDc = dc;
+  auto rendered = std::make_unique<WDL_WinMemBitmap>();
+  rendered->DoSize(dc, w, h);
+  const bool canCache = rendered->GetDC() != nullptr;
+  const RECT target = canCache ? RECT{0, 0, w, h} : rect;
+  if (canCache) dc = rendered->GetDC();
 
   const int sourceWidth = image.width;
   const int sourceHeight = image.height;
@@ -22489,9 +22595,9 @@ static bool nativeUiPaintBackgroundImage(
     static_cast<int>(std::ceil(sourceWidth * scale)));
   const int drawHeight = std::max(h,
     static_cast<int>(std::ceil(sourceHeight * scale)));
-  const int drawLeft = rect.left + (w - drawWidth) / 2;
-  const int drawTop = rect.top + (h - drawHeight) / 2;
-  const NativeUiClipState clip = nativeUiBeginClipRect(dc, rect);
+  const int drawLeft = target.left + (w - drawWidth) / 2;
+  const int drawTop = target.top + (h - drawHeight) / 2;
+  const NativeUiClipState clip = nativeUiBeginClipRect(dc, target);
   bool painted = false;
 #ifdef _WIN32
   BITMAPINFO info{};
@@ -22515,6 +22621,20 @@ static bool nativeUiPaintBackgroundImage(
     drawLeft, drawTop, drawWidth, drawHeight);
 #endif
   nativeUiEndClipRect(dc, clip);
+  if (painted && canCache) {
+    surface.bitmap = std::move(rendered);
+    surface.path = path;
+    surface.width = w;
+    surface.height = h;
+#ifdef _WIN32
+    return BitBlt(destinationDc, rect.left, rect.top, w, h,
+      surface.bitmap->GetDC(), 0, 0, SRCCOPY) != FALSE;
+#else
+    BitBlt(destinationDc, rect.left, rect.top, w, h,
+      surface.bitmap->GetDC(), 0, 0, SRCCOPY);
+    return true;
+#endif
+  }
   return painted;
 }
 
@@ -36076,6 +36196,7 @@ static void nativeUiPaintPremixMixerItemRow(
 
 static void nativePaintAppActivePanel(HWND hwnd)
 {
+  NativeUiDamage::Frame damage(hwnd);
   PAINTSTRUCT ps{};
   HDC paintDc = BeginPaint(hwnd, &ps);
   if (!paintDc) return;
@@ -36085,13 +36206,16 @@ static void nativePaintAppActivePanel(HWND hwnd)
   const int width = std::max(1, static_cast<int>(client.right - client.left));
   const int height = std::max(1, static_cast<int>(client.bottom - client.top));
   HDC dc = paintDc;
-  // Cada quadro e redesenhado por inteiro fora da tela e apresentado de uma
-  // vez. Nao reutiliza recortes do quadro anterior: modais, listas e sombras
-  // nunca podem conservar pixels antigos nem disputar a mesma regiao.
+  // Preserve the last frame outside the update region. Layout/modal changes
+  // still invalidate the entire client, and a new buffer always starts full.
   if (HDC bufferDc = nativeUiBackBuffer(
         paintDc, width, height)) {
     dc = bufferDc;
   }
+  damage.begin(dc, client, ps.rcPaint,
+    dc != paintDc && g_nativeUiBackBufferHasFrame);
+  g_nativeUiProgressDamageRects.clear();
+  g_nativeUiInfoDamageRect = RECT{};
   const auto& paintVisualPrefs =
     nativeUiVisualPrefsForPaint();
   g_nativeUiModernButtonDesign = nativeLower(
@@ -36215,10 +36339,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
     nativeAppActiveFillRoundRect(dc, splashFill,
       RGB(255, 138, 42), RGB(255, 170, 90), splashBarH / 2);
 
+    damage.finish();
     if (dc != paintDc) {
       g_nativeUiBackBufferHasFrame = true;
-      BitBlt(paintDc, client.left, client.top,
-        width, height, dc, client.left, client.top, SRCCOPY);
+      const RECT& dirty = damage.bounds();
+      BitBlt(paintDc, dirty.left, dirty.top,
+        dirty.right - dirty.left, dirty.bottom - dirty.top,
+        dc, dirty.left, dirty.top, SRCCOPY);
     }
     EndPaint(hwnd, &ps);
     return;
@@ -37149,6 +37276,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     const int panelTextTop = 2;
     const int panelTextBottom = 2;
     RECT card{pad, panelY, width - pad, panelY + panelHeight};
+    g_nativeUiProgressDamageRects.push_back(card);
     const COLORREF cardFill = playbackPanelColors && currentActive
       ? RGB(205, 20, 20)
       : playbackPanelColors && auto2QueueActive
@@ -38044,6 +38172,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
               g_nativeAppActivePanelModel.queuedId,
               g_nativeAppActivePanelModel.queuedStart,
               g_nativeAppActivePanelModel.queuedEnd);
+      if (isPlaying || isQueued || familyContainsPlayback) {
+        RECT dirtyRow{rowRect.left,
+          std::max(rowRect.top, static_cast<LONG>(listInnerTop)),
+          rowRect.right,
+          std::min(rowRect.bottom, static_cast<LONG>(listInnerBottom))};
+        if (dirtyRow.bottom > dirtyRow.top) {
+          g_nativeUiProgressDamageRects.push_back(dirtyRow);
+        }
+      }
       // Literal do Lua: somente a linha que iniciou o drag recebe COLORS.drag
       // ({0.48, 0.20, 0.86, 1}). As outras linhas selecionadas conservam seu
       // estado normal e a fila continua indicada pelas barrinhas.
@@ -38991,6 +39128,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
   HFONT infoStripFont = nativeUiInfoStripFont();
   RECT timerStrip{pad, timerStatusY, width - pad,
     timerStatusY + timerStatusH};
+  g_nativeUiInfoDamageRect = timerStrip;
   nativeAppActiveFillRect(dc, timerStrip, timerStripFill);
   RECT timerTopEdge{timerStrip.left, timerStrip.top,
     timerStrip.right, timerStrip.top + 1};
@@ -46636,10 +46774,13 @@ static void nativePaintAppActivePanel(HWND hwnd)
     }
   }
 
+  damage.finish();
   if (dc != paintDc) {
     g_nativeUiBackBufferHasFrame = true;
-    BitBlt(paintDc, client.left, client.top,
-      width, height, dc, client.left, client.top, SRCCOPY);
+    const RECT& dirty = damage.bounds();
+    BitBlt(paintDc, dirty.left, dirty.top,
+      dirty.right - dirty.left, dirty.bottom - dirty.top,
+      dc, dirty.left, dirty.top, SRCCOPY);
   }
   EndPaint(hwnd, &ps);
 }
@@ -58303,7 +58444,7 @@ static void nativeUiPaintRgbAnimatedFrame(HWND hwnd)
   }
 }
 
-static bool nativeUiNeedsTimedVisualRefresh()
+static bool nativeUiNeedsTimedVisualRefresh(bool excludeTransport = false)
 {
   // Depois do prazo ainda precisamos de um último quadro para o paint apagar
   // o popup. O próprio paint limpa o texto e encerra os próximos repaints.
@@ -58322,10 +58463,11 @@ static bool nativeUiNeedsTimedVisualRefresh()
   nativeUiReadManualStopFadeoutVisualState(
     fadeoutActive, fadeoutRestorePending,
     fadeoutProgress, fadeoutDurationSec);
-  return g_nativeAppActivePanelModel.timerExpired ||
+  return (!excludeTransport &&
+    (g_nativeAppActivePanelModel.timerExpired ||
     (g_nativeAppActivePanelModel.partArmed &&
       (g_nativeAppActivePanelModel.showParts1 ||
-       g_nativeAppActivePanelModel.showParts2)) ||
+       g_nativeAppActivePanelModel.showParts2)))) ||
     g_nativeMainSearchFocused ||
     g_nativePartsRenameOpen ||
     g_nativeMixerRenameOpen ||
@@ -58335,6 +58477,51 @@ static bool nativeUiNeedsTimedVisualRefresh()
     fadeoutActive ||
     fadeoutRestorePending ||
     popupPending;
+}
+
+static void nativeUiInvalidateDynamicAreas(HWND hwnd, bool progress, bool info)
+{
+  // Transitions/overlays keep the existing full-frame path. In particular,
+  // do not use geometry from the previous page while a layout is changing.
+  if (!g_nativeUiBackBufferHasFrame ||
+      std::chrono::steady_clock::now() < g_nativeAppActiveSplashUntil ||
+      g_nativeMainModalKind != NativeMainModalKind::None ||
+      g_state.directorInterfaceBlocked ||
+      g_nativeAppActivePanelModel.mixerPage ||
+      g_nativePartsRenameOpen || g_nativeMixerRenameOpen ||
+      g_nativeMainRowInlineRenameOpen || g_nativeMainBpmEditOpen ||
+      g_nativeMainListDrag.pressed || g_nativeMainPartsResizeDragging ||
+      g_nativeMainScrollbarDragging || nativeUiSmoothScrollActive() ||
+      nativeUiNeedsTimedVisualRefresh(true)) {
+    InvalidateRect(hwnd, nullptr, FALSE);
+    return;
+  }
+  if (progress && g_nativeAppActivePanelModel.playing &&
+      !g_nativeAppActivePanelModel.playingId.empty()) {
+    const double remaining = std::max(0.0,
+      (g_nativeAppActivePanelModel.playingEnd -
+       g_nativeAppActivePanelModel.playingStart) *
+      (1.0 - g_nativeAppActivePanelModel.progress));
+    const std::string layoutKey = g_nativeAppActivePanelModel.playingId +
+      "|" + nativeAppActiveFormatDuration(remaining);
+    if (layoutKey != g_nativeUiMainLayoutPlayingKey) {
+      // The remaining-time label can change row wrapping/height.
+      InvalidateRect(hwnd, nullptr, FALSE);
+      return;
+    }
+  }
+  const auto invalidate = [hwnd](const RECT& rect) {
+    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
+    const RECT padded{rect.left - 2, rect.top - 2,
+      rect.right + 2, rect.bottom + 2};
+    InvalidateRect(hwnd, &padded, FALSE);
+  };
+  if (progress) {
+    for (const RECT& rect : g_nativeUiProgressDamageRects) invalidate(rect);
+    if (g_nativeAppActivePanelModel.showParts1) invalidate(g_nativeMainParts1Rect);
+    if (g_nativeAppActivePanelModel.showParts2) invalidate(g_nativeMainParts2Rect);
+  }
+  if (info) invalidate(g_nativeUiInfoDamageRect);
 }
 
 static bool nativeUiLocalClockChanged()
@@ -58481,7 +58668,18 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               localClockChanged ||
              batteryChanged || timedRefresh || splashActive ||
              splashFinished)) {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          const bool fullRefresh = scrollChanged || dragScrollChanged ||
+            searchQueryCommitted || navigationCommitted ||
+            selectionReleasedForEditing || splashActive || splashFinished ||
+            (timedRefresh && nativeUiNeedsTimedVisualRefresh(true));
+          if (fullRefresh) {
+            InvalidateRect(hwnd, nullptr, FALSE);
+          } else {
+            nativeUiInvalidateDynamicAreas(hwnd,
+              timedRefresh && g_nativeAppActivePanelModel.partArmed,
+              localClockChanged || batteryChanged ||
+                g_nativeAppActivePanelModel.timerExpired);
+          }
           // A animação da lista não depende da fila normal de WM_PAINT:
           // no Win32 e no SWELL do macOS, cada passo continua sendo
           // apresentado durante o autorepeat das setas.
@@ -61317,6 +61515,7 @@ static void nativeArmVideoRefreshTimer(
 struct NativeTelepromptSettings {
   std::string preset = "night";
   std::string textColor = "#ffea00";
+  std::string highlightColor = "#00ff55";
   std::string textBoxColor = "#ffea00";
   std::string clockColor = "#00ff55";
   std::string clockExpiredColor = "#ff3131";
@@ -62007,6 +62206,7 @@ static void nativeTelepromptApplySettingsJson(
   stringValue("preset", next.preset);
   if (next.preset != "day") next.preset = "night";
   stringValue("textColor", next.textColor);
+  stringValue("highlightColor", next.highlightColor);
   stringValue("textBoxColor", next.textBoxColor);
   stringValue("clockColor", next.clockColor);
   stringValue("clockExpiredColor", next.clockExpiredColor);
@@ -62145,6 +62345,7 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"slot\":" << slot << ",";
   json << "\"preset\":\"night\",";
   json << "\"textColor\":\"#ffea00\",";
+  json << "\"highlightColor\":\"#00ff55\",";
   json << "\"textBoxColor\":\"#ffea00\",";
   json << "\"clockColor\":\"#00ff55\",";
   json << "\"clockExpiredColor\":\"#ff3131\",";
@@ -62216,6 +62417,8 @@ static std::string nativeTelepromptSettingsToJson(
             settings.preset == "day" ? "day" : "night") << ",";
   json << "\"textColor\":"
        << nativeJsonString(settings.textColor) << ",";
+  json << "\"highlightColor\":"
+       << nativeJsonString(settings.highlightColor) << ",";
   json << "\"textBoxColor\":"
        << nativeJsonString(settings.textBoxColor) << ",";
   json << "\"clockColor\":"
@@ -62342,6 +62545,7 @@ static std::string nativeTelepromptDefaultPresetSettingsJson(
   settings.preset = preset == "day" ? "day" : "night";
   if (settings.preset == "day") {
     settings.textColor = "#ffffff";
+    settings.highlightColor = "#d97706";
     settings.textBoxColor = "#ffffff";
     settings.clockColor = "#ffffff";
     settings.clockExpiredColor = "#d60000";
@@ -62878,11 +63082,61 @@ static RECT nativeTelepromptMeasureText(
 
 struct NativeTelepromptWrappedTextLayout {
   std::vector<std::string> lines;
+  std::vector<std::vector<unsigned char>> highlightedBytes;
   int lineHeight = 1;
   int lineGap = 0;
   int maxLineWidth = 0;
   int totalHeight = 0;
 };
+
+struct NativeTelepromptHighlightedText {
+  std::string text;
+  std::vector<unsigned char> highlightedBytes;
+};
+
+static NativeTelepromptHighlightedText
+nativeTelepromptParseHighlightedText(const std::string& raw)
+{
+  NativeTelepromptHighlightedText parsed;
+  parsed.text.reserve(raw.size());
+  parsed.highlightedBytes.reserve(raw.size());
+  const auto whitespaceAt = [&](size_t offset) {
+    return offset < raw.size() && std::isspace(
+      static_cast<unsigned char>(raw[offset])) != 0;
+  };
+  const auto append = [&](size_t start, size_t length, bool highlighted) {
+    parsed.text.append(raw, start, length);
+    parsed.highlightedBytes.insert(
+      parsed.highlightedBytes.end(), length,
+      highlighted ? 1u : 0u);
+  };
+
+  size_t cursor = 0;
+  while (cursor < raw.size()) {
+    if (raw[cursor] != '*' || cursor + 1 >= raw.size() ||
+        whitespaceAt(cursor + 1)) {
+      append(cursor, 1, false);
+      ++cursor;
+      continue;
+    }
+    size_t closing = cursor + 1;
+    while (closing < raw.size()) {
+      if (raw[closing] == '*' && closing > cursor + 1 &&
+          !whitespaceAt(closing - 1)) {
+        break;
+      }
+      ++closing;
+    }
+    if (closing >= raw.size()) {
+      append(cursor, 1, false);
+      ++cursor;
+      continue;
+    }
+    append(cursor + 1, closing - cursor - 1, true);
+    cursor = closing + 1;
+  }
+  return parsed;
+}
 
 static size_t nativeTelepromptUtf8CharacterLength(
   const std::string& text,
@@ -62909,7 +63163,8 @@ nativeTelepromptLayoutWrappedTextMac(
   HDC dc,
   const std::string& text,
   HFONT font,
-  int maximumWidth)
+  int maximumWidth,
+  const std::vector<unsigned char>* highlightedBytes = nullptr)
 {
   NativeTelepromptWrappedTextLayout layout;
   maximumWidth = std::max(1, maximumWidth);
@@ -62926,14 +63181,20 @@ nativeTelepromptLayoutWrappedTextMac(
   auto textWidth = [&](const std::string& value) {
     return nativeUiTextWidth(dc, value, font);
   };
-  auto appendLine = [&](const std::string& value) {
+  auto appendLine = [&](
+    const std::string& value,
+    const std::vector<unsigned char>& highlights) {
     layout.lines.push_back(value);
+    layout.highlightedBytes.push_back(highlights);
     layout.maxLineWidth =
       std::max(layout.maxLineWidth, textWidth(value));
   };
 
-  auto appendParagraph = [&](const std::string& paragraph) {
+  auto appendParagraph = [&](
+    const std::string& paragraph,
+    size_t paragraphOffset) {
     std::string line;
+    std::vector<unsigned char> lineHighlights;
     bool foundWord = false;
     size_t cursor = 0;
     while (cursor < paragraph.size()) {
@@ -62953,27 +63214,46 @@ nativeTelepromptLayoutWrappedTextMac(
       }
       const std::string word =
         paragraph.substr(wordStart, cursor - wordStart);
+      std::vector<unsigned char> wordHighlights(word.size(), 0u);
+      if (highlightedBytes) {
+        for (size_t byte = 0; byte < word.size(); ++byte) {
+          const size_t source = paragraphOffset + wordStart + byte;
+          if (source < highlightedBytes->size()) {
+            wordHighlights[byte] = (*highlightedBytes)[source];
+          }
+        }
+      }
       if (word.empty()) continue;
       foundWord = true;
 
       const std::string candidate =
         line.empty() ? word : line + " " + word;
       if (textWidth(candidate) <= maximumWidth) {
-        line = candidate;
+        if (!line.empty()) {
+          line.push_back(' ');
+          lineHighlights.push_back(0u);
+        }
+        line += word;
+        lineHighlights.insert(
+          lineHighlights.end(),
+          wordHighlights.begin(), wordHighlights.end());
         continue;
       }
       if (!line.empty()) {
-        appendLine(line);
+        appendLine(line, lineHighlights);
         line.clear();
+        lineHighlights.clear();
       }
       if (textWidth(word) <= maximumWidth) {
         line = word;
+        lineHighlights = wordHighlights;
         continue;
       }
 
       // Uma palavra sem espaços também não pode ultrapassar a lateral.
       // Divide apenas em limites UTF-8 válidos para não corromper acentos.
       std::string fragment;
+      std::vector<unsigned char> fragmentHighlights;
       size_t wordOffset = 0;
       while (wordOffset < word.size()) {
         const size_t characterLength =
@@ -62984,20 +63264,29 @@ nativeTelepromptLayoutWrappedTextMac(
           fragment + character;
         if (!fragment.empty() &&
             textWidth(fragmentCandidate) > maximumWidth) {
-          appendLine(fragment);
+          appendLine(fragment, fragmentHighlights);
           fragment = character;
+          fragmentHighlights.assign(
+            characterLength,
+            wordOffset < wordHighlights.size()
+              ? wordHighlights[wordOffset] : 0u);
         } else {
           fragment = fragmentCandidate;
+          fragmentHighlights.insert(
+            fragmentHighlights.end(), characterLength,
+            wordOffset < wordHighlights.size()
+              ? wordHighlights[wordOffset] : 0u);
         }
         wordOffset += characterLength;
       }
       line = fragment;
+      lineHighlights = fragmentHighlights;
     }
     if (!line.empty()) {
-      appendLine(line);
+      appendLine(line, lineHighlights);
     } else if (!foundWord) {
       // Mantém linhas vazias intencionais entre trechos da letra.
-      appendLine("");
+      appendLine("", {});
     }
   };
 
@@ -63009,7 +63298,7 @@ nativeTelepromptLayoutWrappedTextMac(
       paragraphStart,
       paragraphEnd == std::string::npos
         ? std::string::npos
-        : paragraphEnd - paragraphStart));
+        : paragraphEnd - paragraphStart), paragraphStart);
     if (paragraphEnd == std::string::npos) break;
     paragraphStart = paragraphEnd + 1;
   }
@@ -63030,7 +63319,9 @@ static void nativeTelepromptDrawWrappedTextMac(
   const RECT& available,
   COLORREF color,
   HFONT font,
-  const std::string& alignment = "center")
+  const std::string& alignment = "center",
+  COLORREF highlightColor = 0,
+  bool highlightsEnabled = false)
 {
   if (!dc || layout.lines.empty()) return;
   const int availableHeight = std::max(
@@ -63084,11 +63375,56 @@ static void nativeTelepromptDrawWrappedTextMac(
             normalizedAlignment == "justify"
           ? DT_LEFT
           : (normalizedAlignment == "right" ? DT_RIGHT : DT_CENTER);
-        nativeAppActiveDrawText(
-          dc, line, lineRect,
-          horizontalFlag | DT_VCENTER |
-            DT_SINGLELINE | DT_NOPREFIX,
-          color, font);
+        const std::vector<unsigned char>* highlights =
+          lineIndex < layout.highlightedBytes.size()
+            ? &layout.highlightedBytes[lineIndex] : nullptr;
+        const bool hasHighlightedText = highlightsEnabled && highlights &&
+          highlights->size() == line.size() &&
+          std::find(highlights->begin(), highlights->end(), 1u) !=
+            highlights->end();
+        if (!hasHighlightedText) {
+          nativeAppActiveDrawText(
+            dc, line, lineRect,
+            horizontalFlag | DT_VCENTER |
+              DT_SINGLELINE | DT_NOPREFIX,
+            color, font);
+        } else {
+          const int lineWidth = nativeUiTextWidth(dc, line, font);
+          int x = lineRect.left;
+          if (normalizedAlignment == "center") {
+            x += std::max(
+              0, (static_cast<int>(lineRect.right - lineRect.left) -
+                  lineWidth) / 2);
+          } else if (normalizedAlignment == "right") {
+            x = std::max(
+              static_cast<int>(lineRect.left),
+              static_cast<int>(lineRect.right) - lineWidth);
+          }
+          size_t spanStart = 0;
+          while (spanStart < line.size()) {
+            const bool highlighted = (*highlights)[spanStart] != 0;
+            size_t spanEnd = spanStart + 1;
+            while (spanEnd < line.size() &&
+                   ((*highlights)[spanEnd] != 0) == highlighted) {
+              ++spanEnd;
+            }
+            const std::string span = line.substr(
+              spanStart, spanEnd - spanStart);
+            const int spanWidth = nativeUiTextWidth(dc, span, font);
+            RECT spanRect{
+              x, lineRect.top,
+              x + std::max(1, spanWidth + 2),
+              lineRect.bottom
+            };
+            nativeAppActiveDrawText(
+              dc, span, spanRect,
+              DT_LEFT | DT_VCENTER |
+                DT_SINGLELINE | DT_NOPREFIX,
+              highlighted ? highlightColor : color, font);
+            x += spanWidth;
+            spanStart = spanEnd;
+          }
+        }
       }
     }
     y += layout.lineHeight + layout.lineGap;
@@ -63426,11 +63762,9 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
     const auto cacheAgeMs =
       std::chrono::duration_cast<std::chrono::milliseconds>(
         now - cache.builtAt).count();
-    // Durante Play, os limites do item já indicam exatamente quando a pista
-    // precisa ser relida. A varredura periódica de 100 ms na thread da UI
-    // causava uma pequena pausa visível no vídeo. Parado, a leitura curta
-    // continua para acompanhar o cursor de edição imediatamente.
-    rebuild = !livePlaying && cacheAgeMs >= 50;
+    // Cursor, transporte e revisão já invalidam imediatamente acima. Parado
+    // no mesmo ponto, basta uma reconciliação por segundo para fontes externas.
+    rebuild = !livePlaying && cacheAgeMs >= 1000;
   }
   if (!rebuild &&
       livePosition < cache.lastObservedPosition - 0.0005) {
@@ -66529,7 +66863,10 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
 
   const std::string lyrics = nativeTelepromptDisplayText(
     state.lyrics, settings.textCase);
-  if (!lyrics.empty() && textAreaAvailable) {
+  const NativeTelepromptHighlightedText highlightedLyrics =
+    nativeTelepromptParseHighlightedText(lyrics);
+  const std::string& displayLyrics = highlightedLyrics.text;
+  if (!displayLyrics.empty() && textAreaAvailable) {
     RECT available = textRect;
     const int textRectWidth = std::max(
       1, static_cast<int>(
@@ -66573,7 +66910,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
           settings.fontFamily, size, FW_BOLD);
         const NativeTelepromptWrappedTextLayout measured =
           nativeTelepromptLayoutWrappedTextMac(
-            dc, lyrics, font, availableWidth);
+            dc, displayLyrics, font, availableWidth);
         const bool fits =
           measured.totalHeight <= availableHeight &&
           measured.maxLineWidth <= availableWidth;
@@ -66592,10 +66929,11 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       layoutCache.chosenFont = chosen;
       g_nativeTelepromptWrappedTextLayout[index] =
         nativeTelepromptLayoutWrappedTextMac(
-          dc, lyrics,
+          dc, displayLyrics,
           nativeTelepromptFont(
             settings.fontFamily, chosen, FW_BOLD),
-          availableWidth);
+          availableWidth,
+          &highlightedLyrics.highlightedBytes);
     }
     nativeTelepromptDrawWrappedTextMac(
       dc, g_nativeTelepromptWrappedTextLayout[index],
@@ -66605,7 +66943,10 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
       nativeTelepromptFont(
         settings.fontFamily,
         layoutCache.chosenFont, FW_BOLD),
-      settings.textAlignment);
+      settings.textAlignment,
+      nativeTelepromptColor(
+        settings.highlightColor, RGB(0, 255, 85)),
+      true);
   }
 
   finishPaint();
@@ -69174,7 +69515,7 @@ static void nativeRefreshAppActivePanelModel()
   }
 
   const bool rowsChanged = rowsSourceChanged;
-  const bool changed =
+  const bool structureChanged =
     next.playing != g_nativeAppActivePanelModel.playing ||
     next.queueActive != g_nativeAppActivePanelModel.queueActive ||
     next.loopActive != g_nativeAppActivePanelModel.loopActive ||
@@ -69195,7 +69536,6 @@ static void nativeRefreshAppActivePanelModel()
     next.timerVisible != g_nativeAppActivePanelModel.timerVisible ||
     next.timerExpired != g_nativeAppActivePanelModel.timerExpired ||
     next.timerMode != g_nativeAppActivePanelModel.timerMode ||
-    next.timerDisplayText != g_nativeAppActivePanelModel.timerDisplayText ||
     next.liveEnabled != g_nativeAppActivePanelModel.liveEnabled ||
     next.numberRegionMode != g_nativeAppActivePanelModel.numberRegionMode ||
     next.previewMode != g_nativeAppActivePanelModel.previewMode ||
@@ -69212,9 +69552,6 @@ static void nativeRefreshAppActivePanelModel()
     next.drawerOutlineColor != g_nativeAppActivePanelModel.drawerOutlineColor ||
     next.drawerSymbolColor != g_nativeAppActivePanelModel.drawerSymbolColor ||
     next.activePage != g_nativeAppActivePanelModel.activePage ||
-    // A barra do Lua acompanha cada ciclo de defer. 0.001 fazia uma musica de
-    // cinco minutos atualizar visualmente apenas a cada ~300 ms.
-    std::fabs(next.progress - g_nativeAppActivePanelModel.progress) > 0.000001 ||
     std::fabs(next.listScrollRatio - g_nativeAppActivePanelModel.listScrollRatio) > 0.000001 ||
     next.listScrollRevision != g_nativeAppActivePanelModel.listScrollRevision ||
     next.playlistName != g_nativeAppActivePanelModel.playlistName ||
@@ -69234,9 +69571,17 @@ static void nativeRefreshAppActivePanelModel()
     next.loopPartName != g_nativeAppActivePanelModel.loopPartName ||
     next.selectedMarkerId != g_nativeAppActivePanelModel.selectedMarkerId ||
     next.armedMarkerId != g_nativeAppActivePanelModel.armedMarkerId ||
-    !nativeAppActivePartColumnsEqual(next.parts1, g_nativeAppActivePanelModel.parts1) ||
-    !nativeAppActivePartColumnsEqual(next.parts2, g_nativeAppActivePanelModel.parts2) ||
+    !nativeAppActivePartColumnsEqual(next.parts1, g_nativeAppActivePanelModel.parts1, false) ||
+    !nativeAppActivePartColumnsEqual(next.parts2, g_nativeAppActivePanelModel.parts2, false) ||
     rowsChanged;
+  // Keep the same progress cadence; reduce the damaged pixels, not the FPS.
+  const bool progressChanged =
+    std::fabs(next.progress - g_nativeAppActivePanelModel.progress) > 0.000001 ||
+    std::fabs(next.parts1.regressRatio - g_nativeAppActivePanelModel.parts1.regressRatio) > 0.000001 ||
+    std::fabs(next.parts2.regressRatio - g_nativeAppActivePanelModel.parts2.regressRatio) > 0.000001;
+  const bool timerTextChanged =
+    next.timerDisplayText != g_nativeAppActivePanelModel.timerDisplayText;
+  const bool changed = structureChanged || progressChanged || timerTextChanged;
   if (!changed) {
     if (!rowsSourceChanged) {
       g_nativeAppActivePanelModel.rows =
@@ -69259,7 +69604,12 @@ static void nativeRefreshAppActivePanelModel()
     nativeUiSetFrameTimerInterval(
       g_nativeAppActivePanelHwnd,
       nativeUiDesiredFrameInterval());
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    if (structureChanged) {
+      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    } else {
+      nativeUiInvalidateDynamicAreas(g_nativeAppActivePanelHwnd,
+        progressChanged, timerTextChanged);
+    }
   }
   // O TCP nao depende deste modelo. Durante Play, a variacao da barra de
   // progresso fazia o atualizador geral invalidar o TCP a 30 FPS mesmo sem
@@ -71268,9 +71618,18 @@ static void nativeRebuildState(bool forceSnapshot)
   // mixer em uma cadencia leve; regioes, repertorios e Premix continuam no
   // cache. A composicao reaproveita cada leitura e evita a varredura duplicada
   // que nativeBuildMixerJson faria.
+  // Clientes remotos e mixers visíveis mantêm a cadência rápida. Fora deles,
+  // o cache é reconciliado a cada segundo; comandos continuam forçando leitura.
+  const bool mixerInUse = nativeIsDirectorControlActive() ||
+    g_nativeAppActivePanelModel.mixerPage ||
+    (nativeHookControllerWindowIsOpen() &&
+      g_nativeHookControllerMode == NativeHookControllerMode::Tcp) ||
+    (g_nativeMetersLastRequestMs.load() > 0 &&
+      nativeSteadyNowMs() - g_nativeMetersLastRequestMs.load() <= 900);
+  const int mixerIntervalMs = mixerInUse ? 200 : 1000;
   const bool refreshMixer = rebuildSnapshot || forceMixerRefresh ||
     cachedMixerRefreshAt.time_since_epoch().count() == 0 ||
-    std::chrono::duration_cast<std::chrono::milliseconds>(snapshotNow - cachedMixerRefreshAt).count() >= 200;
+    std::chrono::duration_cast<std::chrono::milliseconds>(snapshotNow - cachedMixerRefreshAt).count() >= mixerIntervalMs;
   if (refreshMixer) {
     nativeBuildMixerTrackListsJson(activeProject, cachedMixerTracksJson, cachedMixerGroupsJson);
     cachedMixerMasterJson = nativeBuildMixerMasterJson(activeProject);
@@ -71554,6 +71913,7 @@ static void nativeRebuildState(bool forceSnapshot)
   bool tpPreviewUnderlineEnabled[2]{true, true};
   bool tpClearMode[2]{false, false};
   std::string tpPreviewTextCase[2]{"uppercase", "uppercase"};
+  std::string tpHighlightColor[2]{"#00ff55", "#00ff55"};
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     for (int index = 0; index < 2; ++index) {
@@ -71567,6 +71927,8 @@ static void nativeRebuildState(bool forceSnapshot)
         g_nativeTelepromptSettings[index].clearMode;
       tpPreviewTextCase[index] =
         g_nativeTelepromptSettings[index].textCase;
+      tpHighlightColor[index] =
+        g_nativeTelepromptSettings[index].highlightColor;
     }
   }
   const bool loopActive = nativeIsRepeatEnabled(activeProject);
@@ -71979,7 +72341,9 @@ static void nativeRebuildState(bool forceSnapshot)
        << ",\"underlineEnabled\":"
        << (tpPreviewUnderlineEnabled[0] ? "true" : "false")
        << ",\"textCase\":"
-       << nativeJsonString(tpPreviewTextCase[0]) << "},";
+       << nativeJsonString(tpPreviewTextCase[0])
+       << ",\"highlightColor\":"
+       << nativeJsonString(tpHighlightColor[0]) << "},";
   json << "\"tp2\":{\"songDurationEnabled\":"
        << (tpPreviewSongDurationEnabled[1] ? "true" : "false")
        << ",\"blockDurationEnabled\":"
@@ -71987,7 +72351,9 @@ static void nativeRebuildState(bool forceSnapshot)
        << ",\"underlineEnabled\":"
        << (tpPreviewUnderlineEnabled[1] ? "true" : "false")
        << ",\"textCase\":"
-       << nativeJsonString(tpPreviewTextCase[1]) << "}},";
+       << nativeJsonString(tpPreviewTextCase[1])
+       << ",\"highlightColor\":"
+       << nativeJsonString(tpHighlightColor[1]) << "}},";
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     json << "\"liveModeEnabled\":" << (g_nativeLiveMarkEnabled ? "true" : "false") << ",";
