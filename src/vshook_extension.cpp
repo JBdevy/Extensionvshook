@@ -7,6 +7,7 @@
 #include "native_static_image_decoder.h"
 #include "native_video_decoder.h"
 #include "native_mtc_timecode.h"
+#include "native_smart_search_session.h"
 #include "vshook_splash_pixels.h"
 #include "vshook_background_assets.h"
 #include "wdlutf8.h"
@@ -1328,6 +1329,7 @@ static constexpr int kNativeUiSmartSearchDebounceMs = 120;
 // A lupa e unica. Quando aberta a partir de um repertorio, primeiro filtra esse
 // repertorio e so muda para Musicas se nao houver resultado local.
 static std::string g_nativeMainSmartSearchSourcePlaylistName;
+static NativeSmartSearchSession g_nativeSmartSearchSession;
 static bool g_nativeMainSmartSearchSelectFirstPending = false;
 static bool g_nativeMainSmartSearchExpectedRegionsPage = false;
 // Gavetas abertas automaticamente pela lupa nao transformam filhos antes
@@ -47189,6 +47191,7 @@ static void nativeUiSmartSearchQueryChanged()
 
 static void nativeUiCloseSmartSearch(bool returnToSource)
 {
+  g_nativeSmartSearchSession.active = false;
   const bool shouldReturn = returnToSource &&
     !g_nativeMainSmartSearchSourcePlaylistName.empty();
   g_nativeMainSearchFocused = false;
@@ -48164,8 +48167,9 @@ static bool nativeUiActivateSmartSearchResult(
   // resultados virtuais. Ao confirmar, abre exclusivamente a família desse
   // resultado; nenhuma outra gaveta é alterada.
   nativeUiOpenSearchResultFamily(row);
-  nativeUiClearMainRowSelectionForPage(regionsPage);
-  nativeUiSetMainRowSelected(row, regionsPage, true);
+  // Fechar a lupa esconde novamente filhos de outras gavetas, mudando a ordem
+  // visual das linhas. A identidade estavel preserva o resultado escolhido.
+  nativeUiSelectOnlyMainRow(row, regionsPage);
   for (size_t visible = 0;
        visible < g_nativeMainVisibleRowIndices.size(); ++visible) {
     const size_t source = g_nativeMainVisibleRowIndices[visible];
@@ -48224,6 +48228,33 @@ static bool nativeApplySmartSearchCommand(
   }
   nativeTimecodeLanRecordCommand(commandBody);
 
+  const std::string searchClient = nativeJsonExtractString(commandBody, "searchClient");
+  const bool sessionProtocol = !searchClient.empty();
+  const uint64_t searchSerial = std::strtoull(
+    nativeJsonExtractString(commandBody, "searchSerial").c_str(), nullptr, 10);
+  const uint64_t searchSequence = std::strtoull(
+    nativeJsonExtractString(commandBody, "searchSequence").c_str(), nullptr, 10);
+  if (sessionProtocol) {
+    if (type == "smart_search_open") {
+      if (!g_nativeSmartSearchSession.open(searchClient, searchSerial, searchSequence)) return true;
+      if (g_nativeMainSearchFocused) nativeUiCloseSmartSearch(true);
+      const std::string page = nativeJsonExtractString(commandBody, "page");
+      if (page == "regions" || page == "playlist") {
+        nativeApplySelectionCommand("{\"type\":\"set_page\",\"page\":" + nativeJsonString(page) + "}");
+        g_nativeUiLastModelRefreshAt = std::chrono::steady_clock::time_point{};
+        nativeRefreshAppActivePanelModel();
+      }
+      nativeUiToggleSmartSearch();
+      g_nativeSmartSearchSession.active = true;
+      g_nativeForceStateBuild.store(true);
+      return true;
+    }
+    if (!g_nativeSmartSearchSession.accept(searchClient, searchSerial, searchSequence)) return true;
+  } else if (g_nativeSmartSearchSession.active) {
+    // An older app must not overwrite another client's in-progress search.
+    return true;
+  }
+
   if (type == "smart_search_close") {
     if (g_nativeMainSearchFocused) {
       nativeUiCloseSmartSearch(true);
@@ -48274,7 +48305,17 @@ static bool nativeApplySmartSearchCommand(
 
   const std::string wantedId = nativeJsonExtractString(
     commandBody, "resultId");
-  if (wantedId.empty()) return true;
+  const auto acknowledge = [&](bool ok) {
+    if (sessionProtocol) {
+      g_nativeSmartSearchSession.activationSequence = searchSequence;
+      g_nativeSmartSearchSession.activationOk = ok;
+      g_nativeSmartSearchSession.activationError = ok ? "" :
+        "Nao foi possivel selecionar este resultado. Atualize a pesquisa e tente novamente.";
+      g_nativeForceStateBuild.store(true);
+    }
+    return true;
+  };
+  if (wantedId.empty()) return acknowledge(false);
   const std::string wantedStartText = nativeTrim(
     nativeJsonExtractString(commandBody, "resultStart"));
   const bool hasWantedStart = !wantedStartText.empty();
@@ -48296,8 +48337,8 @@ static bool nativeApplySmartSearchCommand(
     const auto& row =
       g_nativeAppActivePanelModel.rows[sourceIndex];
     if (matches(row)) {
-      return nativeUiActivateSmartSearchResult(
-        row, g_nativeAppActivePanelModel.regionsPage);
+      return acknowledge(nativeUiActivateSmartSearchResult(
+        row, g_nativeAppActivePanelModel.regionsPage));
     }
   }
   // Fallback apenas para a pequena janela entre a troca automatica de pagina
@@ -48306,11 +48347,11 @@ static bool nativeApplySmartSearchCommand(
   for (const auto& row :
        g_nativeAppActivePanelModel.rows) {
     if (matches(row)) {
-      return nativeUiActivateSmartSearchResult(
-        row, g_nativeAppActivePanelModel.regionsPage);
+      return acknowledge(nativeUiActivateSmartSearchResult(
+        row, g_nativeAppActivePanelModel.regionsPage));
     }
   }
-  return true;
+  return acknowledge(false);
 }
 
 static std::string nativeBuildSmartSearchStateJson()
@@ -48322,6 +48363,13 @@ static std::string nativeBuildSmartSearchStateJson()
   std::ostringstream json;
   json << "{\"open\":"
        << (g_nativeMainSearchFocused ? "true" : "false")
+       << ",\"protocolVersion\":2"
+       << ",\"searchClient\":" << nativeJsonString(g_nativeSmartSearchSession.client)
+       << ",\"searchSerial\":" << g_nativeSmartSearchSession.serial
+       << ",\"searchSequence\":" << g_nativeSmartSearchSession.sequence
+       << ",\"activationSequence\":" << g_nativeSmartSearchSession.activationSequence
+       << ",\"activationOk\":" << (g_nativeSmartSearchSession.activationOk ? "true" : "false")
+       << ",\"activationError\":" << nativeJsonString(g_nativeSmartSearchSession.activationError)
        << ",\"query\":"
        << nativeJsonString(g_nativeMainSearchText)
        << ",\"appliedQuery\":"

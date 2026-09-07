@@ -13,9 +13,12 @@ const extract = (from, to) => {
 };
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'vshook-search-test-'));
 fs.writeFileSync(path.join(temporary, 'search-under-test.h'), [
+  extract('static std::string nativeUiMainRowKey(\n', 'static int nativeUiMainSelectionCount('),
+  extract('static std::string nativeUiMainRowStableIdentity(\n  const NativeAppActivePanelModel::Row& row)\n{', 'struct NativeUiReorderFamilyInfo'),
   extract('static bool nativeUiCommitPendingSmartSearchQuery(bool force)\n', 'static std::string nativeUiPreviewBlocksKey('),
   extract('static void nativeUiCloseSmartSearch(bool returnToSource)\n', 'static bool nativeUiRequestTimerToggle('),
-  extract('static bool nativeUiActivateSmartSearchResult(\n', '// O App do Diretor nao replica')
+  extract('static bool nativeUiActivateSmartSearchResult(\n', '// O App do Diretor nao replica'),
+  extract('static bool nativeApplySmartSearchCommand(\n', 'static std::string nativeBuildSmartSearchStateJson()')
 ].join('\n'));
 const executable = path.join(temporary, 'search-test.exe');
 const result = spawnSync('cl.exe', ['/nologo', '/std:c++17', '/EHsc', '/utf-8',
