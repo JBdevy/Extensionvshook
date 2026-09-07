@@ -40627,15 +40627,6 @@ static void nativePaintAppActivePanel(HWND hwnd)
         addModalButton("rename_premix", "Premix",
           footerRect(2), "yellow_reset", true);
         if (!g_nativeUiRenameFamilyParent) {
-          // "Mapa Resolume" precisa de um pouco mais de largura que os
-          // demais atalhos para não perder o "e" final em DPI alto.
-          const int resolumeButtonW = std::max(116, footerButtonW);
-          addModalButton("rename_resolume_map", "Mapa Resolume",
-            RECT{std::max(footerLeft,
-                   footerRight - resolumeButtonW),
-              modal.bottom - 50, footerRight,
-              modal.bottom - 32},
-            "page", true);
           addModalButton("rename_multiloops", "Multi Loops",
             footerRect(3), "pink", true);
         }
@@ -42299,7 +42290,6 @@ static void nativePaintAppActivePanel(HWND hwnd)
       sectionY = drawSection("App, controles e acesso", sectionY, {
         {"Config Acess", "config_access", "access"},
         {"Conferência/Progresso", "config_project_sync", "play"},
-        {"Mapa Resolume", "config_resolume_map", "page"},
         {"Não mostrar novamente o aviso inicial de atalhos",
           "config_shortcut_notice", "page"}
       }, 2);
@@ -47228,7 +47218,13 @@ static bool nativeUiToggleSmartSearch()
   }
 
   g_nativeMainSmartSearchSourcePlaylistName =
-    nativeUiSmartSearchCurrentPlaylistName();
+    // Uma busca iniciada em Musicas pertence somente a essa aba. O ultimo
+    // repertorio salvo nao e sua origem: usa-lo aqui redirecionava resultados
+    // locais e podia inserir/enfileirar a musica no repertorio durante Play.
+    g_nativeAppActivePanelModel.regionsPage &&
+      !g_nativeAppActivePanelModel.mixerPage
+      ? std::string()
+      : nativeUiSmartSearchCurrentPlaylistName();
   if (g_nativeAppActivePanelModel.mixerPage) {
     nativeUiSmartSearchSetPage(false);
   } else {
@@ -55666,10 +55662,6 @@ static bool nativeMainHandleModalClick(
     nativeProjectSyncOpenConferenceFromConfig();
     return true;
   }
-  if (action == "config_resolume_map") {
-    nativeUiOpenResolumeMapQuestion(false);
-    return true;
-  }
   if (action == "resolume_map_yes" ||
       action == "resolume_map_no") {
     nativeUiShowResolumeMapResult(
@@ -55897,8 +55889,6 @@ static bool nativeMainHandleModalClick(
     nativeUiApplyRowRename();
   } else if (action == "rename_premix") {
     nativeUiOpenPremixFromRename();
-  } else if (action == "rename_resolume_map") {
-    nativeUiOpenResolumeMapQuestion(true);
   } else if (action == "rename_block_midi") {
     nativeUiOpenBlockMidiCapture();
   } else if (action == "rename_block_color") {
