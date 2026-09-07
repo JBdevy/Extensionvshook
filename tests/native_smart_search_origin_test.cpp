@@ -10,8 +10,6 @@
 #include <iomanip>
 #include <cmath>
 #include <cstdlib>
-#include "../src/native_smart_search_session.h"
-static NativeSmartSearchSession g_nativeSmartSearchSession;
 struct NativeAppActivePanelModel {
   struct Row {
     bool block = false;
@@ -113,47 +111,6 @@ static void query(const std::string& text) {
   g_nativeMainSearchApplyPending = true;
   nativeUiCommitPendingSmartSearchQuery(true);
 }
-static void testRemoteSearchProtocol() {
-  g_nativeSmartSearchSession = {};
-  playing = false;
-  localMatch = true;
-  const auto command = [](const std::string& type, int serial, int sequence,
-      const std::string& result = "region-7") {
-    return "{\"type\":\"smart_search_" + type + "\",\"searchClient\":\"tablet\",\"searchSerial\":" +
-      std::to_string(serial) + ",\"searchSequence\":" + std::to_string(sequence) +
-      ",\"page\":\"regions\",\"query\":\"Musica\",\"resultId\":\"" + result + "\",\"resultStart\":120}";
-  };
-  nativeApplySmartSearchCommand(command("open", 1, 1));
-  assert(g_nativeMainSearchFocused && g_nativeAppActivePanelModel.regionsPage);
-  nativeApplySmartSearchCommand(command("query", 1, 3));
-  nativeApplySmartSearchCommand(command("query", 1, 2));
-  assert(g_nativeSmartSearchSession.sequence == 3); // Out-of-order query ignored.
-  nativeApplySmartSearchCommand(command("activate", 1, 4));
-  assert(g_nativeSmartSearchSession.activationOk);
-  assert(g_nativeSmartSearchSession.activationSequence == 4);
-  assert(!g_nativeMainSearchFocused);
-  assertSelectionSurvivesSearchClose(true);
-  nativeApplySmartSearchCommand(command("query", 1, 5));
-  assert(!g_nativeMainSearchFocused); // Delayed query cannot reopen a closed search.
-  nativeApplySmartSearchCommand(command("open", 2, 1));
-  nativeApplySmartSearchCommand(command("close", 1, 6));
-  assert(g_nativeMainSearchFocused); // Old close cannot close a new search.
-  nativeApplySmartSearchCommand(command("open", 1, 1));
-  assert(g_nativeSmartSearchSession.serial == 2);
-  nativeApplySmartSearchCommand(command("activate", 2, 2, "missing-song"));
-  assert(g_nativeMainSearchFocused && !g_nativeSmartSearchSession.activationOk);
-  assert(!g_nativeSmartSearchSession.activationError.empty());
-  playing = true;
-  nativeApplySmartSearchCommand(command("activate", 2, 3));
-  assert(g_nativeSmartSearchSession.activationOk && lastCommand == "queue_region_song");
-  assert(!g_nativeMainSearchFocused);
-  nativeApplySmartSearchCommand(command("activate", 2, 3));
-  assert(g_nativeSmartSearchSession.activationSequence == 3);
-  nativeApplySmartSearchCommand(command("open", 3, 1));
-  assert(!g_nativeSmartSearchSession.accept("phone", 3, 2));
-  nativeApplySmartSearchCommand(command("close", 3, 2));
-  assert(!g_nativeMainSearchFocused);
-}
 int main() {
   for (bool running : {false, true}) {
     for (bool foundInPlaylist : {false, true}) {
@@ -207,6 +164,5 @@ int main() {
   query("Fora novamente");
   nativeUiCloseSmartSearch(true);
   assert(!g_nativeAppActivePanelModel.regionsPage);
-  testRemoteSearchProtocol();
-  std::cout << "SMART_SEARCH_ORIGIN_OK: local/remote selection, queue, failure acknowledgement, session isolation and stale requests\n";
+  std::cout << "SMART_SEARCH_ORIGIN_OK: local selection, queue and playlist fallback\n";
 }

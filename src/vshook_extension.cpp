@@ -7,10 +7,12 @@
 #include "native_static_image_decoder.h"
 #include "native_video_decoder.h"
 #include "native_mtc_timecode.h"
-#include "native_smart_search_session.h"
 #include "vshook_splash_pixels.h"
 #include "vshook_background_assets.h"
 #include "wdlutf8.h"
+#ifndef VSHOOK_EXTENSION_VERSION
+#define VSHOOK_EXTENSION_VERSION "dev"
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -1329,7 +1331,6 @@ static constexpr int kNativeUiSmartSearchDebounceMs = 120;
 // A lupa e unica. Quando aberta a partir de um repertorio, primeiro filtra esse
 // repertorio e so muda para Musicas se nao houver resultado local.
 static std::string g_nativeMainSmartSearchSourcePlaylistName;
-static NativeSmartSearchSession g_nativeSmartSearchSession;
 static bool g_nativeMainSmartSearchSelectFirstPending = false;
 static bool g_nativeMainSmartSearchExpectedRegionsPage = false;
 // Gavetas abertas automaticamente pela lupa nao transformam filhos antes
@@ -32951,8 +32952,29 @@ static bool nativeUiApplyConverterParts()
   return true;
 }
 
-static bool nativePremixTrackIsHidden(const std::string& trackName)
+static std::string nativeMixerTrackFilterKey(std::string trackName)
 {
+  const std::pair<const char*, const char*> accents[] = {
+    {u8"Á", "A"}, {u8"À", "A"}, {u8"Â", "A"}, {u8"Ã", "A"}, {u8"Ä", "A"},
+    {u8"á", "A"}, {u8"à", "A"}, {u8"â", "A"}, {u8"ã", "A"}, {u8"ä", "A"},
+    {u8"É", "E"}, {u8"È", "E"}, {u8"Ê", "E"}, {u8"Ë", "E"},
+    {u8"é", "E"}, {u8"è", "E"}, {u8"ê", "E"}, {u8"ë", "E"},
+    {u8"Í", "I"}, {u8"Ì", "I"}, {u8"Î", "I"}, {u8"Ï", "I"},
+    {u8"í", "I"}, {u8"ì", "I"}, {u8"î", "I"}, {u8"ï", "I"},
+    {u8"Ó", "O"}, {u8"Ò", "O"}, {u8"Ô", "O"}, {u8"Õ", "O"}, {u8"Ö", "O"},
+    {u8"ó", "O"}, {u8"ò", "O"}, {u8"ô", "O"}, {u8"õ", "O"}, {u8"ö", "O"},
+    {u8"Ú", "U"}, {u8"Ù", "U"}, {u8"Û", "U"}, {u8"Ü", "U"},
+    {u8"ú", "U"}, {u8"ù", "U"}, {u8"û", "U"}, {u8"ü", "U"},
+    {u8"Ç", "C"}, {u8"ç", "C"}
+  };
+  for (const auto& accent : accents) {
+    size_t position = 0;
+    while ((position = trackName.find(accent.first, position)) !=
+           std::string::npos) {
+      trackName.replace(position, std::strlen(accent.first), accent.second);
+      position += std::strlen(accent.second);
+    }
+  }
   std::string normalized;
   normalized.reserve(trackName.size());
   for (unsigned char ch : trackName) {
@@ -32960,11 +32982,22 @@ static bool nativePremixTrackIsHidden(const std::string& trackName)
       normalized.push_back(static_cast<char>(std::toupper(ch)));
     }
   }
+  return normalized;
+}
+
+static bool nativeMixerTrackIsHidden(const std::string& trackName)
+{
+  const std::string normalized = nativeMixerTrackFilterKey(trackName);
   return normalized == "TELEPROMPT1" ||
     normalized == "TELEPROMPT2" ||
     normalized == "CIFRAS" ||
     normalized == "MEDIA" ||
     normalized == "TIMECODE";
+}
+
+static bool nativePremixTrackIsHidden(const std::string& trackName)
+{
+  return nativeMixerTrackIsHidden(trackName);
 }
 
 static void nativeUiAppendPremixItems(
@@ -35067,8 +35100,9 @@ nativeUiCollectMyShortcutsLines()
     for (int index = 0; index < count; ++index) {
       MediaTrack* track = GetTrack_ptr(project, index);
       if (!track) continue;
-      addMixer(nativeTrackGuid(track, index),
-        nativeTrackName(track, index));
+      const std::string trackName = nativeTrackName(track, index);
+      if (nativeMixerTrackIsHidden(trackName)) continue;
+      addMixer(nativeTrackGuid(track, index), trackName);
     }
   }
 
@@ -35311,6 +35345,7 @@ static void nativeUiBuildMixerPaintLists(
     if (!track) continue;
     NativeMixerPaintTrack item =
       nativeUiMixerTrackItem(track, index + 1, false, project);
+    if (nativeMixerTrackIsHidden(item.name)) continue;
     if (item.id.empty()) continue;
     projectIds.push_back(item.id);
     byId[item.id] = item;
@@ -45894,8 +45929,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
         for (int index = 0; index < count; ++index) {
           MediaTrack* track = GetTrack_ptr(project, index);
           if (track) {
-            tracks.push_back(nativeUiMixerTrackItem(
-              track, index + 1, false, project));
+            NativeMixerPaintTrack item = nativeUiMixerTrackItem(
+              track, index + 1, false, project);
+            if (!nativeMixerTrackIsHidden(item.name)) {
+              tracks.push_back(std::move(item));
+            }
           }
         }
       }
@@ -47191,7 +47229,6 @@ static void nativeUiSmartSearchQueryChanged()
 
 static void nativeUiCloseSmartSearch(bool returnToSource)
 {
-  g_nativeSmartSearchSession.active = false;
   const bool shouldReturn = returnToSource &&
     !g_nativeMainSmartSearchSourcePlaylistName.empty();
   g_nativeMainSearchFocused = false;
@@ -48212,9 +48249,6 @@ static bool nativeUiActivateSmartSearchResult(
   return true;
 }
 
-// O App do Diretor nao replica a regra da Lupa. Ele apenas dirige a mesma
-// busca inteligente usada pela janela nativa, inclusive a troca automatica
-// Repertorio -> Musicas e a insercao opcional abaixo da musica em execucao.
 static bool nativeApplySmartSearchCommand(
   const std::string& commandBody)
 {
@@ -48227,33 +48261,6 @@ static bool nativeApplySmartSearchCommand(
     return false;
   }
   nativeTimecodeLanRecordCommand(commandBody);
-
-  const std::string searchClient = nativeJsonExtractString(commandBody, "searchClient");
-  const bool sessionProtocol = !searchClient.empty();
-  const uint64_t searchSerial = std::strtoull(
-    nativeJsonExtractString(commandBody, "searchSerial").c_str(), nullptr, 10);
-  const uint64_t searchSequence = std::strtoull(
-    nativeJsonExtractString(commandBody, "searchSequence").c_str(), nullptr, 10);
-  if (sessionProtocol) {
-    if (type == "smart_search_open") {
-      if (!g_nativeSmartSearchSession.open(searchClient, searchSerial, searchSequence)) return true;
-      if (g_nativeMainSearchFocused) nativeUiCloseSmartSearch(true);
-      const std::string page = nativeJsonExtractString(commandBody, "page");
-      if (page == "regions" || page == "playlist") {
-        nativeApplySelectionCommand("{\"type\":\"set_page\",\"page\":" + nativeJsonString(page) + "}");
-        g_nativeUiLastModelRefreshAt = std::chrono::steady_clock::time_point{};
-        nativeRefreshAppActivePanelModel();
-      }
-      nativeUiToggleSmartSearch();
-      g_nativeSmartSearchSession.active = true;
-      g_nativeForceStateBuild.store(true);
-      return true;
-    }
-    if (!g_nativeSmartSearchSession.accept(searchClient, searchSerial, searchSequence)) return true;
-  } else if (g_nativeSmartSearchSession.active) {
-    // An older app must not overwrite another client's in-progress search.
-    return true;
-  }
 
   if (type == "smart_search_close") {
     if (g_nativeMainSearchFocused) {
@@ -48305,17 +48312,7 @@ static bool nativeApplySmartSearchCommand(
 
   const std::string wantedId = nativeJsonExtractString(
     commandBody, "resultId");
-  const auto acknowledge = [&](bool ok) {
-    if (sessionProtocol) {
-      g_nativeSmartSearchSession.activationSequence = searchSequence;
-      g_nativeSmartSearchSession.activationOk = ok;
-      g_nativeSmartSearchSession.activationError = ok ? "" :
-        "Nao foi possivel selecionar este resultado. Atualize a pesquisa e tente novamente.";
-      g_nativeForceStateBuild.store(true);
-    }
-    return true;
-  };
-  if (wantedId.empty()) return acknowledge(false);
+  if (wantedId.empty()) return true;
   const std::string wantedStartText = nativeTrim(
     nativeJsonExtractString(commandBody, "resultStart"));
   const bool hasWantedStart = !wantedStartText.empty();
@@ -48337,8 +48334,9 @@ static bool nativeApplySmartSearchCommand(
     const auto& row =
       g_nativeAppActivePanelModel.rows[sourceIndex];
     if (matches(row)) {
-      return acknowledge(nativeUiActivateSmartSearchResult(
-        row, g_nativeAppActivePanelModel.regionsPage));
+      nativeUiActivateSmartSearchResult(
+        row, g_nativeAppActivePanelModel.regionsPage);
+      return true;
     }
   }
   // Fallback apenas para a pequena janela entre a troca automatica de pagina
@@ -48347,11 +48345,12 @@ static bool nativeApplySmartSearchCommand(
   for (const auto& row :
        g_nativeAppActivePanelModel.rows) {
     if (matches(row)) {
-      return acknowledge(nativeUiActivateSmartSearchResult(
-        row, g_nativeAppActivePanelModel.regionsPage));
+      nativeUiActivateSmartSearchResult(
+        row, g_nativeAppActivePanelModel.regionsPage);
+      return true;
     }
   }
-  return acknowledge(false);
+  return true;
 }
 
 static std::string nativeBuildSmartSearchStateJson()
@@ -48363,13 +48362,6 @@ static std::string nativeBuildSmartSearchStateJson()
   std::ostringstream json;
   json << "{\"open\":"
        << (g_nativeMainSearchFocused ? "true" : "false")
-       << ",\"protocolVersion\":2"
-       << ",\"searchClient\":" << nativeJsonString(g_nativeSmartSearchSession.client)
-       << ",\"searchSerial\":" << g_nativeSmartSearchSession.serial
-       << ",\"searchSequence\":" << g_nativeSmartSearchSession.sequence
-       << ",\"activationSequence\":" << g_nativeSmartSearchSession.activationSequence
-       << ",\"activationOk\":" << (g_nativeSmartSearchSession.activationOk ? "true" : "false")
-       << ",\"activationError\":" << nativeJsonString(g_nativeSmartSearchSession.activationError)
        << ",\"query\":"
        << nativeJsonString(g_nativeMainSearchText)
        << ",\"appliedQuery\":"
@@ -49152,6 +49144,7 @@ static bool nativeUiSaveMixerBulkTracks()
     for (int index = 0; index < count; ++index) {
       MediaTrack* track = GetTrack_ptr(project, index);
       if (!track) continue;
+      if (nativeMixerTrackIsHidden(nativeTrackName(track, index))) continue;
       const std::string id = nativeTrackGuid(track, index);
       if (g_nativeUiMixerBulkTracks[id]) ids.push_back(id);
     }
@@ -56287,7 +56280,8 @@ static bool nativeMainHandleModalClick(
       const int count = CountTracks_ptr(project);
       for (int index = 0; index < count; ++index) {
         MediaTrack* track = GetTrack_ptr(project, index);
-        if (track) {
+        if (track && !nativeMixerTrackIsHidden(
+              nativeTrackName(track, index))) {
           g_nativeUiMixerBulkTracks[
             nativeTrackGuid(track, index)] = true;
         }
@@ -57121,7 +57115,8 @@ nativeUiMixerBindingTracks()
     const int count = CountTracks_ptr(project);
     for (int index = 0; index < count; ++index) {
       MediaTrack* track = GetTrack_ptr(project, index);
-      if (track) {
+      if (track && !nativeMixerTrackIsHidden(
+            nativeTrackName(track, index))) {
         tracks.push_back({nativeTrackGuid(track, index), track});
       }
     }
@@ -69965,6 +69960,7 @@ static void nativeBuildMixerTrackListsJson(ReaProject* project, std::string& tra
     const double folderDepth = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "I_FOLDERDEPTH") : 0.0;
     const std::string guid = nativeTrackGuid(track, i);
     const std::string name = nativeTrackName(track, i);
+    if (nativeMixerTrackIsHidden(name)) continue;
     const double vol = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "D_VOL") : 1.0;
     const bool mute = GetMediaTrackInfo_Value_ptr ? (GetMediaTrackInfo_Value_ptr(track, "B_MUTE") > 0.5) : false;
     const bool solo = GetMediaTrackInfo_Value_ptr ? (GetMediaTrackInfo_Value_ptr(track, "I_SOLO") > 0.5) : false;
@@ -74723,6 +74719,7 @@ static bool nativeApplyMixerCommand(const std::string& commandBody)
       for (int index = 0; index < count; ++index) {
         MediaTrack* track = GetTrack_ptr(project, index);
         if (!track) continue;
+        if (nativeMixerTrackIsHidden(nativeTrackName(track, index))) continue;
         const std::string guid = nativeTrackGuid(track, index);
         if (!selected[guid]) continue;
         const char* field = unsolo ? "I_SOLO" : "B_MUTE";
