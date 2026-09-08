@@ -15658,6 +15658,23 @@ static std::string nativeReadLuaWindowExtState(const char* key)
   return raw ? std::string(raw) : std::string();
 }
 
+static bool nativeMixerTrackIsHidden(const std::string& trackName);
+
+static bool nativeManualStopFadeoutTrackIdIsHidden(
+  ReaProject* project, const std::string& trackId)
+{
+  if (!project || trackId.empty() || !CountTracks_ptr || !GetTrack_ptr) {
+    return false;
+  }
+  const int count = CountTracks_ptr(project);
+  for (int index = 0; index < count; ++index) {
+    MediaTrack* track = GetTrack_ptr(project, index);
+    if (!track || nativeTrackGuid(track, index) != trackId) continue;
+    return nativeMixerTrackIsHidden(nativeTrackName(track, index));
+  }
+  return false;
+}
+
 static std::vector<std::string> nativeManualStopFadeoutTrackIds()
 {
   std::vector<std::string> out;
@@ -15675,7 +15692,11 @@ static std::vector<std::string> nativeManualStopFadeoutTrackIds()
   while (begin <= raw.size()) {
     const size_t end = raw.find(';', begin);
     const std::string id = nativeTrim(raw.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
-    if (!id.empty() && std::find(out.begin(), out.end(), id) == out.end()) out.push_back(id);
+    if (!id.empty() &&
+        !nativeManualStopFadeoutTrackIdIsHidden(project, id) &&
+        std::find(out.begin(), out.end(), id) == out.end()) {
+      out.push_back(id);
+    }
     if (end == std::string::npos) break;
     begin = end + 1;
   }
@@ -15781,7 +15802,11 @@ static bool nativeApplyManualStopFadeoutCommand(const std::string& commandBody)
     if (id.empty()) id = nativeJsonExtractString(commandBody, "guid");
     if (id.empty()) id = nativeJsonExtractString(commandBody, "targetId");
     id = nativeTrim(id);
-    if (!id.empty()) {
+    char pathBuf[2048] = "";
+    ReaProject* project = getCurrentProject(
+      pathBuf, static_cast<int>(sizeof(pathBuf)));
+    if (!id.empty() &&
+        !nativeManualStopFadeoutTrackIdIsHidden(project, id)) {
       std::vector<std::string> ids = nativeManualStopFadeoutTrackIds();
       const auto it = std::find(ids.begin(), ids.end(), id);
       if (it == ids.end()) ids.push_back(id); else ids.erase(it);
@@ -15799,6 +15824,8 @@ static bool nativeApplyManualStopFadeoutCommand(const std::string& commandBody)
       const int count = CountTracks_ptr(project);
       for (int i = 0; i < count; ++i) {
         MediaTrack* track = GetTrack_ptr(project, i);
+        if (!track || nativeMixerTrackIsHidden(
+              nativeTrackName(track, i))) continue;
         const std::string id = nativeTrackGuid(track, i);
         if (!id.empty()) ids.push_back(id);
       }
@@ -22150,10 +22177,12 @@ static void nativeUiRefreshManualStopTracks()
   for (int index = 0; index < count; ++index) {
     MediaTrack* track = GetTrack_ptr(project, index);
     if (!track) continue;
+    const std::string trackName = nativeTrackName(track, index);
+    if (nativeMixerTrackIsHidden(trackName)) continue;
     NativeUiManualStopTrackRow row;
     row.track = track;
     row.guid = nativeTrackGuid(track, index);
-    row.name = nativeTrackName(track, index);
+    row.name = trackName;
     row.index = index + 1;
     row.group = GetMediaTrackInfo_Value_ptr &&
       GetMediaTrackInfo_Value_ptr(track,
@@ -76448,6 +76477,7 @@ static bool nativeTryStartManualStopFadeout(ReaProject* project, const std::stri
   for (int i = 0; i < count; ++i) {
     MediaTrack* track = GetTrack_ptr(project, i);
     if (!track) continue;
+    if (nativeMixerTrackIsHidden(nativeTrackName(track, i))) continue;
     const std::string id = nativeTrackGuid(track, i);
     if (std::find(selectedIds.begin(), selectedIds.end(), id) == selectedIds.end()) continue;
     NativeManualStopFadeoutTrack item;
