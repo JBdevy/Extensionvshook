@@ -1808,6 +1808,11 @@ static std::chrono::steady_clock::time_point
   g_nativeUiLastInteractionAt;
 static std::chrono::steady_clock::time_point
   g_nativeUiLastModelRefreshAt;
+// O snapshot nativo ja e reconstruido em cadencia propria e marca o modelo
+// como sujo. Entre duas publicacoes, a reconciliacao completa cai para uma
+// cadencia de seguranca em vez de copiar musicas e recalcular Parts a cada
+// quadro do Play.
+static std::atomic<bool> g_nativeUiPanelModelSourceDirty{true};
 static bool g_nativePartsRenameOpen = false;
 static std::string g_nativePartsRenameMarkerId;
 static std::string g_nativePartsRenamePrefix;
@@ -3506,7 +3511,8 @@ static ReaProject* getCurrentProject(char* pathOut, int pathOutSize)
 }
 
 static bool nativeTimecodeLanCodeIsValid(const std::string& value);
-static void nativeTimecodeLanRefreshConfigOnMainThread();
+static void nativeTimecodeLanRefreshConfigOnMainThread(
+  bool force = false);
 
 static std::string getTimecodeMode()
 {
@@ -3616,7 +3622,7 @@ static void toggleTimecodeMode(const char* requestedMode)
   SetExtState_ptr(kExtStateSection,
     kTimecodeRejectedPeerKey, "", true);
   SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey, "", true);
-  nativeTimecodeLanRefreshConfigOnMainThread();
+  nativeTimecodeLanRefreshConfigOnMainThread(true);
 
   const std::string waitingMessage = requested == "receive"
     ? "Aguardando conexao.\n\nNo computador principal, abra Timecode > Transmitter. Ele encontrara este dispositivo pelo nome da Hook Center."
@@ -4708,7 +4714,7 @@ static void toggleProjectSync()
     kTimecodeSelectedPeerKey, "", true);
   SetExtState_ptr(kExtStateSection,
     kTimecodeRejectedPeerKey, "", true);
-  nativeTimecodeLanRefreshConfigOnMainThread();
+  nativeTimecodeLanRefreshConfigOnMainThread(true);
 
   const std::string waitingMessage = primaryRole
     ? "Este computador e o PC A - Mestre.\n\nProcurando dispositivos PC B na rede local. Quando o PC B aparecer, confirme o nome para conectar."
@@ -7633,8 +7639,19 @@ static bool nativeTimecodeLanCodeIsValid(const std::string& value)
       });
 }
 
-static void nativeTimecodeLanRefreshConfigOnMainThread()
+static void nativeTimecodeLanRefreshConfigOnMainThread(bool force)
 {
+  // As opcoes ficam em ExtState e nao mudam a cada quadro. A leitura antiga
+  // repetia varias consultas ao REAPER em cada tick mesmo com LAN desligada.
+  // Acoes que acabaram de gravar a configuracao entram com force=true.
+  static std::chrono::steady_clock::time_point lastConfigRead;
+  const auto configNow = std::chrono::steady_clock::now();
+  if (!force && lastConfigRead.time_since_epoch().count() != 0 &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        configNow - lastConfigRead).count() < 250) {
+    return;
+  }
+  lastConfigRead = configNow;
   std::string mode = getTimecodeMode();
   std::string projectSyncRole = getProjectSyncRole();
   std::string code;
@@ -16123,9 +16140,18 @@ static void nativeRefreshLuaControlHeartbeatFromExtState()
 {
   static bool lastPublishedActive = false;
   if (!GetExtState_ptr) return;
+  // O heartbeat expira em 1,8 s. Ler o mesmo ExtState em cada quadro nao muda
+  // essa precisao; 100 ms mantem a troca de controle imediata para o usuario.
+  static std::chrono::steady_clock::time_point lastHeartbeatRead;
+  const auto now = std::chrono::steady_clock::now();
+  if (lastHeartbeatRead.time_since_epoch().count() != 0 &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - lastHeartbeatRead).count() < 100) {
+    return;
+  }
+  lastHeartbeatRead = now;
   const char* raw = GetExtState_ptr(kNativeExtStateSection, kLuaControlHeartbeatKey);
   const std::string token = raw ? nativeTrim(raw) : std::string();
-  const auto now = std::chrono::steady_clock::now();
 
   std::lock_guard<std::mutex> lock(g_nativeMutex);
 
@@ -31922,7 +31948,7 @@ static bool nativeApplyProjectSyncCommand(
         !SetExtState_ptr) return true;
     SetExtState_ptr(kExtStateSection, kProjectSyncRoleKey,
       targetRole.c_str(), true);
-    nativeTimecodeLanRefreshConfigOnMainThread();
+    nativeTimecodeLanRefreshConfigOnMainThread(true);
     {
       std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
       g_nativeProjectSyncRoleHandover.state = "completed";
@@ -69198,9 +69224,14 @@ static void nativeRefreshAppActivePanelModel()
   const bool visualListNavigation =
     g_nativeUiPendingMusicNavigation.pending ||
     nativeUiSmoothScrollActive();
+  const bool sourceDirty =
+    g_nativeUiPanelModelSourceDirty.exchange(
+      false, std::memory_order_acq_rel);
   const int modelIntervalMs =
-    visualListNavigation ? 80 : (activeModel ? 30 : 200);
-  if (g_nativeUiLastModelRefreshAt.time_since_epoch().count() != 0 &&
+    visualListNavigation ? 80 : (recentlyInteracted ? 30 :
+      (activeModel ? 100 : 250));
+  if (!sourceDirty &&
+      g_nativeUiLastModelRefreshAt.time_since_epoch().count() != 0 &&
       std::chrono::duration_cast<std::chrono::milliseconds>(
         modelNow - g_nativeUiLastModelRefreshAt).count() <
           modelIntervalMs) {
@@ -71639,6 +71670,8 @@ static void nativeRebuildState(bool forceSnapshot)
   g_nativeCurrentSongStart = songStart;
   g_nativeCurrentSongEnd = songEnd;
   g_nativeCurrentPlayPosition = playPos;
+  g_nativeUiPanelModelSourceDirty.store(
+    true, std::memory_order_release);
 
   // Enquanto o Lua antigo for o unico controlador, ele e o dono do Tuner. A
   // interface nativa e o Diretor continuam usando este motor normalmente.
@@ -78079,7 +78112,7 @@ static bool nativeApplyTimecodeLanCommand(
       SetExtState_ptr(kExtStateSection,
         rejectedKey, peerId.c_str(), true);
     }
-    nativeTimecodeLanRefreshConfigOnMainThread();
+    nativeTimecodeLanRefreshConfigOnMainThread(true);
     g_nativeForceStateBuild.store(true);
     return true;
   }
@@ -80473,7 +80506,7 @@ static bool initialize()
     vshook_jsapi::registerApi(plugin_register_ptr, plugin_getapi_ptr);
     registerNativeBridgeApi();
     nativeTelepromptLoadSettings();
-    nativeTimecodeLanRefreshConfigOnMainThread();
+    nativeTimecodeLanRefreshConfigOnMainThread(true);
     nativeTechnicalNoticeLoadState();
     nativeTechnicalNoticeRefreshAuthCache(
       nativeDirectorPasswordHash(nativeReadDirectorPassword()),
