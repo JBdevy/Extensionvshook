@@ -1648,7 +1648,7 @@ static int g_nativeUiTimerCaretPositions[7]{};
 static bool g_nativeUiTimerCaretPositionsValid = false;
 static std::string g_nativeUiHelpTopic;
 static int g_nativeUiHelpScroll = 0;
-static int g_nativeUiHelpVisibleRows = 1;
+static int g_nativeUiHelpMaxScroll = 0;
 static std::string g_nativeUiConfigAccessInfo;
 static std::string g_nativeUiCustomizeDrawerTarget = "outline";
 static std::string g_nativeUiCustomizeBlockSymbolTarget = "colon";
@@ -4732,6 +4732,13 @@ static bool nativeSetReaperConfigInt(const char* key, int value)
   return true;
 }
 
+// Flags persistidas pelo dialogo "Save Project As" do REAPER. Converter
+// midia so e uma configuracao valida quando a copia de todas as midias tambem
+// esta ativa. Gravar apenas kNativeSaveConvertMedia fazia o Windows depender
+// do clique tardio no dialogo e fazia o macOS abrir com as duas caixas vazias.
+static constexpr int kNativeSaveCopyAllMedia = 2;
+static constexpr int kNativeSaveConvertMedia = 16;
+
 struct NativeExportProjectFindChild {
   int controlId = 0;
   HWND hwnd = nullptr;
@@ -4778,7 +4785,8 @@ static BOOL nativeExportProjectFindDialogCallback(HWND hwnd, LPARAM param)
   if (processId != GetCurrentProcessId()) return TRUE;
 #endif
   if (nativeExportProjectFindChild(hwnd, search->firstControlId) &&
-      nativeExportProjectFindChild(hwnd, search->secondControlId)) {
+      (search->secondControlId <= 0 ||
+       nativeExportProjectFindChild(hwnd, search->secondControlId))) {
     search->hwnd = hwnd;
     return FALSE;
   }
@@ -4839,61 +4847,212 @@ static bool nativeExportProjectSelectComboText(
   return true;
 }
 
-static void nativeExportProjectConfigureSaveDialog(
-  bool convertToMp3, std::atomic<bool>* cancelled)
+enum class NativeExportProjectDialogStep {
+  Idle,
+  FindSaveDialog,
+  EnsureCopyMedia,
+  EnsureConvertMedia,
+  OpenFormatDialog,
+  SelectMp3Format,
+  ConfigureMp3Quality,
+  ConfirmFormatDialog
+};
+
+static NativeExportProjectDialogStep g_nativeExportProjectDialogStep =
+  NativeExportProjectDialogStep::Idle;
+static bool g_nativeExportProjectConvertToMp3 = false;
+static HWND g_nativeExportProjectSaveDialog = nullptr;
+static HWND g_nativeExportProjectTimerHwnd = nullptr;
+static constexpr UINT_PTR kNativeExportProjectTimerId = 0x56534558;
+static std::chrono::steady_clock::time_point
+  g_nativeExportProjectDialogExpiresAt{};
+static std::chrono::steady_clock::time_point
+  g_nativeExportProjectDialogLastActionAt{};
+static void nativeExportProjectDialogTimerProc(
+  HWND, UINT, UINT_PTR, DWORD);
+
+static void nativeExportProjectScheduleSaveDialog(bool convertToMp3)
 {
-  using namespace std::chrono_literals;
-  HWND saveDialog = nullptr;
-  for (int attempt = 0; attempt < 400 &&
-       (!cancelled || !cancelled->load()); ++attempt) {
-    saveDialog = nativeExportProjectFindDialog(0x413, 0x421);
-    if (saveDialog) break;
-    std::this_thread::sleep_for(25ms);
+  const auto now = std::chrono::steady_clock::now();
+  g_nativeExportProjectConvertToMp3 = convertToMp3;
+  g_nativeExportProjectSaveDialog = nullptr;
+  g_nativeExportProjectDialogLastActionAt =
+    std::chrono::steady_clock::time_point{};
+  g_nativeExportProjectDialogExpiresAt = now + std::chrono::seconds(12);
+  g_nativeExportProjectDialogStep =
+    NativeExportProjectDialogStep::FindSaveDialog;
+  g_nativeExportProjectTimerHwnd =
+    GetMainHwnd_ptr ? GetMainHwnd_ptr() : nullptr;
+  if (g_nativeExportProjectTimerHwnd) {
+    KillTimer(g_nativeExportProjectTimerHwnd,
+      kNativeExportProjectTimerId);
+    SetTimer(g_nativeExportProjectTimerHwnd,
+      kNativeExportProjectTimerId, 25,
+      nativeExportProjectDialogTimerProc);
   }
-  if (!saveDialog || (cancelled && cancelled->load())) return;
+}
 
-  HWND copyMedia = nativeExportProjectFindChild(saveDialog, 0x413);
-  HWND convertMedia = nativeExportProjectFindChild(saveDialog, 0x421);
-  if (copyMedia && SendMessage(copyMedia, BM_GETCHECK, 0, 0) == 0) {
-    nativeExportProjectPostControlClick(copyMedia);
-    std::this_thread::sleep_for(80ms);
+static void nativeExportProjectFinishSaveDialogConfiguration()
+{
+  if (g_nativeExportProjectTimerHwnd) {
+    KillTimer(g_nativeExportProjectTimerHwnd,
+      kNativeExportProjectTimerId);
+    g_nativeExportProjectTimerHwnd = nullptr;
   }
-  const bool conversionChecked = convertMedia &&
-    SendMessage(convertMedia, BM_GETCHECK, 0, 0) != 0;
-  if (convertMedia && conversionChecked != convertToMp3) {
-    nativeExportProjectPostControlClick(convertMedia);
-    std::this_thread::sleep_for(100ms);
-  }
-  if (!convertToMp3 || !convertMedia ||
-      SendMessage(convertMedia, BM_GETCHECK, 0, 0) == 0) {
+  g_nativeExportProjectDialogStep =
+    NativeExportProjectDialogStep::Idle;
+  g_nativeExportProjectSaveDialog = nullptr;
+}
+
+static bool nativeExportProjectActionCanRun(
+  std::chrono::steady_clock::time_point now)
+{
+  return g_nativeExportProjectDialogLastActionAt.time_since_epoch().count() == 0 ||
+    now - g_nativeExportProjectDialogLastActionAt >=
+      std::chrono::milliseconds(90);
+}
+
+// Executado pelo timer principal do REAPER. O Save As e criado de forma
+// assincrona no Windows, portanto a configuracao precisa acompanhar o dialogo
+// depois que ele realmente existe. Manter tudo na thread da interface tambem
+// evita acessar controles AppKit fora da main thread no macOS.
+static void nativeExportProjectProcessSaveDialog()
+{
+  if (g_nativeExportProjectDialogStep ==
+      NativeExportProjectDialogStep::Idle) {
     return;
   }
 
-  HWND formatButton = nativeExportProjectFindChild(saveDialog, 0x420);
-  if (!nativeExportProjectPostControlClick(formatButton)) return;
-
-  HWND formatDialog = nullptr;
-  for (int attempt = 0; attempt < 240 &&
-       (!cancelled || !cancelled->load()); ++attempt) {
-    formatDialog = nativeExportProjectFindDialog(0x45C, IDOK, saveDialog);
-    if (formatDialog) break;
-    std::this_thread::sleep_for(25ms);
-  }
-  if (!formatDialog || (cancelled && cancelled->load())) return;
-
-  if (!nativeExportProjectSelectComboText(formatDialog, 0x45C, "MP3")) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= g_nativeExportProjectDialogExpiresAt) {
+    nativeExportProjectFinishSaveDialogConfiguration();
     return;
   }
-  std::this_thread::sleep_for(120ms);
-  nativeExportProjectSelectComboText(
-    formatDialog, 0x3F6, "Maximum bitrate/quality");
-  nativeExportProjectSelectComboText(
-    formatDialog, 0x3EE, "100 (best)");
-  nativeExportProjectSelectComboText(
-    formatDialog, 0x3EB, "320 kbps");
-  std::this_thread::sleep_for(80ms);
-  nativeExportProjectPostControlClick(
-    nativeExportProjectFindChild(formatDialog, IDOK));
+
+  if (g_nativeExportProjectDialogStep ==
+      NativeExportProjectDialogStep::FindSaveDialog) {
+    // O checkbox Converter pode ser criado ou habilitado alguns ciclos depois;
+    // localizar pelo checkbox Copiar evita perder o dialogo nessa janela curta.
+    g_nativeExportProjectSaveDialog =
+      nativeExportProjectFindDialog(0x413, 0);
+    if (!g_nativeExportProjectSaveDialog) return;
+    g_nativeExportProjectDialogStep =
+      NativeExportProjectDialogStep::EnsureCopyMedia;
+  }
+
+  if (!g_nativeExportProjectSaveDialog ||
+      !IsWindow(g_nativeExportProjectSaveDialog)) {
+    g_nativeExportProjectSaveDialog = nullptr;
+    g_nativeExportProjectDialogStep =
+      NativeExportProjectDialogStep::FindSaveDialog;
+    return;
+  }
+
+  if (g_nativeExportProjectDialogStep ==
+      NativeExportProjectDialogStep::EnsureCopyMedia) {
+    HWND copyMedia = nativeExportProjectFindChild(
+      g_nativeExportProjectSaveDialog, 0x413);
+    if (!copyMedia || !IsWindowEnabled(copyMedia)) return;
+    if (SendMessage(copyMedia, BM_GETCHECK, 0, 0) != BST_CHECKED) {
+      if (nativeExportProjectActionCanRun(now) &&
+          nativeExportProjectPostControlClick(copyMedia)) {
+        g_nativeExportProjectDialogLastActionAt = now;
+      }
+      return;
+    }
+    g_nativeExportProjectDialogStep =
+      NativeExportProjectDialogStep::EnsureConvertMedia;
+  }
+
+  if (g_nativeExportProjectDialogStep ==
+      NativeExportProjectDialogStep::EnsureConvertMedia) {
+    HWND convertMedia = nativeExportProjectFindChild(
+      g_nativeExportProjectSaveDialog, 0x421);
+    if (!convertMedia || !IsWindowEnabled(convertMedia)) return;
+    const bool checked =
+      SendMessage(convertMedia, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (checked != g_nativeExportProjectConvertToMp3) {
+      if (nativeExportProjectActionCanRun(now) &&
+          nativeExportProjectPostControlClick(convertMedia)) {
+        g_nativeExportProjectDialogLastActionAt = now;
+      }
+      return;
+    }
+    if (!g_nativeExportProjectConvertToMp3) {
+      nativeExportProjectFinishSaveDialogConfiguration();
+      return;
+    }
+    g_nativeExportProjectDialogStep =
+      NativeExportProjectDialogStep::OpenFormatDialog;
+  }
+
+  if (g_nativeExportProjectDialogStep ==
+      NativeExportProjectDialogStep::OpenFormatDialog) {
+    if (!nativeExportProjectActionCanRun(now)) return;
+    HWND formatButton = nativeExportProjectFindChild(
+      g_nativeExportProjectSaveDialog, 0x420);
+    if (!nativeExportProjectPostControlClick(formatButton)) return;
+    g_nativeExportProjectDialogLastActionAt = now;
+    g_nativeExportProjectDialogStep =
+      NativeExportProjectDialogStep::SelectMp3Format;
+    return;
+  }
+
+  HWND formatDialog = nativeExportProjectFindDialog(
+    0x45C, IDOK, g_nativeExportProjectSaveDialog);
+  if (!formatDialog) return;
+
+  HWND formatCombo = nativeExportProjectFindChild(formatDialog, 0x45C);
+  const int mp3Item = nativeExportProjectFindComboItem(formatCombo, "MP3");
+  if (!formatCombo || mp3Item < 0) return;
+
+  if (g_nativeExportProjectDialogStep ==
+      NativeExportProjectDialogStep::SelectMp3Format) {
+    if (!nativeExportProjectActionCanRun(now)) return;
+    if (!nativeExportProjectSelectComboText(
+          formatDialog, 0x45C, "MP3")) {
+      return;
+    }
+    g_nativeExportProjectDialogLastActionAt = now;
+    g_nativeExportProjectDialogStep =
+      NativeExportProjectDialogStep::ConfigureMp3Quality;
+    return;
+  }
+
+  const int selectedFormat = static_cast<int>(
+    SendMessage(formatCombo, CB_GETCURSEL, 0, 0));
+  if (selectedFormat != mp3Item) {
+    g_nativeExportProjectDialogStep =
+      NativeExportProjectDialogStep::SelectMp3Format;
+    return;
+  }
+
+  if (g_nativeExportProjectDialogStep ==
+      NativeExportProjectDialogStep::ConfigureMp3Quality) {
+    if (!nativeExportProjectActionCanRun(now)) return;
+    nativeExportProjectSelectComboText(
+      formatDialog, 0x3F6, "Maximum bitrate/quality");
+    nativeExportProjectSelectComboText(
+      formatDialog, 0x3EE, "100 (best)");
+    nativeExportProjectSelectComboText(
+      formatDialog, 0x3EB, "320 kbps");
+    g_nativeExportProjectDialogLastActionAt = now;
+    g_nativeExportProjectDialogStep =
+      NativeExportProjectDialogStep::ConfirmFormatDialog;
+    return;
+  }
+
+  if (!nativeExportProjectActionCanRun(now)) return;
+  if (nativeExportProjectPostControlClick(
+        nativeExportProjectFindChild(formatDialog, IDOK))) {
+    nativeExportProjectFinishSaveDialogConfiguration();
+  }
+}
+
+static void nativeExportProjectDialogTimerProc(
+  HWND, UINT, UINT_PTR, DWORD)
+{
+  nativeExportProjectProcessSaveDialog();
 }
 
 static void nativeExportProject()
@@ -4927,8 +5086,9 @@ static void nativeExportProject()
   // Estes valores preparam o estado inicial. Algumas versoes do REAPER
   // reescrevem esse estado ao criar a janela; o configurador abaixo confirma
   // diretamente os controles visiveis antes de devolver a janela ao usuario.
-  nativeSetReaperConfigInt(
-    "saveFlags", convertToMp3 ? 16 : 2);
+  const int saveFlags = kNativeSaveCopyAllMedia |
+    (convertToMp3 ? kNativeSaveConvertMedia : 0);
+  nativeSetReaperConfigInt("saveFlags", saveFlags);
   // Zero faz o dialogo usar APPLYFX_FORMAT do projeto, configurado abaixo.
   nativeSetReaperConfigInt("saveFlags_fmtused", 0);
 
@@ -4947,16 +5107,11 @@ static void nativeExportProject()
     nativeUiSetProjectString(project, "OPENCOPY_CFGIDX", "1");
   }
 
-  std::atomic<bool> dialogClosed{false};
-  std::thread dialogConfigurator(
-    nativeExportProjectConfigureSaveDialog,
-    convertToMp3, &dialogClosed);
-
   // forceSaveAs=true abre a janela nativa para o usuario escolher destino e
-  // nome. O REAPER executa a copia/conversao e atualiza o projeto resultante.
+  // nome. Um timer da propria janela acompanha a criacao assincrona do dialogo
+  // dentro do loop modal, sempre na thread principal em Windows e macOS.
+  nativeExportProjectScheduleSaveDialog(convertToMp3);
   Main_SaveProject_ptr(project, true);
-  dialogClosed.store(true);
-  if (dialogConfigurator.joinable()) dialogConfigurator.join();
 }
 
 static bool nativeConvertMp3EligibleSourcePath(const std::string& rawPath)
@@ -19342,7 +19497,7 @@ static std::string nativeUiDefaultTooltipForLabel(
   if (label == "View") return "Mostra ou oculta o botao Mostrar/Ocultar das familias no repertorio.";
   if (label == "Midi" || label == "MIDI") return "Abrir mapeamento MIDI.";
   if (label == "Config") return "Abrir configuracoes.";
-  if (label == "Help" || label == "Ajuda" || label == "?") return "Abrir ajuda.";
+  if (label == "Help" || label == "Ajuda" || label == "Atalho" || label == "?") return "Abrir atalhos.";
   if (label == "Auto 1") return "F4: Fila de espera com reprodução automática.";
   if (label == "Auto 2") return "F5: Fila de espera sem reprodução automática; deixa a música pronta para Play.";
   if (label == "Live") return "Deixa marcadas as músicas que já foram tocadas.";
@@ -19386,7 +19541,7 @@ static std::string nativeUiMainTooltipAtPoint(const POINT& point)
   if (PtInRect(&g_nativeMainMidiTabRect, point)) return "Abrir mapeamento MIDI.";
   if (PtInRect(&g_nativeMainTunerTabRect, point)) return "F7: Abrir ou fechar Tuner.";
   if (PtInRect(&g_nativeMainBpmTabRect, point)) return "Abrir ou fechar BPM.";
-  if (PtInRect(&g_nativeMainHelpTabRect, point)) return "Abrir ajuda.";
+  if (PtInRect(&g_nativeMainHelpTabRect, point)) return "Abrir atalhos.";
   if (PtInRect(&g_nativeMainConfigTabRect, point)) return "Abrir configuracoes.";
   if (PtInRect(&g_nativeMainPlayRect, point)) return "Play / Stop. Clique direito configura Stop e FaderOut.";
   if (PtInRect(&g_nativeMainAutoRect, point)) return "F4: Auto 1 — fila de espera com reprodução automática.";
@@ -36940,7 +37095,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
         g_nativeAppActivePanelModel.showBpm,
         true, 48, 34, id};
     } else if (id == "nav_help") {
-      spec = {&g_nativeMainHelpTabRect, "Ajuda", "Aj",
+      spec = {&g_nativeMainHelpTabRect, "Atalho", "Atl",
         "help_no_rgb", false, true, 48, 30, id};
     } else if (id == "nav_config") {
       spec = {&g_nativeMainConfigTabRect, "Config", "Cfg",
@@ -42116,7 +42271,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
     } else if (g_nativeMainModalKind == NativeMainModalKind::Help) {
       RECT title{modal.left + 10, modal.top + 8, modal.right - 10,
         modal.top + 31};
-      nativeAppActiveDrawText(dc, "Help", title,
+      nativeAppActiveDrawText(dc, "Atalho", title,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         RGB(248, 250, 252), nameFont);
       RECT info{modal.left + 10, modal.top + 35, modal.right - 10,
@@ -42156,72 +42311,75 @@ static void nativePaintAppActivePanel(HWND hwnd)
         RGB(248, 250, 252), nameFont);
       RECT topicText{modal.left + 10, modal.top + 38,
         modal.right - 10, modal.bottom - 58};
-      if (g_nativeUiHelpTopic == "my_shortcuts") {
-#ifdef __APPLE__
-        const int lineHeight = 18;
-#else
-        const int lineHeight = 17;
-#endif
-        g_nativeUiHelpVisibleRows = std::max(1,
-          static_cast<int>(topicText.bottom - topicText.top) /
-            lineHeight);
-        const int maxScroll = std::max(0,
-          static_cast<int>(topic.second.size()) -
-            g_nativeUiHelpVisibleRows);
-        g_nativeUiHelpScroll = std::max(0,
-          std::min(maxScroll, g_nativeUiHelpScroll));
-        const int endIndex = std::min(
-          static_cast<int>(topic.second.size()),
-          g_nativeUiHelpScroll +
-            g_nativeUiHelpVisibleRows);
-        for (int index = g_nativeUiHelpScroll;
-             index < endIndex; ++index) {
-          const int visibleIndex =
-            index - g_nativeUiHelpScroll;
-          RECT line{topicText.left,
-            topicText.top + visibleIndex * lineHeight,
-            topicText.right - (maxScroll > 0 ? 8 : 0),
-            topicText.top + (visibleIndex + 1) * lineHeight};
-          nativeAppActiveDrawText(dc,
-            topic.second[static_cast<size_t>(index)], line,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE |
-              DT_END_ELLIPSIS | DT_NOPREFIX,
+      const int textWidth = std::max(1,
+        static_cast<int>(topicText.right - topicText.left) - 10);
+      const UINT paragraphFlags =
+        DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX;
+      const int paragraphGap = 8;
+      std::vector<int> paragraphHeights;
+      paragraphHeights.reserve(topic.second.size());
+      int contentHeight = 0;
+      for (const std::string& paragraph : topic.second) {
+        const int height = nativeAppActiveMeasureTextHeight(
+          dc, paragraph, textWidth, paragraphFlags, statusFont);
+        paragraphHeights.push_back(height);
+        contentHeight += height;
+      }
+      if (topic.second.size() > 1) {
+        contentHeight += paragraphGap *
+          (static_cast<int>(topic.second.size()) - 1);
+      }
+      const int viewportHeight = std::max(1,
+        static_cast<int>(topicText.bottom - topicText.top));
+      g_nativeUiHelpMaxScroll = std::max(0,
+        contentHeight - viewportHeight);
+      g_nativeUiHelpScroll = std::max(0,
+        std::min(g_nativeUiHelpMaxScroll,
+          g_nativeUiHelpScroll));
+
+      const NativeUiClipState helpClip =
+        nativeUiBeginClipRect(dc, topicText);
+      int paragraphY = topicText.top - g_nativeUiHelpScroll;
+      for (size_t index = 0;
+           index < topic.second.size(); ++index) {
+        const int height = paragraphHeights[index];
+        RECT paragraphRect{topicText.left, paragraphY,
+          topicText.right -
+            (g_nativeUiHelpMaxScroll > 0 ? 10 : 0),
+          paragraphY + height};
+        if (paragraphRect.bottom >= topicText.top &&
+            paragraphRect.top <= topicText.bottom) {
+          nativeAppActiveDrawText(dc, topic.second[index],
+            paragraphRect, paragraphFlags,
             RGB(203, 213, 225), statusFont);
         }
-        if (maxScroll > 0) {
-          RECT scrollTrack{topicText.right - 5,
-            topicText.top, topicText.right - 2,
-            topicText.bottom};
-          nativeAppActiveFillRect(dc, scrollTrack,
-            RGB(30, 41, 59));
-          const int trackHeight = std::max(1,
-            static_cast<int>(scrollTrack.bottom -
-              scrollTrack.top));
-          const int thumbHeight = std::max(18,
-            static_cast<int>(trackHeight *
-              (static_cast<double>(g_nativeUiHelpVisibleRows) /
-               std::max(1, static_cast<int>(
-                 topic.second.size())))));
-          const int travel = std::max(0,
-            trackHeight - thumbHeight);
-          const int thumbY = scrollTrack.top +
-            static_cast<int>(travel *
-              (static_cast<double>(g_nativeUiHelpScroll) /
-               maxScroll));
-          nativeAppActiveFillRect(dc,
-            RECT{scrollTrack.left, thumbY,
-              scrollTrack.right, thumbY + thumbHeight},
-            RGB(100, 116, 139));
-        }
-      } else {
-        std::ostringstream helpText;
-        for (size_t i = 0; i < topic.second.size(); ++i) {
-          if (i) helpText << "\n\n";
-          helpText << topic.second[i];
-        }
-        nativeAppActiveDrawText(dc, helpText.str(), topicText,
-          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
-          RGB(203, 213, 225), statusFont);
+        paragraphY += height + paragraphGap;
+      }
+      nativeUiEndClipRect(dc, helpClip);
+
+      if (g_nativeUiHelpMaxScroll > 0) {
+        RECT scrollTrack{topicText.right - 5,
+          topicText.top, topicText.right - 2,
+          topicText.bottom};
+        nativeAppActiveFillRect(dc, scrollTrack,
+          RGB(30, 41, 59));
+        const int trackHeight = std::max(1,
+          static_cast<int>(scrollTrack.bottom -
+            scrollTrack.top));
+        const int thumbHeight = std::max(18,
+          static_cast<int>(trackHeight *
+            (static_cast<double>(viewportHeight) /
+             std::max(viewportHeight, contentHeight))));
+        const int travel = std::max(0,
+          trackHeight - thumbHeight);
+        const int thumbY = scrollTrack.top +
+          static_cast<int>(travel *
+            (static_cast<double>(g_nativeUiHelpScroll) /
+             g_nativeUiHelpMaxScroll));
+        nativeAppActiveFillRect(dc,
+          RECT{scrollTrack.left, thumbY,
+            scrollTrack.right, thumbY + thumbHeight},
+          RGB(100, 116, 139));
       }
       RECT copyright{modal.left + 10, modal.bottom - 48,
         modal.right - 10, modal.bottom - 30};
@@ -44664,7 +44822,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
               g_nativeAppActivePanelModel.showBpm
                 ? "play" : "stop", false};
           } else if (id == "nav_help") {
-            item = {id, "Ajuda", "help_no_rgb", false};
+            item = {id, "Atalho", "help_no_rgb", false};
           } else if (id == "nav_config") {
             item = {id, "Config", "yellow_reset", true};
           } else if (id == "action_play") {
@@ -59447,16 +59605,11 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         return 0;
       }
       if (g_nativeMainModalKind ==
-          NativeMainModalKind::HelpTopic &&
-          g_nativeUiHelpTopic == "my_shortcuts") {
-        const int total = static_cast<int>(
-          nativeUiCollectMyShortcutsLines().size());
-        const int maxScroll = std::max(0,
-          total - g_nativeUiHelpVisibleRows);
+          NativeMainModalKind::HelpTopic) {
         g_nativeUiHelpScroll = std::max(0,
-          std::min(maxScroll,
+          std::min(g_nativeUiHelpMaxScroll,
             g_nativeUiHelpScroll +
-              (delta > 0 ? -3 : 3)));
+              (delta > 0 ? -48 : 48)));
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
@@ -80607,6 +80760,7 @@ static void shutdown()
     return;
   }
 
+  nativeExportProjectFinishSaveDialogConfiguration();
   nativeRemoveReaperMainWindowSubclass();
 
   if (g_state.projectConfigRegistered) {
