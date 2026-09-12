@@ -851,6 +851,7 @@ struct NativeAppActivePanelModel {
   bool multiLoopBypassActive = false;
   bool selectedOrPlayingMultiLoopActive = false;
   bool timerRunning = false;
+  bool timerInitAutoEnabled = false;
   bool timerVisible = false;
   bool timerExpired = false;
   bool liveEnabled = false;
@@ -6989,6 +6990,9 @@ struct NativePendingSelectionCommand {
 
 static NativePendingSelectionCommand g_nativePendingSelection;
 static bool g_nativeTimerRunning = false;
+static bool g_nativeTimerInitAutoEnabled = false;
+static ReaProject* g_nativeTimerObservedProject = nullptr;
+static std::string g_nativeTimerObservedSongId;
 static bool g_nativeTimerWasRunningBeforeExtensionBypass = false;
 static std::string g_nativeTimerMode = "progressive";
 static double g_nativeTimerBaseSec = 0.0;
@@ -7000,6 +7004,9 @@ static std::chrono::system_clock::time_point g_nativeTimerStartedAtSystem;
 // Ponto unico usado tanto pelos comandos do App do Diretor quanto pelo canal
 // ExtState do Lua. O cronometro e sempre aplicado pela extensao.
 static bool nativeApplyTimerCommand(const std::string& commandBody);
+static void nativeTimerObservePlaybackLocked(
+  ReaProject* project, bool playing, bool paused,
+  const std::string& playingId);
 
 
 static std::string nativeJsonEscape(const std::string& value)
@@ -7316,6 +7323,7 @@ static std::string nativeBuildTimerStateJsonLocked()
   json << "{";
   json << "\"running\":" << (g_nativeTimerRunning ? "true" : "false") << ",";
   json << "\"active\":" << (g_nativeTimerRunning ? "true" : "false") << ",";
+  json << "\"initAutoEnabled\":" << (g_nativeTimerInitAutoEnabled ? "true" : "false") << ",";
   json << "\"mode\":" << nativeJsonString(publishedMode) << ",";
   json << "\"type\":" << nativeJsonString(publishedMode) << ",";
   json << "\"startedAt\":" << nativeNumber(startedAtMs) << ",";
@@ -9792,6 +9800,10 @@ static void nativeLoadAutomationSettingsOnceLocked()
 {
   g_nativeAutomationSettingsLoaded = true;
   if (GetExtState_ptr) {
+    const char* timerInitAuto = GetExtState_ptr(
+      kLuaWindowExtStateSection, "TIMER_INIT_AUTO_V1");
+    g_nativeTimerInitAutoEnabled =
+      timerInitAuto && nativeBoolFromText(timerInitAuto, false);
     const char* nativeAuto = GetExtState_ptr(kNativeExtStateSection, kNativeAutoplayExtKey);
     const char* luaAuto = (!nativeAuto || !*nativeAuto) ? GetExtState_ptr(kLuaWindowExtStateSection, kLuaWindowAutoplayKey) : nullptr;
     const char* autoValue = (nativeAuto && *nativeAuto) ? nativeAuto : luaAuto;
@@ -25914,6 +25926,7 @@ nativeUiBackupWindowGlobalKeys()
     "LITE_MODE_V1",
     "TIMER_MODE_V1",
     "TIMER_TARGET_SEC_V1",
+    "TIMER_INIT_AUTO_V1",
     "HASH_CHILDREN_CONTROLS_VIEW_V1",
     "NUMBER_COLUMN_MODE_V1",
     "UI_FPS_MODE_V1",
@@ -41584,10 +41597,10 @@ static void nativePaintAppActivePanel(HWND hwnd)
         "clear_playlist", true);
     } else if (g_nativeMainModalKind ==
                NativeMainModalKind::TimerConfig) {
-      RECT title{modal.left + 10, modal.top + 8, modal.right - 10,
+      RECT title{modal.left + 10, modal.top + 8, modal.right - 124,
         modal.top + 32};
       nativeAppActiveDrawText(dc, "Configurar Timer", title,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(248, 250, 252), nameFont);
       RECT info{modal.left + 10, modal.top + 36, modal.right - 10,
         modal.top + 60};
@@ -41609,6 +41622,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
         RECT{modal.left + 10 + modeW + modeGap, modeY,
           modal.right - 10, modeY + modeH},
         g_nativeUiTimerMode == "countdown" ? "yellow_reset" : "page", true);
+
+      addModalButton("timer_init_auto", "INIT AUTO",
+        RECT{modal.right - 114, modal.top + 8,
+          modal.right - 10, modal.top + 32},
+        g_nativeAppActivePanelModel.timerInitAutoEnabled
+          ? "play" : "stop", true);
 
       const int labelY = modeY + modeH + 22;
       const std::string shownTimer =
@@ -56251,6 +56270,12 @@ static bool nativeMainHandleModalClick(
         NativeUiTextInputKind::TimerCountdown);
   } else if (action == "timer_save") {
     nativeUiSaveTimerConfig();
+  } else if (action == "timer_init_auto") {
+    nativeApplyTimerCommand(
+      "{\"type\":\"timer_init_auto_toggle\"}");
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativeAppActivePanelModel.timerInitAutoEnabled =
+      g_nativeTimerInitAutoEnabled;
   } else if (action == "timer_clear") {
     g_nativeUiTimerDigits = "000000";
     g_nativeUiTimerDigitCursor = 0;
@@ -69449,6 +69474,7 @@ static void nativeRefreshAppActivePanelModel()
     next.autoStopEnabled = g_nativeAutoStopEnabled;
     next.multiLoopBypassActive = g_nativeMultiLoopBypassActive;
     next.timerRunning = g_nativeTimerRunning;
+    next.timerInitAutoEnabled = g_nativeTimerInitAutoEnabled;
     next.timerMode = nativeNormalizeTimerMode(g_nativeTimerMode);
     next.timerVisible = next.timerRunning;
     next.timerExpired = nativeTimerCountdownExpiredLocked();
@@ -69779,6 +69805,7 @@ static void nativeRefreshAppActivePanelModel()
     next.selectedOrPlayingMultiLoopActive !=
       g_nativeAppActivePanelModel.selectedOrPlayingMultiLoopActive ||
     next.timerRunning != g_nativeAppActivePanelModel.timerRunning ||
+    next.timerInitAutoEnabled != g_nativeAppActivePanelModel.timerInitAutoEnabled ||
     next.timerVisible != g_nativeAppActivePanelModel.timerVisible ||
     next.timerExpired != g_nativeAppActivePanelModel.timerExpired ||
     next.timerMode != g_nativeAppActivePanelModel.timerMode ||
@@ -72087,6 +72114,7 @@ static void nativeRebuildState(bool forceSnapshot)
   std::string sharedActivePage = "playlist";
   int previewModeForState = 0;
   bool timerRunning = false;
+  bool timerInitAutoEnabled = false;
   std::string timerMode = "progressive";
   double timerStartedAtMs = 0.0;
   double timerAccumulatedSec = 0.0;
@@ -72124,7 +72152,10 @@ static void nativeRebuildState(bool forceSnapshot)
     previewModeForState =
       g_nativePreviewMode >= 1 && g_nativePreviewMode <= 6
         ? g_nativePreviewMode : 0;
+    nativeTimerObservePlaybackLocked(
+      activeProject, playing, paused, playingId);
     timerRunning = g_nativeTimerRunning;
+    timerInitAutoEnabled = g_nativeTimerInitAutoEnabled;
     timerMode = g_nativeTimerMode;
     timerStartedAtMs = timerRunning ? nativeTimerEpochMs(g_nativeTimerStartedAtSystem) : 0.0;
     timerAccumulatedSec = nativeTimerAccumulatedSecLocked();
@@ -72552,6 +72583,7 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"normalStopEnabled\":true,";
   json << "\"normal_stop_enabled\":true,";
   json << "\"timerRunning\":" << (timerRunning ? "true" : "false") << ",";
+  json << "\"timerInitAutoEnabled\":" << (timerInitAutoEnabled ? "true" : "false") << ",";
   json << "\"timerActive\":" << (timerRunning ? "true" : "false") << ",";
   json << "\"timerEnabled\":" << (timerRunning ? "true" : "false") << ",";
   json << "\"timerMode\":" << nativeJsonString(timerMode) << ",";
@@ -76115,12 +76147,34 @@ static void nativeTimerResetLocked()
   g_nativeTimerResetToZero = true;
 }
 
+static void nativeTimerObservePlaybackLocked(
+  ReaProject* project, bool playing, bool paused,
+  const std::string& playingId)
+{
+  // Pause nao e uma musica nova. Parar limpa a borda para o proximo Play.
+  if (paused) return;
+  if (!playing || !project || playingId.empty()) {
+    g_nativeTimerObservedProject = nullptr;
+    g_nativeTimerObservedSongId.clear();
+    return;
+  }
+  const bool songStarted = project != g_nativeTimerObservedProject ||
+    playingId != g_nativeTimerObservedSongId;
+  g_nativeTimerObservedProject = project;
+  g_nativeTimerObservedSongId = playingId;
+  // Nunca reinicia um cronometro ativo e nao rearma no meio da mesma musica.
+  if (songStarted && g_nativeTimerInitAutoEnabled && !g_nativeTimerRunning) {
+    nativeTimerStartLocked();
+  }
+}
+
 static bool nativeApplyTimerCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
   if (type != "timer_toggle" && type != "timer_start" && type != "timer_stop" &&
       type != "timer_stop_reset" && type != "timer_reset" && type != "timer_set_mode" &&
-      type != "timer_config" && type != "timer_set_target") {
+      type != "timer_config" && type != "timer_set_target" &&
+      type != "timer_set_init_auto" && type != "timer_init_auto_toggle") {
     return false;
   }
   nativeTimecodeLanRecordCommand(commandBody);
@@ -76134,6 +76188,17 @@ static bool nativeApplyTimerCommand(const std::string& commandBody)
   const bool hasSeconds = nativeExtractTimerSeconds(commandBody, seconds);
 
   std::lock_guard<std::mutex> lock(g_nativeMutex);
+  if (type == "timer_set_init_auto" || type == "timer_init_auto_toggle") {
+    g_nativeTimerInitAutoEnabled = type == "timer_init_auto_toggle"
+      ? !g_nativeTimerInitAutoEnabled
+      : nativeJsonBoolValue(commandBody, "initAutoEnabled",
+          nativeJsonBoolValue(commandBody, "enabled", false));
+    if (SetExtState_ptr) {
+      SetExtState_ptr(kLuaWindowExtStateSection,
+        "TIMER_INIT_AUTO_V1",
+        g_nativeTimerInitAutoEnabled ? "1" : "0", true);
+    }
+  }
   if (!modeValue.empty()) {
     const std::string nextMode = nativeNormalizeTimerMode(modeValue);
     if (nextMode != g_nativeTimerMode) {
