@@ -25,8 +25,5 @@ if (!source.includes('configNow - lastConfigRead).count() < 250') ||
     !source.includes('nativeTimecodeLanRefreshConfigOnMainThread(true);')) {
   throw new Error('configuracao LAN voltou a ser relida em cada tick')
 }
-if (!source.includes('now - lastHeartbeatRead).count() < 100')) {
-  throw new Error('heartbeat Lua voltou a consultar ExtState em cada tick')
-}
 
 console.log(`NATIVE_PANEL_MODEL_THROTTLE_OK: ${sourcePath}`)

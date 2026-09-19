@@ -538,8 +538,6 @@ static const char* kParallelTimecodeRejectedPeerKey =
 static const char* kMtcOutputNameKey = "MTC_OUTPUT_NAME_V1";
 static const char* kExtensionBypassKey =
   "EXTENSION_GLOBAL_BYPASS_V1";
-static const char* kScriptControlSection = "VS_HOOK_SCRIPT_CONTROL";
-static const char* kActiveScriptModeKey = "ACTIVE_MODE_V1";
 static const char* kMixerBindingExtSection =
   "JBKEYS_VSHOOK_MIXER_BINDINGS";
 static const char* kMidiBindingExtSection =
@@ -566,7 +564,6 @@ static const int kReaperTransportPlayCommandId = 1007;
 static const int kReaperTransportPauseCommandId = 1008;
 static const int kReaperTransportRecordCommandId = 1013;
 
-static bool nativeIsLuaControlActive();
 static bool nativeIsDirectorControlActive();
 static bool nativeUiBlockInterfaceWhenDirectorConnectedEnabled();
 static bool nativeIsRuntimeControlActive();
@@ -589,18 +586,17 @@ static bool handleTransportQueueStopCommand(int command)
 {
   if (command != kReaperTransportPlayStopCommandId && command != kReaperTransportStopCommandId) return false;
   if (!nativeIsRuntimeControlActive()) return false;
-  const bool luaOwnsQueueLogic = nativeIsLuaControlActive();
 
   // Stop/PlayStop precisa consumir a fila ANTES do REAPER limpar o transporte.
   // Esta interceptacao nao e PlayProtection: ela apenas preserva a regra da fila,
   // deixando a musica aguardando selecionada e pronta para o proximo Play.
-  if (!luaOwnsQueueLogic && !g_transportCommandBypass && Main_OnCommand_ptr) {
+  if (!g_transportCommandBypass && Main_OnCommand_ptr) {
     char pathBuf[2048] = "";
     ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
     const int playState = GetPlayStateEx_ptr ? GetPlayStateEx_ptr(project) : 0;
-    // O Lua considera qualquer estado diferente de zero como transporte ativo.
-    // Isso inclui Pause: Espaco/Stop pausado ainda precisa passar pela mesma
-    // limpeza de fila, selecao e loops usada durante a reproducao.
+    // Qualquer estado diferente de zero conta como transporte ativo, incluindo
+    // Pause: Espaco/Stop pausado ainda precisa passar pela mesma limpeza de fila,
+    // selecao e loops usada durante a reproducao.
     const bool isPlaying = playState != 0;
 
     if (command == kReaperTransportStopCommandId || (command == kReaperTransportPlayStopCommandId && isPlaying)) {
@@ -619,17 +615,6 @@ static bool handleTransportQueueStopCommand(int command)
 
   return false;
 }
-
-struct ScriptEntry {
-  custom_action_register_t action;
-  const char* displayName;
-  const char* fileName;
-  const char* autoOpenMode;
-  bool showInExtensionsMenu = false;
-  std::string scriptPath;
-  int scriptCommandId = 0;
-  int commandId = 0;
-};
 
 struct AutoOpenEntry {
   custom_action_register_t action;
@@ -658,23 +643,6 @@ struct ProjectStartupWindowEntry {
   const char* projectExtStateKey;
   StartupWindowTarget target;
   int commandId = 0;
-};
-
-static ScriptEntry g_scripts[] = {
-  {
-    { 0, "VSHOOKRUNBETA", "VS Hook Beta", nullptr },
-    "VS Hook Beta",
-    "VS Hook Beta.lua",
-    "beta",
-    true
-  },
-  {
-    { 0, "VSHOOKRUNESTABLE", "VS Hook Estable", nullptr },
-    "VS Hook Estable",
-    "VS Hook Estable.lua",
-    "estable",
-    true
-  }
 };
 
 static custom_action_register_t g_nativeInterfaceAction = {
@@ -771,10 +739,7 @@ struct State {
   std::string activeProjectSignature;
   std::string autoOpenedProjectSignature;
   std::string auxiliaryAutoOpenedProjectSignature;
-  std::string lastLaunchedMode;
   std::string modeBeforeDirectorApp;
-  std::string pendingScriptMode;
-  int pendingScriptWaitTicks = 0;
   bool appActiveScreenOpen = false;
   bool directorInterfaceBlocked = false;
   bool pcAccessOverride = false;
@@ -2255,52 +2220,6 @@ static std::string normalizeSlashes(std::string path)
   return path;
 }
 
-static std::vector<std::string> buildScriptCandidates(const char* fileName)
-{
-  std::vector<std::string> candidates;
-
-#ifdef _WIN32
-  candidates.push_back(std::string("C:/Users/Public/VS Hook APP/") + fileName);
-
-  char* publicDir = nullptr;
-  size_t publicLen = 0;
-  if (_dupenv_s(&publicDir, &publicLen, "PUBLIC") == 0 && publicDir && publicDir[0]) {
-    candidates.push_back(joinPath(normalizeSlashes(publicDir), std::string("VS Hook APP/") + fileName));
-  }
-  if (publicDir) free(publicDir);
-#else
-  const char* resource = GetResourcePath_ptr ? GetResourcePath_ptr() : "";
-  const std::string base = normalizeSlashes(resource ? resource : "");
-  candidates.push_back(base + "/Scripts/VS Hook APP/" + fileName);
-  candidates.push_back(base + "/Scripts/" + fileName);
-  candidates.push_back(base + "/VS Hook APP/" + fileName);
-#endif
-
-  return candidates;
-}
-
-static bool resolveScriptPath(ScriptEntry& script)
-{
-  const auto candidates = buildScriptCandidates(script.fileName);
-
-  for (const auto& candidate : candidates) {
-    if (fileExists(candidate)) {
-      script.scriptPath = candidate;
-      return true;
-    }
-  }
-
-  script.scriptPath.clear();
-  return false;
-}
-
-static std::string normalizeActionPathForMatch(std::string value)
-{
-  std::replace(value.begin(), value.end(), '\\', '/');
-  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-  return value;
-}
-
 static std::string readTextFile(const std::string& path)
 {
   std::ifstream file(path, std::ios::in | std::ios::binary);
@@ -2398,269 +2317,11 @@ static bool nativeEnsurePluginLicense()
   return false;
 }
 
-static int lookupNamedCommandToken(const std::string& token)
-{
-  if (!NamedCommandLookup_ptr || token.empty()) return 0;
-  const std::string withUnderscore = token[0] == '_' ? token : ("_" + token);
-  int commandId = NamedCommandLookup_ptr(withUnderscore.c_str());
-  if (commandId == 0 && token[0] != '_') commandId = NamedCommandLookup_ptr(token.c_str());
-  return commandId;
-}
-
-static std::string extractReaScriptTokenFromLine(const std::string& line)
-{
-  size_t pos = line.find("RS");
-  while (pos != std::string::npos) {
-    const bool startsToken = pos == 0 || !(std::isalnum(static_cast<unsigned char>(line[pos - 1])) || line[pos - 1] == '_');
-    if (startsToken) {
-      size_t end = pos + 2;
-      while (end < line.size() && (std::isalnum(static_cast<unsigned char>(line[end])) || line[end] == '_')) ++end;
-      if (end > pos + 2) return line.substr(pos, end - pos);
-    }
-    pos = line.find("RS", pos + 2);
-  }
-  return std::string();
-}
-
-static int findExistingReaScriptCommandInKeyboardIni(const ScriptEntry& script)
-{
-  if (!NamedCommandLookup_ptr || !GetResourcePath_ptr) return 0;
-  const char* resourcePath = GetResourcePath_ptr();
-  if (!resourcePath || !*resourcePath) return 0;
-
-  const std::string kbPath = joinPath(resourcePath, "reaper-kb.ini");
-  const std::string text = readTextFile(kbPath);
-  if (text.empty()) return 0;
-
-  const std::string wantedFile = normalizeActionPathForMatch(script.fileName ? script.fileName : "");
-  const std::string wantedPath = normalizeActionPathForMatch(script.scriptPath);
-  std::istringstream lines(text);
-  std::string line;
-  while (std::getline(lines, line)) {
-    const std::string normalizedLine = normalizeActionPathForMatch(line);
-    const bool matchesFile = !wantedFile.empty() && normalizedLine.find(wantedFile) != std::string::npos;
-    const bool matchesPath = !wantedPath.empty() && normalizedLine.find(wantedPath) != std::string::npos;
-    if (!matchesFile && !matchesPath) continue;
-
-    const std::string token = extractReaScriptTokenFromLine(line);
-    const int commandId = lookupNamedCommandToken(token);
-    if (commandId != 0) return commandId;
-  }
-
-  return 0;
-}
-
-static void rememberScriptNamedCommand(const ScriptEntry& script)
-{
-  if (!SetExtState_ptr || !ReverseNamedCommandLookup_ptr || script.scriptCommandId == 0 || !script.fileName) return;
-  const char* named = ReverseNamedCommandLookup_ptr(script.scriptCommandId);
-  if (!named || !*named) return;
-  SetExtState_ptr("VSHookLoader", (std::string("ReaScriptNamedCommand.") + script.fileName).c_str(), named, true);
-}
-
-static int findRememberedScriptCommand(const ScriptEntry& script)
-{
-  if (!GetExtState_ptr || !NamedCommandLookup_ptr || !script.fileName) return 0;
-  const char* named = GetExtState_ptr("VSHookLoader", (std::string("ReaScriptNamedCommand.") + script.fileName).c_str());
-  if (!named || !*named) return 0;
-  return lookupNamedCommandToken(named);
-}
-
-static int findExistingReaScriptCommand(ScriptEntry& script)
-{
-  int commandId = findRememberedScriptCommand(script);
-  if (commandId != 0) return commandId;
-  if (script.scriptPath.empty()) resolveScriptPath(script);
-  commandId = findExistingReaScriptCommandInKeyboardIni(script);
-  if (commandId != 0) return commandId;
-  return 0;
-}
-
-static bool ensureScriptRegistered(ScriptEntry& script)
-{
-  if (script.scriptCommandId != 0) {
-    return true;
-  }
-
-  const int existingCommandId = findExistingReaScriptCommand(script);
-  if (existingCommandId != 0) {
-    script.scriptCommandId = existingCommandId;
-    rememberScriptNamedCommand(script);
-    return true;
-  }
-
-  if (!AddRemoveReaScript_ptr) {
-    showDiagnostic("REAPER nao entregou a API AddRemoveReaScript para o VS Hook Loader.");
-    return false;
-  }
-
-  if (!resolveScriptPath(script)) {
-    std::ostringstream oss;
-    oss << "Nao encontrei o script: " << script.fileName << "\n\nCaminhos verificados:";
-    for (const auto& candidate : buildScriptCandidates(script.fileName)) {
-      oss << "\n- " << candidate;
-    }
-    showDiagnostic(oss.str());
-    return false;
-  }
-
-  // Nao use commit=true aqui: regravar reaper-kb.ini ao "garantir" registro
-  // pode apagar atalhos do usuario para ReaScripts ja existentes.
-  const int commandId = AddRemoveReaScript_ptr(true, 0, script.scriptPath.c_str(), false);
-  if (commandId == 0) {
-    showDiagnostic(std::string("REAPER nao conseguiu registrar o script:\n") + script.scriptPath);
-    return false;
-  }
-
-  script.scriptCommandId = commandId;
-  rememberScriptNamedCommand(script);
-  return true;
-}
-
-
-static void registerScriptInActionListIfPresent(ScriptEntry& script)
-{
-  if (script.scriptCommandId != 0) return;
-
-  const int existingCommandId = findExistingReaScriptCommand(script);
-  if (existingCommandId != 0) {
-    script.scriptCommandId = existingCommandId;
-    rememberScriptNamedCommand(script);
-    return;
-  }
-
-  if (!AddRemoveReaScript_ptr) return;
-  if (!resolveScriptPath(script)) return;
-
-  const int commandId = AddRemoveReaScript_ptr(true, 0, script.scriptPath.c_str(), false);
-  if (commandId != 0) {
-    script.scriptCommandId = commandId;
-    rememberScriptNamedCommand(script);
-  }
-}
-
-static int getScriptToggleState(const ScriptEntry& script)
-{
-  if (script.scriptCommandId == 0) return 0;
-
-  if (GetToggleCommandStateEx_ptr) {
-    const int state = GetToggleCommandStateEx_ptr(0, script.scriptCommandId);
-    if (state >= 0) return state;
-  }
-
-  if (GetToggleCommandState_ptr) {
-    const int state = GetToggleCommandState_ptr(script.scriptCommandId);
-    if (state >= 0) return state;
-  }
-
-  return 0;
-}
-
-static bool nativeWindowTreeContainsTitle(HWND parent, const char* needle, int depth)
-{
-  if (!needle || !*needle || depth < 0) return false;
-
-  HWND child = nullptr;
-  while ((child = FindWindowEx(parent, child, nullptr, nullptr)) != nullptr) {
-    char title[512] = "";
-    const int length = GetWindowText(child, title, static_cast<int>(sizeof(title)));
-    if (length > 0 && std::strstr(title, needle) != nullptr) {
-      return true;
-    }
-    if (depth > 0 && nativeWindowTreeContainsTitle(child, needle, depth - 1)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static bool isScriptWindowOpen(const ScriptEntry& script)
-{
-  const std::string mode = script.autoOpenMode ? script.autoOpenMode : "";
-  const char* needle = nullptr;
-  if (mode == "beta") needle = "VS Hook Beta";
-  else if (mode == "estable") needle = "VS Hook Est";
-  if (!needle) return false;
-
-  // Procura tanto janelas soltas quanto filhos do docker do REAPER/SWELL.
-  return nativeWindowTreeContainsTitle(nullptr, needle, 8);
-}
-
-static bool isVsHookModeText(const std::string& mode)
-{
-  return mode == "beta" || mode == "estable";
-}
-
-static void rememberActiveScriptMode(const std::string& mode)
-{
-  g_state.lastLaunchedMode = mode;
-  if (SetExtState_ptr) {
-    SetExtState_ptr(kScriptControlSection, kActiveScriptModeKey, mode.c_str(), false);
-  }
-}
-
-static std::string readRememberedActiveScriptMode()
-{
-  if (!g_state.lastLaunchedMode.empty()) return g_state.lastLaunchedMode;
-  if (!GetExtState_ptr) return std::string();
-
-  const char* raw = GetExtState_ptr(kScriptControlSection, kActiveScriptModeKey);
-  const std::string mode = raw ? raw : "";
-  if (mode == "beta" || mode == "estable") {
-    g_state.lastLaunchedMode = mode;
-    return mode;
-  }
-  return std::string();
-}
-
-static std::string getExclusiveActiveScriptMode()
-{
-  if (!g_state.pendingScriptMode.empty()) return g_state.pendingScriptMode;
-
-  std::vector<std::string> openModes;
-  for (ScriptEntry& script : g_scripts) {
-    if (!script.autoOpenMode) continue;
-    if (isScriptWindowOpen(script)) openModes.emplace_back(script.autoOpenMode);
-  }
-
-  if (openModes.size() == 1) {
-    rememberActiveScriptMode(openModes.front());
-    return openModes.front();
-  }
-
-  const std::string remembered = readRememberedActiveScriptMode();
-  if (!remembered.empty()) {
-    for (const std::string& mode : openModes) {
-      if (mode == remembered) return remembered;
-    }
-    // A janela pode estar dockada/oculta e nao ter sido localizada pelo SWELL.
-    if (openModes.empty()) return remembered;
-  }
-
-  // Se uma instalacao antiga deixou Beta e Estable marcados ao mesmo tempo,
-  // nunca devolve dois estados. Na ausencia de memoria, prioriza Beta apenas
-  // para permitir que o proximo clique faça a troca exclusiva corretamente.
-  if (openModes.size() > 1) {
-    for (const std::string& mode : openModes) {
-      if (mode == "beta") return mode;
-    }
-    return openModes.front();
-  }
-
-  return std::string();
-}
-
-
-// FIX 20260711: ESC, R, L e Enter continuam chegando ao Lua mesmo quando
-// o usuario clicou em uma track ou em outra area do REAPER.
-static std::atomic<unsigned long long> g_globalHotkeySequence{0};
 static std::atomic<bool> g_globalStopBreakRequested{false};
 static std::atomic<bool> g_globalStopPauseRequested{false};
 static std::atomic<bool> g_stopPauseModeEnabled{false};
 // -1 = nenhum pedido, 0 = desligar, 1 = ligar, 2 = alternar.
 static std::atomic<int> g_nativeMultiLoopBypassRequest{-1};
-static int g_globalHotkeyLastVirtualKey = 0;
-static std::chrono::steady_clock::time_point g_globalHotkeyLastAt;
 
 static bool nativeWindowOrAncestorTitleContains(HWND hwnd, const char* needle)
 {
@@ -2687,16 +2348,6 @@ static bool nativeWindowOrAncestorTitleEquals(HWND hwnd, const char* expected)
     current = GetParent(current);
   }
   return false;
-}
-
-static bool nativeMessageTargetsVsHookWindow(const MSG* msg)
-{
-  HWND target = msg ? msg->hwnd : nullptr;
-  if (!target) target = GetFocus();
-  return nativeWindowOrAncestorTitleContains(target, "VS Hook Beta") ||
-         nativeWindowOrAncestorTitleContains(target, "VS Hook Est") ||
-         nativeWindowOrAncestorTitleContains(target, "VS Hook New") ||
-         nativeWindowOrAncestorTitleContains(target, "VS Hook");
 }
 
 // A interface nova nao depende mais de um ReaScript ativo. Quando ela esta
@@ -2762,14 +2413,6 @@ static bool nativeMessageTargetsTextInput(const MSG* msg)
     nativeWindowLooksLikeTextInput(target);
 }
 
-static bool nativeAnyVsHookScriptIsOpen()
-{
-  for (ScriptEntry& script : g_scripts) {
-    if (isScriptWindowOpen(script) || getScriptToggleState(script) > 0) return true;
-  }
-  return false;
-}
-
 static bool nativeHotkeyHasCommandModifier()
 {
   const bool control = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -2791,20 +2434,6 @@ static bool nativeStopBreakModifierDown()
   // No Windows, Stop Break continua em Ctrl+Espaco.
   return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 #endif
-}
-
-static void nativePublishForwardedGlobalHotkey(const char* key)
-{
-  if (!SetExtState_ptr || !key || !*key) return;
-  const unsigned long long seq = ++g_globalHotkeySequence;
-  const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::system_clock::now().time_since_epoch()).count();
-  const std::string seqText = std::to_string(seq);
-  const std::string atText = std::to_string(static_cast<long long>(nowMs));
-  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "GLOBAL_HOTKEY_KEY_V1", key, false);
-  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "GLOBAL_HOTKEY_SEQ_V1", seqText.c_str(), false);
-  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "GLOBAL_HOTKEY_AT_MS_V1", atText.c_str(), false);
-  SetExtState_ptr("VS_HOOK_NATIVE_BRIDGE", "GLOBAL_HOTKEY_OUT_OF_FOCUS_V1", "1", false);
 }
 
 static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
@@ -2931,86 +2560,10 @@ static int nativeGlobalHotkeyTranslate(MSG* msg, accelerator_register_t* ctx)
     return vk == VK_ESCAPE ? 0 : 1;
   }
 
-  if (!keyDown) return 0;
-  if (nativeMessageTargetsTextInput(msg)) return 0;
-  // R sozinho pertence ao VS Hook. Shift+R fica inteiramente livre para o
-  // mapa de atalhos do REAPER, inclusive quando a janela do Lua está em foco.
-  const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-  if ((vk == 'R' || vk == 'r') && shiftDown) return 0;
-  const bool stopBreakShortcut = vk == VK_SPACE && nativeStopBreakModifierDown();
-  const bool stopPauseModeShortcut =
-    vk == VK_SPACE && !stopBreakShortcut &&
-    g_stopPauseModeEnabled.load();
-  if (!stopBreakShortcut && nativeHotkeyHasCommandModifier()) return 0;
-  const char* key = nullptr;
-  if (vk == VK_ESCAPE) key = "escape";
-  else if (vk == VK_RETURN) key = "enter";
-  else if (vk == VK_SPACE) key = "space";
-  else if (vk == 'R' || vk == 'r') key = "r";
-  else if (vk == 'B' || vk == 'b') key = "b";
-  else return 0;
-
-  // A validade do atalho precisa pertencer ao mesmo dono do modo lembrado.
-  // Antes, um heartbeat do Diretor ainda ativo podia ser combinado com o ultimo
-  // modo Lua salvo (Beta/Estable) mesmo depois do Lua fechar. Nesse estado o
-  // Espaco continuava sendo consumido e o transporte normal do REAPER parava de
-  // responder. Nao basta existir "algum" runtime: cada modo autoriza apenas o
-  // heartbeat correspondente.
-  const bool luaControlActive = nativeIsLuaControlActive();
-  const bool directorControlActive = nativeIsDirectorControlActive();
-  if (!luaControlActive && !directorControlActive) return 0;
-
-  const std::string activeMode = getExclusiveActiveScriptMode();
-  if (activeMode != "beta" && activeMode != "estable" && !nativeAppActivePanelIsOpen()) return 0;
-  if (isVsHookModeText(activeMode) && !luaControlActive) return 0;
-
-  // Stop/Pause pertence sempre a extensao, inclusive com foco no GFX do Lua.
-  // Os demais atalhos continuam no Lua quando a propria janela esta em foco.
-  const bool extensionOwnsFocusedShortcut = stopPauseModeShortcut ||
-    (stopBreakShortcut && nativeAppActivePanelIsOpen());
-  if (nativeMessageTargetsVsHookWindow(msg) && !extensionOwnsFocusedShortcut) return -1;
-
-  const auto now = std::chrono::steady_clock::now();
-  if (g_globalHotkeyLastAt.time_since_epoch().count() != 0 &&
-      g_globalHotkeyLastVirtualKey == vk &&
-      std::chrono::duration_cast<std::chrono::milliseconds>(now - g_globalHotkeyLastAt).count() < 180) {
-    // ESC nunca deve bloquear o comportamento nativo do REAPER. O primeiro
-    // toque ainda e encaminhado ao Lua; repeticoes apenas seguem para o host.
-    return vk == VK_ESCAPE ? 0 : 1;
-  }
-  g_globalHotkeyLastVirtualKey = vk;
-  g_globalHotkeyLastAt = now;
-
-  if (stopBreakShortcut) {
-    g_globalStopBreakRequested.store(true);
-    return 1;
-  }
-
-  if (stopPauseModeShortcut) {
-    g_globalStopPauseRequested.store(true);
-    return 1;
-  }
-
-  // O bypass de Multiloops pertence a extensao. Quando o Beta/Estavel nao
-  // esta com o foco no proprio GFX, B nao volta mais para o Lua.
-  if (vk == 'B' || vk == 'b') {
-    g_nativeMultiLoopBypassRequest.store(2);
-    return 1;
-  }
-
-  // Com o Diretor no controle, Enter abre a confirmação de retomada.
-  if (nativeAppActivePanelIsOpen() && g_state.directorInterfaceBlocked) {
-    if (vk == VK_RETURN) {
-      if (nativeAppActivePanelIsOpen()) PostMessage(g_nativeAppActivePanelHwnd, WM_KEYDOWN, VK_RETURN, 0);
-      return 1;
-    }
-    return 0;
-  }
-
-  nativePublishForwardedGlobalHotkey(key);
-  // O Lua recebe o ESC para cancelar fila/Parts/loop, mas a tecla continua
-  // chegando ao REAPER para limpar uma selecao comum da timeline.
-  return vk == VK_ESCAPE ? 0 : 1;
+  // Sem o painel nativo aberto (caso ja tratado acima), nao ha mais nenhum
+  // dono de atalho global: a extensao so reserva teclas quando o proprio
+  // painel esta com foco.
+  return 0;
 }
 
 static accelerator_register_t g_vshookGlobalHotkeyAccelerator = {
@@ -3018,179 +2571,6 @@ static accelerator_register_t g_vshookGlobalHotkeyAccelerator = {
   true,
   nullptr
 };
-
-static bool isScriptRunning(ScriptEntry& script)
-{
-  if (!ensureScriptRegistered(script)) return false;
-  const std::string activeMode = getExclusiveActiveScriptMode();
-  return script.autoOpenMode && activeMode == script.autoOpenMode;
-}
-
-static void requestScriptInstanceClose(const ScriptEntry& script)
-{
-  if (!SetExtState_ptr || !script.autoOpenMode) return;
-  const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::system_clock::now().time_since_epoch()).count();
-  const std::string token = std::string("close_") + script.autoOpenMode + "_" + std::to_string(static_cast<long long>(nowMs));
-  SetExtState_ptr(kScriptControlSection, "CLOSE_MODE_V1", script.autoOpenMode, false);
-  SetExtState_ptr(kScriptControlSection, "CLOSE_TOKEN_V1", token.c_str(), false);
-}
-
-static void terminateKnownScript(ScriptEntry& script)
-{
-  if (!ensureScriptRegistered(script)) return;
-  requestScriptInstanceClose(script);
-  if (Main_OnCommand_ptr && script.scriptCommandId != 0) {
-    // Beta e Estable usam set_action_options(5): relancar a action
-    // encerra a instancia atual sem abrir outra.
-    Main_OnCommand_ptr(script.scriptCommandId, 0);
-  }
-}
-
-static bool closeOtherOpenScripts(ScriptEntry& target)
-{
-  bool requestedClose = false;
-  const std::string targetMode = target.autoOpenMode ? target.autoOpenMode : "";
-  const std::string remembered = readRememberedActiveScriptMode();
-
-  for (ScriptEntry& other : g_scripts) {
-    if (&other == &target || !other.autoOpenMode) continue;
-
-    const std::string otherMode = other.autoOpenMode;
-    const bool visiblyOpen = isScriptWindowOpen(other);
-    const bool rememberedOpen = !remembered.empty() && remembered == otherMode;
-    if (visiblyOpen || rememberedOpen) {
-      terminateKnownScript(other);
-      requestedClose = true;
-    }
-  }
-
-  if (requestedClose) {
-    g_state.pendingScriptMode = targetMode;
-    g_state.pendingScriptWaitTicks = 0;
-    rememberActiveScriptMode(targetMode);
-  }
-  return requestedClose;
-}
-
-static void launchScriptNow(ScriptEntry& script)
-{
-  const std::string mode = script.autoOpenMode ? script.autoOpenMode : "";
-  if (!ensureScriptRegistered(script)) return;
-  if (!Main_OnCommand_ptr || script.scriptCommandId == 0) return;
-
-  if (!isScriptWindowOpen(script)) {
-    Main_OnCommand_ptr(script.scriptCommandId, 0);
-  }
-
-  rememberActiveScriptMode(mode);
-}
-
-static void runScript(ScriptEntry& script, bool toggleIfAlreadyOpen = true)
-{
-  if (!nativeEnsureSupportedReaperVersion()) return;
-
-  const std::string targetMode = script.autoOpenMode ? script.autoOpenMode : "";
-  if (!ensureScriptRegistered(script)) return;
-  const bool targetOpen = isScriptWindowOpen(script);
-  const std::string activeMode = getExclusiveActiveScriptMode();
-  bool anotherScriptWindowOpen = false;
-  for (ScriptEntry& other : g_scripts) {
-    if (&other != &script && isScriptWindowOpen(other)) {
-      anotherScriptWindowOpen = true;
-      break;
-    }
-  }
-
-  // Clique no mesmo modo funciona como liga/desliga somente quando ele e o unico
-  // script aberto. Se uma versao antiga deixou Beta e Estable juntos, o clique
-  // preserva o alvo e encerra primeiro a outra versao.
-  if (targetOpen && activeMode == targetMode && !anotherScriptWindowOpen) {
-    if (!toggleIfAlreadyOpen) {
-      rememberActiveScriptMode(targetMode);
-      return;
-    }
-    terminateKnownScript(script);
-    g_state.pendingScriptMode.clear();
-    g_state.pendingScriptWaitTicks = 0;
-    rememberActiveScriptMode("");
-    return;
-  }
-
-  // Encerra primeiro qualquer outro modo. O alvo so sera aberto pelo timer
-  // quando a janela anterior realmente desaparecer, evitando Beta e Estable
-  // coexistirem ate mesmo por um frame.
-  if (closeOtherOpenScripts(script)) {
-    return;
-  }
-
-  launchScriptNow(script);
-}
-
-static void processPendingScriptSwitchOnMainThread()
-{
-  if (g_state.pendingScriptMode.empty()) return;
-
-  ScriptEntry* target = nullptr;
-  for (ScriptEntry& script : g_scripts) {
-    if (script.autoOpenMode && g_state.pendingScriptMode == script.autoOpenMode) {
-      target = &script;
-      break;
-    }
-  }
-  if (!target) {
-    g_state.pendingScriptMode.clear();
-    g_state.pendingScriptWaitTicks = 0;
-    return;
-  }
-
-  bool anotherWindowStillOpen = false;
-  for (ScriptEntry& other : g_scripts) {
-    if (&other == target) continue;
-    if (isScriptWindowOpen(other)) {
-      anotherWindowStillOpen = true;
-      break;
-    }
-  }
-
-  if (anotherWindowStillOpen) {
-    ++g_state.pendingScriptWaitTicks;
-    // Reforca o encerramento apenas uma vez se a janela demorou a responder.
-    if (g_state.pendingScriptWaitTicks == 8) {
-      for (ScriptEntry& other : g_scripts) {
-        if (&other != target && isScriptWindowOpen(other)) terminateKnownScript(other);
-      }
-    }
-    return;
-  }
-
-  launchScriptNow(*target);
-  g_state.pendingScriptMode.clear();
-  g_state.pendingScriptWaitTicks = 0;
-}
-
-
-static bool isVsHookRunMode(const std::string& mode)
-{
-  return mode == "beta" || mode == "estable";
-}
-
-static ScriptEntry* findScriptByAutoOpenModeAny(const char* mode)
-{
-  if (!mode || !*mode) return nullptr;
-  for (ScriptEntry& script : g_scripts) {
-    if (script.autoOpenMode && std::strcmp(script.autoOpenMode, mode) == 0) {
-      return &script;
-    }
-  }
-  return nullptr;
-}
-
-static std::string detectRunningVsHookMode()
-{
-  const std::string mode = getExclusiveActiveScriptMode();
-  return isVsHookRunMode(mode) ? mode : std::string();
-}
 
 static void openAppActiveScreenForDirector()
 {
@@ -5422,14 +4802,8 @@ static void normalizeAutoOpenConflict()
   nativeNormalizeStartupWindowConflicts();
 }
 
-static const char* displayNameForAutoOpenMode(const char* mode)
+static const char* displayNameForAutoOpenMode(const char*)
 {
-  if (mode && std::strcmp(mode, "native") == 0) return "VS Hook";
-  for (const ScriptEntry& script : g_scripts) {
-    if (mode && std::strcmp(script.autoOpenMode, mode) == 0) {
-      return script.displayName;
-    }
-  }
   return "VS Hook";
 }
 
@@ -5475,25 +4849,7 @@ static void runScriptByAutoOpenMode(const std::string& mode)
   if (!nativeReaperVersionIsSupported()) return;
   if (mode == "native") {
     nativeOpenAppActivePanel();
-    return;
   }
-
-  for (ScriptEntry& script : g_scripts) {
-    if (mode == script.autoOpenMode) {
-      runScript(script, false);
-      return;
-    }
-  }
-}
-
-static ScriptEntry* findScriptByCommand(int command)
-{
-  for (ScriptEntry& script : g_scripts) {
-    if (script.commandId != 0 && command == script.commandId) {
-      return &script;
-    }
-  }
-  return nullptr;
 }
 
 static void toggleNativeInterface()
@@ -5556,7 +4912,7 @@ static bool nativeIsRegisteredExtensionCommand(int command)
        g_projectStartupWindowEntries) {
     if (entry.commandId == command) return true;
   }
-  return findScriptByCommand(command) != nullptr;
+  return false;
 }
 
 static bool nativeBlockLegacyReaperCommand(int command)
@@ -5713,12 +5069,6 @@ static bool hookCommand(int command, int flag)
     }
   }
 
-  ScriptEntry* script = findScriptByCommand(command);
-  if (script) {
-    runScript(*script);
-    return true;
-  }
-
   return false;
 }
 
@@ -5868,12 +5218,6 @@ static bool hookCommand2(KbdSectionInfo* sec, int command, int val, int val2, in
     }
   }
 
-  ScriptEntry* script = findScriptByCommand(command);
-  if (script) {
-    runScript(*script);
-    return true;
-  }
-
   return false;
 }
 
@@ -5955,13 +5299,6 @@ static int toggleActionState(int commandId)
        g_projectStartupWindowEntries) {
     if (entry.commandId != 0 && commandId == entry.commandId) {
       return nativeProjectStartupWindowEnabled(entry) ? 1 : 0;
-    }
-  }
-
-  const std::string activeScriptMode = getExclusiveActiveScriptMode();
-  for (ScriptEntry& script : g_scripts) {
-    if (script.commandId != 0 && commandId == script.commandId) {
-      return script.autoOpenMode && activeScriptMode == script.autoOpenMode ? 1 : 0;
     }
   }
 
@@ -6226,7 +5563,6 @@ static constexpr const char*
 static const char* kEnsureReaPitchRequestKey = "ENSURE_REAPITCH_REQUEST_V1";
 static const char* kEnsureReaPitchResultKey = "ENSURE_REAPITCH_RESULT_V1";
 static const char* kDirectorAuthRevisionKey = "DIRECTOR_AUTH_REVISION_V1";
-static const char* kNativeCommandsExtKey = "COMMANDS_JSON_V1";
 static const char* kNativeAutoplayExtKey = "AUTOPLAY_ENABLED_V1";
 static const char* kNativeAutoplayModeExtKey = "AUTOPLAY_MODE_V1";
 static const char* kNativeShortcutNoticeSuppressExtKey =
@@ -6240,28 +5576,6 @@ static const char* kNativeMultiLoopBypassEnabledExtKey =
 static const char* kNativeLiveProjectSection = "VS_HOOK_LIVE";
 static const char* kNativeLiveExecutedItemsProjectKey =
   "EXECUTED_ITEMS_V1";
-static const char* kLuaTimerCommandKey = "TIMER_COMMAND_V1";
-static const char* kLuaTimerCommandTokenKey = "TIMER_COMMAND_TOKEN_V1";
-static const char* kLuaControlHeartbeatKey = "LUA_CONTROL_HEARTBEAT_V1";
-static const char* kLuaQueueSyncSeqKey = "LUA_QUEUE_SYNC_SEQ_V1";
-static const char* kLuaQueueActiveKey = "LUA_QUEUE_ACTIVE_V1";
-static const char* kLuaQueueIdKey = "LUA_QUEUE_ID_V1";
-static const char* kLuaQueueIndexKey = "LUA_QUEUE_INDEX_V1";
-static const char* kLuaQueueStartKey = "LUA_QUEUE_START_V1";
-static const char* kLuaQueueEndKey = "LUA_QUEUE_END_V1";
-static const char* kLuaQueueNameKey = "LUA_QUEUE_NAME_V1";
-static const char* kLuaQueueKindKey = "LUA_QUEUE_KIND_V1";
-static const char* kLuaQueueManualKey = "LUA_QUEUE_MANUAL_V1";
-static const char* kLuaStateSyncSeqKey = "LUA_STATE_SYNC_SEQ_V1";
-static const char* kLuaAutoplayStateKey = "LUA_AUTOPLAY_STATE_V1";
-static const char* kLuaAutoBlocoStateKey = "LUA_AUTOBLOCO_STATE_V1";
-static const char* kLuaAutoStopStateKey = "LUA_AUTOSTOP_STATE_V1";
-static const char* kLuaStopPauseStateKey = "LUA_STOP_PAUSE_STATE_V1";
-static const char* kLuaFamilyDrawersIdsKey = "LUA_FAMILY_DRAWERS_OPEN_IDS_V1";
-static const char* kLuaDrawerOutlineEnabledKey = "LUA_DRAWER_OUTLINE_ENABLED_V1";
-static const char* kLuaDrawerOutlineColorKey = "LUA_DRAWER_OUTLINE_COLOR_V1";
-static const char* kLuaDrawerSymbolEnabledKey = "LUA_DRAWER_SYMBOL_ENABLED_V1";
-static const char* kLuaDrawerSymbolColorKey = "LUA_DRAWER_SYMBOL_COLOR_V1";
 static const char* kSharedControlOwnerKey = "CONTROL_OWNER_V1";
 static const char* kSharedResumeRevisionKey = "RESUME_REVISION_V1";
 static const char* kSharedQueueActiveKey = "SHARED_QUEUE_ACTIVE_V1";
@@ -6294,11 +5608,7 @@ static const char* kNativeMultiLoopProjectStateKey = "STATE_V2";
 static const char* kNativeMultiLoopProjectMsStateKey = "MS_STATE_V1";
 static const char* kNativeMultiLoopKeyPrefix = "MULTILOOPS_STATE_V2_";
 static const char* kNativeMultiLoopMsKeyPrefix = "MULTILOOPS_MS_STATE_V1_";
-static const char* kNativeMultiLoopLuaPushKey = "MULTILOOPS_LUA_PUSH_V2";
-static const char* kNativeMultiLoopLuaPushProjectKey = "MULTILOOPS_LUA_PUSH_PROJECT_V2";
-static const char* kNativeMultiLoopLuaPushSequenceKey = "MULTILOOPS_LUA_PUSH_SEQUENCE_V2";
 static const char* kNativeMultiLoopLegacyMigratedKey = "MULTILOOPS_LEGACY_MIGRATED_V2";
-static const char* kNativeLuaLiveExtKey = "LUA_LIVE_JSON_V1";
 static const char* kManualStopFadeoutEnabledKey = "MANUAL_STOP_FADEOUT_ENABLED_V1";
 static const char* kManualStopFadeoutDurationKey = "MANUAL_STOP_FADEOUT_DURATION_V1";
 static const char* kManualStopFadeoutTracksKey = "MANUAL_STOP_FADEOUT_TRACKS_V1";
@@ -6402,14 +5712,10 @@ static std::string g_nativeStateJson;
 static std::string g_nativeMixerTimelineJson = "{\"ok\":false,\"revision\":0,\"items\":[]}";
 static std::atomic<unsigned long long> g_nativeMixerTimelineRevision{0};
 static std::string g_nativeSnapshotSignature;
-static std::string g_nativeLuaLiveFragment;
-static std::deque<std::string> g_nativeCommandQueue;
 // A thread HTTP nunca pode chamar a API do REAPER. Ela apenas deposita os
 // comandos aqui; o startupTimer consome a fila na thread principal.
 static std::deque<std::string> g_nativeHttpCommandQueue;
 static std::deque<std::string> g_nativeTunerCommandQueue;
-static std::vector<std::string> g_nativeCommandHistory;
-static uint64_t g_nativeCommandSequence = 0;
 
 struct NativeTimecodeLanEvent {
   uint64_t sequence = 0;
@@ -6819,14 +6125,9 @@ struct NativePremixUniqueSoloState {
 };
 static NativePremixUniqueSoloState g_nativePremixUniqueSolo;
 static std::chrono::steady_clock::time_point g_nativeLastDirectorHeartbeat;
-static std::chrono::steady_clock::time_point g_nativeLastLuaControlHeartbeat;
-static std::string g_nativeLastLuaControlHeartbeatToken;
-static std::string g_nativeLastLuaQueueSyncSeq;
-static std::string g_nativeLastLuaStateSyncSeq;
 static uint64_t g_nativeResumeRevision = 1;
 static bool g_nativeDirectorWasActive = false;
-static std::string g_nativeControlOwner = "lua";
-static std::string g_nativePublishedCommandsSignature;
+static std::string g_nativeControlOwner = "native";
 static std::chrono::steady_clock::time_point g_nativeLastLiveBuild;
 static bool g_nativeWinsockStarted = false;
 static std::atomic<bool> g_nativeForceStateBuild{false};
@@ -9554,7 +8855,7 @@ static std::string g_nativeDirectorActivePage = "playlist";
 static double g_nativeDirectorPlaylistScrollRatio = 0.0;
 static double g_nativeDirectorRegionsScrollRatio = 0.0;
 static std::map<std::string, bool> g_nativeDirectorOpenFamilyDrawers;
-static std::string g_nativeFamilyDrawersOwner = "lua";
+static std::string g_nativeFamilyDrawersOwner = "native";
 static uint64_t g_nativeFamilyDrawersRevision = 1;
 static std::string g_nativeFamilyDrawersLoadedProjectSignature;
 static bool g_nativeDrawerOutlineEnabled = true;
@@ -9649,7 +8950,6 @@ static std::string g_nativeMultiLoopRaw;
 static std::string g_nativeMultiLoopStorageKey;
 static std::string g_nativeMultiLoopMsStorageKey;
 static ReaProject* g_nativeMultiLoopProject = nullptr;
-static std::string g_nativeMultiLoopLuaPushSequence;
 static std::string g_nativeMultiLoopFocusId;
 static std::string g_nativeMultiLoopFocusKey;
 static std::string g_nativeMultiLoopFocusName;
@@ -9862,15 +9162,6 @@ static void nativeBumpSharedRevisionLocked(const char* owner = nullptr)
   nativePublishSharedControlStateLocked();
 }
 
-static bool nativeIsLuaControlActive()
-{
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-  if (g_nativeLastLuaControlHeartbeat.time_since_epoch().count() == 0) return false;
-  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-    std::chrono::steady_clock::now() - g_nativeLastLuaControlHeartbeat).count();
-  return elapsed >= 0 && elapsed < 1800;
-}
-
 static bool nativeIsDirectorControlActive()
 {
   std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -9885,7 +9176,7 @@ static bool nativeIsRuntimeControlActive()
   if (g_nativeExtensionBypassActive.load()) return false;
   // As janelas nativas do teleprompt também dependem do snapshot completo do
   // projeto. Mantém o motor acordado enquanto qualquer uma delas estiver
-  // aberta, mesmo sem a interface principal, Lua ou Diretor conectados.
+  // aberta, mesmo sem a interface principal ou o Diretor conectados.
   return nativeAppActivePanelIsOpen() ||
          nativeHookControllerWindowIsOpen() ||
          nativeTelepromptWindowIsOpen(1) ||
@@ -9893,7 +9184,6 @@ static bool nativeIsRuntimeControlActive()
          getTimecodeMode() == "receive" ||
          getTimecodeMode() == "transmitter" ||
          getTimecodeMode() == "project_sync" ||
-         nativeIsLuaControlActive() ||
          nativeIsDirectorControlActive();
 }
 
@@ -16206,47 +15496,6 @@ static void nativeClearSelectedSongLocked()
   g_nativeSelectedNavigationIntent = false;
 }
 
-static void nativeRefreshLuaControlHeartbeatFromExtState()
-{
-  static bool lastPublishedActive = false;
-  if (!GetExtState_ptr) return;
-  // O heartbeat expira em 1,8 s. Ler o mesmo ExtState em cada quadro nao muda
-  // essa precisao; 100 ms mantem a troca de controle imediata para o usuario.
-  static std::chrono::steady_clock::time_point lastHeartbeatRead;
-  const auto now = std::chrono::steady_clock::now();
-  if (lastHeartbeatRead.time_since_epoch().count() != 0 &&
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - lastHeartbeatRead).count() < 100) {
-    return;
-  }
-  lastHeartbeatRead = now;
-  const char* raw = GetExtState_ptr(kNativeExtStateSection, kLuaControlHeartbeatKey);
-  const std::string token = raw ? nativeTrim(raw) : std::string();
-
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-
-  if (token.empty()) {
-    g_nativeLastLuaControlHeartbeat = std::chrono::steady_clock::time_point();
-    g_nativeLastLuaControlHeartbeatToken.clear();
-  } else if (token != g_nativeLastLuaControlHeartbeatToken) {
-    g_nativeLastLuaControlHeartbeatToken = token;
-    g_nativeLastLuaControlHeartbeat = now;
-  }
-
-  const bool isActive = g_nativeLastLuaControlHeartbeat.time_since_epoch().count() != 0 &&
-    std::chrono::duration_cast<std::chrono::milliseconds>(now - g_nativeLastLuaControlHeartbeat).count() < 1800;
-
-  if (lastPublishedActive != isActive) {
-    lastPublishedActive = isActive;
-    // A fila e parte do estado compartilhado. Nao apaga quando o controle muda
-    // entre App Diretor e Lua; isso permite que a fila manual seja retomada.
-    // Limpa apenas a sequencia para reler o snapshot mais recente do Lua.
-    g_nativeLastLuaQueueSyncSeq.clear();
-    nativePublishSharedControlStateLocked();
-    g_nativeForceStateBuild.store(true);
-  }
-}
-
 static void nativeClearExplicitStopQueueState()
 {
   std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -16619,197 +15868,6 @@ static void nativeSetQueuedSongLocked(const NativeSongWindow& song, bool manual,
   }
 }
 
-static const NativeSongWindow* nativeFindLuaQueueSong(
-  const std::vector<NativeSongWindow>& activeItems,
-  const std::vector<NativeSongWindow>& songs,
-  const std::string& idValue,
-  int playlistOrder,
-  double startPos,
-  double endPos)
-{
-  const bool hasBounds = endPos > startPos + 0.0005;
-  const NativeSongWindow* bestByBounds = nullptr;
-  double bestScore = 1e99;
-
-  auto scanExact = [&](const std::vector<NativeSongWindow>& list) -> const NativeSongWindow* {
-    for (const auto& item : list) {
-      if (!nativeSongIsPlayable(item)) continue;
-      const bool idMatch = !idValue.empty() && nativeSongIdMatches(item, idValue);
-      const bool boundsMatch = hasBounds && nativeSongBoundsMatch(item, startPos, endPos);
-      if (idMatch && (!hasBounds || boundsMatch)) return &item;
-      if (boundsMatch) return &item;
-      if (hasBounds) {
-        const double score = std::fabs(item.start - startPos) + std::fabs(item.end - endPos);
-        if (score < bestScore) { bestByBounds = &item; bestScore = score; }
-      }
-    }
-    return nullptr;
-  };
-
-  // O Lua fornece id + limites reais. Eles ganham do indice do repertorio,
-  // porque o indice visual pode incluir blocos que a extensao nao conta igual.
-  if (const NativeSongWindow* exact = scanExact(activeItems)) return exact;
-  if (const NativeSongWindow* exact = scanExact(songs)) return exact;
-
-  if (playlistOrder > 0) {
-    for (const auto& item : activeItems) {
-      if (nativeSongIsPlayable(item) && item.playlistOrder == playlistOrder) return &item;
-    }
-    if (playlistOrder <= static_cast<int>(activeItems.size())) {
-      const NativeSongWindow& item = activeItems[static_cast<size_t>(playlistOrder - 1)];
-      if (nativeSongIsPlayable(item)) return &item;
-    }
-  }
-
-  return bestScore <= 0.050 ? bestByBounds : nullptr;
-}
-
-
-static void nativeSyncControlStateFromLuaExtState()
-{
-  if (!GetExtState_ptr) return;
-  // Aparencia da gaveta pertence ao Lua, inclusive enquanto o Diretor e a
-  // autoridade dos controles de transporte.
-  const char* outlineEnabledRaw = GetExtState_ptr(kNativeExtStateSection, kLuaDrawerOutlineEnabledKey);
-  const char* outlineColorRaw = GetExtState_ptr(kNativeExtStateSection, kLuaDrawerOutlineColorKey);
-  const char* symbolEnabledRaw = GetExtState_ptr(kNativeExtStateSection, kLuaDrawerSymbolEnabledKey);
-  const char* symbolColorRaw = GetExtState_ptr(kNativeExtStateSection, kLuaDrawerSymbolColorKey);
-  bool drawerStyleChanged = false;
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    const bool outlineEnabled = nativeBoolFromText(outlineEnabledRaw ? outlineEnabledRaw : "", g_nativeDrawerOutlineEnabled);
-    const bool symbolEnabled = nativeBoolFromText(symbolEnabledRaw ? symbolEnabledRaw : "", g_nativeDrawerSymbolEnabled);
-    const std::string outlineColorText =
-      nativeTrim(outlineColorRaw ? outlineColorRaw : "");
-    const std::string symbolColorText =
-      nativeTrim(symbolColorRaw ? symbolColorRaw : "");
-    const std::string outlineColor = outlineColorText.empty()
-      ? g_nativeDrawerOutlineColor : outlineColorText;
-    const std::string symbolColor = symbolColorText.empty()
-      ? g_nativeDrawerSymbolColor : symbolColorText;
-    drawerStyleChanged = outlineEnabled != g_nativeDrawerOutlineEnabled ||
-      symbolEnabled != g_nativeDrawerSymbolEnabled || outlineColor != g_nativeDrawerOutlineColor ||
-      symbolColor != g_nativeDrawerSymbolColor;
-    g_nativeDrawerOutlineEnabled = outlineEnabled;
-    g_nativeDrawerSymbolEnabled = symbolEnabled;
-    g_nativeDrawerOutlineColor = outlineColor;
-    g_nativeDrawerSymbolColor = symbolColor;
-  }
-  if (drawerStyleChanged) g_nativeForceStateBuild.store(true);
-  if (!nativeIsLuaControlActive()) return;
-  // Enquanto o Diretor esta conectado, a extensao e a autoridade dos controles.
-  // Impede um snapshot antigo do Lua de religar o AutoStop alguns segundos depois.
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    if (g_nativeLastDirectorHeartbeat.time_since_epoch().count() != 0) {
-      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - g_nativeLastDirectorHeartbeat).count();
-      if (elapsed >= 0 && elapsed < 12000) return;
-    }
-  }
-  const char* seqRaw = GetExtState_ptr(kNativeExtStateSection, kLuaStateSyncSeqKey);
-  const std::string seq = seqRaw ? nativeTrim(seqRaw) : std::string();
-  if (seq.empty()) return;
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-  if (seq == g_nativeLastLuaStateSyncSeq) return;
-  g_nativeLastLuaStateSyncSeq = seq;
-  const char* autoRaw = GetExtState_ptr(kNativeExtStateSection, kLuaAutoplayStateKey);
-  const char* atblRaw = GetExtState_ptr(kNativeExtStateSection, kLuaAutoBlocoStateKey);
-  const char* stopRaw = GetExtState_ptr(kNativeExtStateSection, kLuaAutoStopStateKey);
-  const char* stopPauseRaw = GetExtState_ptr(kNativeExtStateSection, kLuaStopPauseStateKey);
-  const char* drawerIdsRaw = GetExtState_ptr(kNativeExtStateSection, kLuaFamilyDrawersIdsKey);
-  std::map<std::string, bool> luaOpenDrawers;
-  const std::vector<std::string> luaDrawerIds = nativeSplit(drawerIdsRaw ? drawerIdsRaw : "", '|');
-  for (const std::string& rawId : luaDrawerIds) {
-    const std::string id = nativeTrim(rawId);
-    if (!id.empty()) luaOpenDrawers[id] = true;
-  }
-  g_nativeAutoplayEnabled = nativeBoolFromText(autoRaw ? autoRaw : "", g_nativeAutoplayEnabled);
-  // O Lua historico possui somente um Auto; quando ele assume o controle,
-  // esse estado corresponde sempre ao AT/1.
-  g_nativeAuto2Enabled = false;
-  g_nativeAutoBlocoEnabled = nativeBoolFromText(atblRaw ? atblRaw : "", g_nativeAutoBlocoEnabled);
-  if (!g_nativeAutoplayEnabled) nativeClearAutoBlocoTargetLocked();
-  g_nativeAutoStopEnabled = nativeBoolFromText(stopRaw ? stopRaw : "", g_nativeAutoStopEnabled);
-  g_stopPauseModeEnabled.store(nativeBoolFromText(stopPauseRaw ? stopPauseRaw : "", g_stopPauseModeEnabled.load()));
-  if (luaOpenDrawers != g_nativeDirectorOpenFamilyDrawers || g_nativeFamilyDrawersOwner != "lua") {
-    g_nativeDirectorOpenFamilyDrawers = std::move(luaOpenDrawers);
-    g_nativeFamilyDrawersOwner = "lua";
-    ++g_nativeFamilyDrawersRevision;
-    ++g_nativeDirectorListScrollRevision;
-    nativePersistFamilyDrawersForCurrentProjectLocked();
-  }
-  g_nativeControlOwner = "lua";
-  nativeSaveAutoplayEnabledLocked();
-  nativeSaveAutoBlocoEnabledLocked();
-  nativeSaveAutoStopEnabledLocked();
-  nativePublishSharedControlStateLocked();
-  g_nativeForceStateBuild.store(true);
-}
-
-static void nativeSyncQueueFromLuaExtState(
-  const std::vector<NativeSongWindow>& activeItems,
-  const std::vector<NativeSongWindow>& songs)
-{
-  if (!GetExtState_ptr || !nativeIsLuaControlActive()) return;
-
-  const char* seqRaw = GetExtState_ptr(kNativeExtStateSection, kLuaQueueSyncSeqKey);
-  const std::string seq = seqRaw ? nativeTrim(seqRaw) : std::string();
-  if (seq.empty()) return;
-
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    if (seq == g_nativeLastLuaQueueSyncSeq) return;
-    g_nativeLastLuaQueueSyncSeq = seq;
-  }
-
-  const char* activeRaw = GetExtState_ptr(kNativeExtStateSection, kLuaQueueActiveKey);
-  const bool queueActive = nativeBoolFromText(activeRaw ? activeRaw : "", false);
-  if (!queueActive) {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    nativeClearAllQueueStateLocked();
-    g_nativeForceStateBuild.store(true);
-    return;
-  }
-
-  const char* idRaw = GetExtState_ptr(kNativeExtStateSection, kLuaQueueIdKey);
-  const char* indexRaw = GetExtState_ptr(kNativeExtStateSection, kLuaQueueIndexKey);
-  const char* startRaw = GetExtState_ptr(kNativeExtStateSection, kLuaQueueStartKey);
-  const char* endRaw = GetExtState_ptr(kNativeExtStateSection, kLuaQueueEndKey);
-  const char* kindRaw = GetExtState_ptr(kNativeExtStateSection, kLuaQueueKindKey);
-  const char* manualRaw = GetExtState_ptr(kNativeExtStateSection, kLuaQueueManualKey);
-  const std::string idValue = idRaw ? nativeTrim(idRaw) : std::string();
-  const int playlistOrder = indexRaw && nativeLooksNumeric(indexRaw) ? std::atoi(indexRaw) : 0;
-  const double startPos = startRaw && nativeLooksNumeric(startRaw) ? std::atof(startRaw) : 0.0;
-  const double endPos = endRaw && nativeLooksNumeric(endRaw) ? std::atof(endRaw) : 0.0;
-  const std::string queueKind = kindRaw && nativeLower(nativeTrim(kindRaw)) == "regions" ? "regions" : "playlist";
-  const bool queueManual = nativeBoolFromText(manualRaw ? manualRaw : "", true);
-
-  const NativeSongWindow* song = nativeFindLuaQueueSong(activeItems, songs, idValue, playlistOrder, startPos, endPos);
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-  if (song && nativeSongIsPlayable(*song)) {
-    nativeSetQueuedSongLocked(*song, queueManual, queueKind);
-  } else if (!idValue.empty() && endPos > startPos + 0.0005) {
-    g_nativeQueuedSongId = idValue;
-    g_nativeQueuedPlaylistSongId = idValue;
-    g_nativeQueuedRegionNumber = nativeLooksNumeric(idValue) ? std::atoi(idValue.c_str()) : 0;
-    g_nativeQueuedStart = startPos;
-    g_nativeQueuedEnd = endPos;
-    g_nativeQueuedPlaylistIndex = playlistOrder;
-    g_nativeQueuedManual = queueManual;
-    g_nativeQueuedKind = queueKind;
-    g_nativeQueuedSourceId = g_nativeCurrentPlayingId;
-    g_nativeQueuedSourceStart = g_nativeCurrentSongStart;
-    g_nativeQueuedSourceEnd = g_nativeCurrentSongEnd;
-    g_nativeQueuedSeekSignature.clear();
-    g_nativeQueuedTunerSignature.clear();
-    nativeClearAutoBlocoTargetLocked();
-  } else {
-    nativeClearAllQueueStateLocked();
-  }
-  g_nativeForceStateBuild.store(true);
-}
-
 static int nativeFindCurrentIndexInActivePlaylist(const std::vector<NativeSongWindow>& items, const std::string& playingId, double songStart, double songEnd)
 {
   if (items.empty()) return -1;
@@ -16909,7 +15967,6 @@ static bool nativeMaintainQueueAutomation(ReaProject* project, bool playing, con
     g_nativeForceStateBuild.store(true);
     return false;
   }
-  if (nativeIsLuaControlActive()) return false;
 
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -17132,7 +16189,7 @@ static void nativePrepareQueuedTunerNearRegionEndOnMainThread()
 {
   // A janela do Tuner usa o timer leve e o play cursor real; assim nao depende
   // do snapshot vivo da ponte, cuja cadencia de 220 ms poderia pular o gatilho.
-  if (!GetPlayStateEx_ptr || !GetPlayPositionEx_ptr || nativeIsLuaControlActive()) return;
+  if (!GetPlayStateEx_ptr || !GetPlayPositionEx_ptr) return;
 
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -17267,7 +16324,7 @@ static void nativeMaintainAutoStop(
   const std::vector<NativeSongWindow>& activeItems,
   const std::vector<NativeSongWindow>& projectSongs)
 {
-  if (!project || !Main_OnCommand_ptr || !playing || nativeIsLuaControlActive()) return;
+  if (!project || !Main_OnCommand_ptr || !playing) return;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     if (!g_nativeArmedMarkerId.empty()) {
@@ -70836,25 +69893,6 @@ static void nativeLoadMultiLoopState()
     if (migratedFromGlobal && project) nativeSaveMultiLoopState();
   }
 
-  // O Lua publica somente quando o usuário altera algo. Ele não consulta esta
-  // chave durante o uso; a extensão consome o evento e continua dona do estado.
-  if (GetExtState_ptr) {
-    const char* seqPtr = GetExtState_ptr(kNativeExtStateSection, kNativeMultiLoopLuaPushSequenceKey);
-    const std::string sequence = seqPtr ? seqPtr : "";
-    if (!sequence.empty() && sequence != g_nativeMultiLoopLuaPushSequence) {
-      g_nativeMultiLoopLuaPushSequence = sequence;
-      const char* projectPtr = GetExtState_ptr(kNativeExtStateSection, kNativeMultiLoopLuaPushProjectKey);
-      const char* pushPtr = GetExtState_ptr(kNativeExtStateSection, kNativeMultiLoopLuaPushKey);
-      if (projectPtr && storageKey == projectPtr && pushPtr) {
-        nativeParseMultiLoopState(pushPtr);
-        nativeSaveMultiLoopState();
-        std::ostringstream sync;
-        sync << "{\"type\":\"multiloop_snapshot_set\",\"raw\":"
-          << nativeJsonString(pushPtr) << '}';
-        nativeTimecodeLanRecordCommand(sync.str());
-      }
-    }
-  }
 }
 
 static void nativeSaveMultiLoopState()
@@ -71553,7 +70591,6 @@ static void nativeRebuildState(bool forceSnapshot)
   if (!EnumProjects_ptr) return;
   const bool forceMixerRefresh =
     g_nativeForceMixerBuild.exchange(false);
-  nativeRefreshLuaControlHeartbeatFromExtState();
   char activePathBuf[2048] = "";
   ReaProject* activeProject = getCurrentProject(activePathBuf, static_cast<int>(sizeof(activePathBuf)));
   std::string activeProjectName;
@@ -71624,6 +70661,7 @@ static void nativeRebuildState(bool forceSnapshot)
   static std::chrono::steady_clock::time_point cachedMixerRefreshAt;
   static ReaProject* cachedMixerTimelineProject = nullptr;
   static int cachedMixerTimelineChangeCount = -2;
+  static std::string cachedMixerTimelineScopeKey;
   static std::string cachedMixerTimelineItemsJson;
   static std::chrono::steady_clock::time_point cachedMixerTimelineRefreshAt;
   const int projectChangeCount = GetProjectStateChangeCount_ptr
@@ -71747,7 +70785,7 @@ static void nativeRebuildState(bool forceSnapshot)
       (!g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) ||
       (!g_nativeAutoBlocoTargetSongId.empty() && g_nativeAutoBlocoTargetEnd > g_nativeAutoBlocoTargetStart + 0.0005);
   }
-  if (!nativeIsLuaControlActive() && !playing && wasPlayingBeforeNativeState && !suppressStoppedTransitionPrepare && hasStoppedTransitionQueueTarget) {
+  if (!playing && wasPlayingBeforeNativeState && !suppressStoppedTransitionPrepare && hasStoppedTransitionQueueTarget) {
     nativePrepareStopSelectionFromQueueOrCurrent(activeProject, true);
   }
 
@@ -71760,18 +70798,13 @@ static void nativeRebuildState(bool forceSnapshot)
   g_nativeUiPanelModelSourceDirty.store(
     true, std::memory_order_release);
 
-  // Enquanto o Lua antigo for o unico controlador, ele e o dono do Tuner. A
-  // interface nativa e o Diretor continuam usando este motor normalmente.
-  const bool luaOwnsTuner = nativeIsLuaControlActive() &&
-    !nativeIsDirectorControlActive() && !nativeAppActivePanelIsOpen();
-
   if (playing && !playingId.empty() && playingId != previousPlayingId) {
     const NativeSongWindow* premixSong = nullptr;
     for (const auto& song : songs) {
       if (!song.isBlock && !song.isHashParent && song.id == playingId) { premixSong = &song; break; }
     }
     nativeApplyPremixOnSongStart(activeProject, premixSong);
-    if (premixSong && !luaOwnsTuner) {
+    if (premixSong) {
       // O valor incorporado no snapshot pode ser anterior ao ultimo clique. O
       // valor vivo evita aplicar o antigo depois que Play/fila ja aplicou o novo.
       const int liveTunerValue =
@@ -71783,11 +70816,7 @@ static void nativeRebuildState(bool forceSnapshot)
     }
     g_nativeForceStateBuild.store(true);
   }
-  if (luaOwnsTuner) {
-    g_nativeTunerRetryRuntime = NativeTunerRetryRuntime{};
-  } else {
-    nativeProcessTunerRetry(activeProject, playing, playingId);
-  }
+  nativeProcessTunerRetry(activeProject, playing, playingId);
 
   if (rebuildSnapshot) {
     cachedSongs = songs;
@@ -71795,37 +70824,71 @@ static void nativeRebuildState(bool forceSnapshot)
     cachedRegionsTotalSec = nativeComputeRegionsTotalSec(songs);
     cachedPlaylistsJson = nativeBuildPlaylistsJson(activeProject, songs, cachedActivePlaylistIndex, cachedActivePlaylistName, &cachedActivePlaylistItems, &cachedActivePlaylistTotalSec);
     cachedPremixJson = nativeBuildPremixJson(activeProject, songs);
-    // O grid completo pode conter muitos itens. Ele só é varrido quando o
-    // Mixer está realmente aberto e fica em um cache separado do /state.
-    // Assim o polling normal não carrega nem serializa esse payload pesado.
-    const bool mixerTimelineSourceChanged =
-      cachedMixerTimelineProject != activeProject ||
-      cachedMixerTimelineChangeCount != projectChangeCount ||
-      g_nativeMixerTimelineRevision.load() == 0;
-    const bool mixerTimelineFallbackDue = projectChangeCount < 0 &&
-      (cachedMixerTimelineRefreshAt.time_since_epoch().count() == 0 ||
-       std::chrono::duration_cast<std::chrono::milliseconds>(
-         snapshotNow - cachedMixerTimelineRefreshAt).count() >= 1500);
-    if (g_nativeAppActivePanelModel.mixerPage &&
-        (mixerTimelineSourceChanged || mixerTimelineFallbackDue)) {
-      const std::string timelineItems = nativeBuildPremixItemRowsJson(activeProject, nullptr);
-      cachedMixerTimelineProject = activeProject;
-      cachedMixerTimelineChangeCount = projectChangeCount;
-      cachedMixerTimelineRefreshAt = snapshotNow;
-      // Só publica uma nova revisão quando o conteúdo mudou. O app consulta o
-      // endpoint pesado por revisão, então volume/heartbeat sem alteração nos
-      // itens não produz tráfego nem redesenho desnecessário.
-      if (timelineItems != cachedMixerTimelineItemsJson ||
-          g_nativeMixerTimelineRevision.load() == 0) {
-        cachedMixerTimelineItemsJson = timelineItems;
-        const unsigned long long revision =
-          g_nativeMixerTimelineRevision.fetch_add(1) + 1;
-        std::ostringstream timelineJson;
-        timelineJson << "{\"ok\":true,\"revision\":" << revision
-                     << ",\"items\":" << timelineItems << "}";
-        std::lock_guard<std::mutex> timelineLock(g_nativeMutex);
-        g_nativeMixerTimelineJson = timelineJson.str();
+  }
+  // O grid completo pode conter muitos itens. Ele só é varrido quando o
+  // Mixer está realmente aberto e fica em um cache separado do /state.
+  // O Diretor remoto não abre necessariamente o painel nativo local; por isso
+  // a página publicada pelo app também precisa habilitar este cache.
+  bool directorMixerPage = false;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    directorMixerPage = nativeLower(nativeTrim(
+      g_nativeDirectorActivePage)) == "mixer";
+  }
+  const bool mixerTimelineRequested =
+    directorMixerPage || g_nativeAppActivePanelModel.mixerPage;
+  const NativeSongWindow* mixerTimelineSong = nativeFindPremixSelectedSong(songs);
+  if (!mixerTimelineSong && !playingId.empty()) {
+    for (const auto& song : songs) {
+      if (!song.isBlock && song.id == playingId) {
+        mixerTimelineSong = &song;
+        break;
       }
+    }
+  }
+  const std::string mixerTimelineScopeKey = mixerTimelineSong
+    ? mixerTimelineSong->id + "|" + nativeNumber(mixerTimelineSong->start) +
+      "|" + nativeNumber(mixerTimelineSong->end)
+    : std::string();
+  const bool mixerTimelineSourceChanged =
+    cachedMixerTimelineProject != activeProject ||
+    cachedMixerTimelineChangeCount != projectChangeCount ||
+    cachedMixerTimelineScopeKey != mixerTimelineScopeKey ||
+    g_nativeMixerTimelineRevision.load() == 0;
+  const bool mixerTimelineFallbackDue = projectChangeCount < 0 &&
+    (cachedMixerTimelineRefreshAt.time_since_epoch().count() == 0 ||
+     std::chrono::duration_cast<std::chrono::milliseconds>(
+       snapshotNow - cachedMixerTimelineRefreshAt).count() >= 1500);
+  if (mixerTimelineRequested &&
+      (rebuildSnapshot || g_nativeMixerTimelineRevision.load() == 0 ||
+       mixerTimelineFallbackDue) &&
+      (mixerTimelineSourceChanged || mixerTimelineFallbackDue)) {
+    std::string timelineItems = "[]";
+    if (mixerTimelineSong) {
+      // O Mixer remoto mostra somente a região selecionada/em reprodução.
+      // Força a regra de sobreposição para incluir também stems que começaram
+      // antes da região e continuam tocando dentro dela.
+      NativeSongWindow timelineScope = *mixerTimelineSong;
+      timelineScope.isRegionChild = true;
+      timelineItems = nativeBuildPremixItemRowsJson(activeProject, &timelineScope);
+    }
+    cachedMixerTimelineProject = activeProject;
+    cachedMixerTimelineChangeCount = projectChangeCount;
+    cachedMixerTimelineScopeKey = mixerTimelineScopeKey;
+    cachedMixerTimelineRefreshAt = snapshotNow;
+    // Só publica uma nova revisão quando o conteúdo mudou. O app consulta o
+    // endpoint pesado por revisão, então heartbeats sem alteração nos itens
+    // não produzem tráfego nem redesenho desnecessário.
+    if (timelineItems != cachedMixerTimelineItemsJson ||
+        g_nativeMixerTimelineRevision.load() == 0) {
+      cachedMixerTimelineItemsJson = timelineItems;
+      const unsigned long long revision =
+        g_nativeMixerTimelineRevision.fetch_add(1) + 1;
+      std::ostringstream timelineJson;
+      timelineJson << "{\"ok\":true,\"revision\":" << revision
+                   << ",\"items\":" << timelineItems << "}";
+      std::lock_guard<std::mutex> timelineLock(g_nativeMutex);
+      g_nativeMixerTimelineJson = timelineJson.str();
     }
   }
   // Mute, solo e volume podem ser alterados diretamente no REAPER sem mudar
@@ -71860,8 +70923,6 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::vector<NativeSongWindow>& activePlaylistItems = cachedActivePlaylistItems;
   const double activePlaylistTotalSec = cachedActivePlaylistTotalSec;
   const std::string& playlistsJson = cachedPlaylistsJson;
-  nativeSyncControlStateFromLuaExtState();
-  nativeSyncQueueFromLuaExtState(activePlaylistItems, songs);
   const bool queueSeekPerformed = nativeMaintainQueueAutomation(
     activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems, songs);
   // O snapshot deste ciclo ainda descreve a música anterior. Se a fila acabou
@@ -71935,7 +70996,6 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string tp2UpdatedAt = nativeJsonExtractString(tp2Json, "updatedAt");
   const std::string nowIso = nativeIsoNow();
   const bool appActive = nativeIsDirectorControlActive();
-  const bool luaControlActive = nativeIsLuaControlActive();
   const bool blockInterfaceWhenDirectorConnected =
     nativeUiBlockInterfaceWhenDirectorConnectedEnabled();
   if (!appActive && g_state.directorInterfaceBlocked) {
@@ -71962,12 +71022,14 @@ static void nativeRebuildState(bool forceSnapshot)
       nativePublishSharedControlStateLocked();
     } else if (g_nativeDirectorWasActive) {
       g_nativeDirectorWasActive = false;
-      nativeBumpSharedRevisionLocked(nativeAppActivePanelIsOpen() ? "pc" : "lua");
+      nativeBumpSharedRevisionLocked(nativeAppActivePanelIsOpen() ? "pc" : "native");
     } else if (nativeAppActivePanelIsOpen()) {
       g_nativeControlOwner = "pc";
       nativePublishSharedControlStateLocked();
     } else {
-      g_nativeControlOwner = "lua";
+      // Nem Diretor nem painel nativo estao ativos: nenhum dono real, mas o
+      // campo sempre precisa de um valor para o Hook Center/App Diretor.
+      g_nativeControlOwner = "native";
       nativePublishSharedControlStateLocked();
     }
   }
@@ -71978,7 +71040,6 @@ static void nativeRebuildState(bool forceSnapshot)
     SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
   }
 
-  std::string luaLiveRaw;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     // FIX67: marker engatilhado precisa aparecer verde/piscando no front,
@@ -72024,11 +71085,6 @@ static void nativeRebuildState(bool forceSnapshot)
         g_nativeArmedMarkerLastPlayPos = playPos;
       }
     }
-    luaLiveRaw = g_nativeLuaLiveFragment;
-  }
-  if (luaLiveRaw.empty() && GetExtState_ptr) {
-    const char* extLuaLive = GetExtState_ptr(kNativeExtStateSection, kNativeLuaLiveExtKey);
-    if (extLuaLive && *extLuaLive) luaLiveRaw = extLuaLive;
   }
 
   std::string queuedSongId;
@@ -72387,8 +71443,8 @@ static void nativeRebuildState(bool forceSnapshot)
        << nativeJsonString(
             "Pare a reprodução da outra aba antes de trocar de repertório, dar Play ou usar a fila de espera")
        << ",";
-  json << "\"luaControlActive\":" << (luaControlActive ? "true" : "false") << ",";
-  json << "\"nativeQueueExecutionBypassed\":" << (luaControlActive ? "true" : "false") << ",";
+  json << "\"luaControlActive\":false,";
+  json << "\"nativeQueueExecutionBypassed\":false,";
   json << "\"forceDirectorLogout\":" << (directorLogoutRequested ? "true" : "false") << ",";
   json << "\"directorLogoutRequested\":" << (directorLogoutRequested ? "true" : "false") << ",";
   json << "\"logoutDirector\":" << (directorLogoutRequested ? "true" : "false") << ",";
@@ -72760,34 +71816,8 @@ static void nativeRebuildState(bool forceSnapshot)
 }
 
 
-static void nativePublishCommandsToExtState()
-{
-  if (!SetExtState_ptr) return;
-
-  std::string payload;
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    std::ostringstream oss;
-    oss << "{\"seq\":" << static_cast<unsigned long long>(g_nativeCommandSequence) << ",\"commands\":[";
-    // FIX12: não publica histórico antigo em ExtState.
-    // O Lua puxa a fila real por VS_Hook_Native_PullCommand; publicar histórico fazia comandos velhos
-    // voltarem quando o script era fechado e aberto novamente.
-    for (size_t i = 0; i < g_nativeCommandQueue.size(); ++i) {
-      if (i) oss << ",";
-      oss << g_nativeCommandQueue[i];
-    }
-    oss << "]}";
-    payload = oss.str();
-  }
-
-  if (payload == g_nativePublishedCommandsSignature) return;
-  g_nativePublishedCommandsSignature = payload;
-  SetExtState_ptr(kNativeExtStateSection, kNativeCommandsExtKey, payload.c_str(), false);
-}
-
 static void nativeBridgeTick()
 {
-  nativePublishCommandsToExtState();
   // A selecao e o scroll das setas sao inteiramente locais durante o
   // autorepeat. Reconstruir o estado completo aqui varre TP1/TP2, mixer e o
   // projeto por cerca de 110 ms nesta maquina, bloqueando o mesmo thread que
@@ -72802,37 +71832,6 @@ static void nativeBridgeTick()
   if (!liveDue) return;
   g_nativeLastLiveBuild = now;
   nativeRebuildState(forceSnapshot);
-}
-
-static bool VS_Hook_Native_PullCommand(char* buf, int bufSize)
-{
-  if (!buf || bufSize <= 0) return false;
-  buf[0] = '\0';
-  if (g_nativeExtensionBypassActive.load()) return false;
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-  if (g_nativeCommandQueue.empty()) return false;
-  std::string command = g_nativeCommandQueue.front();
-  g_nativeCommandQueue.pop_front();
-  std::strncpy(buf, command.c_str(), static_cast<size_t>(bufSize - 1));
-  buf[bufSize - 1] = '\0';
-  return true;
-}
-
-static bool VS_Hook_Native_SetLuaState(const char* jsonFragment)
-{
-  if (g_nativeExtensionBypassActive.load()) return false;
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-  g_nativeLuaLiveFragment = jsonFragment ? jsonFragment : "";
-  return true;
-}
-
-static bool VS_Hook_Native_ApplyTimerCommand(const char* commandJson)
-{
-  if (g_nativeExtensionBypassActive.load()) return false;
-  if (!commandJson || !*commandJson) return false;
-  // ReaScripts executam na thread principal do REAPER, a mesma em que os
-  // comandos HTTP eram consumidos. Assim Windows e macOS seguem a mesma rota.
-  return nativeApplyTimerCommand(commandJson);
 }
 
 static bool VS_Hook_Native_SetActivePlaylist(const char* playlistName)
@@ -72970,14 +71969,8 @@ static bool VS_Hook_Native_SetMultiLoopBypass(bool enabled)
   return true;
 }
 
-static char g_apiDefNativePullCommand[] =
-  "bool\0char*,int\0commandJsonOutNeedBig,commandJsonOutNeedBig_sz\0Pull one pending VS Hook command from the native bridge.";
-static char g_apiDefNativeSetLuaState[] =
-  "bool\0const char*\0jsonFragment\0Send small Lua-only live state fields to the VS Hook native bridge.";
-static char g_apiDefNativeApplyTimerCommand[] =
-  "bool\0const char*\0commandJson\0Apply a VS Hook timer command directly from ReaScript.";
 static char g_apiDefNativeSetActivePlaylist[] =
-  "bool\0const char*\0playlistName\0Publish the playlist selected locally in VS Hook Lua to the native bridge.";
+  "bool\0const char*\0playlistName\0Publish the locally selected playlist to the native bridge.";
 static char g_apiDefNativeGetState[] =
   "bool\0char*,int\0stateJsonOutNeedBig,stateJsonOutNeedBig_sz\0Read the current VS Hook native bridge state.";
 static char g_apiDefNativeResumePcAccess[] =
@@ -72999,12 +71992,6 @@ static bool registerNativeBridgeApi()
 {
   if (!plugin_register_ptr) return false;
   bool ok = true;
-  ok = (plugin_register_ptr("API_VS_Hook_Native_PullCommand", reinterpret_cast<void*>(&VS_Hook_Native_PullCommand)) != 0) && ok;
-  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_PullCommand", reinterpret_cast<void*>(g_apiDefNativePullCommand)) != 0) && ok;
-  ok = (plugin_register_ptr("API_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(&VS_Hook_Native_SetLuaState)) != 0) && ok;
-  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(g_apiDefNativeSetLuaState)) != 0) && ok;
-  ok = (plugin_register_ptr("API_VS_Hook_Native_ApplyTimerCommand", reinterpret_cast<void*>(&VS_Hook_Native_ApplyTimerCommand)) != 0) && ok;
-  ok = (plugin_register_ptr("APIdef_VS_Hook_Native_ApplyTimerCommand", reinterpret_cast<void*>(g_apiDefNativeApplyTimerCommand)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_Native_SetActivePlaylist", reinterpret_cast<void*>(&VS_Hook_Native_SetActivePlaylist)) != 0) && ok;
   ok = (plugin_register_ptr("APIdef_VS_Hook_Native_SetActivePlaylist", reinterpret_cast<void*>(g_apiDefNativeSetActivePlaylist)) != 0) && ok;
   ok = (plugin_register_ptr("API_VS_Hook_Native_GetState", reinterpret_cast<void*>(&VS_Hook_Native_GetState)) != 0) && ok;
@@ -73047,12 +72034,6 @@ static void unregisterNativeBridgeApi()
   plugin_register_ptr("-API_VS_Hook_Native_GetState", reinterpret_cast<void*>(&VS_Hook_Native_GetState));
   plugin_register_ptr("-APIdef_VS_Hook_Native_SetActivePlaylist", reinterpret_cast<void*>(g_apiDefNativeSetActivePlaylist));
   plugin_register_ptr("-API_VS_Hook_Native_SetActivePlaylist", reinterpret_cast<void*>(&VS_Hook_Native_SetActivePlaylist));
-  plugin_register_ptr("-APIdef_VS_Hook_Native_ApplyTimerCommand", reinterpret_cast<void*>(g_apiDefNativeApplyTimerCommand));
-  plugin_register_ptr("-API_VS_Hook_Native_ApplyTimerCommand", reinterpret_cast<void*>(&VS_Hook_Native_ApplyTimerCommand));
-  plugin_register_ptr("-APIdef_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(g_apiDefNativeSetLuaState));
-  plugin_register_ptr("-API_VS_Hook_Native_SetLuaState", reinterpret_cast<void*>(&VS_Hook_Native_SetLuaState));
-  plugin_register_ptr("-APIdef_VS_Hook_Native_PullCommand", reinterpret_cast<void*>(g_apiDefNativePullCommand));
-  plugin_register_ptr("-API_VS_Hook_Native_PullCommand", reinterpret_cast<void*>(&VS_Hook_Native_PullCommand));
 }
 
 static std::string nativeHttpResponse(int status, const std::string& body, const char* contentType = "application/json; charset=utf-8")
@@ -75166,10 +74147,6 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
   if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "selectedRegionId");
   if (idValue.empty()) idValue = nativeJsonExtractString(commandBody, "id");
 
-  const std::string sourceValue = nativeLower(nativeJsonExtractString(commandBody, "source"));
-  const std::string roleValue = nativeLower(nativeJsonExtractString(commandBody, "role"));
-  const std::string clientRoleValue = nativeLower(nativeJsonExtractString(commandBody, "clientRole"));
-  const bool fromLua = sourceValue == "vshook_lua" || roleValue == "lua" || clientRoleValue == "lua";
   std::string manualValue = nativeJsonExtractString(commandBody, "manual");
   if (manualValue.empty()) manualValue = nativeJsonExtractString(commandBody, "queuedManual");
   std::string autoQueueValue = nativeJsonExtractString(commandBody, "autoQueue");
@@ -75184,10 +74161,9 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
   if (playlistOrderValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "songIndex");
   if (playlistOrderValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "index");
   if (playlistOrderValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "order");
-  // O Lua FIX99 envia playlistIndex como indice do item selecionado no repertorio.
-  // Para clientes externos, playlistIndex pode significar o ID do repertorio; por isso
-  // so confiamos nele quando o comando vem do Lua ou quando nao veio nenhum id.
-  if (playlistOrderValue.empty() && (fromLua || idValue.empty())) playlistOrderValue = nativeJsonExtractString(commandBody, "playlistIndex");
+  // playlistIndex pode significar o ID do repertorio para clientes externos;
+  // so confiamos nele quando nao veio nenhum id.
+  if (playlistOrderValue.empty() && idValue.empty()) playlistOrderValue = nativeJsonExtractString(commandBody, "playlistIndex");
   const int playlistOrder = nativeLooksNumeric(playlistOrderValue) ? std::atoi(playlistOrderValue.c_str()) : 0;
 
   std::string startValue = nativeJsonExtractString(commandBody, "selectedStartPos");
@@ -75275,13 +74251,12 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
       else g_nativeLastAutoQueueForPlayingId = g_nativeCurrentPlayingId;
     }
 
-    nativeBumpSharedRevisionLocked(fromLua ? "lua" : "director");
+    nativeBumpSharedRevisionLocked("director");
     g_nativeForceStateBuild.store(true);
     return true;
   }
 
-  const NativeSongWindow* song = (fromLua && hasExplicitBounds) ? nativeFindSongForCommand(idValue, startPos, endPos) : nullptr;
-  if (!song) song = nativeFindActivePlaylistSongByOrderLocked(playlistOrder);
+  const NativeSongWindow* song = nativeFindActivePlaylistSongByOrderLocked(playlistOrder);
   if (!song) song = nativeFindSongForCommand(idValue, startPos, endPos);
   if (!song || !nativeSongIsPlayable(*song)) return true;
   if (isOpenFamilyParent(song)) {
@@ -75302,11 +74277,9 @@ static bool nativeApplyQueueCommand(const std::string& commandBody)
       nativeSongBoundsMatch(*song, g_nativeQueuedStart, g_nativeQueuedEnd))) {
     nativeClearQueuedSongLocked();
   } else {
-    // O Lua escolhe o alvo. Auto vindo do Lua entra como fila automatica;
-    // clique manual continua entrando como fila manual.
     nativeSetQueuedSongLocked(*song, commandManualQueue, commandQueueKind);
   }
-  nativeBumpSharedRevisionLocked(fromLua ? "lua" : "director");
+  nativeBumpSharedRevisionLocked("director");
   g_nativeForceStateBuild.store(true);
   return true;
 }
@@ -76193,34 +75166,6 @@ static bool nativeApplyTimerCommand(const std::string& commandBody)
   return true;
 }
 
-static void nativeProcessLuaTimerCommandOnMainThread()
-{
-  if (!GetExtState_ptr || !SetExtState_ptr) return;
-  const char* tokenRaw = GetExtState_ptr(kNativeExtStateSection, kLuaTimerCommandTokenKey);
-  const std::string token = tokenRaw ? tokenRaw : "";
-  if (token.empty()) return;
-
-  const char* commandRaw = GetExtState_ptr(kNativeExtStateSection, kLuaTimerCommandKey);
-  const std::string command = commandRaw ? commandRaw : "";
-  // Limpa antes de aplicar para que o mesmo token nunca seja executado duas
-  // vezes, mesmo que a acao nativa force uma nova construcao de estado.
-  SetExtState_ptr(kNativeExtStateSection, kLuaTimerCommandTokenKey, "", false);
-  SetExtState_ptr(kNativeExtStateSection, kLuaTimerCommandKey, "", false);
-  if (!command.empty()) nativeApplyTimerCommand(command);
-}
-
-
-static bool nativeShouldMirrorCommandToLua(const std::string& commandType)
-{
-  return commandType == "autoplay_toggle" || commandType == "autoplay1_toggle" || commandType == "auto1_toggle" || commandType == "auto_toggle" || commandType == "director_auto_toggle" || commandType == "autoplay_set" || commandType == "autoplay1_set" || commandType == "auto1_set" || commandType == "auto_set" ||
-         commandType == "auto_bloco_toggle" || commandType == "at_bl_toggle" || commandType == "atbl_toggle" || commandType == "director_at_bl_toggle" || commandType == "auto_bloco_set" || commandType == "at_bl_set" ||
-         commandType == "auto_stop_toggle" || commandType == "autostop_toggle" || commandType == "director_auto_stop_toggle" || commandType == "auto_stop_set" || commandType == "autostop_set" || commandType == "set_auto_stop" || commandType == "set_autostop" || commandType == "toggle_auto_stop" || commandType == "toggle_autostop" || commandType == "auto_stop" || commandType == "autostop" ||
-         commandType == "preview_set" || commandType == "preview_toggle" || commandType == "preview_clear" ||
-         commandType == "multiloop_focus" || commandType == "multiloop_open" || commandType == "multiloop_close" || commandType == "multiloop_slot_set" || commandType == "multiloop_ms_set" || commandType == "multiloop_fade_adjust" || commandType == "multiloop_track_toggle" || commandType == "multiloop_track_set" || commandType == "multiloop_track_limit_set" || commandType == "multiloop_bypass_toggle" || commandType == "multiloop_bypass_set" ||
-         commandType == "loop_toggle" || commandType == "loop_set" || commandType == "director_loop_toggle" ||
-         commandType == "set_page" || commandType == "set_active_playlist";
-}
-
 static bool nativeApplyDirectorListScrollCommand(const std::string& commandBody)
 {
   const std::string type = nativeLower(nativeJsonExtractString(commandBody, "type"));
@@ -76365,16 +75310,6 @@ static bool nativeApplyDirectorFamilyDrawersCommand(const std::string& commandBo
   }
   g_nativeForceStateBuild.store(true);
   return true;
-}
-
-static void nativeMirrorCommandToLuaIfNeeded(const std::string& commandType, const std::string& commandBody)
-{
-  if (!nativeShouldMirrorCommandToLua(commandType)) return;
-  std::lock_guard<std::mutex> lock(g_nativeMutex);
-  if (g_nativeCommandQueue.size() > 200) g_nativeCommandQueue.pop_front();
-  g_nativeCommandQueue.push_back(commandBody);
-  ++g_nativeCommandSequence;
-  g_nativeForceStateBuild.store(true);
 }
 
 static bool nativeResolveProjectMarkerPosition(
@@ -76597,7 +75532,10 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
         clearLocalSelection = g_nativeDirectorActivePage != page;
         g_nativeDirectorActivePage = page;
         ++g_nativeDirectorListScrollRevision;
-        if (!g_nativeSelectedId.empty() && !g_nativeSelectedTab.empty() && g_nativeSelectedTab != page) {
+        // Abrir o Mixer não muda a origem da música selecionada. Ela continua
+        // pertencendo a Repertório/Regiões e passa a definir o recorte do grid.
+        if (page != "mixer" && !g_nativeSelectedId.empty() &&
+            !g_nativeSelectedTab.empty() && g_nativeSelectedTab != page) {
           nativeClearSelectedSongLocked();
           clearLocalSelection = true;
         }
@@ -78999,20 +77937,6 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
   g_nativeApplyingExternalHttpCommand =
     previousExternalHttpCommandState;
 
-  if (handledByNative) nativeMirrorCommandToLuaIfNeeded(commandType, commandBody);
-
-  if (!handledByNative && !lightweightDirectorHeartbeat) {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    if (g_nativeCommandQueue.size() > 200) g_nativeCommandQueue.pop_front();
-    g_nativeCommandQueue.push_back(commandBody);
-    g_nativeCommandHistory.push_back(commandBody);
-    if (g_nativeCommandHistory.size() > 120) {
-      g_nativeCommandHistory.erase(
-        g_nativeCommandHistory.begin(),
-        g_nativeCommandHistory.begin() + static_cast<long>(g_nativeCommandHistory.size() - 120));
-    }
-    ++g_nativeCommandSequence;
-  }
   if (!lightweightDirectorHeartbeat && !lightweightSelectionCommand) {
     g_nativeForceStateBuild.store(true);
   }
@@ -79852,16 +78776,6 @@ static void nativeSetExtensionBypass(bool enabled)
     g_state.directorInterfaceBlocked = false;
     g_state.pcAccessOverride = false;
 
-    g_state.pendingScriptMode.clear();
-    g_state.pendingScriptWaitTicks = 0;
-    for (ScriptEntry& script : g_scripts) {
-      if (isScriptWindowOpen(script) ||
-          getScriptToggleState(script) > 0) {
-        terminateKnownScript(script);
-      }
-    }
-    rememberActiveScriptMode("");
-
     nativeDestroyBpmScanAccessor();
     nativeUiCancelPendingMusicNavigation();
     g_nativeUiPendingBlockMidiNumber = 0;
@@ -79881,17 +78795,9 @@ static void nativeSetExtensionBypass(bool enabled)
       if (g_nativeTimerRunning) nativeTimerStopLocked();
       nativePublishTimerStateLocked();
 
-      g_nativeCommandQueue.clear();
       g_nativeHttpCommandQueue.clear();
       g_nativeTunerCommandQueue.clear();
-      g_nativeCommandHistory.clear();
-      g_nativePublishedCommandsSignature.clear();
-      g_nativeLuaLiveFragment.clear();
       g_nativeLastDirectorHeartbeat = {};
-      g_nativeLastLuaControlHeartbeat = {};
-      g_nativeLastLuaControlHeartbeatToken.clear();
-      g_nativeLastLuaQueueSyncSeq.clear();
-      g_nativeLastLuaStateSyncSeq.clear();
       g_nativeDirectorWasActive = false;
       g_nativePendingSelection = NativePendingSelectionCommand{};
       g_nativePendingPlayTarget = NativePendingPlayTarget{};
@@ -79905,7 +78811,6 @@ static void nativeSetExtensionBypass(bool enabled)
       g_nativeStateJson =
         "{\"ok\":false,\"connected\":false,\"bypassed\":true}";
     }
-    nativePublishCommandsToExtState();
     if (SetExtState_ptr) {
       SetExtState_ptr(kNativeExtStateSection,
         "NATIVE_STATE_JSON_V1",
@@ -80137,11 +79042,10 @@ static void startupTimer()
     startNativeBridgeServer();
   }
 
-  // A leitura do heartbeat e a unica verificacao permanente. Sem App Diretor
-  // nem Lua ativo, nenhum atalho, transporte, loop, fila ou varredura pesada do
-  // projeto e executado pela extensao. A descoberta leve de abas fica ativa.
-  nativeRefreshLuaControlHeartbeatFromExtState();
-  nativeProcessLuaTimerCommandOnMainThread();
+  // A leitura do heartbeat do Diretor e a unica verificacao permanente. Sem
+  // App Diretor ativo, nenhum atalho, transporte, loop, fila ou varredura
+  // pesada do projeto e executado pela extensao. A descoberta leve de abas
+  // fica ativa.
   nativePollAppActiveEnterKey();
   nativeUiProcessMidiCapture();
   nativeUiProcessBoundMidiTriggers();
@@ -80216,12 +79120,11 @@ static void startupTimer()
     g_nativeRuntimeWasActive = false;
     nativeReleaseRuntimeControlOnMainThread();
   }
-  processPendingScriptSwitchOnMainThread();
   ++g_state.startupTimerTicks;
 
   nativeLoadFamilyDrawersForCurrentProject(projectSignature);
 
-  // Publica o projeto mesmo antes de qualquer Lua abrir. Enumera somente as
+  // Publica o projeto mesmo antes do painel abrir. Enumera somente as
   // abas do REAPER e os dados de login; a lista completa e os controles seguem
   // dormindo ate o Diretor ou um Lua enviar heartbeat.
   if (!runtimeActive && g_state.projectStableTicks >= 1 &&
@@ -80308,7 +79211,6 @@ static bool loadApi(reaper_plugin_info_t* rec)
     rec->GetFunc("EnumExtState"));
   GetUserInputs_ptr = reinterpret_cast<GetUserInputs_t>(
     rec->GetFunc("GetUserInputs"));
-  readRememberedActiveScriptMode();
   EnumProjects_ptr = reinterpret_cast<EnumProjects_t>(rec->GetFunc("EnumProjects"));
   GetProjExtState_ptr = reinterpret_cast<GetProjExtState_t>(rec->GetFunc("GetProjExtState"));
   SetProjExtState_ptr = reinterpret_cast<SetProjExtState_t>(rec->GetFunc("SetProjExtState"));
@@ -80719,21 +79621,7 @@ static bool initialize()
       "custom_action", (void*)&g_extensionBypassAction);
   if (g_extensionBypassCommandId != 0) hasRegisteredAction = true;
 
-  for (ScriptEntry& script : g_scripts) {
-    script.commandId = plugin_register_ptr("custom_action", (void*)&script.action);
-    if (script.commandId != 0) {
-      hasRegisteredAction = true;
-    }
-  }
-
   if (!g_state.legacyReaperMenuOnly) {
-    // Registra scripts auxiliares ocultos no Action List quando o arquivo existe.
-    for (ScriptEntry& script : g_scripts) {
-      if (!script.showInExtensionsMenu) {
-        registerScriptInActionListIfPresent(script);
-      }
-    }
-
     registerClipboardApi();
     vshook_jsapi::registerApi(plugin_register_ptr, plugin_getapi_ptr);
     registerNativeBridgeApi();
@@ -80748,20 +79636,13 @@ static bool initialize()
         "{\"ok\":false,\"connected\":false,\"bypassed\":true}";
       {
         std::lock_guard<std::mutex> lock(g_nativeMutex);
-        g_nativeCommandQueue.clear();
         g_nativeHttpCommandQueue.clear();
         g_nativeTunerCommandQueue.clear();
         g_nativeStateJson = bypassedState;
-        g_nativePublishedCommandsSignature.clear();
       }
       if (SetExtState_ptr) {
         SetExtState_ptr(kNativeExtStateSection,
           "NATIVE_STATE_JSON_V1", bypassedState, false);
-        SetExtState_ptr(kNativeExtStateSection,
-          kNativeCommandsExtKey,
-          "{\"seq\":0,\"commands\":[]}", false);
-        SetExtState_ptr(kNativeExtStateSection,
-          kLuaControlHeartbeatKey, "", false);
       }
     }
     // Deixa a descoberta do projeto pronta antes da primeira consulta da Hook
@@ -80817,7 +79698,6 @@ static bool initialize()
     g_state.activeProjectSignature.clear();
     g_state.autoOpenedProjectSignature.clear();
     g_state.auxiliaryAutoOpenedProjectSignature.clear();
-    rememberActiveScriptMode("");
     if (plugin_register_ptr("timer", reinterpret_cast<void*>(&startupTimer))) {
       g_state.timerRegistered = true;
     } else if (!startsBypassed) {
@@ -80989,13 +79869,6 @@ static void shutdown()
     g_extensionBypassCommandId = 0;
   }
 
-  for (ScriptEntry& script : g_scripts) {
-    if (script.commandId != 0) {
-      plugin_register_ptr("-custom_action", (void*)&script.action);
-      script.commandId = 0;
-    }
-  }
-
   for (AutoOpenEntry& entry : g_autoOpenEntries) {
     if (entry.commandId != 0) {
       plugin_register_ptr("-custom_action", (void*)&entry.action);
@@ -81026,7 +79899,6 @@ static void shutdown()
   g_state.autoOpenedProjectSignature.clear();
   g_state.auxiliaryAutoOpenedProjectSignature.clear();
   g_state.didAuxiliaryStartupAutoOpen = false;
-  rememberActiveScriptMode("");
   g_state.modeBeforeDirectorApp.clear();
   g_appActiveOpenRequested.store(false);
   g_state.appActiveScreenOpen = false;
