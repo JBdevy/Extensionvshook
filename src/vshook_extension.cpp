@@ -8852,6 +8852,7 @@ static uint64_t g_nativePendingPlayTargetRevision = 0;
 static std::string g_nativeSelectedId;
 static std::string g_nativeSelectedTab;
 static std::string g_nativeDirectorActivePage = "playlist";
+static bool g_nativeRemoteMixerKeepsNativePage = false;
 static double g_nativeDirectorPlaylistScrollRatio = 0.0;
 static double g_nativeDirectorRegionsScrollRatio = 0.0;
 static std::map<std::string, bool> g_nativeDirectorOpenFamilyDrawers;
@@ -13768,6 +13769,7 @@ static bool nativeApplyPlaylistCommand(const std::string& commandBody)
     g_nativeSelectedEnd = 0.0;
     g_nativeSelectedNavigationIntent = false;
     g_nativeDirectorActivePage = "playlist";
+    g_nativeRemoteMixerKeepsNativePage = false;
     ++g_nativeDirectorListScrollRevision;
   }
   nativeUiClearMainRowSelection();
@@ -68426,7 +68428,10 @@ static void nativeRefreshAppActivePanelModel()
     armedMarkerLabel = g_nativeArmedMarkerLabel;
     selectedMarkerPos = g_nativeSelectedMarkerPos;
     armedMarkerOriginPos = g_nativeArmedMarkerStartPlayPos;
-    activePage = g_nativeDirectorActivePage;
+    activePage = g_nativeRemoteMixerKeepsNativePage &&
+        !g_nativeAppActivePanelModel.activePage.empty()
+      ? g_nativeAppActivePanelModel.activePage
+      : g_nativeDirectorActivePage;
     next.autoplayEnabled = g_nativeAutoplayEnabled;
     next.autoplay2Enabled =
       g_nativeAutoplayEnabled && g_nativeAuto2Enabled;
@@ -75526,15 +75531,21 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
     if (page.empty()) page = nativeJsonExtractString(commandBody, "activeTab");
     page = nativeLower(nativeTrim(page));
     if (page == "playlist" || page == "regions" || page == "mixer") {
+      const bool preserveNativePage =
+        nativeJsonBoolValue(commandBody, "preserveNativePage", false);
+      const bool preserveSelection =
+        nativeJsonBoolValue(commandBody, "preserveSelection", false);
       bool clearLocalSelection = false;
       {
         std::lock_guard<std::mutex> lock(g_nativeMutex);
-        clearLocalSelection = g_nativeDirectorActivePage != page;
+        clearLocalSelection = !preserveNativePage &&
+          g_nativeDirectorActivePage != page;
         g_nativeDirectorActivePage = page;
+        g_nativeRemoteMixerKeepsNativePage = preserveNativePage;
         ++g_nativeDirectorListScrollRevision;
-        // Abrir o Mixer não muda a origem da música selecionada. Ela continua
+        // Abrir o Mixer remoto não muda a origem da música selecionada. Ela continua
         // pertencendo a Repertório/Regiões e passa a definir o recorte do grid.
-        if (page != "mixer" && !g_nativeSelectedId.empty() &&
+        if (!preserveSelection && page != "mixer" && !g_nativeSelectedId.empty() &&
             !g_nativeSelectedTab.empty() && g_nativeSelectedTab != page) {
           nativeClearSelectedSongLocked();
           clearLocalSelection = true;
