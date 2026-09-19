@@ -6399,6 +6399,8 @@ static std::thread g_nativeThread;
 static native_socket_t g_nativeServerSocket = kInvalidNativeSocket;
 static native_socket_t g_nativeActiveClientSocket = kInvalidNativeSocket;
 static std::string g_nativeStateJson;
+static std::string g_nativeMixerTimelineJson = "{\"ok\":false,\"revision\":0,\"items\":[]}";
+static std::atomic<unsigned long long> g_nativeMixerTimelineRevision{0};
 static std::string g_nativeSnapshotSignature;
 static std::string g_nativeLuaLiveFragment;
 static std::deque<std::string> g_nativeCommandQueue;
@@ -70383,7 +70385,7 @@ static std::string nativeBuildPremixItemRowsJson(ReaProject* project, const Nati
 {
   std::ostringstream oss;
   oss << "[";
-  if (!project || !song || song->end <= song->start + 0.0005 ||
+  if (!project || (song && song->end <= song->start + 0.0005) ||
       !CountTracks_ptr || !GetTrack_ptr || !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr ||
       !GetMediaItemInfo_Value_ptr) {
     oss << "]";
@@ -70407,11 +70409,11 @@ static std::string nativeBuildPremixItemRowsJson(ReaProject* project, const Nati
       const double itemStart = GetMediaItemInfo_Value_ptr(item, "D_POSITION");
       const double itemLength = std::max(0.0, GetMediaItemInfo_Value_ptr(item, "D_LENGTH"));
       const double itemEnd = itemStart + itemLength;
-      if (song->isRegionChild) {
+      if (song && song->isRegionChild) {
         // Stems do pai atravessam as regiões-filho. Na lane 2, o Premix usa
         // sobreposição; nas músicas normais continua usando o ponto inicial.
         if (itemEnd <= song->start + eps || itemStart >= song->end - eps) continue;
-      } else if (itemStart < song->start - eps || itemStart >= song->end - eps) {
+      } else if (song && (itemStart < song->start - eps || itemStart >= song->end - eps)) {
         continue;
       }
       const double volume = nativePremixMediaItemVolume(item);
@@ -71620,6 +71622,10 @@ static void nativeRebuildState(bool forceSnapshot)
   static std::string cachedMixerHardwareOutputsJson = "[]";
   static std::string cachedPremixJson = "{}";
   static std::chrono::steady_clock::time_point cachedMixerRefreshAt;
+  static ReaProject* cachedMixerTimelineProject = nullptr;
+  static int cachedMixerTimelineChangeCount = -2;
+  static std::string cachedMixerTimelineItemsJson;
+  static std::chrono::steady_clock::time_point cachedMixerTimelineRefreshAt;
   const int projectChangeCount = GetProjectStateChangeCount_ptr
     ? GetProjectStateChangeCount_ptr(activeProject)
     : -1;
@@ -71789,6 +71795,38 @@ static void nativeRebuildState(bool forceSnapshot)
     cachedRegionsTotalSec = nativeComputeRegionsTotalSec(songs);
     cachedPlaylistsJson = nativeBuildPlaylistsJson(activeProject, songs, cachedActivePlaylistIndex, cachedActivePlaylistName, &cachedActivePlaylistItems, &cachedActivePlaylistTotalSec);
     cachedPremixJson = nativeBuildPremixJson(activeProject, songs);
+    // O grid completo pode conter muitos itens. Ele só é varrido quando o
+    // Mixer está realmente aberto e fica em um cache separado do /state.
+    // Assim o polling normal não carrega nem serializa esse payload pesado.
+    const bool mixerTimelineSourceChanged =
+      cachedMixerTimelineProject != activeProject ||
+      cachedMixerTimelineChangeCount != projectChangeCount ||
+      g_nativeMixerTimelineRevision.load() == 0;
+    const bool mixerTimelineFallbackDue = projectChangeCount < 0 &&
+      (cachedMixerTimelineRefreshAt.time_since_epoch().count() == 0 ||
+       std::chrono::duration_cast<std::chrono::milliseconds>(
+         snapshotNow - cachedMixerTimelineRefreshAt).count() >= 1500);
+    if (g_nativeAppActivePanelModel.mixerPage &&
+        (mixerTimelineSourceChanged || mixerTimelineFallbackDue)) {
+      const std::string timelineItems = nativeBuildPremixItemRowsJson(activeProject, nullptr);
+      cachedMixerTimelineProject = activeProject;
+      cachedMixerTimelineChangeCount = projectChangeCount;
+      cachedMixerTimelineRefreshAt = snapshotNow;
+      // Só publica uma nova revisão quando o conteúdo mudou. O app consulta o
+      // endpoint pesado por revisão, então volume/heartbeat sem alteração nos
+      // itens não produz tráfego nem redesenho desnecessário.
+      if (timelineItems != cachedMixerTimelineItemsJson ||
+          g_nativeMixerTimelineRevision.load() == 0) {
+        cachedMixerTimelineItemsJson = timelineItems;
+        const unsigned long long revision =
+          g_nativeMixerTimelineRevision.fetch_add(1) + 1;
+        std::ostringstream timelineJson;
+        timelineJson << "{\"ok\":true,\"revision\":" << revision
+                     << ",\"items\":" << timelineItems << "}";
+        std::lock_guard<std::mutex> timelineLock(g_nativeMutex);
+        g_nativeMixerTimelineJson = timelineJson.str();
+      }
+    }
   }
   // Mute, solo e volume podem ser alterados diretamente no REAPER sem mudar
   // de forma confiavel a revisao usada pelo snapshot pesado. Atualiza apenas o
@@ -72696,6 +72734,7 @@ static void nativeRebuildState(bool forceSnapshot)
     json << ",\"drawerSymbolColor\":" << nativeJsonString(g_nativeDrawerSymbolColor);
   }
   // Native premix vem por ultimo para sobrepor qualquer fragmento antigo do Lua.
+  json << ",\"mixerTimelineRevision\":" << g_nativeMixerTimelineRevision.load();
   json << ",\"premix\":" << premixJson;
   json << ",\"multiloops\":" << multiLoopsJson;
   json << "}";
@@ -76193,6 +76232,86 @@ static bool nativeApplyDirectorListScrollCommand(const std::string& commandBody)
   return true;
 }
 
+static bool nativeApplyMixerViewportCommand(const std::string& commandBody)
+{
+  const std::string type = nativeLower(nativeTrim(
+    nativeJsonExtractString(commandBody, "type")));
+  if (type != "mixer_viewport_set") return false;
+
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project) return true;
+
+  // Este comando altera somente a janela visual do Arrange. Não marca o
+  // projeto como modificado e não força snapshot/cache do Mixer.
+  if (GetSet_ArrangeView2_ptr) {
+    const std::string startText = nativeJsonExtractString(
+      commandBody, "arrangeStart");
+    const std::string endText = nativeJsonExtractString(
+      commandBody, "arrangeEnd");
+    double start = nativeLooksNumeric(startText)
+      ? std::atof(startText.c_str()) : -1.0;
+    double end = nativeLooksNumeric(endText)
+      ? std::atof(endText.c_str()) : -1.0;
+    if (std::isfinite(start) && std::isfinite(end) &&
+        start >= 0.0 && end > start + 0.0005) {
+      GetSet_ArrangeView2_ptr(project, true, 0, 0, &start, &end);
+    }
+  }
+
+#ifdef _WIN32
+  HWND arrange = nativeProjectSyncArrangeWindow();
+  if (arrange && CoolSB_GetScrollInfo_ptr && CoolSB_SetScrollInfo_ptr) {
+    SCROLLINFO info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SIF_ALL;
+    if (CoolSB_GetScrollInfo_ptr(arrange, SB_VERT, &info)) {
+      const int maximum = std::max(info.nMin,
+        info.nMax - static_cast<int>(info.nPage) + 1);
+      int target = info.nPos;
+      bool hasVerticalTarget = false;
+      const std::string anchorId = nativeTrim(
+        nativeJsonExtractString(commandBody, "anchorTrackId"));
+      const std::string offsetText = nativeJsonExtractString(
+        commandBody, "anchorOffsetRatio");
+      MediaTrack* anchor = anchorId.empty()
+        ? nullptr : nativeFindTrackById(project, anchorId);
+      if (anchor && GetMediaTrackInfo_Value_ptr) {
+        const double offsetRatio = nativeLooksNumeric(offsetText)
+          ? std::max(0.0, std::min(1.0, std::atof(offsetText.c_str())))
+          : 0.0;
+        const int currentY = static_cast<int>(std::lround(
+          GetMediaTrackInfo_Value_ptr(anchor, "I_TCPY")));
+        const int height = std::max(1, static_cast<int>(std::lround(
+          GetMediaTrackInfo_Value_ptr(anchor, "I_WNDH"))));
+        const int wantedY = -static_cast<int>(std::lround(
+          offsetRatio * static_cast<double>(height)));
+        target = info.nPos + currentY - wantedY;
+        hasVerticalTarget = true;
+      } else {
+        const std::string ratioText = nativeJsonExtractString(
+          commandBody, "verticalRatio");
+        if (nativeLooksNumeric(ratioText)) {
+          const double ratio = std::max(0.0, std::min(1.0,
+            std::atof(ratioText.c_str())));
+          target = info.nMin + static_cast<int>(std::lround(
+            ratio * static_cast<double>(maximum - info.nMin)));
+          hasVerticalTarget = true;
+        }
+      }
+      if (hasVerticalTarget) {
+        target = std::max(info.nMin, std::min(maximum, target));
+        info.fMask = SIF_POS;
+        info.nPos = target;
+        CoolSB_SetScrollInfo_ptr(arrange, SB_VERT, &info, TRUE);
+        SendMessage(arrange, WM_VSCROLL,
+          static_cast<WPARAM>((target << 16) | SB_THUMBPOSITION), 0);
+      }
+    }
+  }
+#endif
+  return true;
+}
+
 static bool nativeApplyDirectorFamilyDrawersCommand(const std::string& commandBody)
 {
   const std::string type = nativeLower(nativeJsonExtractString(commandBody, "type"));
@@ -78847,6 +78966,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     nativeApplyTechnicalNoticeSettingsCommand(commandBody) ||
     nativeApplyTelepromptSettingsCommand(commandBody) ||
     nativeApplyDirectorListScrollCommand(commandBody) ||
+    nativeApplyMixerViewportCommand(commandBody) ||
     nativeApplyDirectorFamilyDrawersCommand(commandBody) ||
     nativeApplyStopPauseModeCommand(commandBody) ||
     nativeApplyPlayProtectionCommand(commandBody) ||
@@ -78934,6 +79054,13 @@ static void nativeHandleClient(native_socket_t client)
         : g_nativeStateJson;
     }
     body = nativeHttpResponse(200, snapshot);
+  } else if (path == "/mixer-timeline" || path == "/mixer-timeline.json") {
+    std::string timeline;
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      timeline = g_nativeMixerTimelineJson;
+    }
+    body = nativeHttpResponse(200, timeline);
   } else if (path == "/teleprompt-settings" ||
              path == "/teleprompt-settings.json") {
     body = nativeHttpResponse(
