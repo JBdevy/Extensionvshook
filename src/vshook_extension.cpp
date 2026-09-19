@@ -6840,14 +6840,6 @@ static std::atomic<int64_t>
 // uma selecao do app nao pode obrigar a extensao a reenumerar o projeto inteiro.
 static std::atomic<bool> g_nativeForceSnapshotBuild{false};
 static std::atomic<uint64_t> g_lastCursorMoveSeq{0};
-// Os meters ficam fora do snapshot principal. A thread HTTP apenas renova esta
-// assinatura; a leitura dos peaks acontece no timer principal do REAPER e para
-// automaticamente quando Mixer/Premix deixam de solicitar dados.
-static std::atomic<int64_t> g_nativeMetersLastRequestMs{0};
-static std::string g_nativeMetersJson = "{\"ok\":true,\"active\":false,\"tracks\":[],\"master\":null}";
-static std::chrono::steady_clock::time_point g_nativeMetersLastBuild;
-static bool g_nativeMetersPublishedActive = false;
-
 struct NativeTechnicalNoticeSettings {
   std::string textColor = "#ffea00";
   std::string backgroundColor = "#000000";
@@ -7481,105 +7473,14 @@ static std::string nativeTrackGuid(MediaTrack* track, int index)
   return std::string("track_") + std::to_string(index + 1);
 }
 
+// O painel nativo da extensão ainda possui meters próprios. Esta leitura não
+// é publicada para o app e só é usada ao desenhar a interface local.
 static double nativeSafeTrackPeak(MediaTrack* track, int channel)
 {
   if (!track || !Track_GetPeakInfo_ptr) return 0.0;
   const double peak = Track_GetPeakInfo_ptr(track, channel);
   if (!std::isfinite(peak) || peak <= 0.0) return 0.0;
   return std::min(8.0, peak);
-}
-
-static void nativeUpdateTrackMetersOnMainThread()
-{
-  const int64_t nowMs = nativeSteadyNowMs();
-  const int64_t requestedAtMs = g_nativeMetersLastRequestMs.load(std::memory_order_relaxed);
-  const bool requested = requestedAtMs > 0 && (nowMs - requestedAtMs) <= 900;
-  if (!requested) {
-    if (g_nativeMetersPublishedActive) {
-      std::lock_guard<std::mutex> lock(g_nativeMutex);
-      g_nativeMetersJson = "{\"ok\":true,\"active\":false,\"tracks\":[],\"master\":null}";
-      g_nativeMetersPublishedActive = false;
-    }
-    return;
-  }
-
-  const std::chrono::steady_clock::time_point tickNow = std::chrono::steady_clock::now();
-  if (g_nativeMetersLastBuild.time_since_epoch().count() != 0 &&
-      std::chrono::duration_cast<std::chrono::milliseconds>(tickNow - g_nativeMetersLastBuild).count() < 66) {
-    return;
-  }
-  g_nativeMetersLastBuild = tickNow;
-
-  char projectPath[2048] = "";
-  ReaProject* project = getCurrentProject(projectPath, static_cast<int>(sizeof(projectPath)));
-  std::ostringstream tracks;
-  tracks << "[";
-  bool first = true;
-  if (project && CountTracks_ptr && GetTrack_ptr && Track_GetPeakInfo_ptr) {
-    const int count = CountTracks_ptr(project);
-    for (int index = 0; index < count; ++index) {
-      MediaTrack* track = GetTrack_ptr(project, index);
-      if (!track) continue;
-      const double left = nativeSafeTrackPeak(track, 0);
-      const double right = nativeSafeTrackPeak(track, 1);
-      const double volume = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "D_VOL") : 1.0;
-      const bool mute = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "B_MUTE") > 0.5 : false;
-      const bool solo = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(track, "I_SOLO") > 0.5 : false;
-      if (!first) tracks << ",";
-      first = false;
-      const std::string guid = nativeTrackGuid(track, index);
-      tracks << "{";
-      tracks << "\"id\":" << nativeJsonString(guid) << ",";
-      tracks << "\"guid\":" << nativeJsonString(guid) << ",";
-      tracks << "\"index\":" << (index + 1) << ",";
-      tracks << "\"peakL\":" << nativeNumber(left, 7) << ",";
-      tracks << "\"peakR\":" << nativeNumber(right, 7) << ",";
-      tracks << "\"peak\":" << nativeNumber(std::max(left, right), 7) << ",";
-      tracks << "\"volume\":" << nativeNumber(volume, 7) << ",";
-      tracks << "\"volumeRatio\":" << nativeNumber(nativeVolumeToRatio(volume), 7) << ",";
-      tracks << "\"db\":" << nativeNumber(nativeVolumeToDb(volume), 3) << ",";
-      tracks << "\"mute\":" << (mute ? "true" : "false") << ",";
-      tracks << "\"solo\":" << (solo ? "true" : "false");
-      tracks << "}";
-    }
-  }
-  tracks << "]";
-
-  std::string masterJson = "null";
-  if (project && GetMasterTrack_ptr && Track_GetPeakInfo_ptr) {
-    MediaTrack* master = GetMasterTrack_ptr(project);
-    if (master) {
-      const double left = nativeSafeTrackPeak(master, 0);
-      const double right = nativeSafeTrackPeak(master, 1);
-      const double volume = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(master, "D_VOL") : 1.0;
-      const bool mute = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(master, "B_MUTE") > 0.5 : false;
-      const bool solo = GetMediaTrackInfo_Value_ptr ? GetMediaTrackInfo_Value_ptr(master, "I_SOLO") > 0.5 : false;
-      std::ostringstream masterStream;
-      masterStream << "{";
-      masterStream << "\"id\":\"MASTER_TRACK\",";
-      masterStream << "\"index\":0,";
-      masterStream << "\"peakL\":" << nativeNumber(left, 7) << ",";
-      masterStream << "\"peakR\":" << nativeNumber(right, 7) << ",";
-      masterStream << "\"peak\":" << nativeNumber(std::max(left, right), 7) << ",";
-      masterStream << "\"volume\":" << nativeNumber(volume, 7) << ",";
-      masterStream << "\"volumeRatio\":" << nativeNumber(nativeVolumeToRatio(volume), 7) << ",";
-      masterStream << "\"db\":" << nativeNumber(nativeVolumeToDb(volume), 3) << ",";
-      masterStream << "\"mute\":" << (mute ? "true" : "false") << ",";
-      masterStream << "\"solo\":" << (solo ? "true" : "false");
-      masterStream << "}";
-      masterJson = masterStream.str();
-    }
-  }
-
-  std::ostringstream payload;
-  payload << "{\"ok\":true,\"active\":true,\"updatedAtMs\":" << nowMs;
-  payload << ",\"tracks\":" << tracks.str();
-  payload << ",\"master\":" << masterJson << "}";
-  {
-    std::lock_guard<std::mutex> lock(g_nativeMutex);
-    g_nativeMetersJson = payload.str();
-  }
-  g_nativeMetersPublishedActive = true;
 }
 
 static std::string nativeMediaItemGuid(MediaItem* item, const std::string& fallback)
@@ -71899,9 +71800,7 @@ static void nativeRebuildState(bool forceSnapshot)
   const bool mixerInUse = nativeIsDirectorControlActive() ||
     g_nativeAppActivePanelModel.mixerPage ||
     (nativeHookControllerWindowIsOpen() &&
-      g_nativeHookControllerMode == NativeHookControllerMode::Tcp) ||
-    (g_nativeMetersLastRequestMs.load() > 0 &&
-      nativeSteadyNowMs() - g_nativeMetersLastRequestMs.load() <= 900);
+      g_nativeHookControllerMode == NativeHookControllerMode::Tcp);
   const int mixerIntervalMs = mixerInUse ? 200 : 1000;
   const bool refreshMixer = rebuildSnapshot || forceMixerRefresh ||
     cachedMixerRefreshAt.time_since_epoch().count() == 0 ||
@@ -79066,16 +78965,6 @@ static void nativeHandleClient(native_socket_t client)
       body = nativeHttpResponse(
         200, nativeTechnicalNoticeResponseJson());
     }
-  } else if (path == "/meters" || path == "/meters.json") {
-    // Apenas assina a coleta. A API do REAPER continua sendo acessada somente
-    // pela thread principal em nativeUpdateTrackMetersOnMainThread().
-    g_nativeMetersLastRequestMs.store(nativeSteadyNowMs(), std::memory_order_relaxed);
-    std::string meters;
-    {
-      std::lock_guard<std::mutex> lock(g_nativeMutex);
-      meters = g_nativeMetersJson;
-    }
-    body = nativeHttpResponse(200, meters);
   } else if (path == "/timecode/status" ||
              path == "/timecode/status.json") {
     body = nativeHttpResponse(200, nativeTimecodeLanStatusJson());
@@ -79832,7 +79721,6 @@ static void nativeSetExtensionBypass(bool enabled)
     g_pcResumeRequested.store(false);
     g_nativeForceSnapshotBuild.store(false);
     g_nativeForceStateBuild.store(false);
-    g_nativeMetersLastRequestMs.store(0);
     g_state.appActiveScreenOpen = false;
     g_state.directorInterfaceBlocked = false;
     g_state.pcAccessOverride = false;
@@ -80158,7 +80046,6 @@ static void startupTimer()
   // pista nunca chega ao PC B antes do upsert que cria essa pista.
   nativeProjectSyncPollTracksOnMainThread();
   nativeProcessBpmScanJobOnMainThread();
-  nativeUpdateTrackMetersOnMainThread();
 #ifndef _WIN32
   // A interface pode continuar aberta depois que o heartbeat do Diretor
   // cair. No Mac, o clique é agendado; portanto ele precisa ser consumido mesmo
