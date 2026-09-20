@@ -5728,6 +5728,10 @@ static native_socket_t g_nativeActiveClientSocket = kInvalidNativeSocket;
 static std::string g_nativeStateJson;
 static std::string g_nativeMixerTimelineJson = "{\"ok\":false,\"revision\":0,\"items\":[]}";
 static std::atomic<unsigned long long> g_nativeMixerTimelineRevision{0};
+// Alvo pedido explicitamente pelo App Diretor ao abrir o Mixer. A seleção do
+// snapshot pode chegar um ciclo depois do comando; guardar o ID aqui impede o
+// endpoint pesado de ser reconstruído para uma música antiga ou sem alvo.
+static std::string g_nativeMixerTimelineRequestedSongId;
 static std::string g_nativeSnapshotSignature;
 // A thread HTTP nunca pode chamar a API do REAPER. Ela apenas deposita os
 // comandos aqui; o startupTimer consome a fila na thread principal.
@@ -69411,6 +69415,7 @@ static const NativeSongWindow* nativeFindMixerTimelineSong(
   const std::vector<NativeSongWindow>& songs,
   const std::string& livePlayingId)
 {
+  std::string requestedId;
   std::string selectedId;
   double selectedStart = 0.0;
   double selectedEnd = 0.0;
@@ -69418,6 +69423,7 @@ static const NativeSongWindow* nativeFindMixerTimelineSong(
   double playingEnd = 0.0;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
+    requestedId = g_nativeMixerTimelineRequestedSongId;
     selectedId = g_nativeSelectedId;
     selectedStart = g_nativeSelectedStart;
     selectedEnd = g_nativeSelectedEnd;
@@ -69444,6 +69450,10 @@ static const NativeSongWindow* nativeFindMixerTimelineSong(
     return fallback;
   };
 
+  if (const NativeSongWindow* requested =
+        findSong(requestedId, 0.0, 0.0, false)) {
+    return requested;
+  }
   if (const NativeSongWindow* selected =
         findSong(selectedId, selectedStart, selectedEnd, false)) {
     return selected;
@@ -70918,14 +70928,18 @@ static void nativeRebuildState(bool forceSnapshot)
     cachedMixerTimelineChangeCount != projectChangeCount ||
     cachedMixerTimelineScopeKey != mixerTimelineScopeKey ||
     g_nativeMixerTimelineRevision.load() == 0;
+  const bool mixerTimelineScopeChanged =
+    cachedMixerTimelineProject != activeProject ||
+    cachedMixerTimelineScopeKey != mixerTimelineScopeKey;
   const bool mixerTimelineFallbackDue = projectChangeCount < 0 &&
     (cachedMixerTimelineRefreshAt.time_since_epoch().count() == 0 ||
      std::chrono::duration_cast<std::chrono::milliseconds>(
        snapshotNow - cachedMixerTimelineRefreshAt).count() >= 1500);
   if (mixerTimelineRequested &&
       (rebuildSnapshot || g_nativeMixerTimelineRevision.load() == 0 ||
-       mixerTimelineFallbackDue) &&
-      (mixerTimelineSourceChanged || mixerTimelineFallbackDue)) {
+       mixerTimelineFallbackDue || forceMixerRefresh) &&
+      (mixerTimelineSourceChanged || mixerTimelineFallbackDue ||
+       forceMixerRefresh)) {
     std::string timelineItems = "[]";
     if (mixerTimelineSong) {
       // O Mixer remoto mostra somente a região selecionada/em reprodução.
@@ -70939,16 +70953,26 @@ static void nativeRebuildState(bool forceSnapshot)
     cachedMixerTimelineChangeCount = projectChangeCount;
     cachedMixerTimelineScopeKey = mixerTimelineScopeKey;
     cachedMixerTimelineRefreshAt = snapshotNow;
-    // Só publica uma nova revisão quando o conteúdo mudou. O app consulta o
-    // endpoint pesado por revisão, então heartbeats sem alteração nos itens
-    // não produzem tráfego nem redesenho desnecessário.
+    // Um pedido explícito também publica nova revisão mesmo quando o resultado
+    // é vazio. Sem isso, o app podia buscar o cache antigo antes deste ciclo e
+    // considerar aquela revisão vazia como definitivamente carregada.
     if (timelineItems != cachedMixerTimelineItemsJson ||
-        g_nativeMixerTimelineRevision.load() == 0) {
+        g_nativeMixerTimelineRevision.load() == 0 ||
+        mixerTimelineScopeChanged || forceMixerRefresh) {
       cachedMixerTimelineItemsJson = timelineItems;
       const unsigned long long revision =
         g_nativeMixerTimelineRevision.fetch_add(1) + 1;
       std::ostringstream timelineJson;
       timelineJson << "{\"ok\":true,\"revision\":" << revision
+                   << ",\"scopeId\":"
+                   << nativeJsonString(mixerTimelineSong
+                        ? mixerTimelineSong->id : std::string())
+                   << ",\"scopeStart\":"
+                   << nativeNumber(mixerTimelineSong
+                        ? mixerTimelineSong->start : 0.0)
+                   << ",\"scopeEnd\":"
+                   << nativeNumber(mixerTimelineSong
+                        ? mixerTimelineSong->end : 0.0)
                    << ",\"items\":" << timelineItems << "}";
       std::lock_guard<std::mutex> timelineLock(g_nativeMutex);
       g_nativeMixerTimelineJson = timelineJson.str();
@@ -73891,6 +73915,31 @@ static bool nativeApplyProjectSyncTrackStateCommand(
 static bool nativeApplyMixerCommand(const std::string& commandBody)
 {
   const std::string type = nativeJsonExtractString(commandBody, "type");
+  if (type == "mixer_focus") {
+    // O grid de itens vive num cache separado do snapshot leve. Abrir ou
+    // trocar a visão do Mixer precisa reconstruí-lo para a seleção atual,
+    // mesmo quando o projeto em si não mudou.
+    const std::string page = nativeLower(nativeTrim(
+      nativeJsonExtractString(commandBody, "page")));
+    const bool hasSelectedId =
+      commandBody.find("\"selectedId\"") != std::string::npos;
+    const std::string selectedId =
+      nativeJsonExtractString(commandBody, "selectedId");
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      if (hasSelectedId) {
+        g_nativeMixerTimelineRequestedSongId = selectedId;
+      }
+      if (page == "mixer") {
+        // Habilita o cache remoto sem trocar a aba visível da extensão.
+        g_nativeDirectorActivePage = "mixer";
+        g_nativeRemoteMixerKeepsNativePage = true;
+      }
+    }
+    g_nativeForceMixerBuild.store(true);
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
   if (type != "mixer_set_volume" &&
       type != "mixer_reset_volume" &&
       type != "mixer_toggle_mute" &&
@@ -75266,57 +75315,6 @@ static bool nativeApplyMixerViewportCommand(const std::string& commandBody)
     }
   }
 
-#ifdef _WIN32
-  HWND arrange = nativeProjectSyncArrangeWindow();
-  if (arrange && CoolSB_GetScrollInfo_ptr && CoolSB_SetScrollInfo_ptr) {
-    SCROLLINFO info{};
-    info.cbSize = sizeof(info);
-    info.fMask = SIF_ALL;
-    if (CoolSB_GetScrollInfo_ptr(arrange, SB_VERT, &info)) {
-      const int maximum = std::max(info.nMin,
-        info.nMax - static_cast<int>(info.nPage) + 1);
-      int target = info.nPos;
-      bool hasVerticalTarget = false;
-      const std::string anchorId = nativeTrim(
-        nativeJsonExtractString(commandBody, "anchorTrackId"));
-      const std::string offsetText = nativeJsonExtractString(
-        commandBody, "anchorOffsetRatio");
-      MediaTrack* anchor = anchorId.empty()
-        ? nullptr : nativeFindTrackById(project, anchorId);
-      if (anchor && GetMediaTrackInfo_Value_ptr) {
-        const double offsetRatio = nativeLooksNumeric(offsetText)
-          ? std::max(0.0, std::min(1.0, std::atof(offsetText.c_str())))
-          : 0.0;
-        const int currentY = static_cast<int>(std::lround(
-          GetMediaTrackInfo_Value_ptr(anchor, "I_TCPY")));
-        const int height = std::max(1, static_cast<int>(std::lround(
-          GetMediaTrackInfo_Value_ptr(anchor, "I_WNDH"))));
-        const int wantedY = -static_cast<int>(std::lround(
-          offsetRatio * static_cast<double>(height)));
-        target = info.nPos + currentY - wantedY;
-        hasVerticalTarget = true;
-      } else {
-        const std::string ratioText = nativeJsonExtractString(
-          commandBody, "verticalRatio");
-        if (nativeLooksNumeric(ratioText)) {
-          const double ratio = std::max(0.0, std::min(1.0,
-            std::atof(ratioText.c_str())));
-          target = info.nMin + static_cast<int>(std::lround(
-            ratio * static_cast<double>(maximum - info.nMin)));
-          hasVerticalTarget = true;
-        }
-      }
-      if (hasVerticalTarget) {
-        target = std::max(info.nMin, std::min(maximum, target));
-        info.fMask = SIF_POS;
-        info.nPos = target;
-        CoolSB_SetScrollInfo_ptr(arrange, SB_VERT, &info, TRUE);
-        SendMessage(arrange, WM_VSCROLL,
-          static_cast<WPARAM>((target << 16) | SB_THUMBPOSITION), 0);
-      }
-    }
-  }
-#endif
   return true;
 }
 
@@ -75470,6 +75468,7 @@ static void nativeProcessPendingSelectionOnMainThread()
       command.id, command.startPos, command.endPos);
     if (song) {
       g_nativeSelectedId = song->id;
+      g_nativeMixerTimelineRequestedSongId = song->id;
       g_nativeSelectedTab =
         (command.type == "select_region") ? "regions" : "playlist";
       g_nativeSelectedStart = song->start;
@@ -75481,12 +75480,22 @@ static void nativeProcessPendingSelectionOnMainThread()
       }
     } else if (!command.id.empty()) {
       g_nativeSelectedId = command.id;
+      g_nativeMixerTimelineRequestedSongId = command.id;
       g_nativeSelectedTab =
         (command.type == "select_region") ? "regions" : "playlist";
       g_nativeSelectedStart = command.startPos;
       g_nativeSelectedEnd = command.endPos;
       g_nativeSelectedNavigationIntent = true;
     }
+  }
+
+  if (command.type == "select_playlist_song" ||
+      command.type == "select_region") {
+    // Trocar apenas a seleção não altera necessariamente o contador do
+    // projeto. Força somente o cache de itens do Mixer, sem reconstruir o
+    // snapshot estrutural completo.
+    g_nativeForceMixerBuild.store(true);
+    g_nativeForceStateBuild.store(true);
   }
 
   // Durante playback a navegacao muda somente a selecao azul. O cursor de
@@ -75620,6 +75629,8 @@ static bool nativeApplySelectionCommand(const std::string& commandBody)
       std::lock_guard<std::mutex> lock(g_nativeMutex);
       g_nativePendingSelection = NativePendingSelectionCommand{};
       nativeClearSelectedSongLocked();
+      g_nativeMixerTimelineRequestedSongId.clear();
+      g_nativeForceMixerBuild.store(true);
       g_nativeForceStateBuild.store(true);
     }
     nativeUiClearMainRowSelection();
