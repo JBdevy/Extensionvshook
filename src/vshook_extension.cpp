@@ -69386,6 +69386,54 @@ static const NativeSongWindow* nativeFindPremixSelectedSong(const std::vector<Na
   return nullptr;
 }
 
+// O grid do Mixer segue a seleção/reprodução do Diretor, não a última música
+// aberta na tela de Pre-Mix. Reaproveitar nativeFindPremixSelectedSong aqui
+// podia manter um alvo antigo do Pre-Mix e publicar itens fora da região que o
+// app estava mostrando; o filtro do app então descartava todos eles.
+static const NativeSongWindow* nativeFindMixerTimelineSong(
+  const std::vector<NativeSongWindow>& songs,
+  const std::string& livePlayingId)
+{
+  std::string selectedId;
+  double selectedStart = 0.0;
+  double selectedEnd = 0.0;
+  double playingStart = 0.0;
+  double playingEnd = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    selectedId = g_nativeSelectedId;
+    selectedStart = g_nativeSelectedStart;
+    selectedEnd = g_nativeSelectedEnd;
+    playingStart = g_nativeCurrentSongStart;
+    playingEnd = g_nativeCurrentSongEnd;
+  }
+
+  const auto findSong = [&](const std::string& id, double start,
+                            double end, bool preferPlayable) {
+    if (id.empty()) return static_cast<const NativeSongWindow*>(nullptr);
+    const bool hasBounds = end > start + 0.0005;
+    const NativeSongWindow* fallback = nullptr;
+    for (const auto& song : songs) {
+      if (song.isBlock || !nativeSongIdMatches(song, id)) continue;
+      if (hasBounds && std::fabs(song.start - start) <= 0.002 &&
+          std::fabs(song.end - end) <= 0.002) {
+        return &song;
+      }
+      if (!fallback || (preferPlayable && fallback->isHashParent &&
+                        !song.isHashParent)) {
+        fallback = &song;
+      }
+    }
+    return fallback;
+  };
+
+  if (const NativeSongWindow* selected =
+        findSong(selectedId, selectedStart, selectedEnd, false)) {
+    return selected;
+  }
+  return findSong(livePlayingId, playingStart, playingEnd, true);
+}
+
 
 static std::string nativeBuildPremixSongsJson(const std::vector<NativeSongWindow>& songs, const std::map<std::string, bool>& enabled)
 {
@@ -70842,15 +70890,8 @@ static void nativeRebuildState(bool forceSnapshot)
   }
   const bool mixerTimelineRequested =
     directorMixerPage || g_nativeAppActivePanelModel.mixerPage;
-  const NativeSongWindow* mixerTimelineSong = nativeFindPremixSelectedSong(songs);
-  if (!mixerTimelineSong && !playingId.empty()) {
-    for (const auto& song : songs) {
-      if (!song.isBlock && song.id == playingId) {
-        mixerTimelineSong = &song;
-        break;
-      }
-    }
-  }
+  const NativeSongWindow* mixerTimelineSong =
+    nativeFindMixerTimelineSong(songs, playingId);
   const std::string mixerTimelineScopeKey = mixerTimelineSong
     ? mixerTimelineSong->id + "|" + nativeNumber(mixerTimelineSong->start) +
       "|" + nativeNumber(mixerTimelineSong->end)
