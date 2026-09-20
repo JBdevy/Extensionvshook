@@ -38,8 +38,11 @@ namespace {
 constexpr const char* kProduct = "VSLIVE";
 constexpr const char* kFingerprintPrefix = "VSHOOK_DEVICE_V1";
 constexpr const char* kClockDigestPrefix = "VSHOOK_CLOCK_V1_GUARD_2026";
+constexpr const char* kOfflineWarningDigestPrefix =
+  "VSHOOK_OFFLINE_WARNING_V1_GUARD_2026";
 constexpr int64_t kClockRollbackToleranceSeconds = 10 * 60;
 constexpr int64_t kClockWriteIntervalSeconds = 5 * 60;
+constexpr int64_t kOfflineWarningSeconds = 3 * 24 * 60 * 60;
 
 std::string trim(std::string value)
 {
@@ -154,6 +157,15 @@ std::string clockStatePath()
   return joinPath(sharedDirectory(), "vshook_license_clock_v1.dat");
 #else
   return joinPath(sharedDirectory(), ".vshook_license_clock_v1.dat");
+#endif
+}
+
+std::string offlineWarningStatePath()
+{
+#ifdef _WIN32
+  return joinPath(sharedDirectory(), "vshook_license_offline_warning_v1.dat");
+#else
+  return joinPath(sharedDirectory(), ".vshook_license_offline_warning_v1.dat");
 #endif
 }
 
@@ -292,6 +304,149 @@ std::string clockDigest(int64_t highWatermark,
   if (!sha256(reinterpret_cast<const unsigned char*>(input.data()),
               input.size(), digest)) return {};
   return hexUpper(digest.data(), digest.size());
+}
+
+std::string offlineWarningDigest(
+  int64_t tokenExpiresAt,
+  int64_t warningStartedAt,
+  int warningCount,
+  int64_t lastWarningAt,
+  const std::string& machine,
+  const std::string& fingerprint)
+{
+  const std::string input = std::string(kOfflineWarningDigestPrefix) + "|2|" +
+    std::to_string(tokenExpiresAt) + "|" +
+    std::to_string(warningStartedAt) + "|" +
+    std::to_string(warningCount) + "|" +
+    std::to_string(lastWarningAt) + "|" + machine + "|" + fingerprint;
+  std::array<unsigned char, 32> digest{};
+  if (!sha256(reinterpret_cast<const unsigned char*>(input.data()),
+              input.size(), digest)) return {};
+  return hexUpper(digest.data(), digest.size());
+}
+
+bool readOfflineWarningState(
+  int64_t expectedExpiresAt,
+  const std::string& machine,
+  const std::string& fingerprint,
+  int64_t& warningStartedAt,
+  int& warningCount,
+  int64_t& lastWarningAt)
+{
+  std::istringstream input(readFile(offlineWarningStatePath()));
+  std::string version;
+  std::string expiresText;
+  std::string startedText;
+  std::string countText;
+  std::string lastWarningText;
+  std::string storedMachine;
+  std::string storedFingerprint;
+  std::string storedDigest;
+  if (!std::getline(input, version) ||
+      !std::getline(input, expiresText) ||
+      !std::getline(input, startedText) ||
+      !std::getline(input, countText) ||
+      !std::getline(input, lastWarningText) ||
+      !std::getline(input, storedMachine) ||
+      !std::getline(input, storedFingerprint) ||
+      !std::getline(input, storedDigest) || version != "2") return false;
+  try {
+    const int64_t expiresAt = std::stoll(expiresText);
+    const int64_t startedAt = std::stoll(startedText);
+    const int count = std::stoi(countText);
+    const int64_t lastAt = std::stoll(lastWarningText);
+    if (expiresAt != expectedExpiresAt || startedAt <= 0 ||
+        count < 1 || count > 3 || lastAt < startedAt ||
+        normalize(storedMachine) != machine ||
+        normalize(storedFingerprint) != fingerprint ||
+        normalize(storedDigest) != offlineWarningDigest(
+          expiresAt, startedAt, count, lastAt,
+          machine, fingerprint)) return false;
+    warningStartedAt = startedAt;
+    warningCount = count;
+    lastWarningAt = lastAt;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool writeOfflineWarningState(
+  int64_t tokenExpiresAt,
+  int64_t warningStartedAt,
+  int warningCount,
+  int64_t lastWarningAt,
+  const std::string& machine,
+  const std::string& fingerprint)
+{
+  const std::string digest = offlineWarningDigest(
+    tokenExpiresAt, warningStartedAt, warningCount, lastWarningAt,
+    machine, fingerprint);
+  if (digest.empty()) return false;
+  const std::string content = "2\n" + std::to_string(tokenExpiresAt) + "\n" +
+    std::to_string(warningStartedAt) + "\n" +
+    std::to_string(warningCount) + "\n" +
+    std::to_string(lastWarningAt) + "\n" + machine + "\n" +
+    fingerprint + "\n" + digest + "\n";
+  return replaceFile(offlineWarningStatePath(), content);
+}
+
+Result expiredLicenseResult(
+  int64_t tokenExpiresAt,
+  int64_t now,
+  const std::string& machine,
+  const std::string& fingerprint)
+{
+  int64_t warningStartedAt = 0;
+  int warningCount = 0;
+  int64_t lastWarningAt = 0;
+  if (!readOfflineWarningState(
+        tokenExpiresAt, machine, fingerprint,
+        warningStartedAt, warningCount, lastWarningAt)) {
+    // O prazo de aviso comeca quando este computador percebe o vencimento.
+    // Assim, quem ficou desligado por muito tempo recebe os tres dias inteiros
+    // em vez de saltar diretamente para o bloqueio ao abrir para um show.
+    warningStartedAt = now;
+    warningCount = 1;
+    lastWarningAt = now;
+    if (!writeOfflineWarningState(
+          tokenExpiresAt, warningStartedAt, warningCount, lastWarningAt,
+          machine, fingerprint)) {
+      // Uma falha de persistencia nunca derruba uma sessao potencialmente em
+      // uso. A proxima abertura tentara gravar o aviso novamente.
+      return {true, Failure::None, true,
+              now + kOfflineWarningSeconds, 1};
+    }
+    return {true, Failure::None, true,
+            now + kOfflineWarningSeconds, 1};
+  }
+  if (now + kClockRollbackToleranceSeconds < warningStartedAt ||
+      now + kClockRollbackToleranceSeconds < lastWarningAt) {
+    return {false, Failure::Clock};
+  }
+  bool warningDeliveredNow = false;
+  if (warningCount < 3 &&
+      now >= lastWarningAt + (24 * 60 * 60)) {
+    ++warningCount;
+    lastWarningAt = now;
+    warningDeliveredNow = true;
+    if (!writeOfflineWarningState(
+          tokenExpiresAt, warningStartedAt, warningCount, lastWarningAt,
+          machine, fingerprint)) {
+      return {true, Failure::None, true,
+              now + (24 * 60 * 60), warningCount};
+    }
+  }
+  const OfflineGraceDecision decision =
+    evaluateOfflineGrace(
+      now, warningStartedAt, warningCount, lastWarningAt,
+      warningDeliveredNow);
+  if (decision.allowed) {
+    return {true, Failure::None, true,
+            decision.deadline, warningCount};
+  }
+  return {false, Failure::Expired, false,
+          decision.deadline, warningCount};
 }
 
 bool readClockState(const std::string& machine,
@@ -561,6 +716,27 @@ done:
 
 } // namespace
 
+OfflineGraceDecision evaluateOfflineGrace(
+  int64_t now,
+  int64_t warningStartedAt,
+  int warningCount,
+  int64_t lastWarningAt,
+  bool warningDeliveredNow)
+{
+  const int64_t safeStartedAt = warningStartedAt > 0
+    ? warningStartedAt
+    : now;
+  const int safeWarningCount = std::max(0, std::min(3, warningCount));
+  const int64_t threeDayDeadline = safeStartedAt + kOfflineWarningSeconds;
+  const int64_t afterThirdWarning = safeWarningCount >= 3 && lastWarningAt > 0
+    ? lastWarningAt + (24 * 60 * 60)
+    : 0;
+  const int64_t deadline = std::max(threeDayDeadline, afterThirdWarning);
+  const bool allowed = warningDeliveredNow || safeWarningCount < 3 ||
+    now < deadline;
+  return {allowed, allowed, deadline};
+}
+
 std::string installedTokenPath()
 {
 #ifdef _WIN32
@@ -638,7 +814,10 @@ Result validateInstalledLicense()
     return {false, Failure::Invalid};
   }
   if (notBefore > now + 300) return {false, Failure::NotYetValid};
-  if (expiresAt <= now) return {false, Failure::Expired};
+  if (expiresAt <= now) {
+    return expiredLicenseResult(
+      expiresAt, now, localMachine, localFingerprint);
+  }
   if (clockVersionFound && clockVersion != 1) {
     return {false, Failure::Invalid};
   }

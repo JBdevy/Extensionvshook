@@ -2266,11 +2266,28 @@ static bool writeTextFileAtomically(
   return true;
 }
 
+static std::atomic<bool> g_nativeLicenseSessionAuthorized{false};
+
 static bool nativeEnsurePluginLicense()
 {
   const vshook_license::Result result =
     vshook_license::validateInstalledLicense();
-  if (result.valid) return true;
+  if (result.valid) {
+    g_nativeLicenseSessionAuthorized.store(true);
+    if (result.offlineWarning && ShowMessageBox_ptr) {
+      const int warningNumber = std::max(
+        1, std::min(3, result.offlineWarningNumber));
+      const std::string warningMessage =
+        "AVISO " + std::to_string(warningNumber) + " DE 3\n\n" +
+        "É necessário conectar à internet para validar sua licença.\n\n" +
+        "Não fique muito tempo sem conexão com a internet.";
+      ShowMessageBox_ptr(
+        warningMessage.c_str(),
+        "VS Hook",
+        0);
+    }
+    return true;
+  }
 
   std::string message;
   switch (result.failure) {
@@ -79025,8 +79042,6 @@ static void startupTimer()
 {
   static bool standbyDiscoveryPublished = false;
   static std::string standbyDiscoveryProjectSignature;
-  static bool runtimeLicenseValid = true;
-  static std::chrono::steady_clock::time_point nextLicenseCheck{};
 
   if (g_nativeExtensionBypassActive.load()) {
     if (g_nativeRunning.load()) stopNativeBridgeServer();
@@ -79040,14 +79055,10 @@ static void startupTimer()
   nativeInstallReaperMainWindowSubclass();
   nativeRestorePanelAfterCancelledHostClose();
 
-  const auto licenseNow = std::chrono::steady_clock::now();
-  if (nextLicenseCheck.time_since_epoch().count() == 0 ||
-      licenseNow >= nextLicenseCheck) {
-    runtimeLicenseValid =
-      vshook_license::validateInstalledLicense().valid;
-    nextLicenseCheck = licenseNow + std::chrono::seconds(60);
-  }
-  if (!runtimeLicenseValid) {
+  // A licença é decidida na abertura. Depois que a sessão foi aceita, uma
+  // virada de prazo nunca fecha o painel nem interrompe o show em andamento.
+  // O eventual bloqueio é aplicado somente na próxima abertura do REAPER.
+  if (!g_nativeLicenseSessionAuthorized.load()) {
     if (nativeAppActivePanelIsOpen()) nativeCloseAppActivePanel();
     if (g_nativeRuntimeWasActive) {
       g_nativeRuntimeWasActive = false;
