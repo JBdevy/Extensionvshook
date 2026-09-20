@@ -5728,6 +5728,14 @@ static native_socket_t g_nativeActiveClientSocket = kInvalidNativeSocket;
 static std::string g_nativeStateJson;
 static std::string g_nativeMixerTimelineJson = "{\"ok\":false,\"revision\":0,\"items\":[]}";
 static std::atomic<unsigned long long> g_nativeMixerTimelineRevision{0};
+// Catálogo leve para o TCP remoto: contém todos os itens de cada projeto
+// aberto e é reconstruído somente quando a estrutura de algum projeto muda.
+// O app filtra localmente pela região selecionada, então trocar de música não
+// exige uma nova varredura do REAPER nem outra transferência pesada.
+static std::string g_nativeMixerTimelineCatalogJson =
+  "{\"ok\":false,\"revision\":0,\"projects\":[]}";
+static std::atomic<unsigned long long>
+  g_nativeMixerTimelineCatalogRevision{0};
 // Alvo pedido explicitamente pelo App Diretor ao abrir o Mixer. A seleção do
 // snapshot pode chegar um ciclo depois do comando; guardar o ID aqui impede o
 // endpoint pesado de ser reconstruído para uma música antiga ou sem alvo.
@@ -69593,6 +69601,83 @@ static std::string nativeBuildPremixItemRowsJson(ReaProject* project, const Nati
   return oss.str();
 }
 
+static std::string nativeMixerTimelineCatalogSourceSignature()
+{
+  std::ostringstream signature;
+  if (!EnumProjects_ptr) return signature.str();
+  for (int index = 0; index < 64; ++index) {
+    ReaProject* project = EnumProjects_ptr(index, nullptr, 0);
+    if (!project) break;
+    const int changeCount = GetProjectStateChangeCount_ptr
+      ? GetProjectStateChangeCount_ptr(project) : -1;
+    signature << reinterpret_cast<std::uintptr_t>(project)
+              << ":" << changeCount << ";";
+  }
+  return signature.str();
+}
+
+static void nativeRefreshMixerTimelineCatalog(
+  const std::chrono::steady_clock::time_point& snapshotNow)
+{
+  static std::string observedSignature;
+  static std::string publishedSignature;
+  static std::chrono::steady_clock::time_point observedAt;
+
+  if (!nativeIsDirectorControlActive() || !EnumProjects_ptr) return;
+  const std::string sourceSignature =
+    nativeMixerTimelineCatalogSourceSignature();
+  if (sourceSignature != observedSignature) {
+    observedSignature = sourceSignature;
+    observedAt = snapshotNow;
+  }
+  const bool firstBuild =
+    g_nativeMixerTimelineCatalogRevision.load() == 0;
+  const bool settledChange = sourceSignature != publishedSignature &&
+    observedAt.time_since_epoch().count() != 0 &&
+    std::chrono::duration_cast<std::chrono::milliseconds>(
+      snapshotNow - observedAt).count() >= 900;
+  if (!firstBuild && !settledChange) return;
+
+  std::ostringstream projects;
+  projects << "[";
+  bool first = true;
+  for (int index = 0; index < 64; ++index) {
+    char pathBuf[2048] = "";
+    ReaProject* project = EnumProjects_ptr(
+      index, pathBuf, static_cast<int>(sizeof(pathBuf)));
+    if (!project) break;
+    const std::string path = normalizeSlashes(pathBuf);
+    std::string name = nativeBasenameNoRpp(path);
+    if (name.empty()) name = std::string("Projeto ") +
+      std::to_string(index + 1);
+    const std::string id = std::to_string(
+      reinterpret_cast<std::uintptr_t>(project));
+    const int changeCount = GetProjectStateChangeCount_ptr
+      ? GetProjectStateChangeCount_ptr(project) : -1;
+    if (!first) projects << ",";
+    first = false;
+    projects << "{\"id\":" << nativeJsonString(id)
+             << ",\"index\":" << index
+             << ",\"name\":" << nativeJsonString(name)
+             << ",\"projectPath\":" << nativeJsonString(path)
+             << ",\"changeCount\":" << changeCount
+             << ",\"items\":"
+             << nativeBuildPremixItemRowsJson(project, nullptr)
+             << "}";
+  }
+  projects << "]";
+  const unsigned long long revision =
+    g_nativeMixerTimelineCatalogRevision.fetch_add(1) + 1;
+  std::ostringstream payload;
+  payload << "{\"ok\":true,\"revision\":" << revision
+          << ",\"projects\":" << projects.str() << "}";
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    g_nativeMixerTimelineCatalogJson = payload.str();
+  }
+  publishedSignature = sourceSignature;
+}
+
 static std::vector<const NativeSongWindow*> nativePremixFamilyChildren(
   const std::vector<NativeSongWindow>& songs,
   const NativeSongWindow* parent)
@@ -70748,6 +70833,7 @@ static void nativeRebuildState(bool forceSnapshot)
     ? GetProjectStateChangeCount_ptr(activeProject)
     : -1;
   const auto snapshotNow = std::chrono::steady_clock::now();
+  nativeRefreshMixerTimelineCatalog(snapshotNow);
   const bool snapshotProjectChanged = cachedSnapshotProject != activeProject;
   // Alguns caminhos de edição da régua de tempo não acordam imediatamente o
   // snapshot pelo contador geral do projeto. A assinatura dos próprios pontos
@@ -71592,6 +71678,8 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"mixerMaster\":" << cachedMixerMasterJson << ",";
   json << "\"mixerHardwareOutputs\":"
        << cachedMixerHardwareOutputsJson << ",";
+  json << "\"mixerTimelineCatalogRevision\":"
+       << g_nativeMixerTimelineCatalogRevision.load() << ",";
   json << "\"manualStopFadeout\":" << manualStopFadeoutJson << ",";
   json << "\"manualStopFadeoutEnabled\":" << (nativeBoolFromText(nativeReadLuaWindowExtState(kManualStopFadeoutEnabledKey), false) ? "true" : "false") << ",";
   json << "\"manualStopFadeoutDuration\":" << nativeManualStopFadeoutClampDuration(nativeReadLuaWindowExtState(kManualStopFadeoutDurationKey)) << ",";
@@ -78065,6 +78153,14 @@ static void nativeHandleClient(native_socket_t client)
       timeline = g_nativeMixerTimelineJson;
     }
     body = nativeHttpResponse(200, timeline);
+  } else if (path == "/mixer-timeline-cache" ||
+             path == "/mixer-timeline-cache.json") {
+    std::string catalog;
+    {
+      std::lock_guard<std::mutex> lock(g_nativeMutex);
+      catalog = g_nativeMixerTimelineCatalogJson;
+    }
+    body = nativeHttpResponse(200, catalog);
   } else if (path == "/teleprompt-settings" ||
              path == "/teleprompt-settings.json") {
     body = nativeHttpResponse(
