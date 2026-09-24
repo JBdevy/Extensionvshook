@@ -45,3 +45,19 @@ O workflow do macOS compila separadamente `x86_64` para macOS 10.13+ e
 - `.github/workflows`: builds oficiais de Windows e macOS.
 
 Consulte `THIRD_PARTY_NOTICES.md` para os componentes de terceiros.
+
+## Clonar repertório
+
+No seletor de repertórios, `Clone` fica à esquerda de `Multi`. Com um único
+repertório da aba atual selecionado, cria `Clone 2`, `Clone 3` etc., evitando
+nomes já existentes. Copia os itens e sua ordem, incluindo blocos e campos de
+configuração, sem duplicar mídia nem alterar o repertório em reprodução.
+A cópia fica selecionada no modal; use `Abrir` quando quiser ativá-la.
+Para repertórios de outra aba, abra essa aba antes de clonar, assim como nas
+demais operações de edição do seletor.
+
+Teste de regressão (Developer Command Prompt do Visual Studio):
+
+```text
+node tests/run-playlist-clone-test.js
+```

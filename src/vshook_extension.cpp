@@ -14367,6 +14367,63 @@ static bool nativeUiOpenPlaylistDropdown()
   return true;
 }
 
+static std::string nativeUiNextPlaylistCloneName(
+  const std::vector<NativeUiPlaylistRecord>& playlists)
+{
+  std::set<std::string> names;
+  for (const auto& playlist : playlists) {
+    names.insert(nativeUpperNamePtBr(nativeTrim(playlist.name)));
+  }
+  // At most playlists.size() names can be occupied. Start at 2, even when
+  // cloning another clone; never overwrite a manually named repertoire.
+  for (size_t number = 2; ; ++number) {
+    const std::string name = "Clone " + std::to_string(number);
+    if (names.find(nativeUpperNamePtBr(name)) == names.end()) return name;
+  }
+}
+
+static bool nativeUiCloneSelectedPlaylist()
+{
+  if (!nativeUiSelectedPlaylistEditableInCurrentProject()) return false;
+  const int selected = nativeUiFirstSelectedPlaylist();
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  const NativeUiPlaylistRecord source =
+    g_nativeUiPlaylists[static_cast<size_t>(selected)];
+  auto playlists = nativeUiReadPlaylistRecords(project);
+  if (source.localIndex < 0 ||
+      source.localIndex >= static_cast<int>(playlists.size()) ||
+      playlists[static_cast<size_t>(source.localIndex)].name != source.name) {
+    // The list may have changed since this modal was opened. Do not clone
+    // a different record that has taken the selected index.
+    nativeUiOpenPlaylistDropdown();
+    return false;
+  }
+
+  NativeUiPlaylistRecord clone;
+  clone.name = nativeUiNextPlaylistCloneName(playlists);
+  // Copy serialized entries verbatim: order, duplicates, blocks, durations,
+  // hash children and all per-entry fields must survive unchanged.
+  clone.itemLines = playlists[static_cast<size_t>(source.localIndex)].itemLines;
+  const int cloneIndex = static_cast<int>(playlists.size());
+  playlists.push_back(std::move(clone));
+  if (!nativeUiSavePlaylistRecords(project, playlists)) return false;
+
+  // Select the new copy only in the modal. Do not change LAST_PLAYLIST_NAME,
+  // active playback, project tab, or any underlying regions/media.
+  g_nativeUiPlaylists = nativeUiReadPlaylistDropdownRecords(project);
+  g_nativeUiPlaylistFilterDirty.store(false);
+  g_nativeUiPlaylistRowHits.clear();
+  g_nativeUiPlaylistInputFocused = false;
+  for (size_t index = 0; index < g_nativeUiPlaylists.size(); ++index) {
+    const auto& candidate = g_nativeUiPlaylists[index];
+    if (candidate.project == project && candidate.localIndex == cloneIndex) {
+      nativeUiSelectPlaylistIndex(static_cast<int>(index), false, false);
+      break;
+    }
+  }
+  return true;
+}
+
 static bool nativeUiRenameSelectedPlaylist()
 {
   const int selected = nativeUiFirstSelectedPlaylist();
@@ -39348,14 +39405,14 @@ static void nativePaintAppActivePanel(HWND hwnd)
         g_nativeMultiProjectPlaylistsEnabled.load();
       const bool multiProjectPlaylistsAvailable =
         g_nativeMultiProjectPlaylistsAvailable.load();
-      RECT title{modal.left + 12, modal.top + 8, modal.right - 213,
+      RECT title{modal.left + 12, modal.top + 8, modal.right - 278,
         modal.top + 30};
       nativeAppActiveDrawText(dc,
         multiProjectPlaylists
           ? "Escolher repertório - abas abertas"
           : "Escolher repertório",
         title,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
         RGB(248, 250, 252), nameFont);
       const int selectedCount = nativeUiPlaylistSelectedCount();
       const int selectedIndex = nativeUiFirstSelectedPlaylist();
@@ -39540,6 +39597,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
       RECT multiButton{exportButton.left - modalButtonGap - topButtonW,
         exportButton.top, exportButton.left - modalButtonGap,
         exportButton.bottom};
+      RECT cloneButton{multiButton.left - modalButtonGap - topButtonW,
+        multiButton.top, multiButton.left - modalButtonGap,
+        multiButton.bottom};
+      addModalButton("playlist_clone", "Clone", cloneButton,
+        "copy", true, selectedEditable);
       addModalButton("playlist_multi_toggle", "Multi",
         multiButton,
         multiProjectPlaylists ? "play" : "stop",
@@ -55066,6 +55128,8 @@ static bool nativeMainHandleModalClick(
         "{\"type\":\"playlist_multi_toggle\"}");
       nativeUiOpenPlaylistDropdown();
     }
+  } else if (action == "playlist_clone") {
+    nativeUiCloneSelectedPlaylist();
   } else if (action == "playlist_copy") {
     nativeUiRequestCopyCurrentPlaylistNames();
   } else if (action == "playlist_open") {
