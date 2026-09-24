@@ -75,21 +75,21 @@ int main() {
   stored = {original};
   select(0);
   assert(nativeUiCloneSelectedPlaylist());
-  assert(stored.size() == 2 && stored[1].name == "Clone 2");
+  assert(stored.size() == 2 && stored[1].name == "DOMINGO - clone 2");
   assert(stored[0].name == "DOMINGO" && stored[0].itemLines == original.itemLines);
   assert(stored[1].itemLines == original.itemLines);
-  assert(g_nativeUiPlaylistSelectedIndex == 1 && g_nativeUiPlaylistInput == "Clone 2");
+  assert(g_nativeUiPlaylistSelectedIndex == 1 && g_nativeUiPlaylistInput == "DOMINGO - clone 2");
   assert(nativeUiPlaylistSelectedCount() == 1 && !g_nativeUiPlaylistInputFocused);
   assert(activeProject == &project);
-  // Repeated click clones the selected copy without creating "Clone 2 Clone 2".
+  // Repeated click clones the selected copy without accumulating suffixes.
   assert(nativeUiCloneSelectedPlaylist());
-  assert(stored.back().name == "Clone 3");
+  assert(stored.back().name == "DOMINGO - clone 3");
   stored[1].itemLines.clear();
   assert(stored[0].itemLines == original.itemLines && stored[2].itemLines == original.itemLines);
   // Clone the actual selection (not the active/first repertoire), including empty ones.
   select(1);
   assert(nativeUiCloneSelectedPlaylist());
-  assert(stored.back().name == "Clone 4" && stored.back().itemLines.empty());
+  assert(stored.back().name == "DOMINGO - clone 4" && stored.back().itemLines.empty());
   select(0);
   failSave = true;
   assert(!nativeUiCloneSelectedPlaylist() && stored.size() == 4);
@@ -114,8 +114,15 @@ int main() {
   assert(!nativeUiCloneSelectedPlaylist() && refreshes == 2);
   assert(saves == 3);
   NativeUiPlaylistRecord manualName;
-  manualName.name = "  cLoNe 2  ";
-  assert(nativeUiNextPlaylistCloneName({manualName}) == "Clone 3");
-  assert(nativeUiNextPlaylistCloneName({}) == "Clone 2");
+  manualName.name = "  domingo - cLoNe 2  ";
+  assert(nativeUiNextPlaylistCloneName("DOMINGO", {manualName}) == "DOMINGO - clone 3");
+  assert(nativeUiNextPlaylistCloneName("SABADO", {manualName}) == "SABADO - clone 2");
+  assert(nativeUiNextPlaylistCloneName("DOMINGO - CLONE 2", {manualName}) == "DOMINGO - clone 3");
+  assert(nativeUiNextPlaylistCloneName("  São João  ", {}) == "São João - clone 2");
+  assert(nativeUiNextPlaylistCloneName("São João - clone 12", {}) == "São João - clone 2");
+  assert(nativeUiNextPlaylistCloneName("Show - clone especial", {}) == "Show - clone especial - clone 2");
+  assert(nativeUiNextPlaylistCloneName("Show - clone 2 extra", {}) == "Show - clone 2 extra - clone 2");
+  assert(nativeUiNextPlaylistCloneName("Show - clone 1", {}) == "Show - clone 1 - clone 2");
+  assert(nativeUiNextPlaylistCloneName("Show - clone ", {}) == "Show - clone - clone 2");
   std::cout << "PLAYLIST_CLONE_OK: naming, exact entries, selection, failures and project isolation\n";
 }

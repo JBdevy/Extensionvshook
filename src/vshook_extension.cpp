@@ -14368,16 +14368,30 @@ static bool nativeUiOpenPlaylistDropdown()
 }
 
 static std::string nativeUiNextPlaylistCloneName(
+  const std::string& sourceName,
   const std::vector<NativeUiPlaylistRecord>& playlists)
 {
+  std::string baseName = nativeTrim(sourceName);
+  const size_t separator = baseName.rfind(" - ");
+  if (separator != std::string::npos && separator > 0) {
+    // Inspect only the suffix so UTF-8 names retain their original spelling.
+    const std::string suffix = nativeUpperNamePtBr(baseName.substr(separator + 3));
+    if (suffix.compare(0, 6, "CLONE ") == 0) {
+      const std::string number = suffix.substr(6);
+      const bool cloneNumber = !number.empty() && number[0] != '0' &&
+        std::all_of(number.begin(), number.end(), [](char c) { return c >= '0' && c <= '9'; }) &&
+        (number.size() > 1 || number[0] >= '2');
+      if (cloneNumber) baseName = nativeTrim(baseName.substr(0, separator));
+    }
+  }
   std::set<std::string> names;
   for (const auto& playlist : playlists) {
     names.insert(nativeUpperNamePtBr(nativeTrim(playlist.name)));
   }
-  // At most playlists.size() names can be occupied. Start at 2, even when
-  // cloning another clone; never overwrite a manually named repertoire.
+  // Number each original name independently, including when cloning a clone.
+  // Never overwrite a manually named repertoire.
   for (size_t number = 2; ; ++number) {
-    const std::string name = "Clone " + std::to_string(number);
+    const std::string name = baseName + " - clone " + std::to_string(number);
     if (names.find(nativeUpperNamePtBr(name)) == names.end()) return name;
   }
 }
@@ -14400,7 +14414,7 @@ static bool nativeUiCloneSelectedPlaylist()
   }
 
   NativeUiPlaylistRecord clone;
-  clone.name = nativeUiNextPlaylistCloneName(playlists);
+  clone.name = nativeUiNextPlaylistCloneName(source.name, playlists);
   // Copy serialized entries verbatim: order, duplicates, blocks, durations,
   // hash children and all per-entry fields must survive unchanged.
   clone.itemLines = playlists[static_cast<size_t>(source.localIndex)].itemLines;

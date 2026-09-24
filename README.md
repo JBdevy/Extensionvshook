@@ -49,8 +49,9 @@ Consulte `THIRD_PARTY_NOTICES.md` para os componentes de terceiros.
 ## Clonar repertório
 
 No seletor de repertórios, `Clone` fica à esquerda de `Multi`. Com um único
-repertório da aba atual selecionado, cria `Clone 2`, `Clone 3` etc., evitando
-nomes já existentes. Copia os itens e sua ordem, incluindo blocos e campos de
+repertório da aba atual selecionado, cria `Nome original - clone 2`,
+`Nome original - clone 3` etc., evitando nomes já existentes. A numeração é por
+nome original; clonar uma cópia não acumula sufixos. Copia os itens e sua ordem, incluindo blocos e campos de
 configuração, sem duplicar mídia nem alterar o repertório em reprodução.
 A cópia fica selecionada no modal; use `Abrir` quando quiser ativá-la.
 Para repertórios de outra aba, abra essa aba antes de clonar, assim como nas
