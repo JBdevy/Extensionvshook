@@ -46,6 +46,66 @@ O workflow do macOS compila separadamente `x86_64` para macOS 10.13+ e
 
 Consulte `THIRD_PARTY_NOTICES.md` para os componentes de terceiros.
 
+## Consumo em repouso
+
+A seleção de pistas do fadeout é resolvida em uma passagem pelo projeto,
+mantendo ordem, compatibilidade com o estado Lua e atualização após renomear,
+remover pistas ou trocar de projeto.
+
+Com Project Sync sem par, transporte parado e sem consumidores, o snapshot
+completo é atualizado a cada segundo. Janelas, consultas da Hook Center/app
+(inclusive sem heartbeat de Diretor), reprodução, cronômetro, fadeout e um
+par conectado preservam o intervalo normal de 220 ms. Comandos forçados não
+esperam esse intervalo. A descoberta e a recepção de comandos continuam ativas.
+
+No macOS/Linux, a espera de conexões usa `poll`, permitindo descritores acima
+de 1023 em projetos com muitos arquivos abertos. Erros fatais encerram a ponte
+para reinicialização, sem um ciclo contínuo que consuma CPU.
+
+O painel conserva áreas separadas de pintura no backbuffer. Animações RGB
+invalidam os contornos; relógio, letreiro e botões piscantes mantêm suas próprias
+atualizações. Mudanças de layout, modais e buffers novos seguem o redesenho
+completo. Cores fixas de contorno não acionam o timer de animação RGB.
+Com `VSHOOK_BUILD_TESTS=ON`, o alvo `vshook_ui_damage_mac_test` compara os pixels
+da pintura parcial e completa em CoreGraphics, inclusive em escala Retina.
+Durante a reprodução, os cartões de transporte invalidam suas barras e o
+tempo restante; Parts invalida a regressão e o item engatilhado, sem repintar
+as duas colunas inteiras. Mudanças de conteúdo, layout, seleção e modais
+mantêm a composição completa. Preenchimentos arredondados usam o caminho
+retangular somente quando toda a área alterada está no interior sólido;
+contornos fora dessa área são ignorados. O teste de pixels também verifica
+esse caso, cantos, áreas separadas e formas pequenas. A cadência do transporte
+e o serviço do aplicativo remoto não dependem dessas otimizações de pintura.
+O RGB possui cadência própria de 100 ms, também durante reprodução e arraste;
+o timer de 30/60 Hz dos controles não acelera o redesenho decorativo. A cor
+continua calculada pelo tempo real, conservando a duração de cada ciclo.
+
+Teste de regressão em macOS/Linux com compilador C++17, ou no Developer
+Command Prompt do Visual Studio no Windows:
+
+```text
+node tests/run-idle-work-test.js
+node tests/run-json-string-cache-test.js
+node tests/run-director-heartbeat-paint-test.js
+```
+
+O teste executa as funções extraídas do código de produção, compara a seleção
+com o comportamento anterior e verifica a retomada por clientes remotos com
+as janelas fechadas. Reduções de CPU/bateria devem ser medidas novamente no
+REAPER após carregar o novo binário.
+
+O status do Project Sync reutiliza a serialização JSON do manifesto e do plano
+de diferenças enquanto o conteúdo permanece idêntico. O cache guarda somente
+o último valor de cada campo e usa o mesmo mutex do estado. Alterações no
+documento, inclusive sem mudança de revisão, invalidam o valor imediatamente;
+transporte e progresso continuam sendo publicados em cada consulta. O teste
+de JSON verifica equivalência byte a byte e informa um benchmark isolado, sem
+interpretá-lo como redução de CPU do processo inteiro.
+
+Heartbeats repetidos do Diretor atualizam a presença sem invalidar toda a
+janela. Mudanças na permissão e fechamento dos avisos ainda repintam de
+imediato; a recepção remota continua ativa com o painel fechado.
+
 ## Clonar repertório
 
 No seletor de repertórios, `Clone` fica à esquerda de `Multi`. Com um único

@@ -64,6 +64,7 @@
   #include <sys/types.h>
   #include <sys/socket.h>
   #include <sys/time.h>
+  #include <poll.h>
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
@@ -912,9 +913,28 @@ static std::unique_ptr<WDL_WinMemBitmap> g_nativeUiBackBuffer;
 static int g_nativeUiBackBufferWidth = 0;
 static int g_nativeUiBackBufferHeight = 0;
 static bool g_nativeUiBackBufferHasFrame = false;
+static std::vector<RECT> g_nativeUiRgbDamageRects;
+static NativeUiDamage::AnimationCadence g_nativeUiRgbCadence;
+static std::vector<RECT> g_nativeUiBlinkDamageRects;
+static int64_t g_nativeUiLastBlinkPhase = -1;
+static std::mutex g_nativeUiDamageMutex;
+static NativeUiDamage::Pending g_nativeUiPendingDamage;
+
+// Remember disjoint damage before Cocoa coalesces it into one bounding box.
+// Other windows retain their existing invalidation behavior.
+static BOOL nativeUiInvalidateRect(HWND hwnd, const RECT* rect, BOOL erase)
+{
+  if (hwnd && hwnd == g_nativeAppActivePanelHwnd) {
+    std::lock_guard<std::mutex> lock(g_nativeUiDamageMutex);
+    g_nativeUiPendingDamage.add(rect);
+  }
+  return InvalidateRect(hwnd, rect, erase);
+}
+
 // Rebuilt with the hit-test geometry, including off-damage rows. Repainting
 // fewer pixels must never remove click targets from the rest of the panel.
 static std::vector<RECT> g_nativeUiProgressDamageRects;
+static std::vector<RECT> g_nativeUiPartsProgressDamageRects;
 static RECT g_nativeUiInfoDamageRect{};
 static std::map<COLORREF, HBRUSH> g_nativeUiBrushCache;
 static std::map<uint64_t, HPEN> g_nativeUiPenCache;
@@ -2593,15 +2613,22 @@ static void openAppActiveScreenForDirector()
 {
   // O bloqueio e uma preferencia global. Quando o usuario usa "Permitir",
   // essa preferencia e desmarcada e o Diretor continua conectado.
-  g_state.directorInterfaceBlocked =
+  const bool blocked =
     nativeUiBlockInterfaceWhenDirectorConnectedEnabled() &&
     !g_state.pcAccessOverride;
+  const bool visualChanged =
+    blocked != g_state.directorInterfaceBlocked ||
+    g_nativeAppActiveResumeConfirmOpen ||
+    g_nativeAppActiveControlBlockedNoticeOpen;
+  g_state.directorInterfaceBlocked = blocked;
   g_state.appActiveScreenOpen = false;
   g_lastAppActiveTransition = std::chrono::steady_clock::now();
   g_nativeAppActiveResumeConfirmOpen = false;
   g_nativeAppActiveControlBlockedNoticeOpen = false;
-  if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  // Repeated heartbeats update liveness, not the entire window. A real
+  // permission/dialog transition still repaints immediately.
+  if (visualChanged && nativeAppActivePanelIsOpen()) {
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
 
@@ -2695,7 +2722,7 @@ static bool resumePcAccessFromAppActiveScreen()
   // Libera a interface local sem deslogar o App Diretor.
   g_lastAppActiveTransition = std::chrono::steady_clock::now();
   if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
   return true;
 }
@@ -6364,6 +6391,26 @@ static std::string nativeJsonString(const std::string& value)
   return std::string("\"") + nativeJsonEscape(value) + "\"";
 }
 
+// One entry per field, protected by the caller's state mutex. Compare the
+// content, not a revision or pointer: replacing a project or a preflight plan
+// must immediately invalidate the serialized value, even with the same ID.
+struct NativeJsonStringCache {
+  const std::string& get(const std::string& value)
+  {
+    if (!initialized || input != value) {
+      std::string next = nativeJsonString(value);
+      input = value;
+      serialized = std::move(next);
+      initialized = true;
+    }
+    return serialized;
+  }
+private:
+  bool initialized = false;
+  std::string input;
+  std::string serialized;
+};
+
 static std::string nativeTrim(std::string value)
 {
   while (!value.empty() && (value.front() == ' ' || value.front() == '\t' || value.front() == '\r' || value.front() == '\n')) value.erase(value.begin());
@@ -7682,6 +7729,10 @@ static void nativeRestoreTransportEditCursorOnMainThread()
 static std::string nativeTimecodeLanStatusJson()
 {
   std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+  // Hook Center polls transport frequently. Keep its live fields current,
+  // while escaping large, unchanged Project Sync documents only once.
+  static NativeJsonStringCache manifestJson;
+  static NativeJsonStringCache differencePlanJson;
   const NativeTimecodeLanTransport& transport =
     g_nativeTimecodeLanTransport;
   std::ostringstream json;
@@ -7709,7 +7760,7 @@ static std::string nativeTimecodeLanStatusJson()
        << ",\"peerName\":"
        << nativeJsonString(g_nativeTimecodeLanPeerName) << ","
        << "\"manifest\":"
-       << nativeJsonString(g_nativeProjectSyncPreflight.manifest) << ","
+       << manifestJson.get(g_nativeProjectSyncPreflight.manifest) << ","
        << "\"manifestRevision\":"
        << nativeJsonString(
             g_nativeProjectSyncPreflight.manifestRevision) << ","
@@ -7775,7 +7826,7 @@ static std::string nativeTimecodeLanStatusJson()
        << "\"automatic\":"
        << (g_nativeProjectSyncApply.automatic ? "true" : "false")
        << ",\"differencePlan\":"
-       << nativeJsonString(g_nativeProjectSyncApply.differencePlan)
+       << differencePlanJson.get(g_nativeProjectSyncApply.differencePlan)
        << "},\"projectSyncApplyRequested\":"
        << (g_nativeProjectSyncApply.state == "requested"
              ? "true" : "false") << ","
@@ -10928,7 +10979,7 @@ static void nativeUiOpenResolumeMapQuestion(bool fromRename)
   g_nativeMainModalKind = NativeMainModalKind::ResolumeMapQuestion;
   if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
   if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
 
@@ -11012,7 +11063,7 @@ static void nativeUiShowResolumeMapResult(bool includeMarkers)
   g_nativeMainModalMessage = message.str();
   g_nativeMainModalKind = NativeMainModalKind::ResolumeMapResult;
   if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
 
@@ -13699,7 +13750,7 @@ static bool nativeApplyPlaylistCommand(const std::string& commandBody)
     g_nativeForceStateBuild.store(true);
     if (g_nativeAppActivePanelHwnd &&
         IsWindow(g_nativeAppActivePanelHwnd)) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
     return true;
   }
@@ -15157,6 +15208,7 @@ static bool nativeManualStopFadeoutTrackIdIsHidden(
 static std::vector<std::string> nativeManualStopFadeoutTrackIds()
 {
   std::vector<std::string> out;
+  std::set<std::string> pending;
   std::string raw;
   bool projectValueExists = false;
   char projectPath[2048] = "";
@@ -15171,14 +15223,34 @@ static std::vector<std::string> nativeManualStopFadeoutTrackIds()
   while (begin <= raw.size()) {
     const size_t end = raw.find(';', begin);
     const std::string id = nativeTrim(raw.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
-    if (!id.empty() &&
-        !nativeManualStopFadeoutTrackIdIsHidden(project, id) &&
-        std::find(out.begin(), out.end(), id) == out.end()) {
+    if (!id.empty() && pending.insert(id).second) {
       out.push_back(id);
     }
     if (end == std::string::npos) break;
     begin = end + 1;
   }
+  // Resolve todos os IDs numa passagem. A busca individual repetia os GUIDs
+  // das mesmas pistas para cada seleção, inclusive com o transporte parado.
+  // Não guarda ponteiros/cache entre chamadas: renomear/remover uma pista ou
+  // trocar de projeto precisa continuar refletindo imediatamente no filtro.
+  std::set<std::string> hidden;
+  if (project && CountTracks_ptr && GetTrack_ptr && !pending.empty()) {
+    const int count = CountTracks_ptr(project);
+    for (int index = 0; index < count && !pending.empty(); ++index) {
+      MediaTrack* track = GetTrack_ptr(project, index);
+      if (!track) continue;
+      const std::string id = nativeTrackGuid(track, index);
+      if (pending.erase(id) != 0 &&
+          nativeMixerTrackIsHidden(nativeTrackName(track, index))) {
+        hidden.insert(id);
+      }
+    }
+  }
+  // IDs ausentes são preservados, como no leitor antigo. A ordem persistida
+  // também é mantida; somente duplicatas e pistas ocultas são removidas.
+  out.erase(std::remove_if(out.begin(), out.end(),
+    [&hidden](const std::string& id) { return hidden.count(id) != 0; }),
+    out.end());
   return out;
 }
 
@@ -16814,6 +16886,15 @@ static void nativeAppActiveFillRoundRect(HDC dc, const RECT& rect, COLORREF fill
       paintRect.bottom <= paintRect.top) return;
   // Paineis e a superficie principal conservam seus proprios raios. A
   // preferencia Quadrado/Redondo controla somente os botoes.
+  // Within the solid interior, a rectangle produces exactly the same pixels
+  // without rasterizing a large rounded path on each playback update.
+  const int edgeInset = std::max(2, radius * 2 + 2);
+  if (!NativeUiDamage::edgeVisible(dc, paintRect, edgeInset)) {
+    const NativeUiBrushRef brush = nativeUiBrush(fill);
+    if (brush.handle) FillRect(dc, &paintRect, brush.handle);
+    if (brush.temporary && brush.handle) DeleteObject(brush.handle);
+    return;
+  }
   if (radius > 0) {
     const NativeUiBrushRef brush = nativeUiBrush(fill);
     const NativeUiPenRef pen = nativeUiPen(border);
@@ -16862,6 +16943,8 @@ static void nativeAppActiveStrokeRoundRect(
 {
   const RECT paintRect = nativeUiCustomizePaintRect(rect);
   if (!NativeUiDamage::visible(dc, paintRect)) return;
+  if (!NativeUiDamage::edgeVisible(dc, paintRect,
+        std::max(2, cornerRadius * 2 + 2))) return;
   if (!dc || paintRect.right <= paintRect.left ||
       paintRect.bottom <= paintRect.top) return;
   if (cornerRadius > 0) {
@@ -17385,7 +17468,12 @@ static void nativeUiReleaseBackBuffer()
   g_nativeUiBackBufferWidth = 0;
   g_nativeUiBackBufferHeight = 0;
   g_nativeUiBackBufferHasFrame = false;
+  g_nativeUiRgbDamageRects.clear();
+  g_nativeUiRgbCadence.reset();
+  g_nativeUiBlinkDamageRects.clear();
+  g_nativeUiLastBlinkPhase = -1;
   g_nativeUiProgressDamageRects.clear();
+  g_nativeUiPartsProgressDamageRects.clear();
   g_nativeUiInfoDamageRect = RECT{};
 }
 
@@ -18321,6 +18409,10 @@ static void nativePaintPartsColumn(
   nativeAppActiveFillRect(dc, headerBar, RGB(26, 31, 41));
   const double regressRatio =
     nativeUiLivePartsRegressRatio(column);
+  // Only the regression strip and armed row blink during playback. Other
+  // Parts rows change through the structural/model or interaction path.
+  g_nativeUiPartsProgressDamageRects.push_back(
+    headerArmed ? headerHitRect : headerBar);
   if (regressRatio > 0.0) {
     RECT fill = headerBar;
     fill.right = fill.left + std::max(1,
@@ -18399,6 +18491,13 @@ static void nativePaintPartsColumn(
         rowHeights[static_cast<size_t>(i)] -
         scrollPixels};
     const bool armed = row.id == g_nativeAppActivePanelModel.armedMarkerId;
+    if (armed) {
+      const RECT dirty{rowRect.left,
+        std::max(rowRect.top, listHitRect.top), rowRect.right,
+        std::min(rowRect.bottom, listHitRect.bottom)};
+      if (dirty.bottom > dirty.top)
+        g_nativeUiPartsProgressDamageRects.push_back(dirty);
+    }
     const bool selected = row.id == g_nativeAppActivePanelModel.selectedMarkerId;
     const bool focused = (parts2 && g_nativeMainNavigationFocus == "parts2") ||
       (!parts2 && g_nativeMainNavigationFocus == "parts");
@@ -18841,7 +18940,7 @@ static void nativeUiRefreshTextInputNow(HWND hwnd)
   // WM_PAINT tem prioridade menor que a repetição de WM_KEYDOWN. Sem forçar
   // esta atualização, segurar Backspace apaga internamente, mas a tela só
   // mostra o resultado quando a tecla é solta.
-  InvalidateRect(hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(hwnd, nullptr, FALSE);
   UpdateWindow(hwnd);
 }
 
@@ -18852,7 +18951,7 @@ static void nativeUiRefreshNavigationNow(HWND hwnd)
   if (!hwnd || !IsWindow(hwnd)) return;
   nativeUiSetFrameTimerInterval(
     hwnd, kNativeUiFrameFastIntervalMs);
-  InvalidateRect(hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(hwnd, nullptr, FALSE);
   // WM_PAINT/timer podem perder prioridade durante a repetição de WM_KEYDOWN
   // tanto no Win32 quanto no SWELL do macOS. Apresentar no máximo um quadro
   // a cada 16 ms mantém os dois sistemas com a mesma resposta visual.
@@ -19746,14 +19845,20 @@ static void nativeUiDrawButton(
   int padding = 8,
   int textColorOverride = -1)
 {
+  // Keep customization layout accounting even when this button is off-damage.
+  const RECT paintRect = nativeUiCustomizePaintRect(rect);
+  const std::string normalizedStyle = nativeLower(nativeTrim(style));
+  if (dc == NativeUiDamage::activeDc && enabled && (normalizedStyle == "loop_active" ||
+      normalizedStyle == "bypass_active" || normalizedStyle == "live_active")) {
+    g_nativeUiBlinkDamageRects.push_back(paintRect);
+  }
+  if (!NativeUiDamage::visible(dc, paintRect)) return;
   if (g_nativeUiButtonPaintFont) font = g_nativeUiButtonPaintFont;
   NativeUiButtonColors colors =
     nativeUiButtonColors(style, enabled);
   if (textColorOverride >= 0) {
     colors.text = static_cast<COLORREF>(textColorOverride);
   }
-  const std::string normalizedStyle =
-    nativeLower(nativeTrim(style));
   if (enabled && !active &&
       (normalizedStyle == "stop" ||
        normalizedStyle == "danger")) {
@@ -20373,7 +20478,7 @@ static void nativeUiWriteVisualPrefs(
     barPresets.str().c_str(), true);
   if (UpdateArrange_ptr) UpdateArrange_ptr();
   if (g_nativeAppActivePanelHwnd) {
-    InvalidateRect(g_nativeAppActivePanelHwnd,
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd,
       nullptr, FALSE);
   }
 }
@@ -20559,7 +20664,7 @@ static bool nativeUiButtonLayoutZoneValid(
 static int nativeUiButtonLayoutActivePreset()
 {
   return nativeUiVisualPresetIndex(
-    nativeUiReadVisualPrefs());
+    nativeUiVisualPrefsForPaint());
 }
 
 static std::string nativeUiButtonLayoutStorageKey(
@@ -20955,7 +21060,7 @@ static void nativeUiWakeTemporaryPopupPaint()
   nativeUiSetFrameTimerInterval(
     g_nativeAppActivePanelHwnd,
     kNativeUiFrameActiveIntervalMs);
-  InvalidateRect(g_nativeAppActivePanelHwnd,
+  nativeUiInvalidateRect(g_nativeAppActivePanelHwnd,
     nullptr, FALSE);
 }
 
@@ -23000,7 +23105,7 @@ static bool nativeApplyUiSelectionSnapshotCommand(
   }
   g_nativeForceStateBuild.store(true);
   if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
   return true;
 }
@@ -24142,7 +24247,7 @@ static bool nativeUiCreatePlaylistBlock()
     std::chrono::steady_clock::now() + std::chrono::seconds(4);
   g_nativeUiRowsSourceSignatureValid = false;
   if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
   return true;
 }
@@ -26899,7 +27004,7 @@ static void nativeProjectSyncShowDiffModal(
     // podem substituir a tela AGUARDE pela lista de diferencas. A conferencia
     // original permanece congelada ate sucesso ou erro terminal.
     if (nativeAppActivePanelIsOpen()) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
     return;
   }
@@ -26912,7 +27017,7 @@ static void nativeProjectSyncShowDiffModal(
     // Não reabre nem reparsa o mesmo diagnóstico: preserva scroll, captura da
     // barra e posição visual durante a rolagem contínua no Windows.
     if (nativeAppActivePanelIsOpen()) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
     return;
   }
@@ -27010,7 +27115,7 @@ static void nativeProjectSyncShowDiffModal(
   if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
   g_nativeMainModalKind = NativeMainModalKind::ProjectSyncDiff;
   if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
 
@@ -29502,7 +29607,7 @@ static bool nativeProjectSyncUpdateApplyProgressFromCommand(
   // responder no mesmo instante, sem depender de outra interacao do usuario.
   if (g_nativeMainModalKind == NativeMainModalKind::ProjectSyncDiff &&
       nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
   return true;
 }
@@ -29555,7 +29660,7 @@ static void nativeProjectSyncExpireStalledApplyOnMainThread()
   g_nativeForceStateBuild.store(true);
   if (g_nativeMainModalKind == NativeMainModalKind::ProjectSyncDiff &&
       nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
 
@@ -29740,7 +29845,7 @@ static void nativeProjectSyncApplyConfigFromDiffModal()
     nativeUiShowTemporaryPopup(
       "Falha ao aplicar as configuracoes do PC A.", 2.0);
     if (nativeAppActivePanelIsOpen()) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
     return;
   }
@@ -30072,7 +30177,7 @@ static void nativeProjectSyncRequestApplyFromDiffModal()
   }
   g_nativeForceStateBuild.store(true);
   if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
 
@@ -35518,6 +35623,12 @@ static void nativeUiPaintPremixMixerItemRow(
 
 static void nativePaintAppActivePanel(HWND hwnd)
 {
+  NativeUiDamage::Pending pending;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeUiDamageMutex);
+    pending = std::move(g_nativeUiPendingDamage);
+    g_nativeUiPendingDamage = {};
+  }
   NativeUiDamage::Frame damage(hwnd);
   PAINTSTRUCT ps{};
   HDC paintDc = BeginPaint(hwnd, &ps);
@@ -35534,10 +35645,16 @@ static void nativePaintAppActivePanel(HWND hwnd)
         paintDc, width, height)) {
     dc = bufferDc;
   }
-  damage.begin(dc, client, ps.rcPaint,
-    dc != paintDc && g_nativeUiBackBufferHasFrame);
+  // Unknown OS paints, modal/layout changes and new buffers redraw fully.
+  const bool partial = !pending.full && !pending.rects.empty();
+  damage.begin(dc, client, client,
+    dc != paintDc && g_nativeUiBackBufferHasFrame,
+    partial ? &pending.rects : nullptr);
+  g_nativeUiRgbDamageRects.clear();
+  g_nativeUiBlinkDamageRects.clear();
   g_nativeUiProgressDamageRects.clear();
   g_nativeUiInfoDamageRect = RECT{};
+  g_nativeUiPartsProgressDamageRects.clear();
   const auto& paintVisualPrefs =
     nativeUiVisualPrefsForPaint();
   g_nativeUiModernButtonDesign = nativeLower(
@@ -35791,6 +35908,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
         nativeUiBorderColor(paintVisualPrefs, modeBorder)) {
       const RECT inner{rect.left + 1, rect.top + 1,
         rect.right - 1, rect.bottom - 1};
+      NativeUiDamage::outline(g_nativeUiRgbDamageRects,
+        nativeUiCustomizePaintRect(inner, false), 2);
       nativeAppActiveFillRect(dc,
         RECT{inner.left, inner.top, inner.right, inner.top + 1},
         modeBorder);
@@ -36480,6 +36599,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
       card.right - 7, card.top + 5};
     RECT bottomTrack{card.left + 7, card.bottom - 3,
       card.right - 7, card.bottom - 1};
+    if (showTop) g_nativeUiProgressDamageRects.push_back(topTrack);
+    if (showBottom) g_nativeUiProgressDamageRects.push_back(bottomTrack);
     if (showTop) {
       nativeAppActiveFillRect(dc, topTrack,
         RGB(26, 31, 41));
@@ -36598,7 +36719,6 @@ static void nativePaintAppActivePanel(HWND hwnd)
     const int panelTextTop = 2;
     const int panelTextBottom = 2;
     RECT card{pad, panelY, width - pad, panelY + panelHeight};
-    g_nativeUiProgressDamageRects.push_back(card);
     const COLORREF cardFill = playbackPanelColors && currentActive
       ? RGB(205, 20, 20)
       : playbackPanelColors && auto2QueueActive
@@ -36713,6 +36833,8 @@ static void nativePaintAppActivePanel(HWND hwnd)
       card.top + panelTextTop,
       card.right - 8,
       card.bottom - panelTextBottom};
+    if (current && panelHasTime)
+      g_nativeUiProgressDamageRects.push_back(panelTime);
     RECT panelName{panelLabel.right + panelNameGap,
       card.top + panelTextTop,
       panelTimeText.empty()
@@ -38078,6 +38200,12 @@ static void nativePaintAppActivePanel(HWND hwnd)
             nativeUiBorderColor(visualPrefs, modeBorder)) {
           blockEdge = nativeUiBlendColor(
             rowFill, modeBorder, 0.72);
+          // Clip to the visible list; offscreen block edges must not damage controls.
+          const RECT edge{rowRect.left + indexColumnW,
+            std::max(rowRect.top, listInnerTop), rowRect.right,
+            std::min(rowRect.bottom, listInnerBottom)};
+          NativeUiDamage::outline(g_nativeUiRgbDamageRects,
+            nativeUiCustomizePaintRect(edge, false), 2);
         }
         // A linha de contorno do bloco começa depois da coluna de números,
         // sem passar por cima dela.
@@ -46092,6 +46220,7 @@ static void nativePaintAppActivePanel(HWND hwnd)
 
   COLORREF windowBorder = RGB(0, 0, 0);
   if (nativeUiBorderColor(paintVisualPrefs, windowBorder)) {
+    NativeUiDamage::outline(g_nativeUiRgbDamageRects, client, 5, 9);
     for (int inset = 0; inset < 3; ++inset) {
       const int offset = inset + 1;
       const RECT edge{client.left + offset,
@@ -46648,7 +46777,7 @@ static bool nativeApplyPartsVisibilityCommand(
   }
   nativeSetPartsColumnVisible(column == 2, visible);
   if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
   return true;
 }
@@ -48899,7 +49028,7 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     if (!rightClick) {
       g_nativeMainPreviewSecondPage =
         !g_nativeMainPreviewSecondPage;
-      InvalidateRect(
+      nativeUiInvalidateRect(
         g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
     return true;
@@ -48931,7 +49060,7 @@ static bool nativeMainHandleControlClick(const POINT& point, bool rightClick)
     } else if (bpmHit.delta == -1 || bpmHit.delta == 1) {
       nativeUiAdjustBpmValue(bpmHit);
     }
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     return true;
   }
   for (const auto& liveResetHit : g_nativeMainLiveResetHits) {
@@ -51276,7 +51405,7 @@ static void nativeBigClockHandleMenu(HWND hwnd)
     return;
   }
   nativeBigClockSaveSettings(slot);
-  InvalidateRect(hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(hwnd, nullptr, FALSE);
 }
 
 static LRESULT CALLBACK nativeBigClockWndProc(
@@ -51317,7 +51446,7 @@ static LRESULT CALLBACK nativeBigClockWndProc(
           g_nativeBigClockWindowStateDirty[slot] = false;
           nativeBigClockSaveWindowState(slot);
         }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       break;
@@ -51344,7 +51473,7 @@ static LRESULT CALLBACK nativeBigClockWndProc(
         g_nativeBigClockWindowStateChangedAt[slot] =
           std::chrono::steady_clock::now();
       }
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_GETMINMAXINFO: {
       MINMAXINFO* limits = reinterpret_cast<MINMAXINFO*>(lParam);
@@ -51489,7 +51618,7 @@ static bool nativeOpenBigClockWindow(int slot)
     ShowWindow(hwnd, SW_SHOW);
   }
   SetFocus(hwnd);
-  InvalidateRect(hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(hwnd, nullptr, FALSE);
   const int commandId = nativeBigClockCommandId(slot);
   if (RefreshToolbar2_ptr && commandId != 0) {
     RefreshToolbar2_ptr(0, commandId);
@@ -51678,10 +51807,10 @@ static bool nativeUiResetRegionsToGridOrder()
   g_nativeForceSnapshotBuild.store(true);
   g_nativeForceStateBuild.store(true);
   if (nativeAppActivePanelIsOpen()) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
   if (g_nativeHookControllerHwnd) {
-    InvalidateRect(g_nativeHookControllerHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeHookControllerHwnd, nullptr, FALSE);
   }
   return true;
 }
@@ -53738,7 +53867,7 @@ static void nativeHookControllerHandleClick(
   if (g_nativeHookControllerSearchFocused &&
       !PtInRect(&g_nativeHookControllerSearchRect, point)) {
     g_nativeHookControllerSearchFocused = false;
-    InvalidateRect(hwnd, &g_nativeHookControllerSearchRect, FALSE);
+    nativeUiInvalidateRect(hwnd, &g_nativeHookControllerSearchRect, FALSE);
   }
   const bool inlineRenameGesture =
     rightClick && nativeUiRowInlineRenameModifierDown();
@@ -53756,7 +53885,7 @@ static void nativeHookControllerHandleClick(
         g_nativeUiTextSelectionKind = NativeUiTextInputKind::RenameRow;
         g_nativeUiRenameInputCursor = g_nativeUiRenameInput.size();
         g_nativeUiTextSelectionAnchor = g_nativeUiRenameInputCursor;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       } else {
         // O clique direito comum continua levando ao modal completo.
         g_nativeMainRowInlineRenameOpen = false;
@@ -53769,7 +53898,7 @@ static void nativeHookControllerHandleClick(
       return;
     }
     if (!nativeUiApplyRowRename()) {
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return;
     }
   }
@@ -53794,7 +53923,7 @@ static void nativeHookControllerHandleClick(
     nativeAppActiveWriteWindowInt("HOOK_CONTROLLER_MODE_V1", index);
     nativeHookControllerSetFrameTimerInterval(
       hwnd, nativeHookControllerDesiredFrameInterval());
-    InvalidateRect(hwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(hwnd, nullptr, FALSE);
     return;
   }
   if (PtInRect(&g_nativeHookControllerSearchRect, point)) {
@@ -53811,7 +53940,7 @@ static void nativeHookControllerHandleClick(
           g_nativeHookControllerSearchText,
           point.x, 7);
       SetFocus(hwnd);
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
     }
     return;
   }
@@ -53838,7 +53967,7 @@ static void nativeHookControllerHandleClick(
           nativePersistFamilyDrawersForCurrentProjectLocked();
         }
         g_nativeForceStateBuild.store(true);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return;
       }
     }
@@ -53918,7 +54047,7 @@ static void nativeHookControllerHandleClick(
         }
       }
       g_nativeForceStateBuild.store(true);
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return;
     }
     for (const auto& hit : g_nativeHookControllerSongHits) {
@@ -53931,7 +54060,7 @@ static void nativeHookControllerHandleClick(
             RECT{0, 0, 0, 0};
           g_nativeHookControllerSearchFocused = false;
           SetFocus(hwnd);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         } else {
           nativeUiOpenRowRename(hit.row, true);
           if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
@@ -53953,7 +54082,7 @@ static void nativeHookControllerHandleClick(
         std::lock_guard<std::mutex> lock(g_nativeMutex);
         nativeBumpSharedRevisionLocked("pc");
       }
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return;
     }
   }
@@ -53964,7 +54093,7 @@ static void nativeHookControllerHandleClick(
       std::lock_guard<std::mutex> lock(g_nativeMutex);
       nativeBumpSharedRevisionLocked("pc");
       g_nativeForceStateBuild.store(true);
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return;
     }
   }
@@ -53987,16 +54116,16 @@ static void nativeHookControllerHandleClick(
         nativeUiOpenMixerBinding(it->trackId, action);
         if (!nativeAppActivePanelIsOpen()) nativeOpenAppActivePanel();
         if (g_nativeAppActivePanelHwnd) {
-          InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
         }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return;
       }
       for (auto it = g_nativeHookControllerMixerRowHits.rbegin();
            it != g_nativeHookControllerMixerRowHits.rend(); ++it) {
         if (!PtInRect(&it->rect, point) || it->trackId.empty()) continue;
         nativeHookControllerChooseTrackColor(hwnd, it->trackId);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return;
       }
     }
@@ -54036,7 +54165,7 @@ static void nativeHookControllerHandleClick(
       std::lock_guard<std::mutex> lock(g_nativeMutex);
       nativeBumpSharedRevisionLocked("pc");
       g_nativeForceStateBuild.store(true);
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
     }
     if (handled) return;
   }
@@ -54058,7 +54187,7 @@ static void nativeHookControllerHandleClick(
       nativeApplyTunerCommand(command.str());
     }
     g_nativeForceStateBuild.store(true);
-    InvalidateRect(hwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(hwnd, nullptr, FALSE);
     return;
   }
 }
@@ -54130,7 +54259,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
             NativeHookControllerMode::Tcp) {
           nativeRefreshAppActivePanelModel();
         }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         if (navigationChanged || scrollChanged) UpdateWindow(hwnd);
         nativeHookControllerSetFrameTimerInterval(
           hwnd, nativeHookControllerDesiredFrameInterval());
@@ -54167,7 +54296,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
         g_nativeHookControllerWindowStateChangedAt =
           std::chrono::steady_clock::now();
       }
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_LBUTTONDOWN: {
       SetFocus(hwnd);
@@ -54187,12 +54316,12 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
         }
         // Um clique fora confirma a edição antes de executar a ação clicada.
         if (!nativeUiApplyRowRename()) {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
       }
       if (nativeHookControllerBeginScrollbarDrag(hwnd, point)) {
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeHookControllerMode ==
@@ -54224,7 +54353,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
             g_nativeHookControllerLastFaderClickAt = {};
             g_nativeHookControllerSuppressNextMouseUp = true;
             g_nativeForceStateBuild.store(true);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            nativeUiInvalidateRect(hwnd, nullptr, FALSE);
             return 0;
           }
           g_nativeMixerVolumeDragging = true;
@@ -54235,7 +54364,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
           SetCapture(hwnd);
           nativeUiSetMixerVolumeAtPoint(
             hit.trackId, hit.rect, point.x);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
       }
@@ -54247,7 +54376,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
         }
         NativeHookControllerSongContext context;
         if (nativeUiBeginMainListPress(hwnd, point)) {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
       }
@@ -54261,7 +54390,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
         nativeHookControllerSetScrollbarFromPoint(point.y);
         g_nativeHookControllerScrollbarDragging = false;
         if (GetCapture() == hwnd) ReleaseCapture();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeHookControllerSuppressNextMouseUp) {
@@ -54280,7 +54409,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
           hwnd, nativeHookControllerDesiredFrameInterval());
         if (GetCapture() == hwnd) ReleaseCapture();
         g_nativeForceStateBuild.store(true);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainListDrag.pressed &&
@@ -54297,7 +54426,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
         if (!wasDrag) {
           nativeHookControllerHandleClick(hwnd, point);
         }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       nativeHookControllerHandleClick(hwnd, point);
@@ -54309,7 +54438,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
           static_cast<short>(LOWORD(lParam)),
           static_cast<short>(HIWORD(lParam))};
         nativeHookControllerSetScrollbarFromPoint(point.y);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         UpdateWindow(hwnd);
         return 0;
       }
@@ -54322,7 +54451,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
         nativeUiSetMixerVolumeAtPoint(
           g_nativeMixerVolumeDragTrackId,
           g_nativeMixerVolumeDragRect, point.x);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainListDrag.pressed &&
@@ -54333,7 +54462,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
           static_cast<short>(HIWORD(lParam))};
         NativeHookControllerSongContext context;
         nativeUiUpdateMainListDrag(point);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       break;
@@ -54341,18 +54470,18 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
     case WM_CAPTURECHANGED:
       if (g_nativeHookControllerScrollbarDragging) {
         g_nativeHookControllerScrollbarDragging = false;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeMixerVolumeDragging) {
         g_nativeMixerVolumeDragging = false;
         g_nativeMixerVolumeDragTrackId.clear();
         nativeHookControllerSetFrameTimerInterval(
           hwnd, nativeHookControllerDesiredFrameInterval());
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeMainListDrag.pressed) {
         nativeUiResetMainListDrag();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       break;
     case WM_RBUTTONUP: {
@@ -54380,7 +54509,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
         const int step = delta > 0 ? -1 : 1;
         g_nativeHookControllerMixerTracksScroll = std::max(0,
           g_nativeHookControllerMixerTracksScroll + step);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeHookControllerMode ==
@@ -54393,18 +54522,18 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
             parts.scrollPixels -
               (delta > 0 ? 72 : -72)));
         g_nativeHookControllerScroll = parts.scrollPixels;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       g_nativeHookControllerScroll = std::max(0,
         std::min(g_nativeHookControllerMaxScroll,
           g_nativeHookControllerScroll -
             (delta > 0 ? 72 : -72)));
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
     case WM_SETFOCUS:
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_KILLFOCUS:
       if (nativeHookControllerInlineRenameActive()) {
@@ -54414,7 +54543,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       g_nativeUiPlaylistStepKeyHeld[0] = false;
       g_nativeUiPlaylistStepKeyHeld[1] = false;
       nativeUiReleaseMusicSelectionForArrangeEditing();
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_KEYUP:
     case WM_SYSKEYUP:
@@ -54671,7 +54800,7 @@ static bool nativeOpenHookControllerWindow()
     ShowWindow(hwnd, SW_SHOW);
   }
   SetFocus(hwnd);
-  InvalidateRect(hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(hwnd, nullptr, FALSE);
   if (RefreshToolbar2_ptr && g_hookControllerCommandId != 0) {
     RefreshToolbar2_ptr(0, g_hookControllerCommandId);
   }
@@ -55012,7 +55141,7 @@ static bool nativeMainHandleModalClick(
     g_nativeMainModalKind =
       NativeMainModalKind::ResolumeMapQuestion;
     if (nativeAppActivePanelIsOpen()) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
     return true;
   }
@@ -55021,7 +55150,7 @@ static bool nativeMainHandleModalClick(
       ? NativeMainModalKind::RenameRow
       : NativeMainModalKind::Config;
     if (nativeAppActivePanelIsOpen()) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
     return true;
   }
@@ -55869,7 +55998,7 @@ static bool nativeMainHandleModalClick(
     g_nativeForceSnapshotBuild.store(true);
     g_nativeForceStateBuild.store(true);
     if (nativeAppActivePanelIsOpen()) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
   } else if (action == "config_export_backup") {
     nativeUiExportBackup();
@@ -56302,7 +56431,7 @@ static void nativeUiProcessMidiCapture()
       NativeMainModalKind::MixerBinding;
   }
   if (g_nativeAppActivePanelHwnd) {
-    InvalidateRect(
+    nativeUiInvalidateRect(
       g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
@@ -56357,7 +56486,7 @@ static void nativeSetTunerColumnVisible(bool visible)
   }
   g_nativeForceStateBuild.store(true);
   if (g_nativeAppActivePanelHwnd) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
 
@@ -56370,7 +56499,7 @@ static void nativeSetBpmColumnVisible(bool visible)
   }
   g_nativeForceStateBuild.store(true);
   if (g_nativeAppActivePanelHwnd) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
 
@@ -57770,17 +57899,31 @@ static bool nativeUiFinishMainListPress(
 static bool nativeUiRgbBorderAnimated()
 {
   const auto& prefs = nativeUiVisualPrefsForPaint();
-  return std::atoi(nativeUiVisualPref(
-    prefs, "rgb_border_mode", "0").c_str()) != 0;
+  const int mode = std::atoi(nativeUiVisualPref(
+    prefs, "rgb_border_mode", "0").c_str());
+  return mode == 1 || mode == 12 || mode == 13 || mode == 14;
 }
 
 static void nativeUiPaintRgbAnimatedFrame(HWND hwnd)
 {
-  // A borda animada faz parte do quadro completo. Pintá-la diretamente na
-  // janela deixava pixels da lista antiga por cima de modais e causava
-  // cintilação. O WM_PAINT redesenha tudo no backbuffer e apresenta uma vez.
-  if (hwnd && IsWindowVisible(hwnd)) {
-    InvalidateRect(hwnd, nullptr, FALSE);
+  if (!hwnd || !IsWindowVisible(hwnd)) return;
+  const auto now = std::chrono::steady_clock::now();
+  const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+    now.time_since_epoch()).count();
+  // Playback/input runs at 30/60 Hz, but decorative RGB remains at its own
+  // 10 Hz cadence. Hue still comes from wall time, so cycle speed is unchanged.
+  if (!g_nativeUiRgbCadence.due(nowMs, kNativeUiFrameRgbIntervalMs)) return;
+  // Modal previews/overlays retain full composition. For the normal panel,
+  // repaint just animated outlines in the persistent backbuffer.
+  if (!g_nativeUiBackBufferHasFrame || g_nativeUiRgbDamageRects.empty() ||
+      g_nativeMainModalKind != NativeMainModalKind::None ||
+      g_state.directorInterfaceBlocked ||
+      std::chrono::steady_clock::now() < g_nativeAppActiveSplashUntil) {
+    nativeUiInvalidateRect(hwnd, nullptr, FALSE);
+    return;
+  }
+  for (const auto& rect : g_nativeUiRgbDamageRects) {
+    nativeUiInvalidateRect(hwnd, &rect, FALSE);
   }
 }
 
@@ -57833,7 +57976,7 @@ static void nativeUiInvalidateDynamicAreas(HWND hwnd, bool progress, bool info)
       g_nativeMainListDrag.pressed || g_nativeMainPartsResizeDragging ||
       g_nativeMainScrollbarDragging || nativeUiSmoothScrollActive() ||
       nativeUiNeedsTimedVisualRefresh(true)) {
-    InvalidateRect(hwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(hwnd, nullptr, FALSE);
     return;
   }
   if (progress && g_nativeAppActivePanelModel.playing &&
@@ -57846,7 +57989,7 @@ static void nativeUiInvalidateDynamicAreas(HWND hwnd, bool progress, bool info)
       "|" + nativeAppActiveFormatDuration(remaining);
     if (layoutKey != g_nativeUiMainLayoutPlayingKey) {
       // The remaining-time label can change row wrapping/height.
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return;
     }
   }
@@ -57854,12 +57997,11 @@ static void nativeUiInvalidateDynamicAreas(HWND hwnd, bool progress, bool info)
     if (rect.right <= rect.left || rect.bottom <= rect.top) return;
     const RECT padded{rect.left - 2, rect.top - 2,
       rect.right + 2, rect.bottom + 2};
-    InvalidateRect(hwnd, &padded, FALSE);
+    nativeUiInvalidateRect(hwnd, &padded, FALSE);
   };
   if (progress) {
     for (const RECT& rect : g_nativeUiProgressDamageRects) invalidate(rect);
-    if (g_nativeAppActivePanelModel.showParts1) invalidate(g_nativeMainParts1Rect);
-    if (g_nativeAppActivePanelModel.showParts2) invalidate(g_nativeMainParts2Rect);
+    for (const RECT& rect : g_nativeUiPartsProgressDamageRects) invalidate(rect);
   }
   if (info) invalidate(g_nativeUiInfoDamageRect);
 }
@@ -57909,7 +58051,7 @@ static UINT nativeUiDesiredFrameInterval()
       nativeUiNeedsTimedVisualRefresh()) {
     return kNativeUiFrameActiveIntervalMs;
   }
-  if (nativeUiRgbBorderAnimated()) {
+  if (nativeUiRgbBorderAnimated() || !g_nativeUiBlinkDamageRects.empty()) {
     return kNativeUiFrameRgbIntervalMs;
   }
   return kNativeUiFrameIdleIntervalMs;
@@ -58013,7 +58155,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             selectionReleasedForEditing || splashActive || splashFinished ||
             (timedRefresh && nativeUiNeedsTimedVisualRefresh(true));
           if (fullRefresh) {
-            InvalidateRect(hwnd, nullptr, FALSE);
+            nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           } else {
             nativeUiInvalidateDynamicAreas(hwnd,
               timedRefresh && g_nativeAppActivePanelModel.partArmed,
@@ -58030,11 +58172,23 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           if (g_nativeUiPlaylistMarqueeActive &&
               g_nativeMainPlaylistFieldRect.right >
                 g_nativeMainPlaylistFieldRect.left) {
-            InvalidateRect(hwnd,
+            nativeUiInvalidateRect(hwnd,
               &g_nativeMainPlaylistFieldRect, FALSE);
           }
           if (nativeUiRgbBorderAnimated()) {
             nativeUiPaintRgbAnimatedFrame(hwnd);
+          }
+        }
+        // Blinking buttons must keep animating independently of RGB borders.
+        const int64_t blinkPhase =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count() / 167;
+        if (IsWindowVisible(hwnd) && blinkPhase != g_nativeUiLastBlinkPhase) {
+          g_nativeUiLastBlinkPhase = blinkPhase;
+          for (const auto& rect : g_nativeUiBlinkDamageRects) {
+            const RECT padded{rect.left - 2, rect.top - 2,
+              rect.right + 2, rect.bottom + 2};
+            nativeUiInvalidateRect(hwnd, &padded, FALSE);
           }
         }
         nativeUiSetFrameTimerInterval(
@@ -58043,7 +58197,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       }
       break;
     case WM_SIZE:
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_GETMINMAXINFO:
       if (lParam) {
@@ -58126,7 +58280,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           nativeUiBeginMainPartsResize(hwnd, point)) {
         nativeUiSetFrameTimerInterval(
           hwnd, kNativeUiFrameFastIntervalMs);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!mouseDown && g_nativeMainPartsResizeDragging) {
@@ -58135,7 +58289,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
 #ifndef _WIN32
@@ -58149,7 +58303,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #endif
       if (mouseDown && !g_state.directorInterfaceBlocked &&
           nativeProjectSyncBeginDiffModalScrollbarDrag(hwnd, point)) {
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!mouseDown &&
@@ -58161,20 +58315,20 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (mouseDown &&
           !g_state.directorInterfaceBlocked &&
           nativeUiBeginTextMouseSelection(hwnd, point)) {
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (mouseDown &&
           !g_state.directorInterfaceBlocked &&
           g_nativeMainRowInlineRenameOpen) {
         if (!nativeUiApplyRowRename()) {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
       }
@@ -58184,7 +58338,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!mouseDown && g_nativeMixerSuppressNextMouseUp) {
@@ -58197,7 +58351,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       if (mouseDown && !g_state.directorInterfaceBlocked &&
           nativeUiBeginButtonLayoutDrag(point)) {
         SetCapture(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!mouseDown && g_nativeUiButtonLayoutDrag.pressed) {
@@ -58211,13 +58365,13 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (mouseDown && !g_state.directorInterfaceBlocked &&
           g_nativeMixerRenameOpen &&
           nativeUiHandleMixerInlineRenameClick(point)) {
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (mouseDown && !g_state.directorInterfaceBlocked &&
@@ -58226,7 +58380,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           g_nativeAppActivePanelModel.mixerPage) {
         if (nativeUiHandleMixerNameMouseDown(point) ||
             nativeUiHandleMixerFaderDoubleClick(point)) {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
       }
@@ -58234,7 +58388,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           g_nativeMainModalKind ==
             NativeMainModalKind::PremixItemEditor) {
         if (nativeUiHandlePremixFaderDoubleClick(point)) {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         for (const auto& slider : g_nativeUiPremixSliderHits) {
@@ -58245,7 +58399,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           SetCapture(hwnd);
           nativeUiSetPremixVolumeFromPoint(slider.rowIndex,
             slider.rect, point.x);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
       }
@@ -58260,7 +58414,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (mouseDown && !g_state.directorInterfaceBlocked &&
@@ -58270,7 +58424,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         g_nativeUiMultiLoopLimitDragging = true;
         SetCapture(hwnd);
         nativeUiSetMultiLoopLimitFromPoint(point.x);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!mouseDown && g_nativeUiMultiLoopLimitDragging) {
@@ -58280,7 +58434,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (mouseDown && !g_state.directorInterfaceBlocked &&
@@ -58298,7 +58452,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           SetCapture(hwnd);
           nativeUiSetMixerVolumeAtPoint(
             hit.trackId, hit.rect, point.x);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
       }
@@ -58308,7 +58462,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           g_nativeAppActivePanelModel.mixerPage &&
           nativeUiBeginMixerReorderPress(point)) {
         SetCapture(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!mouseDown && g_nativeMixerVolumeDragging) {
@@ -58322,7 +58476,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!mouseDown &&
@@ -58340,7 +58494,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (mouseDown && !g_state.directorInterfaceBlocked &&
@@ -58349,7 +58503,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           !g_nativeAppActivePanelModel.mixerPage) {
         if (nativeUiBeginMainScrollbarDrag(hwnd, point) ||
             nativeUiBeginMainListPress(hwnd, point)) {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
       }
@@ -58360,7 +58514,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!mouseDown && g_nativeMainListDrag.pressed) {
@@ -58368,7 +58522,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
 #ifndef _WIN32
         g_nativeAppActiveMouseDownHandled = false;
 #endif
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
 #ifdef _WIN32
@@ -58389,20 +58543,20 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           g_nativeMainModalKind != NativeMainModalKind::None) {
         nativeMainHandleModalClick(point, false);
         if (GetFocus() != hwnd) SetFocus(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMixerRenameOpen &&
           !g_state.directorInterfaceBlocked) {
         nativeUiHandleMixerInlineRenameClick(point);
         if (GetFocus() != hwnd) SetFocus(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativePartsRenameOpen && !g_state.directorInterfaceBlocked) {
         nativeHandlePartsRenameClick(point);
         if (GetFocus() != hwnd) SetFocus(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!g_state.directorInterfaceBlocked) {
@@ -58418,19 +58572,19 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         // A janela de roteamento do REAPER e um popup que fecha ao perder o
         // foco. Depois de abri-la, nao devolva o foco imediatamente ao painel.
         if (!opensMixerRouteWindow && GetFocus() != hwnd) SetFocus(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeAppActiveControlBlockedNoticeOpen) {
         if (PtInRect(&g_nativeAppActiveControlBlockedNoticeOkRect, point)) {
           g_nativeAppActiveControlBlockedNoticeOpen = false;
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
       }
       nativeNotifyDirectorBlockedInterfaceClick();
       g_nativeAppActiveControlBlockedNoticeOpen = true;
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
     case WM_MOUSEMOVE: {
@@ -58438,13 +58592,13 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         nativeAppActiveClickPoint(hwnd, lParam);
       if (g_nativeProjectSyncDiffModalScrollbarDragging) {
         nativeProjectSyncSetDiffModalScrollFromPoint(point.y);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         UpdateWindow(hwnd);
         return 0;
       }
       if (g_nativeMainPartsResizeDragging) {
         nativeUiUpdateMainPartsResize(point);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         UpdateWindow(hwnd);
         return 0;
       }
@@ -58454,29 +58608,29 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       }
       if (g_nativeUiButtonLayoutDrag.pressed) {
         nativeUiUpdateButtonLayoutDrag(point);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainScrollbarDragging) {
         nativeUiSetMainScrollbarFromPoint(point.y);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainListDrag.pressed) {
         nativeUiUpdateMainListDrag(point);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeUiPremixSliderDragging) {
         nativeUiSetPremixVolumeFromPoint(
           g_nativeUiPremixActiveSliderRow,
           g_nativeUiPremixActiveSliderRect, point.x);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeUiMultiLoopLimitDragging) {
         nativeUiSetMultiLoopLimitFromPoint(point.x);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMixerReorderDrag.pressed) {
@@ -58493,64 +58647,64 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             ? nativeUiMixerDragTargetIndex(point,
                 g_nativeMixerReorderDrag.areaId)
             : 0;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!g_nativeMixerVolumeDragging) {
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       nativeUiSetMixerVolumeAtPoint(
         g_nativeMixerVolumeDragTrackId,
         g_nativeMixerVolumeDragRect, point.x);
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
     case WM_CAPTURECHANGED:
       if (g_nativeProjectSyncDiffModalScrollbarDragging) {
         g_nativeProjectSyncDiffModalScrollbarDragging = false;
         g_nativeProjectSyncDiffModalScrollbarDragOffsetY = 0;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeMainPartsResizeDragging) {
         g_nativeMainPartsResizeDragging = false;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeUiTextMouseSelecting) {
         g_nativeUiTextMouseSelecting = false;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeUiButtonLayoutDrag.pressed) {
         nativeUiResetButtonLayoutDrag();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeMainScrollbarDragging) {
         g_nativeMainScrollbarDragging = false;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeMainListDrag.pressed) {
         nativeUiResetMainListDrag();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeUiPremixSliderDragging) {
         g_nativeUiPremixSliderDragging = false;
         g_nativeUiPremixActiveSliderRow = -1;
         g_nativeUiPremixActiveSliderRect = RECT{0, 0, 0, 0};
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeUiMultiLoopLimitDragging) {
         g_nativeUiMultiLoopLimitDragging = false;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeMixerVolumeDragging) {
         g_nativeMixerVolumeDragging = false;
         g_nativeMixerVolumeDragTrackId.clear();
         g_nativeMixerVolumeDragRect = RECT{0, 0, 0, 0};
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       if (g_nativeMixerReorderDrag.pressed) {
         nativeUiResetMixerReorderDrag();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
     case WM_RBUTTONUP: {
@@ -58574,7 +58728,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         const POINT point = nativeAppActiveClickPoint(hwnd, lParam);
         nativeMainHandleControlClick(point, true);
       }
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
     case WM_MOUSEWHEEL: {
@@ -58589,7 +58743,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           std::min(g_nativeProjectSyncDiffModalMaxScrollPixels,
             g_nativeProjectSyncDiffModalScrollPixels +
               (delta > 0 ? -wheelStep : wheelStep)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind == NativeMainModalKind::BpmScanSelect ||
@@ -58603,7 +58757,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         g_nativeUiBpmScanScroll = std::max(0,
           std::min(maxScroll, g_nativeUiBpmScanScroll +
             (delta > 0 ? -2 : 2)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58614,7 +58768,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         g_nativeUiPlaylistScroll = std::max(0,
           std::min(maxScroll, g_nativeUiPlaylistScroll +
             (delta > 0 ? -2 : 2)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58626,7 +58780,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           std::min(maxScroll,
             g_nativeUiTargetPlaylistScroll +
               (delta > 0 ? -2 : 2)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58639,7 +58793,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           std::min(maxScroll,
             g_nativeUiConverterPartsScroll +
               (delta > 0 ? -2 : 2)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58650,7 +58804,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         g_nativeUiPremixScroll = std::max(0,
           std::min(maxScroll, g_nativeUiPremixScroll +
             (delta > 0 ? -2 : 2)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58661,7 +58815,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           std::min(maxScroll,
             g_nativeUiMultiLoopTrackScroll +
               (delta > 0 ? -2 : 2)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58674,7 +58828,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           std::min(maxScroll,
             g_nativeUiManualStopTrackScroll +
               (delta > 0 ? -2 : 2)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58684,7 +58838,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           0, std::min(g_nativeUiCustomizeMainMaxScroll,
             g_nativeUiCustomizeMainScroll +
               (delta > 0 ? -wheelStep : wheelStep)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (nativeUiIsCustomizeModal(
@@ -58695,7 +58849,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             g_nativeUiCustomizeSubpageMaxScroll,
             g_nativeUiCustomizeSubpageScroll +
               (delta > 0 ? -wheelStep : wheelStep)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58704,7 +58858,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           std::min(g_nativeUiHelpMaxScroll,
             g_nativeUiHelpScroll +
               (delta > 0 ? -48 : 48)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58716,7 +58870,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           0, std::min(maxScroll,
             g_nativeUiMidiScroll +
               (delta > 0 ? -2 : 2)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind ==
@@ -58733,7 +58887,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           0, std::min(maxScroll,
             g_nativeUiMixerBulkScroll +
               (delta > 0 ? -1 : 1)));
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (g_nativeMainModalKind != NativeMainModalKind::None) return 0;
@@ -58750,7 +58904,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             0, g_nativeMixerTracksScroll +
               (delta > 0 ? -1 : 1));
         }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       int* targetScroll = &g_nativeAppActiveListScrollPixels;
@@ -58778,7 +58932,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       smoothState->lastApplied = *targetScroll;
       nativeUiSetFrameTimerInterval(
         hwnd, kNativeUiFrameFastIntervalMs);
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
     case WM_KILLFOCUS:
@@ -58786,7 +58940,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       g_nativeUiPlaylistStepKeyHeld[0] = false;
       g_nativeUiPlaylistStepKeyHeld[1] = false;
       nativeUiReleaseMusicSelectionForArrangeEditing();
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_SYSKEYUP:
     case WM_KEYUP:
@@ -58832,7 +58986,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               nativeUiStepActivePlaylist(
                 wParam == VK_UP ? -1 : 1);
               g_nativeForceStateBuild.store(true);
-              InvalidateRect(hwnd, nullptr, FALSE);
+              nativeUiInvalidateRect(hwnd, nullptr, FALSE);
             }
           }
           return 0;
@@ -58974,7 +59128,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             NativeMainModalKind::BpmScanResults &&
           wParam == VK_SPACE) {
         nativeUiToggleBpmScanPreviewPlayback();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         return 0;
       }
       if (!g_state.directorInterfaceBlocked &&
@@ -59289,7 +59443,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
                        wParam == VK_DOWN) {
               if (g_nativeUiPlaylists.empty()) {
                 g_nativeUiTargetPlaylistIndex = -1;
-                InvalidateRect(hwnd, nullptr, FALSE);
+                nativeUiInvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
               }
               int index = g_nativeUiTargetPlaylistIndex;
@@ -59433,7 +59587,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               nativeUiCloseMainModal();
             }
           }
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (g_nativePartsRenameOpen) {
@@ -59447,7 +59601,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             nativePopLastUtf8Codepoint(g_nativePartsRenameInput);
             nativeUiRefreshTextInputNow(hwnd);
           }
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         // O painel pede todas as teclas ao host. Portanto F11 precisa ser
@@ -59463,7 +59617,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         // continua reservado exclusivamente ao transporte.
         if (nativeUiProcessPreviewKeyboardBinding(
               mappedKeyboardCode)) {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (g_nativeMainSearchFocused) {
@@ -59481,7 +59635,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               "Tab", "Busca inteligente fechada");
             nativeUiToggleSmartSearch();
             g_nativeForceStateBuild.store(true);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            nativeUiInvalidateRect(hwnd, nullptr, FALSE);
             return 0;
           }
           g_nativeMainSearchCursor = std::min(
@@ -59574,7 +59728,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           if (refreshSearchInputNow) {
             nativeUiRefreshTextInputNow(hwnd);
           } else {
-            InvalidateRect(hwnd, nullptr, FALSE);
+            nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           }
           return 0;
         }
@@ -59586,7 +59740,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               mappedKeyboardCode) ||
             nativeUiProcessMixerKeyboardBinding(
               mappedKeyboardCode)) {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         const bool commandModifier =
@@ -59611,7 +59765,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             nativeUiStepActivePlaylist(
               wParam == VK_UP ? -1 : 1);
             g_nativeForceStateBuild.store(true);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           }
           // Ctrl (Windows) ou Command (macOS) + setas pertence
           // exclusivamente ao Repertório. Nas demais abas ele é consumido
@@ -59627,28 +59781,28 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           nativeUiShowShortcutPopup(
             "Tab", "Busca inteligente aberta");
           nativeUiToggleSmartSearch();
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier && wParam == VK_F1) {
           nativeUiShowShortcutPopup(
             "F1", "Tela Repertorios aberta");
           nativeUiSetMainPageFromShortcut("playlist");
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier && wParam == VK_F2) {
           nativeUiShowShortcutPopup(
             "F2", "Tela Musicas aberta");
           nativeUiSetMainPageFromShortcut("regions");
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier && wParam == VK_F3) {
           nativeUiShowShortcutPopup(
             "F3", "Tela Mixer aberta");
           nativeUiSetMainPageFromShortcut("mixer");
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier && wParam == VK_F4) {
@@ -59664,7 +59818,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           } else {
             nativeApplyAutoCommand("{\"type\":\"autoplay1_toggle\"}");
           }
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier && wParam == VK_F5) {
@@ -59680,7 +59834,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           } else {
             nativeApplyAutoCommand("{\"type\":\"autoplay2_toggle\"}");
           }
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier &&
@@ -59691,7 +59845,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             "R", g_nativeAppActivePanelModel.loopActive
               ? "Loop desativado" : "Loop ativado");
           nativeApplyLoopCommand("{\"type\":\"loop_toggle\"}");
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier && wParam == VK_F6) {
@@ -59701,7 +59855,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               ? "BY desativado" : "BY ativado");
           nativeApplyMultiLoopCommand(
             "{\"type\":\"multiloop_bypass_toggle\"}");
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier && wParam == VK_F7) {
@@ -59712,7 +59866,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               ? "Tuner aberto" : "Tuner fechado");
           nativeSetTunerColumnVisible(
             targetVisible);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier &&
@@ -59731,7 +59885,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           }
           nativeSetPartsColumnVisible(parts2,
             targetVisible);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (!commandModifier && !altModifier && wParam == 'C') {
@@ -59741,7 +59895,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               ? "Confirmar parada do cronometro"
               : "Cronometro iniciado");
           nativeUiRequestTimerToggle(false);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         bool deletePlaylistItemsKey = wParam == VK_DELETE;
@@ -59753,7 +59907,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             !nativeUiSelectedPlaylistRowsForEdit().empty()) {
           g_nativeMainModalKind =
             NativeMainModalKind::ConfirmDeletePlaylistItems;
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (wParam == VK_SPACE) {
@@ -59761,7 +59915,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             nativeUiTransportActive();
           if (!nativePlayProtectionShouldAllow(
                 transportActive ? "stop" : "play")) {
-            InvalidateRect(hwnd, nullptr, FALSE);
+            nativeUiInvalidateRect(hwnd, nullptr, FALSE);
             return 0;
           }
           // Durante o FaderOut, o indicador proprio ja mostra inicio,
@@ -59797,7 +59951,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               *selectedRow, g_nativeAppActivePanelModel.regionsPage));
           }
           g_nativeForceStateBuild.store(true);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (wParam == VK_ESCAPE) {
@@ -59843,7 +59997,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             nativeApplyAutoCommand(
               "{\"type\":\"autoplay_set\",\"desiredState\":false}");
           }
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (wParam == VK_UP) {
@@ -59884,7 +60038,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               nativeSelectPartsNavigationTarget(false, 0);
             }
           }
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         if (wParam == VK_LEFT) {
@@ -59899,7 +60053,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
               nativeSelectPartsNavigationTarget(true, 0);
             }
           }
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
           return 0;
         }
         break;
@@ -59907,21 +60061,21 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       if (wParam == VK_RETURN) {
         if (g_nativeAppActiveControlBlockedNoticeOpen) {
           g_nativeAppActiveControlBlockedNoticeOpen = false;
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         } else {
           nativeNotifyDirectorBlockedInterfaceClick();
           g_nativeAppActiveControlBlockedNoticeOpen = true;
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
       }
       if (wParam == VK_ESCAPE) {
         if (g_nativeAppActiveControlBlockedNoticeOpen) {
           g_nativeAppActiveControlBlockedNoticeOpen = false;
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         } else if (g_nativeAppActiveResumeConfirmOpen) {
           g_nativeAppActiveResumeConfirmOpen = false;
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
       }
@@ -59955,7 +60109,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
         if (g_nativeUiTimerMode == "countdown" &&
             wParam >= '0' && wParam <= '9') {
           nativeUiSetTimerDigit(static_cast<char>(wParam));
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
       }
@@ -60203,7 +60357,7 @@ static LRESULT CALLBACK nativeShortcutNoticeWndProc(
             g_nativeShortcutNoticeSuppressChecked ? "1" : "0",
             true);
         }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       } else if (PtInRect(&g_nativeShortcutNoticeCloseRect,
             point)) {
         nativeCloseShortcutNotice();
@@ -60360,7 +60514,7 @@ static void nativeOpenShortcutNotice()
   g_nativeShortcutNoticeHwnd = hwnd;
   ShowWindow(hwnd, SW_SHOW);
   SetFocus(hwnd);
-  InvalidateRect(hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(hwnd, nullptr, FALSE);
 }
 
 static bool nativeAppActivePanelIsOpen()
@@ -60599,7 +60753,7 @@ static bool nativeOpenAppActivePanel()
   // direto do usuario ou se ele tiver ativado explicitamente suas opcoes de
   // Startup; nunca como consequencia de abrir o VS Hook pela primeira vez.
   SetFocus(hwnd);
-  InvalidateRect(hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(hwnd, nullptr, FALSE);
   // Evita empilhar duas confirmacoes na mesma abertura. Se a preferencia de
   // seeking ja estiver correta, o aviso normal de atalhos segue igual.
   if (!nativePromptEnablePartsSmoothSeek()) {
@@ -62250,7 +62404,7 @@ static void nativeTelepromptReloadSettingsAfterBackup()
     HWND hwnd =
       g_nativeTelepromptWindows[nativeTelepromptIndex(slot)].hwnd;
     if (hwnd && IsWindow(hwnd)) {
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
     }
   }
 }
@@ -62284,7 +62438,7 @@ static bool nativeTelepromptSaveSettings(
   }
   nativeTelepromptApplyTopmost(slot);
   HWND hwnd = g_nativeTelepromptWindows[index].hwnd;
-  if (hwnd && IsWindow(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
+  if (hwnd && IsWindow(hwnd)) nativeUiInvalidateRect(hwnd, nullptr, FALSE);
   return true;
 }
 
@@ -66440,7 +66594,7 @@ static void nativeTelepromptPrimeVideoDecoder(
       return;
     }
 #endif
-    InvalidateRect(hwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(hwnd, nullptr, FALSE);
     // Apresenta o frame enquanto a mensagem de callback esta no topo da
     // fila; WM_PAINT de baixa prioridade podia ficar atras do input do REAPER.
     UpdateWindow(hwnd);
@@ -66533,7 +66687,7 @@ static void nativeTelepromptToggleFullscreen(int slot)
     nativeTelepromptRememberFullscreen(
       slot, false, nullptr);
   }
-  InvalidateRect(window.hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(window.hwnd, nullptr, FALSE);
 }
 
 static POINT nativeTelepromptClientPoint(LPARAM lParam)
@@ -66741,7 +66895,7 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
       // O decoder acorda aqui e seu callback apresenta o frame diretamente;
       // nao fazemos um paint sincrono pesado em cada evento de autorepeat.
       nativeTelepromptPrimeVideoDecoder(hwnd, slot);
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
 #endif
     case WM_NCHITTEST:
@@ -66865,15 +67019,15 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
           // Isso preserva também a atualização agressiva durante edits e
           // scrolls usada pela janela principal.
           nativeTelepromptPrimeVideoDecoder(hwnd, slot);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
 #else
           // O caminho GDI do Windows já está fluido e permanece com a
           // atualização agressiva que havia sido validada nessa plataforma.
           nativeTelepromptPrimeVideoDecoder(hwnd, slot);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
 #endif
         } else {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
       }
@@ -66882,7 +67036,7 @@ static LRESULT CALLBACK nativeTelepromptWndProc(
 #ifdef __APPLE__
       VSHookMacSynchronizeTelepromptVideoWindow(hwnd);
 #endif
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_LBUTTONDBLCLK:
       window.dragging = false;
@@ -67229,7 +67383,7 @@ static bool nativeOpenTelepromptWindow(int slot)
     nativeTelepromptToggleFullscreen(slot);
   }
   SetFocus(hwnd);
-  InvalidateRect(hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(hwnd, nullptr, FALSE);
   if (RefreshToolbar2_ptr) {
     RefreshToolbar2_ptr(0,
       slot == 1 ? g_telepromptOneCommandId
@@ -67454,13 +67608,13 @@ static void nativeToggleVideoStretch()
   if (g_nativeVideoWindow.hwnd &&
       IsWindow(g_nativeVideoWindow.hwnd)) {
     g_nativeVideoPresentedSequence = 0;
-    InvalidateRect(g_nativeVideoWindow.hwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeVideoWindow.hwnd, nullptr, FALSE);
   }
   for (int index = 0; index < 2; ++index) {
     if (g_nativeTelepromptWindows[index].hwnd &&
         IsWindow(g_nativeTelepromptWindows[index].hwnd)) {
       g_nativeTelepromptPresentedVideoSequence[index] = 0;
-      InvalidateRect(
+      nativeUiInvalidateRect(
         g_nativeTelepromptWindows[index].hwnd,
         nullptr,
         FALSE);
@@ -67824,7 +67978,7 @@ static void nativeVideoPrimeDecoder(HWND hwnd)
         frame) &&
       frame.pixels &&
       frame.sequence != g_nativeVideoPresentedSequence) {
-    InvalidateRect(hwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(hwnd, nullptr, FALSE);
     UpdateWindow(hwnd);
   }
 #else
@@ -67880,7 +68034,7 @@ static void nativeVideoToggleFullscreen()
 #endif
     window.fullscreen = false;
   }
-  InvalidateRect(window.hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(window.hwnd, nullptr, FALSE);
 }
 
 static LRESULT CALLBACK nativeVideoWndProc(
@@ -67921,16 +68075,16 @@ static LRESULT CALLBACK nativeVideoWndProc(
         if (nativeLower(timerState.mediaType) == "video" &&
             !timerState.mediaPath.empty()) {
           nativeVideoPrimeDecoder(hwnd);
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         } else {
-          InvalidateRect(hwnd, nullptr, FALSE);
+          nativeUiInvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
       }
       break;
     case WM_SIZE:
       g_nativeVideoPresentedSequence = 0;
-      InvalidateRect(hwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_NCHITTEST:
 #ifdef _WIN32
@@ -68223,7 +68377,7 @@ static bool nativeOpenVideoWindow()
   if (RefreshToolbar2_ptr && g_videoWindowCommandId != 0) {
     RefreshToolbar2_ptr(0, g_videoWindowCommandId);
   }
-  InvalidateRect(hwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(hwnd, nullptr, FALSE);
   return true;
 }
 
@@ -68950,7 +69104,7 @@ static void nativeRefreshAppActivePanelModel()
       g_nativeAppActivePanelHwnd,
       nativeUiDesiredFrameInterval());
     if (structureChanged) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     } else {
       nativeUiInvalidateDynamicAreas(g_nativeAppActivePanelHwnd,
         progressChanged, timerTextChanged);
@@ -68961,7 +69115,7 @@ static void nativeRefreshAppActivePanelModel()
   // nenhuma pista mudar, anulando o timer adaptativo da Hook Controller.
   if (nativeHookControllerWindowIsOpen() &&
       g_nativeHookControllerMode != NativeHookControllerMode::Tcp) {
-    InvalidateRect(g_nativeHookControllerHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeHookControllerHwnd, nullptr, FALSE);
   }
 }
 
@@ -70829,6 +70983,62 @@ static std::string nativeBuildMultiLoopsJson(ReaProject* project)
   return cachedJson;
 }
 
+static std::string nativeBuildTCPMultiLoopRangesJson(
+  ReaProject* project, const std::vector<NativeSongWindow>& songs)
+{
+  // O estado ja foi carregado por nativeBuildMultiLoopsJson. Publica os pares
+  // habilitados sem depender do modal de Multiloops ou do Repeat estar ligado.
+  std::ostringstream out;
+  out << "[";
+  bool first = true;
+  for (const auto& song : songs) {
+    const std::string key = nativeMultiLoopSongKey(song);
+    if (key.empty()) continue;
+    const auto found = g_nativeMultiLoopStates.find(key);
+    if (found == g_nativeMultiLoopStates.end()) continue;
+    for (int slot = 0; slot < kNativeMultiLoopSlotCount; ++slot) {
+      if (!found->second.loop[slot]) continue;
+      const NativeMultiLoopPair pair = nativeFindMultiLoopPair(
+        project, key, song.start, song.end, slot);
+      if (!pair.valid) continue;
+      if (!first) out << ",";
+      first = false;
+      out << "{\"songId\":" << nativeJsonString(song.id)
+          << ",\"slot\":" << slot + 1
+          << ",\"startPos\":" << nativeNumber(pair.start)
+          << ",\"endPos\":" << nativeNumber(pair.end) << "}";
+    }
+  }
+  out << "]";
+  return out.str();
+}
+
+static void nativeReleaseLoopAfterPartsArrival(
+  ReaProject* project, double target, double playPos)
+{
+  if (!project || !nativeIsRepeatEnabled(project)) return;
+  double loopStart = 0.0;
+  double loopEnd = 0.0;
+  const bool hasRange = nativeGetLoopTimeRange(project, loopStart, loopEnd);
+  const auto inside = [&](double position) {
+    return hasRange && position >= loopStart - 0.002 &&
+      position < loopEnd - 0.0005;
+  };
+  // O Multiloops pode ja ter instalado o par do destino no timer principal.
+  // Preserva esse par, assim como um salto dentro do mesmo loop manual.
+  if (inside(target) || inside(playPos)) return;
+
+  nativeSetRepeatEnabled(project, false);
+  nativeClearLoopTimeRange(project);
+  if (g_nativeMultiLoopActivePair.valid &&
+      (playPos < g_nativeMultiLoopActivePair.start - 0.002 ||
+       playPos >= g_nativeMultiLoopActivePair.end - 0.0005)) {
+    nativeRestoreMultiLoopTracks();
+    g_nativeMultiLoopActivePair = NativeMultiLoopPair();
+  }
+  g_nativeForceStateBuild.store(true);
+}
+
 static void nativeRebuildState(bool forceSnapshot)
 {
   if (!EnumProjects_ptr) return;
@@ -71184,6 +71394,7 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::string& mixerJson = cachedMixerJson;
   const std::string& premixJson = cachedPremixJson;
   const std::string multiLoopsJson = nativeBuildMultiLoopsJson(activeProject);
+  const std::string tcpMultiLoopRangesJson = nativeBuildTCPMultiLoopRangesJson(activeProject, songs);
   const std::string manualStopFadeoutJson = nativeBuildManualStopFadeoutJson();
   nativeRefreshStopPauseModeFromExtState();
   const bool stopPauseModeEnabled = g_stopPauseModeEnabled.load();
@@ -71254,7 +71465,7 @@ static void nativeRebuildState(bool forceSnapshot)
     g_state.pcAccessOverride = false;
     g_nativeAppActiveControlBlockedNoticeOpen = false;
     if (nativeAppActivePanelIsOpen()) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
   }
   const bool directorInterfaceBlocked =
@@ -71291,6 +71502,8 @@ static void nativeRebuildState(bool forceSnapshot)
     SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_AT_SEC_V1", "0", false);
   }
 
+  bool partsArrived = false;
+  double partsArrivalTarget = 0.0;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     // FIX67: marker engatilhado precisa aparecer verde/piscando no front,
@@ -71324,6 +71537,8 @@ static void nativeRebuildState(bool forceSnapshot)
       const bool playReached = nearTarget || forwardCrossed ||
         backwardCrossed || backwardJumpReached;
       if (playReached && hasGraceElapsed) {
+        partsArrived = true;
+        partsArrivalTarget = target;
         // FIX73: ao chegar no alvo, limpa tambem a selecao amarela do marker.
         g_nativeArmedMarkerId.clear();
         g_nativeArmedMarkerLabel.clear();
@@ -71336,6 +71551,11 @@ static void nativeRebuildState(bool forceSnapshot)
         g_nativeArmedMarkerLastPlayPos = playPos;
       }
     }
+  }
+
+  if (partsArrived) {
+    // REAPER/track APIs run outside the bridge mutex.
+    nativeReleaseLoopAfterPartsArrival(activeProject, partsArrivalTarget, playPos);
   }
 
   std::string queuedSongId;
@@ -72046,6 +72266,7 @@ static void nativeRebuildState(bool forceSnapshot)
   json << ",\"mixerTimelineRevision\":" << g_nativeMixerTimelineRevision.load();
   json << ",\"premix\":" << premixJson;
   json << ",\"multiloops\":" << multiLoopsJson;
+  json << ",\"tcpMultiLoopRanges\":" << tcpMultiLoopRangesJson;
   json << "}";
 
   {
@@ -72069,6 +72290,63 @@ static void nativeRebuildState(bool forceSnapshot)
 }
 
 
+static std::atomic<int64_t> g_nativeLastStateClientReadMs{0};
+
+static bool nativeBridgeStateClientActive()
+{
+  const int64_t last = g_nativeLastStateClientReadMs.load();
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+  return last != 0 && now >= last && now - last < 12000;
+}
+
+static void nativeBridgeNoteStateClient()
+{
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+  const int64_t previous = g_nativeLastStateClientReadMs.exchange(now);
+  if (previous == 0 || now - previous >= 12000) {
+    g_nativeForceStateBuild.store(true);
+  }
+}
+
+static int nativeBridgeStateIntervalMs()
+{
+  // Project Sync sem par mantém descoberta/recepção ativas, mas não precisa
+  // serializar o estado completo a cada 220 ms quando ninguém o está usando.
+  // Transporte, comandos forçados, janelas e conexões retomam o ritmo normal.
+  if (getTimecodeMode() != "project_sync" ||
+      !getParallelTimecodeMode().empty() ||
+      nativeAppActivePanelIsOpen() ||
+      nativeHookControllerWindowIsOpen() ||
+      nativeTelepromptWindowIsOpen(1) ||
+      nativeTelepromptWindowIsOpen(2) ||
+      nativeVideoWindowIsOpen() ||
+      nativeBigClockWindowIsOpen(0) ||
+      nativeBigClockWindowIsOpen(1) ||
+      nativeIsDirectorControlActive() ||
+      nativeBridgeStateClientActive()) return kNativeBridgeLiveIntervalMs;
+  ReaProject* project = getCurrentProject(nullptr, 0);
+  if (!project || !GetPlayStateEx_ptr ||
+      GetPlayStateEx_ptr(project) != 0) return kNativeBridgeLiveIntervalMs;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
+    if (g_nativeTimecodeLanPeerConnected) return kNativeBridgeLiveIntervalMs;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (g_nativeTimerRunning) return kNativeBridgeLiveIntervalMs;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_nativeManualStopFadeoutMutex);
+    if (g_nativeManualStopFadeoutRuntime.active ||
+        g_nativeManualStopFadeoutRuntime.restorePending) {
+      return kNativeBridgeLiveIntervalMs;
+    }
+  }
+  return 1000;
+}
+
 static void nativeBridgeTick()
 {
   // A selecao e o scroll das setas sao inteiramente locais durante o
@@ -72081,7 +72359,7 @@ static void nativeBridgeTick()
   const bool forceLive = g_nativeForceStateBuild.exchange(false);
   const bool forceSnapshot = g_nativeForceSnapshotBuild.exchange(false);
   const bool liveDue = forceLive || forceSnapshot || g_nativeLastLiveBuild.time_since_epoch().count() == 0 ||
-    std::chrono::duration_cast<std::chrono::milliseconds>(now - g_nativeLastLiveBuild).count() >= kNativeBridgeLiveIntervalMs;
+    std::chrono::duration_cast<std::chrono::milliseconds>(now - g_nativeLastLiveBuild).count() >= nativeBridgeStateIntervalMs();
   if (!liveDue) return;
   g_nativeLastLiveBuild = now;
   nativeRebuildState(forceSnapshot);
@@ -72113,6 +72391,7 @@ static bool VS_Hook_Native_GetState(char* buf, int bufSize)
   if (!buf || bufSize <= 0) return false;
   buf[0] = '\0';
   if (g_nativeExtensionBypassActive.load()) return false;
+  nativeBridgeNoteStateClient();
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   const std::string state = g_nativeStateJson.empty() ? std::string("{\"ok\":false,\"connected\":false}") : g_nativeStateJson;
   std::strncpy(buf, state.c_str(), static_cast<size_t>(bufSize - 1));
@@ -78110,7 +78389,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     g_nativeAppActiveResumeConfirmOpen = false;
     g_nativeAppActiveControlBlockedNoticeOpen = false;
     if (nativeAppActivePanelIsOpen()) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
     handledAccessControlCommand = true;
   } else if (commandType ==
@@ -78131,7 +78410,7 @@ static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
     g_nativeAppActiveResumeConfirmOpen = false;
     g_nativeAppActiveControlBlockedNoticeOpen = false;
     if (nativeAppActivePanelIsOpen()) {
-      InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+      nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
     }
     if (SetExtState_ptr) {
       SetExtState_ptr(kNativeExtStateSection, "DIRECTOR_ACTIVE_V1", "0", false);
@@ -78216,6 +78495,9 @@ static void nativeHandleClient(native_socket_t client)
   } else if (path == "/media" || path == "/tp-media" || path == "/teleprompt-media") {
     body = nativeBuildTpMediaResponse(req);
   } else if (path == "/state" || path == "/state.json" || path == "/snapshot" || path == "/projects" || path == "/projects.json") {
+    // Leitores da Hook Center/músicos também contam, mesmo sem heartbeat de
+    // Diretor e com todas as janelas locais fechadas.
+    nativeBridgeNoteStateClient();
     std::string snapshot;
     {
       std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -78225,6 +78507,7 @@ static void nativeHandleClient(native_socket_t client)
     }
     body = nativeHttpResponse(200, snapshot);
   } else if (path == "/mixer-timeline" || path == "/mixer-timeline.json") {
+    nativeBridgeNoteStateClient();
     std::string timeline;
     {
       std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -78233,6 +78516,7 @@ static void nativeHandleClient(native_socket_t client)
     body = nativeHttpResponse(200, timeline);
   } else if (path == "/mixer-timeline-cache" ||
              path == "/mixer-timeline-cache.json") {
+    nativeBridgeNoteStateClient();
     std::string catalog;
     {
       std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -78405,6 +78689,7 @@ static void nativeHandleClient(native_socket_t client)
       }
     }
   } else if (path == "/command" && nativeRequestIsPost(req)) {
+    nativeBridgeNoteStateClient();
     const std::string commandBody = nativeTrim(nativeRequestBody(req));
     const bool queued = nativeQueueHttpCommand(commandBody);
     body = queued
@@ -78433,6 +78718,33 @@ static void nativeHandleClient(native_socket_t client)
     body = nativeHttpResponse(404, "{\"ok\":false,\"error\":\"not_found\"}");
   }
   nativeSendAll(client, body.data(), body.size());
+}
+
+static int nativeWaitForBridgeConnection(native_socket_t serverSocket)
+{
+#ifdef _WIN32
+  // Winsock usa uma lista de SOCKETs, não um bitmap indexado pelo descritor.
+  fd_set readSet;
+  FD_ZERO(&readSet);
+  FD_SET(serverSocket, &readSet);
+  timeval timeout{};
+  timeout.tv_usec = 200000;
+  const int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+  if (ready <= 0) return ready;
+  return FD_ISSET(serverSocket, &readSet) ? 1 : 0;
+#else
+  // Projetos grandes podem abrir mais de FD_SETSIZE arquivos. FD_SET nesse
+  // caso estoura o bitmap e select passa a falhar sem esperar, ocupando um
+  // núcleo e impedindo o app de conectar. poll não tem esse limite de índice.
+  pollfd descriptor{};
+  descriptor.fd = serverSocket;
+  descriptor.events = POLLIN;
+  const int ready = poll(&descriptor, 1, 200);
+  if (ready < 0) return errno == EINTR ? 0 : -1;
+  if (ready == 0) return 0;
+  if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+  return (descriptor.revents & POLLIN) ? 1 : 0;
+#endif
 }
 
 static void nativeBridgeServerThread()
@@ -78500,19 +78812,10 @@ static void nativeBridgeServerThread()
   }
 
   while (g_nativeRunning.load()) {
-    fd_set readSet;
-    FD_ZERO(&readSet);
-    FD_SET(serverSocket, &readSet);
-    timeval selectTimeout{};
-    selectTimeout.tv_sec = 0;
-    selectTimeout.tv_usec = 200000;
-#ifdef _WIN32
-    const int ready = select(0, &readSet, nullptr, nullptr, &selectTimeout);
-#else
-    const int ready = select(serverSocket + 1, &readSet, nullptr, nullptr, &selectTimeout);
-#endif
+    const int ready = nativeWaitForBridgeConnection(serverSocket);
     if (!g_nativeRunning.load()) break;
-    if (ready <= 0 || !FD_ISSET(serverSocket, &readSet)) continue;
+    if (ready < 0) break; // Fecha/reabre a ponte em vez de girar sobre um erro.
+    if (ready == 0) continue;
 
     sockaddr_in clientAddr{};
 #ifdef _WIN32
@@ -78670,7 +78973,7 @@ static void nativePollAppActiveMouseClick()
 
   nativeNotifyDirectorBlockedInterfaceClick();
   g_nativeAppActiveControlBlockedNoticeOpen = true;
-  InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+  nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
 }
 #endif
 
@@ -79219,7 +79522,7 @@ static void nativeUiResetForProjectTabChange()
 
   if (g_nativeAppActivePanelHwnd &&
       IsWindow(g_nativeAppActivePanelHwnd)) {
-    InvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
+    nativeUiInvalidateRect(g_nativeAppActivePanelHwnd, nullptr, FALSE);
   }
 }
 

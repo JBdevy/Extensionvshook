@@ -69,6 +69,12 @@ if(APPLE)
 endif()
 
 if(VSHOOK_BUILD_TESTS)
+  if(APPLE)
+    add_executable(vshook_ui_damage_mac_test tests/native_ui_damage_mac_test.cpp)
+    target_compile_options(vshook_ui_damage_mac_test PRIVATE -UNDEBUG)
+    target_link_libraries(vshook_ui_damage_mac_test PRIVATE
+      "-framework CoreGraphics" "-framework CoreFoundation")
+  endif()
   add_executable(vshook_mtc_timecode_test tests/native_mtc_timecode_test.cpp)
   target_include_directories(vshook_mtc_timecode_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -136,6 +142,8 @@ if(VSHOOK_BUILD_TESTS)
       target_link_libraries(vshook_video_decoder_smoke_test PRIVATE
         "-framework Accelerate"
         "-framework AVFoundation"
+        "-framework Foundation"
+        "-framework CoreFoundation"
         "-framework CoreGraphics"
         "-framework CoreMedia"
         "-framework CoreVideo"
