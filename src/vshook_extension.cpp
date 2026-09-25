@@ -38202,8 +38202,9 @@ static void nativePaintAppActivePanel(HWND hwnd)
             rowFill, modeBorder, 0.72);
           // Clip to the visible list; offscreen block edges must not damage controls.
           const RECT edge{rowRect.left + indexColumnW,
-            std::max(rowRect.top, listInnerTop), rowRect.right,
-            std::min(rowRect.bottom, listInnerBottom)};
+            std::max(rowRect.top, static_cast<LONG>(listInnerTop)),
+            rowRect.right,
+            std::min(rowRect.bottom, static_cast<LONG>(listInnerBottom))};
           NativeUiDamage::outline(g_nativeUiRgbDamageRects,
             nativeUiCustomizePaintRect(edge, false), 2);
         }
