@@ -46,6 +46,25 @@ O workflow do macOS compila separadamente `x86_64` para macOS 10.13+ e
 
 Consulte `THIRD_PARTY_NOTICES.md` para os componentes de terceiros.
 
+## Itens do Premix
+
+O Premix inclui os itens cujo início está dentro da música, incluindo regiões
+filhas: início da música inclusivo, fim exclusivo. Um áudio que começou antes
+não pertence ao Premix dessa música. O grid do Mixer continua mostrando os
+trechos sobrepostos, pois representa o que existe naquele intervalo.
+
+Filhos de markers enviados pelo app como `m12` são resolvidos apenas para o
+marker correspondente, sem confundir uma região com o mesmo número. O snapshot
+confirma esse identificador em `selectedSongId` e informa o identificador nativo
+em `selectedCanonicalSongId`, mantendo compatibilidade com os apps existentes.
+
+Teste de regressão:
+
+```text
+node tests/run-premix-selection-test.js
+node tests/run-premix-item-scope-test.js
+```
+
 ## Consumo em repouso
 
 A seleção de pistas do fadeout é resolvida em uma passagem pelo projeto,

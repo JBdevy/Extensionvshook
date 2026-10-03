@@ -32401,7 +32401,6 @@ static void nativeUiAppendPremixItems(
       !GetMediaItemInfo_Value_ptr) {
     return;
   }
-  const double epsilon = 0.001;
   int visualIndex = 0;
   const int trackCount = CountTracks_ptr(project);
   for (int trackIndex = 0; trackIndex < trackCount; ++trackIndex) {
@@ -32418,18 +32417,9 @@ static void nativeUiAppendPremixItems(
       if (!item) continue;
       const double itemStart =
         GetMediaItemInfo_Value_ptr(item, "D_POSITION");
-      const double itemLength = std::max(0.0,
-        GetMediaItemInfo_Value_ptr(item, "D_LENGTH"));
-      const double itemEnd = itemStart + itemLength;
-      if (song.isRegionChild) {
-        if (itemEnd <= song.start + epsilon ||
-            itemStart >= song.end - epsilon) {
-          continue;
-        }
-      } else if (itemStart < song.start - epsilon ||
-                 itemStart >= song.end - epsilon) {
-        continue;
-      }
+      // No Premix a música é dona somente dos itens que começam nela,
+      // inclusive quando ela é uma região-filho.
+      if (itemStart < song.start || itemStart >= song.end) continue;
       ++visualIndex;
       NativeUiPremixItemRow row;
       row.kind = NativeUiPremixRowKind::Item;
@@ -69610,6 +69600,32 @@ static bool nativePremixGlobalEnabled()
   return raw && std::strcmp(raw, "1") == 0;
 }
 
+static bool nativePremixSongIdMatches(
+  const NativeSongWindow& song, const std::string& requestedId)
+{
+  if (song.id == requestedId) return true;
+  // A gaveta do app identifica filhos de markers como m12. Regiões e
+  // markers têm numeração independente: esse alias só pode resolver um
+  // filho de marker, nunca uma região que também tenha o número 12.
+  if (!song.isHashChild || song.isRegionChild || requestedId.size() < 2 ||
+      requestedId.front() != 'm') return false;
+  const std::string markerId = requestedId.substr(1);
+  if (!std::all_of(markerId.begin(), markerId.end(),
+        [](char ch) { return ch >= '0' && ch <= '9'; })) return false;
+  return song.id == markerId || std::to_string(song.sourceNumber) == markerId;
+}
+
+static std::string nativePremixSelectedSongRequestId(const NativeSongWindow* song)
+{
+  if (!song) return std::string();
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  // Confirma o identificador que o app pediu somente quando ele corresponde
+  // à música resolvida. Assim clientes existentes saem do estado de loading.
+  return !g_nativePremixSelectedSongId.empty() &&
+    nativePremixSongIdMatches(*song, g_nativePremixSelectedSongId)
+      ? g_nativePremixSelectedSongId : song->id;
+}
+
 static const NativeSongWindow* nativeFindPremixSelectedSong(const std::vector<NativeSongWindow>& songs)
 {
   std::string explicitPremixId;
@@ -69625,7 +69641,7 @@ static const NativeSongWindow* nativeFindPremixSelectedSong(const std::vector<Na
   if (!explicitPremixId.empty()) {
     const NativeSongWindow* fallback = nullptr;
     for (const auto& song : songs) {
-      if (song.isBlock || song.id != explicitPremixId) continue;
+      if (song.isBlock || !nativePremixSongIdMatches(song, explicitPremixId)) continue;
       if (!fallback) fallback = &song;
       if (explicitEnd > explicitStart + 0.0005 &&
           std::fabs(song.start - explicitStart) <= 0.001 &&
@@ -69760,7 +69776,9 @@ static double nativePremixRatioToVolume(double ratio)
   return std::pow(10.0, db / 20.0);
 }
 
-static std::string nativeBuildPremixItemRowsJson(ReaProject* project, const NativeSongWindow* song)
+static std::string nativeBuildPremixItemRowsJson(
+  ReaProject* project, const NativeSongWindow* song,
+  bool includeOverlappingItems = false)
 {
   std::ostringstream oss;
   oss << "[";
@@ -69788,11 +69806,11 @@ static std::string nativeBuildPremixItemRowsJson(ReaProject* project, const Nati
       const double itemStart = GetMediaItemInfo_Value_ptr(item, "D_POSITION");
       const double itemLength = std::max(0.0, GetMediaItemInfo_Value_ptr(item, "D_LENGTH"));
       const double itemEnd = itemStart + itemLength;
-      if (song && song->isRegionChild) {
-        // Stems do pai atravessam as regiões-filho. Na lane 2, o Premix usa
-        // sobreposição; nas músicas normais continua usando o ponto inicial.
+      if (song && includeOverlappingItems) {
+        // O grid do Mixer mostra também trechos audíveis de itens anteriores.
+        // O Premix, por padrão, mantém apenas os que começam na música.
         if (itemEnd <= song->start + eps || itemStart >= song->end - eps) continue;
-      } else if (song && (itemStart < song->start - eps || itemStart >= song->end - eps)) {
+      } else if (song && (itemStart < song->start || itemStart >= song->end)) {
         continue;
       }
       const double volume = nativePremixMediaItemVolume(item);
@@ -70107,7 +70125,8 @@ static std::string nativeBuildPremixJson(ReaProject* project, const std::vector<
   std::ostringstream oss;
   oss << "{";
   oss << "\"available\":true,\"enabled\":true,\"mode\":\"native\",";
-  oss << "\"selectedSongId\":" << nativeJsonString(selected ? selected->id : "") << ",";
+  oss << "\"selectedSongId\":" << nativeJsonString(nativePremixSelectedSongRequestId(selected)) << ",";
+  oss << "\"selectedCanonicalSongId\":" << nativeJsonString(selected ? selected->id : "") << ",";
   oss << "\"selectedSongName\":" << nativeJsonString(selected ? selected->name : "") << ",";
   oss << "\"selectedSongStart\":" << nativeNumber(selected ? selected->start : 0.0) << ",";
   oss << "\"selectedSongEnd\":" << nativeNumber(selected ? selected->end : 0.0) << ",";
@@ -71326,11 +71345,9 @@ static void nativeRebuildState(bool forceSnapshot, bool allowRuntimeControl)
     std::string timelineItems = "[]";
     if (mixerTimelineSong) {
       // O Mixer remoto mostra somente a região selecionada/em reprodução.
-      // Força a regra de sobreposição para incluir também stems que começaram
+      // Pede a regra de sobreposição para incluir também stems que começaram
       // antes da região e continuam tocando dentro dela.
-      NativeSongWindow timelineScope = *mixerTimelineSong;
-      timelineScope.isRegionChild = true;
-      timelineItems = nativeBuildPremixItemRowsJson(activeProject, &timelineScope);
+      timelineItems = nativeBuildPremixItemRowsJson(activeProject, mixerTimelineSong, true);
     }
     cachedMixerTimelineProject = activeProject;
     cachedMixerTimelineChangeCount = projectChangeCount;
