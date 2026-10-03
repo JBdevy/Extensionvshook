@@ -10217,7 +10217,8 @@ static void nativeNotifyProjectPlaylistSwitchBlocked()
 // Mantem a descoberta do App disponivel sem acordar o motor completo.
 // Este snapshot nao percorre tracks, markers, regioes, Parts, Premix ou Mixer;
 // apenas enumera as abas de projeto e publica a autenticacao necessaria para a
-// tela de entrada do Diretor. O heartbeat do app ativa o snapshot completo.
+// tela de entrada do Diretor. Um leitor do app ativa o snapshot completo;
+// somente uma sessão de controle ativa também as automações de transporte.
 static std::string nativeTelepromptProjectMediaDirectory(
   ReaProject* project);
 
@@ -71040,7 +71041,7 @@ static void nativeReleaseLoopAfterPartsArrival(
   g_nativeForceStateBuild.store(true);
 }
 
-static void nativeRebuildState(bool forceSnapshot)
+static void nativeRebuildState(bool forceSnapshot, bool allowRuntimeControl)
 {
   if (!EnumProjects_ptr) return;
   const bool forceMixerRefresh =
@@ -71163,7 +71164,7 @@ static void nativeRebuildState(bool forceSnapshot)
     cachedSnapshotChangeCount = projectChangeCount;
     cachedTempoMarkerBpmSignature = currentTempoMarkerBpmSignature;
     cachedSongs = nativeCollectProjectSongs(activeProject, cachedMarkersJson);
-    nativeProcessTunerCommands(activeProject, cachedSongs);
+    if (allowRuntimeControl) nativeProcessTunerCommands(activeProject, cachedSongs);
     const auto tunerOffsets = nativeLoadTunerOffsets(activeProject);
     const auto bpmResults = nativeLoadBpmScanCache(activeProject);
     const NativeTempoMarkerBpmValues& bpmTempoMarkers =
@@ -71214,13 +71215,16 @@ static void nativeRebuildState(bool forceSnapshot)
   double songStart = 0.0;
   double songEnd = 0.0;
   std::string playingId =
-    nativeFindPlayingIdWithPendingTarget(
-      activeProject, songs, playing, playPos,
-      playingName, songStart, songEnd);
+    allowRuntimeControl
+      ? nativeFindPlayingIdWithPendingTarget(
+          activeProject, songs, playing, playPos,
+          playingName, songStart, songEnd)
+      : (playing ? nativeFindPlayingId(
+          songs, playPos, playingName, songStart, songEnd) : std::string());
 
   // Musicas-filho agora sao regioes reais da ruler lane 2 e ja fazem parte de
   // `songs`. Nao existe mais motivo para revarrer markers durante a reproducao.
-  nativeUpdateLiveMarkTracker(playing, paused, playingId);
+  if (allowRuntimeControl) nativeUpdateLiveMarkTracker(playing, paused, playingId);
   nativeApplyLiveExecutedFlags(songs);
   const double duration = std::max(0.0, songEnd - songStart);
   const double elapsed = playingId.empty() ? 0.0 : std::max(0.0, std::min(duration, playPos - songStart));
@@ -71240,20 +71244,24 @@ static void nativeRebuildState(bool forceSnapshot)
       (!g_nativeQueuedSongId.empty() && g_nativeQueuedEnd > g_nativeQueuedStart + 0.0005) ||
       (!g_nativeAutoBlocoTargetSongId.empty() && g_nativeAutoBlocoTargetEnd > g_nativeAutoBlocoTargetStart + 0.0005);
   }
-  if (!playing && wasPlayingBeforeNativeState && !suppressStoppedTransitionPrepare && hasStoppedTransitionQueueTarget) {
+  if (allowRuntimeControl && !playing && wasPlayingBeforeNativeState && !suppressStoppedTransitionPrepare && hasStoppedTransitionQueueTarget) {
     nativePrepareStopSelectionFromQueueOrCurrent(activeProject, true);
   }
 
   const std::string previousPlayingId = g_nativeCurrentPlayingId;
-  g_nativeCurrentTransportPlaying = playing;
-  g_nativeCurrentPlayingId = playingId;
-  g_nativeCurrentSongStart = songStart;
-  g_nativeCurrentSongEnd = songEnd;
-  g_nativeCurrentPlayPosition = playPos;
-  g_nativeUiPanelModelSourceDirty.store(
-    true, std::memory_order_release);
+  if (allowRuntimeControl) {
+    // Observation must not consume playback transitions that the next real
+    // Director/local session still needs for Premix, tuner and stop handling.
+    g_nativeCurrentTransportPlaying = playing;
+    g_nativeCurrentPlayingId = playingId;
+    g_nativeCurrentSongStart = songStart;
+    g_nativeCurrentSongEnd = songEnd;
+    g_nativeCurrentPlayPosition = playPos;
+    g_nativeUiPanelModelSourceDirty.store(
+      true, std::memory_order_release);
+  }
 
-  if (playing && !playingId.empty() && playingId != previousPlayingId) {
+  if (allowRuntimeControl && playing && !playingId.empty() && playingId != previousPlayingId) {
     const NativeSongWindow* premixSong = nullptr;
     for (const auto& song : songs) {
       if (!song.isBlock && !song.isHashParent && song.id == playingId) { premixSong = &song; break; }
@@ -71271,7 +71279,7 @@ static void nativeRebuildState(bool forceSnapshot)
     }
     g_nativeForceStateBuild.store(true);
   }
-  nativeProcessTunerRetry(activeProject, playing, playingId);
+  if (allowRuntimeControl) nativeProcessTunerRetry(activeProject, playing, playingId);
 
   if (rebuildSnapshot) {
     cachedSongs = songs;
@@ -71385,11 +71393,11 @@ static void nativeRebuildState(bool forceSnapshot)
   const std::vector<NativeSongWindow>& activePlaylistItems = cachedActivePlaylistItems;
   const double activePlaylistTotalSec = cachedActivePlaylistTotalSec;
   const std::string& playlistsJson = cachedPlaylistsJson;
-  const bool queueSeekPerformed = nativeMaintainQueueAutomation(
+  const bool queueSeekPerformed = allowRuntimeControl && nativeMaintainQueueAutomation(
     activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems, songs);
   // O snapshot deste ciclo ainda descreve a música anterior. Se a fila acabou
   // de transferir o playback, o AutoStop só pode avaliar novamente no próximo ciclo.
-  if (!queueSeekPerformed) {
+  if (allowRuntimeControl && !queueSeekPerformed) {
     nativeMaintainAutoStop(activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems, songs);
   }
   const std::string& mixerJson = cachedMixerJson;
@@ -71510,7 +71518,7 @@ static void nativeRebuildState(bool forceSnapshot)
     // FIX67: marker engatilhado precisa aparecer verde/piscando no front,
     // mas deve limpar quando o seek realmente chegou no alvo. Mantem um hold curto
     // para o Diretor receber ao menos um snapshot com markerGoId ativo.
-    if (!g_nativeArmedMarkerId.empty() && g_nativeSelectedMarkerPos >= 0.0) {
+    if (allowRuntimeControl && !g_nativeArmedMarkerId.empty() && g_nativeSelectedMarkerPos >= 0.0) {
       // FIX68: nao usa o cursor de edicao para limpar o pisca verde.
       // O comando marker_go move o cursor de edicao imediatamente, mas o visual
       // do Diretor deve continuar piscando ate o cursor de reproducao chegar no alvo.
@@ -71554,7 +71562,7 @@ static void nativeRebuildState(bool forceSnapshot)
     }
   }
 
-  if (partsArrived) {
+  if (allowRuntimeControl && partsArrived) {
     // REAPER/track APIs run outside the bridge mutex.
     nativeReleaseLoopAfterPartsArrival(activeProject, partsArrivalTarget, playPos);
   }
@@ -71617,8 +71625,10 @@ static void nativeRebuildState(bool forceSnapshot)
     previewModeForState =
       g_nativePreviewMode >= 1 && g_nativePreviewMode <= 6
         ? g_nativePreviewMode : 0;
-    nativeTimerObservePlaybackLocked(
-      activeProject, playing, paused, playingId);
+    if (allowRuntimeControl) {
+      nativeTimerObservePlaybackLocked(
+        activeProject, playing, paused, playingId);
+    }
     timerRunning = g_nativeTimerRunning;
     timerInitAutoEnabled = g_nativeTimerInitAutoEnabled;
     timerMode = g_nativeTimerMode;
@@ -71786,6 +71796,8 @@ static void nativeRebuildState(bool forceSnapshot)
   json << "\"nativeBridge\":true,";
   json << "\"bridgeVersion\":2,";
   json << "\"extensionVersion\":" << nativeJsonString(VSHOOK_EXTENSION_VERSION) << ",";
+  json << "\"standby\":false,";
+  json << "\"runtimeControlActive\":" << (allowRuntimeControl ? "true" : "false") << ",";
   json << "\"batteryPresent\":"
        << (g_nativeUiBatteryPresent ? "true" : "false") << ",";
   json << "\"batteryPercent\":" << g_nativeUiBatteryPercent << ",";
@@ -72348,7 +72360,7 @@ static int nativeBridgeStateIntervalMs()
   return 1000;
 }
 
-static void nativeBridgeTick()
+static void nativeBridgeTick(bool allowRuntimeControl = true)
 {
   // A selecao e o scroll das setas sao inteiramente locais durante o
   // autorepeat. Reconstruir o estado completo aqui varre TP1/TP2, mixer e o
@@ -72363,7 +72375,9 @@ static void nativeBridgeTick()
     std::chrono::duration_cast<std::chrono::milliseconds>(now - g_nativeLastLiveBuild).count() >= nativeBridgeStateIntervalMs();
   if (!liveDue) return;
   g_nativeLastLiveBuild = now;
-  nativeRebuildState(forceSnapshot);
+  // A passive state reader needs the same repertoire/status payload, but it
+  // must not enable queue, loop, tuner, Premix or transport automation.
+  nativeRebuildState(forceSnapshot, allowRuntimeControl);
 }
 
 static bool VS_Hook_Native_SetActivePlaylist(const char* playlistName)
@@ -78497,8 +78511,11 @@ static void nativeHandleClient(native_socket_t client)
     body = nativeBuildTpMediaResponse(req);
   } else if (path == "/state" || path == "/state.json" || path == "/snapshot" || path == "/projects" || path == "/projects.json") {
     // Leitores da Hook Center/músicos também contam, mesmo sem heartbeat de
-    // Diretor e com todas as janelas locais fechadas.
-    nativeBridgeNoteStateClient();
+    // Diretor e com todas as janelas locais fechadas. O poll de descoberta da
+    // Hook Center não é um leitor: sem celular ele mantém o motor em repouso.
+    if (nativeQueryParam(nativeRequestTarget(req), "discovery") != "1") {
+      nativeBridgeNoteStateClient();
+    }
     std::string snapshot;
     {
       std::lock_guard<std::mutex> lock(g_nativeMutex);
@@ -79594,10 +79611,10 @@ static void startupTimer()
     startNativeBridgeServer();
   }
 
-  // A leitura do heartbeat do Diretor e a unica verificacao permanente. Sem
-  // App Diretor ativo, nenhum atalho, transporte, loop, fila ou varredura
-  // pesada do projeto e executado pela extensao. A descoberta leve de abas
-  // fica ativa.
+  // Leitores passivos podem receber o snapshot completo sem adquirir controle.
+  // Atalhos, transporte, loops e fila continuam condicionados ao Diretor,
+  // às janelas locais ou ao modo de sincronização. Sem leitores nem controle,
+  // a descoberta leve de abas continua ativa.
   nativePollAppActiveEnterKey();
   nativeUiProcessMidiCapture();
   nativeUiProcessBoundMidiTriggers();
@@ -79639,6 +79656,7 @@ static void startupTimer()
   // ReaPitch deve ser consumido mesmo sem Diretor/Teleprompt em execução.
   nativeProcessEnsureReaPitchRequestOnMainThread();
   const bool runtimeActive = nativeIsRuntimeControlActive();
+  const bool stateClientActive = nativeBridgeStateClientActive();
   if (runtimeActive) {
     const bool runtimeJustActivated = !g_nativeRuntimeWasActive;
     standbyDiscoveryPublished = false;
@@ -79672,14 +79690,19 @@ static void startupTimer()
     g_nativeRuntimeWasActive = false;
     nativeReleaseRuntimeControlOnMainThread();
   }
+  if (!runtimeActive && stateClientActive) {
+    // GET /state is observation, not a Director session. Publish the full
+    // snapshot independently of the control engine and its access policy.
+    standbyDiscoveryPublished = false;
+    nativeBridgeTick(false);
+  }
   ++g_state.startupTimerTicks;
 
   nativeLoadFamilyDrawersForCurrentProject(projectSignature);
 
-  // Publica o projeto mesmo antes do painel abrir. Enumera somente as
-  // abas do REAPER e os dados de login; a lista completa e os controles seguem
-  // dormindo ate o Diretor ou um Lua enviar heartbeat.
-  if (!runtimeActive && g_state.projectStableTicks >= 1 &&
+  // Sem leitores nem controle, publica somente abas e dados de login. Uma
+  // consulta de descoberta da Hook Center não acorda a varredura completa.
+  if (!runtimeActive && !stateClientActive && g_state.projectStableTicks >= 1 &&
       (!standbyDiscoveryPublished || standbyDiscoveryProjectSignature != projectSignature)) {
     nativePublishStandbyDiscoveryState();
     standbyDiscoveryProjectSignature = projectSignature;

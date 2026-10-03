@@ -70,7 +70,7 @@ static int g_nativeUiHeldNavigationKey = 0, builds = 0;
 static bool lastForcedSnapshot = false;
 static std::atomic<bool> g_nativeForceStateBuild{false}, g_nativeForceSnapshotBuild{false};
 static std::chrono::steady_clock::time_point g_nativeLastLiveBuild;
-static void nativeRebuildState(bool force) { ++builds; lastForcedSnapshot = force; }
+static void nativeRebuildState(bool force, bool) { ++builds; lastForcedSnapshot = force; }
 
 #include "idle-work-under-test.h"
 

@@ -87,12 +87,23 @@ Command Prompt do Visual Studio no Windows:
 node tests/run-idle-work-test.js
 node tests/run-json-string-cache-test.js
 node tests/run-director-heartbeat-paint-test.js
+node tests/run-passive-state-test.js
 ```
 
 O teste executa as funções extraídas do código de produção, compara a seleção
 com o comportamento anterior e verifica a retomada por clientes remotos com
 as janelas fechadas. Reduções de CPU/bateria devem ser medidas novamente no
 REAPER após carregar o novo binário.
+
+O app Músico também recebe regiões, repertórios e status quando todas as
+janelas do VS Hook estão fechadas e não há Diretor conectado. A consulta
+`GET /state` mantém esse leitor ativo por 12 segundos, sem ativar fila,
+AutoStop, Multiloops, Premix, afinador ou auto-início do cronômetro. A entrada
+posterior do Diretor força um snapshot novo antes de retomar essas funções.
+O poll de descoberta da Hook Center usa `GET /state?discovery=1`: recebe o
+cache existente sem manter um leitor ativo. Sem app, a descoberta não passa a
+reconstruir o estado completo. O teste passivo executa o guard real do timer
+e os trechos de efeitos do snapshot, incluindo desconexão e reconexão.
 
 O status do Project Sync reutiliza a serialização JSON do manifesto e do plano
 de diferenças enquanto o conteúdo permanece idêntico. O cache guarda somente
