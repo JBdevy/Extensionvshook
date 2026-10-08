@@ -82,6 +82,7 @@ MUTATION_PROBE(nativeTimerObservePlaybackLocked)
 #undef MUTATION_PROBE
 static void nativePrepareStopSelectionFromQueueOrCurrent(ReaProject*, bool) { ++mutationCalls; ++stopPrepares; }
 static int nativeTunerValueForSong(ReaProject*, const NativeSongWindow&) { return 0; }
+static bool nativeHasUnconfirmedPlayTarget(ReaProject*) { return false; }
 static void snapshotPlaybackEffects(bool allowRuntimeControl, bool playing) {
   auto* activeProject = &project;
   std::vector<NativeSongWindow> songs(1), cachedSongs(1), activePlaylistItems(1);

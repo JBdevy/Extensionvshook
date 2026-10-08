@@ -9074,6 +9074,7 @@ static std::string g_nativeQueuedSeekSignature;
 static std::string g_nativeQueuedTunerSignature;
 static std::string g_nativeLastAutoQueueForPlayingId;
 static std::string g_nativeAutoStopLastStoppedSignature;
+static ReaProject* g_nativeAutoStopLastPlayingProject = nullptr;
 static std::string g_nativeAutoStopLastPlayingId;
 static double g_nativeAutoStopLastPlayingStart = 0.0;
 static double g_nativeAutoStopLastPlayingEnd = 0.0;
@@ -14980,11 +14981,30 @@ static std::string nativeFindPlayingId(const std::vector<NativeSongWindow>& song
   return id;
 }
 
+static void nativeResetAutoStopPlaybackLocked()
+{
+  g_nativeAutoStopLastPlayingProject = nullptr;
+  g_nativeAutoStopLastPlayingId.clear();
+  g_nativeAutoStopLastPlayingStart = 0.0;
+  g_nativeAutoStopLastPlayingEnd = 0.0;
+  g_nativeAutoStopLastStoppedSignature.clear();
+}
+
+static bool nativeHasUnconfirmedPlayTarget(ReaProject* project)
+{
+  std::lock_guard<std::mutex> lock(g_nativeMutex);
+  return g_nativePendingPlayTarget.active &&
+    g_nativePendingPlayTarget.project == project &&
+    std::chrono::steady_clock::now() - g_nativePendingPlayTarget.requestedAt <=
+      std::chrono::milliseconds(500);
+}
+
 static void nativeClearPendingPlayTarget()
 {
   std::lock_guard<std::mutex> lock(g_nativeMutex);
   g_nativePendingPlayTarget = NativePendingPlayTarget{};
   ++g_nativePendingPlayTargetRevision;
+  nativeResetAutoStopPlaybackLocked();
 }
 
 static void nativeArmPendingPlayTarget(
@@ -14992,6 +15012,7 @@ static void nativeArmPendingPlayTarget(
   const NativeSongWindow& song)
 {
   std::lock_guard<std::mutex> lock(g_nativeMutex);
+  nativeResetAutoStopPlaybackLocked();
   NativePendingPlayTarget pending;
   pending.project = project;
   pending.id = song.id;
@@ -15107,7 +15128,10 @@ static std::string nativeFindPlayingIdWithPendingTarget(
     return target->id;
   }
 
-  clearPendingCopy();
+  // GetPlayPositionEx tambem pode devolver o fim da musica anterior quando
+  // o destino esta separado por um intervalo, ou foi escolhido para tras.
+  // Nao inventa uma posicao: conserva a protecao ate observar o destino real
+  // (ou expirar o limite acima). Stop, fila e Multiloops aguardam essa chegada.
   return playingId;
 }
 
@@ -16499,7 +16523,16 @@ static void nativeMaintainAutoStop(
   const std::vector<NativeSongWindow>& activeItems,
   const std::vector<NativeSongWindow>& projectSongs)
 {
-  if (!project || !Main_OnCommand_ptr || !playing) return;
+  if (!project || !Main_OnCommand_ptr) return;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeMutex);
+    if (!playing || g_nativeAutoStopLastPlayingProject != project) {
+      nativeResetAutoStopPlaybackLocked();
+    }
+    if (!playing) return;
+    g_nativeAutoStopLastPlayingProject = project;
+  }
+  if (nativeHasUnconfirmedPlayTarget(project)) return;
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     if (!g_nativeArmedMarkerId.empty()) {
@@ -61040,6 +61073,7 @@ struct NativeTelepromptSettings {
   bool queueNameEnabled = true;
   bool progressEnabled = false;
   bool previewEnabled = true;
+  bool ignorePreview = false;
   bool previewSongDurationEnabled = true;
   bool previewBlockDurationEnabled = true;
   bool previewUnderlineEnabled = true;
@@ -61790,6 +61824,8 @@ static void nativeTelepromptApplySettingsJson(
     json, "progressEnabled", next.progressEnabled);
   next.previewEnabled = nativeTelepromptJsonBool(
     json, "previewEnabled", next.previewEnabled);
+  next.ignorePreview = nativeTelepromptJsonBool(
+    json, "ignorePreview", next.ignorePreview);
   const bool legacyPreviewDurationEnabled = nativeTelepromptJsonBool(
     json, "previewDurationEnabled", true);
   next.previewSongDurationEnabled = nativeTelepromptJsonBool(
@@ -61870,6 +61906,7 @@ static std::string nativeTelepromptDefaultSettingsJson(int slot)
   json << "\"queueNameEnabled\":true,";
   json << "\"progressEnabled\":false,";
   json << "\"previewEnabled\":" << (slot == 1 ? "true" : "false") << ",";
+  json << "\"ignorePreview\":false,";
   json << "\"previewSongDurationEnabled\":true,";
   json << "\"previewBlockDurationEnabled\":true,";
   json << "\"previewUnderlineEnabled\":true,";
@@ -61986,6 +62023,8 @@ static std::string nativeTelepromptSettingsToJson(
        << boolean(settings.progressEnabled) << ",";
   json << "\"previewEnabled\":"
        << boolean(settings.previewEnabled) << ",";
+  json << "\"ignorePreview\":"
+       << boolean(settings.ignorePreview) << ",";
   json << "\"previewSongDurationEnabled\":"
        << boolean(settings.previewSongDurationEnabled) << ",";
   json << "\"previewBlockDurationEnabled\":"
@@ -65673,6 +65712,7 @@ static void nativeTelepromptPaint(HWND hwnd, int slot)
     !technicalNoticeActive &&
     !settings.clearMode &&
     settings.previewEnabled &&
+    !settings.ignorePreview &&
     state.preview.active &&
     state.preview.mode >= 1 &&
     state.preview.mode <= 6;
@@ -70893,7 +70933,9 @@ static void nativeProcessMultiLoopsOnMainThread()
       project, songs, playing, playPos,
       playingName, songStart, songEnd);
 
-  nativeProcessMultiLoops(project, songs, playing, playPos, playingId, songStart, songEnd);
+  if (!nativeHasUnconfirmedPlayTarget(project)) {
+    nativeProcessMultiLoops(project, songs, playing, playPos, playingId, songStart, songEnd);
+  }
   nativePublishMultiLoopBypassState();
 }
 
@@ -71410,7 +71452,8 @@ static void nativeRebuildState(bool forceSnapshot, bool allowRuntimeControl)
   const std::vector<NativeSongWindow>& activePlaylistItems = cachedActivePlaylistItems;
   const double activePlaylistTotalSec = cachedActivePlaylistTotalSec;
   const std::string& playlistsJson = cachedPlaylistsJson;
-  const bool queueSeekPerformed = allowRuntimeControl && nativeMaintainQueueAutomation(
+  const bool queueSeekPerformed = allowRuntimeControl &&
+    !nativeHasUnconfirmedPlayTarget(activeProject) && nativeMaintainQueueAutomation(
     activeProject, playing, playingId, playPos, songStart, songEnd, activePlaylistItems, songs);
   // O snapshot deste ciclo ainda descreve a música anterior. Se a fila acabou
   // de transferir o playback, o AutoStop só pode avaliar novamente no próximo ciclo.
