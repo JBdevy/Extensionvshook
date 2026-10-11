@@ -12,32 +12,22 @@ enum class Failure {
   Signature,
   Machine,
   Hardware,
-  NotYetValid,
-  Expired,
-  Clock
+  NotYetValid
 };
 
 struct Result {
   bool valid = false;
   Failure failure = Failure::Invalid;
-  bool offlineWarning = false;
-  int64_t offlineWarningDeadline = 0;
-  int offlineWarningNumber = 0;
-};
-
-struct OfflineGraceDecision {
-  bool allowed = false;
-  bool warning = false;
-  int64_t deadline = 0;
 };
 
 Result validateInstalledLicense();
 std::string installedTokenPath();
-OfflineGraceDecision evaluateOfflineGrace(
-  int64_t now,
-  int64_t warningStartedAt,
-  int warningCount,
-  int64_t lastWarningAt,
-  bool warningDeliveredNow = false);
+// Pure local verification: no helper process, network, renewal deadline or
+// auxiliary clock/warning files. The installed wrapper supplies this device.
+Result validateLocalActivation(
+  const std::string& token,
+  const std::string& machine,
+  const std::string& fingerprint,
+  int64_t now);
 
 } // namespace vshook_license

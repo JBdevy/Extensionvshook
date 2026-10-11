@@ -15,6 +15,31 @@ A Hook Center instala o binário e a pasta auxiliar
 necessária para abrir Configurações do Teleprompt e Recados pelo menu da
 extensão, mas não faz parte dos artefatos gerados neste repositório.
 
+## Ativação e uso offline
+
+Após a ativação inicial, a extensão funciona com a Hook Center fechada e sem
+internet, inclusive depois de longos períodos desconectada. Não há mais
+contagem de dias, avisos de reconexão nem bloqueio pelo prazo de renovação do
+token. O token local continua sendo conferido pela assinatura, produto e
+identificação do computador; uma instalação sem ativação ou um token alterado
+continua recusado. Os antigos arquivos auxiliares de relógio e avisos não são
+mais necessários para carregar a extensão.
+
+A Hook Center continua instalando/ativando o produto e transportando os
+recursos que a utilizam explicitamente, como Project Sync entre computadores.
+Isso não condiciona a abertura e o uso local da extensão.
+
+Teste em macOS ou Developer Command Prompt do Visual Studio no Windows:
+
+```text
+node tests/run-license-runtime-policy-test.js
+```
+
+O teste compila o verificador real com uma chave RSA temporária de teste e
+verifica tokens recentes e antigos, assinatura adulterada e vínculo com o
+dispositivo, sem ler nem alterar a ativação instalada. A chave de produção e
+as políticas de conta do servidor não são modificadas.
+
 ## Build nativo
 
 Requisitos: CMake 3.20 ou superior e compilador com suporte a C++17.

@@ -83,14 +83,7 @@ if(VSHOOK_BUILD_TESTS)
     src/license_validator.cpp
     tests/license_validator_test.cpp
   )
-  add_executable(vshook_license_offline_grace_test
-    src/license_validator.cpp
-    tests/license_offline_grace_test.cpp
-  )
   target_include_directories(vshook_license_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-  )
-  target_include_directories(vshook_license_offline_grace_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
   if(WIN32)
@@ -99,17 +92,8 @@ if(VSHOOK_BUILD_TESTS)
       NOMINMAX
     )
     target_link_libraries(vshook_license_test PRIVATE advapi32 bcrypt)
-    target_compile_definitions(vshook_license_offline_grace_test PRIVATE
-      WIN32_LEAN_AND_MEAN
-      NOMINMAX
-    )
-    target_link_libraries(vshook_license_offline_grace_test PRIVATE advapi32 bcrypt)
   elseif(APPLE)
     target_link_libraries(vshook_license_test PRIVATE
-      "-framework CoreFoundation"
-      "-framework Security"
-    )
-    target_link_libraries(vshook_license_offline_grace_test PRIVATE
       "-framework CoreFoundation"
       "-framework Security"
     )

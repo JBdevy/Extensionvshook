@@ -2294,36 +2294,11 @@ static bool nativeEnsurePluginLicense()
     vshook_license::validateInstalledLicense();
   if (result.valid) {
     g_nativeLicenseSessionAuthorized.store(true);
-    if (result.offlineWarning && ShowMessageBox_ptr) {
-      const int warningNumber = std::max(
-        1, std::min(3, result.offlineWarningNumber));
-      const std::string warningMessage =
-        "AVISO " + std::to_string(warningNumber) + " DE 3\n\n" +
-        "É necessário conectar à internet para validar sua licença.\n\n" +
-        "Não fique muito tempo sem conexão com a internet.";
-      ShowMessageBox_ptr(
-        warningMessage.c_str(),
-        "VS Hook",
-        0);
-    }
     return true;
   }
 
   std::string message;
   switch (result.failure) {
-    case vshook_license::Failure::Expired:
-      message =
-        "A validacao offline do VS Hook expirou.\n\n"
-        "Abra a Hook Center conectado a internet para renovar a licenca e "
-        "depois abra o REAPER novamente.";
-      break;
-    case vshook_license::Failure::Clock:
-      message =
-        "A data ou hora deste computador foi retrocedida, ou o estado de "
-        "seguranca da licenca foi alterado.\n\n"
-        "Corrija o relogio e abra a Hook Center conectado a internet para "
-        "renovar a licenca.";
-      break;
     case vshook_license::Failure::Machine:
     case vshook_license::Failure::Hardware:
       message =
@@ -79621,9 +79596,8 @@ static void startupTimer()
   nativeInstallReaperMainWindowSubclass();
   nativeRestorePanelAfterCancelledHostClose();
 
-  // A licença é decidida na abertura. Depois que a sessão foi aceita, uma
-  // virada de prazo nunca fecha o painel nem interrompe o show em andamento.
-  // O eventual bloqueio é aplicado somente na próxima abertura do REAPER.
+  // A ativação local é conferida na abertura, sem prazo de renovação online.
+  // Uma sessão aceita não depende da Hook Center nem da conexão com a internet.
   if (!g_nativeLicenseSessionAuthorized.load()) {
     if (nativeAppActivePanelIsOpen()) nativeCloseAppActivePanel();
     if (g_nativeRuntimeWasActive) {
