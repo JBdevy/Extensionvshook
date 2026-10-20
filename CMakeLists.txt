@@ -69,7 +69,33 @@ if(APPLE)
 endif()
 
 if(VSHOOK_BUILD_TESTS)
+  enable_testing()
+  if(WIN32)
+    add_executable(vshook_ui_renderer_win_test
+      tests/native_ui_renderer_win_test.cpp
+      src/native_ui_renderer_win.cpp)
+    target_compile_definitions(vshook_ui_renderer_win_test PRIVATE
+      WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(vshook_ui_renderer_win_test PRIVATE
+      d2d1 dwrite user32 gdi32)
+    if(MSVC)
+      target_compile_options(vshook_ui_renderer_win_test PRIVATE /utf-8 /UNDEBUG)
+    endif()
+    add_test(NAME ui_renderer_windows COMMAND vshook_ui_renderer_win_test)
+  endif()
   if(APPLE)
+    add_executable(vshook_ui_renderer_mac_test
+      tests/native_ui_renderer_mac_test.mm
+      src/native_ui_renderer_mac.mm)
+    target_include_directories(vshook_ui_renderer_mac_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/WDL)
+    target_compile_definitions(vshook_ui_renderer_mac_test PRIVATE SWELL_PROVIDED_BY_APP)
+    target_compile_options(vshook_ui_renderer_mac_test PRIVATE -UNDEBUG)
+    target_link_libraries(vshook_ui_renderer_mac_test PRIVATE
+      "-framework AppKit" "-framework CoreGraphics" "-framework CoreText"
+      "-framework CoreFoundation" "-framework QuartzCore")
+    add_test(NAME ui_renderer_macos COMMAND vshook_ui_renderer_mac_test)
     add_executable(vshook_ui_damage_mac_test tests/native_ui_damage_mac_test.cpp)
     target_compile_options(vshook_ui_damage_mac_test PRIVATE -UNDEBUG)
     target_link_libraries(vshook_ui_damage_mac_test PRIVATE
@@ -145,10 +171,12 @@ add_library(reaper_vshook SHARED
 
 if(WIN32)
   target_sources(reaper_vshook PRIVATE
+    src/native_ui_renderer_win.cpp
     src/native_video_decoder_ffmpeg.cpp
   )
 elseif(APPLE)
   target_sources(reaper_vshook PRIVATE
+    src/native_ui_renderer_mac.mm
     src/native_keyboard_mac.mm
     src/native_teleprompt_mac.mm
   )
@@ -182,6 +210,8 @@ if(WIN32)
     ole32
     advapi32
     bcrypt
+    d2d1
+    dwrite
     d3d11
     dxgi
     mfplat
@@ -229,6 +259,7 @@ if(APPLE)
     "-framework AppKit"
     "-framework AVFoundation"
     "-framework CoreGraphics"
+    "-framework CoreText"
     "-framework CoreFoundation"
     "-framework QuartzCore"
     "-framework ImageIO"

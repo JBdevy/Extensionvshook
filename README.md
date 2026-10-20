@@ -61,6 +61,39 @@ cmake --build build --config Release
 O workflow do macOS compila separadamente `x86_64` para macOS 10.13+ e
 `arm64` para macOS 11+, depois combina os dois binários.
 
+## Desenho das telas principais
+
+O painel principal (incluindo suas abas), a Hook Controller e os Big Clocks
+usam a camada `native_ui_renderer`. O layout, as áreas de clique, as cores
+configuráveis e os cálculos das barras de progresso/regresso continuam
+compartilhados com os controles existentes.
+
+No Windows, Direct2D desenha em uma superfície persistente da janela e
+DirectWrite desenha os textos. O dispositivo de hardware é preferido; quando
+indisponível, Direct2D pode selecionar software. Operações GDI remanescentes
+usam a mesma superfície por interoperabilidade, respeitando a ordem de desenho
+e os recortes. Falhas na criação ou perda do dispositivo permitem redesenho
+pelo caminho anterior, com nova tentativa posterior.
+
+No macOS, Core Graphics e Core Text desenham no contexto do SWELL, e o AppKit
+usa camadas de Core Animation para apresentação. O painel principal conserva
+seu buffer e seus recortes incrementais. Isso não transfere toda rasterização
+para a GPU. Ambos os sistemas mantêm caches limitados de texto.
+
+Os testes de renderização independem do REAPER. No Windows, verificam a
+mistura Direct2D/GDI, recortes, texto, recriação da superfície e redução de
+progresso; no Mac, verificam Core Graphics/Core Text em escalas 1x e 2x.
+
+```text
+cmake -S . -B build -DVSHOOK_BUILD_TESTS=ON
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Os testes de cada plataforma precisam ser executados no sistema correspondente.
+O ganho de desempenho da interface completa deve ser medido no REAPER com
+projetos representativos.
+
 ## Estrutura
 
 - `src`: código da extensão e dos decodificadores nativos.

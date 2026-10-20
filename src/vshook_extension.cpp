@@ -74,6 +74,7 @@
 // no macOS usa SWELL_CreateMemContext, o caminho suportado pelo REAPER.
 #include "wingui/membitmap.h"
 #include "native_ui_damage.h"
+#include "native_ui_renderer_bridge.h"
 
 class LICE_IBitmap;
 class AudioAccessor;
@@ -883,8 +884,8 @@ static constexpr UINT kNativeUiFrameActiveIntervalMs = 33;
 static constexpr UINT kNativeUiFrameRgbIntervalMs = 100;
 static constexpr UINT kNativeUiFrameIdleIntervalMs = 200;
 static UINT g_nativeUiFrameTimerIntervalMs = 0;
-// Windows e macOS entregam autorepeat com ritmos diferentes. A interface
-// ignora essas repetições nativas e usa o mesmo relógio nas duas plataformas.
+// Windows follows the user's native keyboard repeat, like REAPER's lists.
+// SWELL/macOS retains its timer repeat because native repeats are inconsistent.
 static constexpr int kNativeUiNavigationRepeatDelayMs = 220;
 // 25 passos/s preservam a navegacao rapida sem atravessar duas musicas entre
 // quadros em maquinas cujo paint varia entre 16 e 25 ms.
@@ -913,6 +914,7 @@ static std::unique_ptr<WDL_WinMemBitmap> g_nativeUiBackBuffer;
 static int g_nativeUiBackBufferWidth = 0;
 static int g_nativeUiBackBufferHeight = 0;
 static bool g_nativeUiBackBufferHasFrame = false;
+static bool g_nativeUiWindowSurfaceHasFrame = false;
 static std::vector<RECT> g_nativeUiRgbDamageRects;
 static NativeUiDamage::AnimationCadence g_nativeUiRgbCadence;
 static std::vector<RECT> g_nativeUiBlinkDamageRects;
@@ -16894,6 +16896,8 @@ static void nativeAppActiveFillRoundRect(HDC dc, const RECT& rect, COLORREF fill
   if (!NativeUiDamage::visible(dc, paintRect)) return;
   if (!dc || paintRect.right <= paintRect.left ||
       paintRect.bottom <= paintRect.top) return;
+  if (NativeUiRenderer::fillRoundRect(
+        dc, paintRect, fill, border, radius)) return;
   // Paineis e a superficie principal conservam seus proprios raios. A
   // preferencia Quadrado/Redondo controla somente os botoes.
   // Within the solid interior, a rectangle produces exactly the same pixels
@@ -16957,6 +16961,8 @@ static void nativeAppActiveStrokeRoundRect(
         std::max(2, cornerRadius * 2 + 2))) return;
   if (!dc || paintRect.right <= paintRect.left ||
       paintRect.bottom <= paintRect.top) return;
+  if (NativeUiRenderer::strokeRoundRect(
+        dc, paintRect, color, cornerRadius)) return;
   if (cornerRadius > 0) {
     const NativeUiPenRef pen = nativeUiPen(color);
     HGDIOBJ hollowBrush = GetStockObject(NULL_BRUSH);
@@ -16995,6 +17001,7 @@ static void nativeAppActiveFillRect(HDC dc, const RECT& rect, COLORREF fill)
 {
   const RECT paintRect = nativeUiCustomizePaintRect(rect);
   if (!NativeUiDamage::visible(dc, paintRect)) return;
+  if (NativeUiRenderer::fillRect(dc, paintRect, fill)) return;
   const NativeUiBrushRef brush = nativeUiBrush(fill);
   if (!brush.handle) return;
   FillRect(dc, &paintRect, brush.handle);
@@ -17028,6 +17035,10 @@ static void nativeAppActiveFillVerticalGradient(
     baseColor, RGB(255, 255, 255), 0.15);
   const COLORREF bottomColor = nativeUiGradientColor(
     baseColor, RGB(0, 0, 0), 0.24);
+  const RECT paintRect = nativeUiCustomizePaintRect(rect);
+  if (!NativeUiDamage::visible(dc, paintRect)) return;
+  if (NativeUiRenderer::fillGradient(
+        dc, paintRect, topColor, bottomColor)) return;
   const int height = std::max(1,
     static_cast<int>(rect.bottom - rect.top));
   const int bands = std::max(1, std::min(8, height));
@@ -17057,6 +17068,10 @@ static void nativeAppActiveFillSubtleVerticalGradient(
     baseColor, RGB(255, 255, 255), 0.02);
   const COLORREF bottomColor = nativeUiGradientColor(
     baseColor, RGB(0, 0, 0), 0.04);
+  const RECT paintRect = nativeUiCustomizePaintRect(rect);
+  if (!NativeUiDamage::visible(dc, paintRect)) return;
+  if (NativeUiRenderer::fillGradient(
+        dc, paintRect, topColor, bottomColor)) return;
   const int height = std::max(1,
     static_cast<int>(rect.bottom - rect.top));
   const int bands = std::max(1, std::min(4, height));
@@ -17086,6 +17101,10 @@ static void nativeAppActiveFillHorizontalGradient(
     baseColor, RGB(255, 255, 255), 0.24);
   const COLORREF endColor = nativeUiGradientColor(
     baseColor, RGB(0, 0, 0), 0.24);
+  const RECT paintRect = nativeUiCustomizePaintRect(rect);
+  if (!NativeUiDamage::visible(dc, paintRect)) return;
+  if (NativeUiRenderer::fillGradient(
+        dc, paintRect, startColor, endColor, true)) return;
   const int width = std::max(1,
     static_cast<int>(rect.right - rect.left));
   const int bands = std::max(1, std::min(12, width));
@@ -17478,6 +17497,7 @@ static void nativeUiReleaseBackBuffer()
   g_nativeUiBackBufferWidth = 0;
   g_nativeUiBackBufferHeight = 0;
   g_nativeUiBackBufferHasFrame = false;
+  g_nativeUiWindowSurfaceHasFrame = false;
   g_nativeUiRgbDamageRects.clear();
   g_nativeUiRgbCadence.reset();
   g_nativeUiBlinkDamageRects.clear();
@@ -17576,7 +17596,7 @@ static void nativeAppActiveDrawBlackShadow(HDC dc, const RECT& rect)
     BLENDFUNCTION blend{};
     blend.BlendOp = AC_SRC_OVER;
     blend.SourceConstantAlpha = 176;
-    alphaBlend(dc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+    alphaBlend(NativeUiRenderer::gdiDC(dc), rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
       layer, 0, 0, 1, 1, blend);
     SelectObject(layer, oldBitmap);
     DeleteObject(bitmap);
@@ -17608,6 +17628,7 @@ static void nativeAppActiveDrawText(HDC dc, const std::string& text, RECT rect, 
   // must not depend on which pixels happened to need painting this frame.
   if (!(flags & (DT_NOCLIP | DT_CALCRECT)) &&
       !NativeUiDamage::visible(dc, rect)) return;
+  if (NativeUiRenderer::drawText(dc, text, rect, flags, color, font)) return;
   HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
   SetBkMode(dc, TRANSPARENT);
   SetTextColor(dc, color);
@@ -18631,6 +18652,9 @@ static void nativePaintPartsColumn(
 static int nativeUiTextWidth(HDC dc, const std::string& text, HFONT font)
 {
   if (!dc || text.empty()) return 0;
+  int nativeWidth = 0, nativeHeight = 0;
+  if (NativeUiRenderer::measureText(dc, text, font, nativeWidth, nativeHeight))
+    return std::max(0, nativeWidth);
   const auto cacheKey = std::make_pair(
     reinterpret_cast<uintptr_t>(font), text);
   const auto cached = g_nativeUiTextWidthCache.find(cacheKey);
@@ -18962,6 +18986,10 @@ static void nativeUiRefreshNavigationNow(HWND hwnd)
   nativeUiSetFrameTimerInterval(
     hwnd, kNativeUiFrameFastIntervalMs);
   nativeUiInvalidateRect(hwnd, nullptr, FALSE);
+  // A synthetic repeat is already inside WM_TIMER. Let that timer advance
+  // scrolling and paint once, instead of re-entering WM_PAINT here and then
+  // painting the same step again on return to the controller/main timer.
+  if (g_nativeUiSyntheticNavigationRepeat) return;
   // WM_PAINT/timer podem perder prioridade durante a repetição de WM_KEYDOWN
   // tanto no Win32 quanto no SWELL do macOS. Apresentar no máximo um quadro
   // a cada 16 ms mantém os dois sistemas com a mesma resposta visual.
@@ -19926,6 +19954,31 @@ static void nativeUiDrawButton(
     ? colors.hover : colors.fill;
   const bool pressed = hovered &&
     (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+
+  if (NativeUiRenderer::isActive(dc) && normalizedStyle != "rgb") {
+    // Modern finish within the original button rectangle. All hit targets,
+    // labels, semantic colors and the square/round preference stay shared.
+    const int radius = g_nativeUiModernButtonDesign ? 5 : 2;
+    const COLORREF faceFill = pressed
+      ? nativeUiBlendColor(fill, RGB(6, 9, 14), 0.18) : fill;
+    const COLORREF faceEdge = active
+      ? nativeUiBlendColor(colors.edge, RGB(255, 255, 255), 0.20)
+      : nativeUiBlendColor(colors.edge, faceFill, 0.30);
+    nativeAppActiveFillRoundRect(dc, rect, faceFill, faceEdge, radius);
+    if (active && enabled && rect.bottom - rect.top >= 8 &&
+        rect.right - rect.left > radius * 2 + 4) {
+      nativeAppActiveFillRect(dc,
+        RECT{rect.left + radius + 1, rect.bottom - 3,
+          rect.right - radius - 1, rect.bottom - 2},
+        nativeUiBlendColor(colors.text, colors.edge, 0.35));
+    }
+    const std::string shown = nativeUiFitButtonLabel(
+      dc, label, static_cast<int>(rect.right - rect.left), font, padding);
+    nativeAppActiveDrawText(dc, shown, rect,
+      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+      colors.text, font);
+    return;
+  }
 
   if (g_nativeUiModernButtonDesign) {
     const int buttonH = std::max(1,
@@ -35623,6 +35676,7 @@ static void nativeUiPaintPremixMixerItemRow(
 
 static void nativePaintAppActivePanel(HWND hwnd)
 {
+  NativeUiRenderer::prepareWindow(hwnd);
   NativeUiDamage::Pending pending;
   {
     std::lock_guard<std::mutex> lock(g_nativeUiDamageMutex);
@@ -35645,11 +35699,15 @@ static void nativePaintAppActivePanel(HWND hwnd)
         paintDc, width, height)) {
     dc = bufferDc;
   }
+  NativeUiRendererBridge::Frame renderer(hwnd, dc, client);
   // Unknown OS paints, modal/layout changes and new buffers redraw fully.
   const bool partial = !pending.full && !pending.rects.empty();
   damage.begin(dc, client, client,
-    dc != paintDc && g_nativeUiBackBufferHasFrame,
+    renderer.presentsWindow()
+      ? !NativeUiRenderer::needsFullPaint()
+      : dc != paintDc && g_nativeUiBackBufferHasFrame,
     partial ? &pending.rects : nullptr);
+  NativeUiRenderer::invalidateClip(dc);
   g_nativeUiRgbDamageRects.clear();
   g_nativeUiBlinkDamageRects.clear();
   g_nativeUiProgressDamageRects.clear();
@@ -35779,7 +35837,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
       RGB(255, 138, 42), RGB(255, 170, 90), splashBarH / 2);
 
     damage.finish();
-    if (dc != paintDc) {
+    renderer.finish();
+    g_nativeUiWindowSurfaceHasFrame =
+      renderer.presentsWindow() && renderer.succeeded();
+    if (renderer.presentsWindow()) g_nativeUiBackBufferHasFrame = false;
+    if (!renderer.presentsWindow() && dc != paintDc) {
       g_nativeUiBackBufferHasFrame = true;
       const RECT& dirty = damage.bounds();
       BitBlt(paintDc, dirty.left, dirty.top,
@@ -46234,7 +46296,11 @@ static void nativePaintAppActivePanel(HWND hwnd)
   }
 
   damage.finish();
-  if (dc != paintDc) {
+  renderer.finish();
+  g_nativeUiWindowSurfaceHasFrame =
+    renderer.presentsWindow() && renderer.succeeded();
+  if (renderer.presentsWindow()) g_nativeUiBackBufferHasFrame = false;
+  if (!renderer.presentsWindow() && dc != paintDc) {
     g_nativeUiBackBufferHasFrame = true;
     const RECT& dirty = damage.bounds();
     BitBlt(paintDc, dirty.left, dirty.top,
@@ -47169,7 +47235,19 @@ static bool nativeUiCommitPendingMusicNavigation(bool force)
   return nativeApplySelectionCommand(pending.commitCommand);
 }
 
-static bool nativeNavigateMainRows(int step)
+static bool nativeUiNavigationKeyIsRepeat(LPARAM keyData)
+{
+#ifdef _WIN32
+  // WM_KEYDOWN bit 30 describes the previous physical key state. A fresh
+  // press after key-up must still be allowed to wrap at either list edge.
+  return (keyData & (static_cast<LPARAM>(1) << 30)) != 0;
+#else
+  (void)keyData;
+  return g_nativeUiSyntheticNavigationRepeat;
+#endif
+}
+
+static bool nativeNavigateMainRows(int step, bool repeatedKey = false)
 {
   if (step == 0 || g_nativeAppActivePanelModel.mixerPage ||
       g_nativeMainVisibleRowIndices.empty()) {
@@ -47187,7 +47265,7 @@ static bool nativeNavigateMainRows(int step)
   // Ao soltar e pressionar novamente, o primeiro WM_KEYDOWN físico fica livre
   // para atravessar para a outra ponta da lista nas duas plataformas.
   const bool rapidNavigationRepeat =
-    g_nativeUiSyntheticNavigationRepeat;
+    repeatedKey || g_nativeUiSyntheticNavigationRepeat;
   int current = -1;
   const auto* selected = nativeUiCurrentMainSelectedSongRow();
   if (selected) {
@@ -47348,14 +47426,10 @@ static bool nativeNavigateMainRows(int step)
         std::min(revealTarget,
           g_nativeMainListMaxScrollPixels));
       if (revealTarget != g_nativeAppActiveListScrollPixels) {
-        if (g_nativeUiSyntheticNavigationRepeat ||
-            wrappedAtListEdge) {
-          // O repeat das duas plataformas é produzido pelo mesmo timer que
-          // anima o scroll. Deslocar lista e seleção no mesmo passo impede
-          // pulos: descendo fica na antepenúltima linha; subindo, com uma
-          // linha de contexto acima. Ao atravessar começo/fim também posiciona
-          // imediatamente; animar a distância inteira faz a lista parecer
-          // rolar no sentido errado antes de chegar à outra extremidade.
+        if (wrappedAtListEdge) {
+          // Only wrap-around jumps directly to the other end. Held arrows
+          // keep retargeting the existing animation, so scrolling is updated
+          // between repeat steps instead of snapping a full row at 25 Hz.
           g_nativeAppActiveListScrollPixels = revealTarget;
           g_nativeMainSmoothScroll = NativeUiSmoothScrollState{};
           g_nativeUiLastSmoothScrollAdvanceAt = {};
@@ -50651,6 +50725,7 @@ static std::string nativeBigClockProjectSyncPcLabel()
 
 static void nativeBigClockPaint(HWND hwnd)
 {
+  NativeUiRenderer::prepareWindow(hwnd);
   const int slot = nativeBigClockSlotFromWindow(hwnd);
   nativeBigClockLoadRuntimeSettings(slot);
   PAINTSTRUCT ps{};
@@ -50686,9 +50761,11 @@ static void nativeBigClockPaint(HWND hwnd)
   HDC dc = g_nativeBigClockBackBuffer[slot]
     ? g_nativeBigClockBackBuffer[slot]->GetDC() : paintDc;
 #endif
+  NativeUiRendererBridge::Frame renderer(hwnd, dc, client);
   const auto finishPaint = [&]() {
+    renderer.finish();
 #ifndef __APPLE__
-    if (dc && dc != paintDc && width > 0 && height > 0) {
+    if (!renderer.presentsWindow() && dc && dc != paintDc && width > 0 && height > 0) {
       BitBlt(paintDc, 0, 0, width, height,
         dc, 0, 0, SRCCOPY);
     }
@@ -51417,6 +51494,7 @@ static LRESULT CALLBACK nativeBigClockWndProc(
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
+      NativeUiRenderer::prepareWindow(hwnd);
       SetTimer(hwnd, kNativeBigClockTimerId, 30, nullptr);
       return message == WM_INITDIALOG ? TRUE : 0;
     case WM_NCHITTEST:
@@ -51507,6 +51585,7 @@ static LRESULT CALLBACK nativeBigClockWndProc(
       return 0;
     case WM_DESTROY:
     case WM_NCDESTROY:
+      NativeUiRenderer::releaseWindow(hwnd);
       if (message == WM_DESTROY &&
           !g_nativeBigClockClosing[slot]) {
         nativeBigClockSaveWindowState(slot);
@@ -52069,10 +52148,10 @@ private:
   std::string savedNavigationFocus_;
 };
 
-static bool nativeHookControllerNavigateSong(int step)
+static bool nativeHookControllerNavigateSong(int step, bool repeatedKey)
 {
   NativeHookControllerSongContext context;
-  return nativeNavigateMainRows(step);
+  return nativeNavigateMainRows(step, repeatedKey);
 }
 
 static bool nativeHookControllerNavigateParts(bool parts2, int step)
@@ -53531,6 +53610,7 @@ static void nativeHookControllerPaintTcp(HDC dc,
 
 static void nativeHookControllerPaint(HWND hwnd)
 {
+  NativeUiRenderer::prepareWindow(hwnd);
   PAINTSTRUCT ps{};
   HDC paintDc = BeginPaint(hwnd, &ps);
   if (!paintDc) return;
@@ -53559,6 +53639,7 @@ static void nativeHookControllerPaint(HWND hwnd)
       g_nativeHookControllerBackBuffer->GetDC()
     ? g_nativeHookControllerBackBuffer->GetDC() : paintDc;
 #endif
+  NativeUiRendererBridge::Frame renderer(hwnd, dc, client);
   const auto& visualPrefs = nativeUiVisualPrefsForPaint();
   g_nativeUiModernButtonDesign = nativeLower(
     nativeUiVisualPref(visualPrefs,
@@ -53716,8 +53797,9 @@ static void nativeHookControllerPaint(HWND hwnd)
         normalFont, boldFont);
       break;
   }
+  renderer.finish();
 #ifndef __APPLE__
-  if (dc != paintDc && width > 0 && height > 0) {
+  if (!renderer.presentsWindow() && dc != paintDc && width > 0 && height > 0) {
     BitBlt(paintDc, 0, 0, width, height,
       dc, 0, 0, SRCCOPY);
   }
@@ -54209,6 +54291,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
+      NativeUiRenderer::prepareWindow(hwnd);
       g_nativeHookControllerTimerIntervalMs = 0;
       nativeHookControllerSetFrameTimerInterval(
         hwnd, nativeHookControllerDesiredFrameInterval());
@@ -54582,7 +54665,8 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
         bool handled = false;
         if (g_nativeHookControllerMode ==
             NativeHookControllerMode::Songs) {
-          handled = nativeHookControllerNavigateSong(step);
+          handled = nativeHookControllerNavigateSong(
+            step, nativeUiNavigationKeyIsRepeat(lParam));
         } else if (g_nativeHookControllerMode ==
                      NativeHookControllerMode::Parts2) {
           handled = nativeHookControllerNavigateParts(
@@ -54591,8 +54675,10 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
         }
         if (handled) {
           nativeUiRefreshNavigationNow(hwnd);
-          return 0;
         }
+        // At a list edge, the held arrow still belongs to this controller.
+        // Forwarding it would unexpectedly navigate the main panel instead.
+        return 0;
       }
       if (g_nativeHookControllerMode ==
             NativeHookControllerMode::Songs &&
@@ -54667,6 +54753,7 @@ static LRESULT CALLBACK nativeHookControllerWndProc(
       return 0;
     case WM_DESTROY:
     case WM_NCDESTROY:
+      NativeUiRenderer::releaseWindow(hwnd);
       if (nativeHookControllerInlineRenameActive()) {
         nativeUiCloseMainModal();
       }
@@ -57492,9 +57579,14 @@ static bool nativeUiPrepareNavigationKeyDown(
   }
 
   const int navigationKey = static_cast<int>(key);
+#ifdef _WIN32
+  // Keep every native repeat event. Replacing these with a 40 ms WM_TIMER
+  // capped navigation speed and made it differ from REAPER's Region Manager.
+  g_nativeUiHeldNavigationKey = navigationKey;
+  g_nativeUiNextNavigationRepeatAt = {};
+#else
   if (g_nativeUiHeldNavigationKey == navigationKey) {
-    // O timer próprio já produz o autorepeat. Consome as repetições nativas
-    // para não somar dois ritmos diferentes no Windows ou no macOS.
+    // SWELL's timer already produces repeats; never add its native cadence.
     return true;
   }
 
@@ -57503,6 +57595,7 @@ static bool nativeUiPrepareNavigationKeyDown(
     std::chrono::steady_clock::now() +
     std::chrono::milliseconds(
       kNativeUiNavigationRepeatDelayMs);
+#endif
   nativeUiSetFrameTimerInterval(
     hwnd, kNativeUiFrameFastIntervalMs);
   return false;
@@ -57510,6 +57603,14 @@ static bool nativeUiPrepareNavigationKeyDown(
 
 static bool nativeUiAdvanceNavigationRepeat(HWND hwnd)
 {
+#ifdef _WIN32
+  // The OS owns repeat cadence on Windows. A visual timer must never add a
+  // second selection step, even if a stale deadline happens to be present.
+  if (!hwnd || !IsWindow(hwnd) || g_state.directorInterfaceBlocked) {
+    nativeUiResetNavigationRepeat();
+  }
+  return false;
+#else
 #ifdef __APPLE__
   // O SWELL pode deixar de entregar WM_KEYUP para setas combinadas com
   // Command. Confere o estado físico e elimina qualquer latch restante antes
@@ -57564,6 +57665,7 @@ static bool nativeUiAdvanceNavigationRepeat(HWND hwnd)
     nativeUiResetNavigationRepeat();
   }
   return true;
+#endif
 }
 
 static bool nativeUiSmoothScrollActive()
@@ -57916,7 +58018,8 @@ static void nativeUiPaintRgbAnimatedFrame(HWND hwnd)
   if (!g_nativeUiRgbCadence.due(nowMs, kNativeUiFrameRgbIntervalMs)) return;
   // Modal previews/overlays retain full composition. For the normal panel,
   // repaint just animated outlines in the persistent backbuffer.
-  if (!g_nativeUiBackBufferHasFrame || g_nativeUiRgbDamageRects.empty() ||
+  if ((!g_nativeUiBackBufferHasFrame && !g_nativeUiWindowSurfaceHasFrame) ||
+      g_nativeUiRgbDamageRects.empty() ||
       g_nativeMainModalKind != NativeMainModalKind::None ||
       g_state.directorInterfaceBlocked ||
       std::chrono::steady_clock::now() < g_nativeAppActiveSplashUntil) {
@@ -57967,7 +58070,7 @@ static void nativeUiInvalidateDynamicAreas(HWND hwnd, bool progress, bool info)
 {
   // Transitions/overlays keep the existing full-frame path. In particular,
   // do not use geometry from the previous page while a layout is changing.
-  if (!g_nativeUiBackBufferHasFrame ||
+  if ((!g_nativeUiBackBufferHasFrame && !g_nativeUiWindowSurfaceHasFrame) ||
       std::chrono::steady_clock::now() < g_nativeAppActiveSplashUntil ||
       g_nativeMainModalKind != NativeMainModalKind::None ||
       g_state.directorInterfaceBlocked ||
@@ -58076,6 +58179,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
   switch (message) {
     case WM_CREATE:
     case WM_INITDIALOG:
+      NativeUiRenderer::prepareWindow(hwnd);
       nativeUiSetFrameTimerInterval(
         hwnd, kNativeUiFrameFastIntervalMs);
       return 0;
@@ -58106,7 +58210,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
     case WM_TIMER:
       if (wParam == kNativeUiFrameTimerId) {
         const auto now = std::chrono::steady_clock::now();
-        nativeUiAdvanceNavigationRepeat(hwnd);
+        const bool navigationChanged = nativeUiAdvanceNavigationRepeat(hwnd);
         const bool selectionReleasedForEditing =
           nativeUiReleaseMusicSelectionForArrangeEditing();
         const bool scrollChanged =
@@ -58145,13 +58249,13 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             std::chrono::steady_clock::time_point{};
         }
         if (IsWindowVisible(hwnd) &&
-            (scrollChanged || dragScrollChanged ||
+            (navigationChanged || scrollChanged || dragScrollChanged ||
              searchQueryCommitted ||
               navigationCommitted || selectionReleasedForEditing ||
               localClockChanged ||
              batteryChanged || timedRefresh || splashActive ||
              splashFinished)) {
-          const bool fullRefresh = scrollChanged || dragScrollChanged ||
+          const bool fullRefresh = navigationChanged || scrollChanged || dragScrollChanged ||
             searchQueryCommitted || navigationCommitted ||
             selectionReleasedForEditing || splashActive || splashFinished ||
             (timedRefresh && nativeUiNeedsTimedVisualRefresh(true));
@@ -58166,7 +58270,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
           // A animação da lista não depende da fila normal de WM_PAINT:
           // no Win32 e no SWELL do macOS, cada passo continua sendo
           // apresentado durante o autorepeat das setas.
-          if (scrollChanged || dragScrollChanged) {
+          if (navigationChanged || scrollChanged || dragScrollChanged) {
             UpdateWindow(hwnd);
           }
         } else if (IsWindowVisible(hwnd)) {
@@ -59682,11 +59786,13 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             g_nativeMainSearchCursor = g_nativeMainSearchText.size();
             refreshSearchInputNow = true;
           } else if (wParam == VK_UP) {
-            nativeNavigateMainRows(-1);
+            nativeNavigateMainRows(
+              -1, nativeUiNavigationKeyIsRepeat(lParam));
             nativeUiRefreshNavigationNow(hwnd);
             return 0;
           } else if (wParam == VK_DOWN) {
-            nativeNavigateMainRows(1);
+            nativeNavigateMainRows(
+              1, nativeUiNavigationKeyIsRepeat(lParam));
             nativeUiRefreshNavigationNow(hwnd);
             return 0;
           } else if (wParam == VK_ESCAPE) {
@@ -60007,9 +60113,11 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             nativeNavigateParts(
               g_nativeMainNavigationFocus == "parts2", -1);
           } else if (g_nativeAppActivePanelModel.regionsPage) {
-            nativeNavigateMainRows(-1);
+            nativeNavigateMainRows(
+              -1, nativeUiNavigationKeyIsRepeat(lParam));
           } else {
-            nativeNavigateMainRows(-1);
+            nativeNavigateMainRows(
+              -1, nativeUiNavigationKeyIsRepeat(lParam));
           }
           nativeUiRefreshNavigationNow(hwnd);
           return 0;
@@ -60020,9 +60128,11 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
             nativeNavigateParts(
               g_nativeMainNavigationFocus == "parts2", 1);
           } else if (g_nativeAppActivePanelModel.regionsPage) {
-            nativeNavigateMainRows(1);
+            nativeNavigateMainRows(
+              1, nativeUiNavigationKeyIsRepeat(lParam));
           } else {
-            nativeNavigateMainRows(1);
+            nativeNavigateMainRows(
+              1, nativeUiNavigationKeyIsRepeat(lParam));
           }
           nativeUiRefreshNavigationNow(hwnd);
           return 0;
@@ -60199,6 +60309,7 @@ static LRESULT CALLBACK nativeAppActivePanelWndProc(HWND hwnd, UINT message, WPA
       return 0;
     case WM_DESTROY:
     case WM_NCDESTROY:
+      NativeUiRenderer::releaseWindow(hwnd);
       nativeUiResetNavigationRepeat();
       if (message == WM_DESTROY && DockWindowRemove_ptr &&
           !g_nativeAppActivePanelClosing) {
@@ -60637,8 +60748,9 @@ static bool nativeOpenAppActivePanel()
 
   g_nativeAppActivePanelHwnd = hwnd;
   g_nativeAppActivePanelClosing = false;
+  // Abre diretamente o painel, sem agendar a animacao de abertura.
   g_nativeAppActiveSplashUntil =
-    std::chrono::steady_clock::now() + kNativeAppActiveSplashDuration;
+    std::chrono::steady_clock::time_point{};
   // Nao execute evento MIDI antigo ao reabrir a interface e nao preserve
   // latch de uma tecla cuja soltura ocorreu enquanto o painel estava fechado.
   nativeUiResetMidiRuntimeState(true);
@@ -80402,6 +80514,7 @@ static void shutdown()
   nativeCloseBigClockWindow(0);
   nativeCloseBigClockWindow(1);
   nativeCloseHookControllerWindow();
+  NativeUiRenderer::shutdown();
   nativeTechnicalNoticeFlushPersistenceOnMainThread();
 
   unregisterNativeBridgeApi();
