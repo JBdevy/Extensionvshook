@@ -1880,6 +1880,7 @@ static void nativeLoadLiveMarksForCurrentProject(
   const std::string& projectSignature);
 static bool nativeApplyPlaylistNumberSortCommand(const std::string& commandBody);
 static bool nativeApplyPremixCommand(const std::string& commandBody);
+static std::string nativeObserveProjectTabChange();
 static bool nativeApplyMixerCommand(const std::string& commandBody);
 static std::string nativeUiReadMixerBulkBinding(
   const std::string& action,
@@ -75472,10 +75473,32 @@ static bool nativeApplyPremixUniqueSolo(
   return true;
 }
 
+static bool nativePremixCommandMatchesCurrentProject(const std::string& commandBody)
+{
+  // O outro PC tem ponteiros/caminhos proprios. O Project Sync ja selecionou
+  // a aba correspondente antes de aplicar os comandos recebidos pela LAN.
+  if (g_nativeApplyingTimecodeLanRemoteCommand) return true;
+  char pathBuf[2048] = "";
+  ReaProject* project = getCurrentProject(pathBuf, static_cast<int>(sizeof(pathBuf)));
+  const std::string requestedProjectId = nativeJsonExtractString(commandBody, "premixProjectId");
+  const std::string requestedProjectPath = normalizeSlashes(
+    nativeJsonExtractString(commandBody, "premixProjectPath"));
+  return (requestedProjectId.empty() || requestedProjectId ==
+      std::to_string(reinterpret_cast<std::uintptr_t>(project))) &&
+    (requestedProjectPath.empty() || requestedProjectPath == normalizeSlashes(pathBuf));
+}
+
 static bool nativeApplyPremixCommand(const std::string& commandBody)
 {
   const std::string type = nativeLower(nativeJsonExtractString(commandBody, "type"));
   if (!nativeStartsWith(type, "premix")) return false;
+  // Um gesto enviado antes da troca de aba pertence ao projeto que o app
+  // estava exibindo. Nao resolve GUIDs repetidos contra a nova aba.
+  if (!nativePremixCommandMatchesCurrentProject(commandBody)) {
+    g_nativeForceSnapshotBuild.store(true);
+    g_nativeForceStateBuild.store(true);
+    return true;
+  }
   nativeTimecodeLanRecordCommand(commandBody);
 
   if (type == "premix_focus_song" || type == "premix_item_open" || type == "premix_open_song" || type == "premix_open") {
@@ -77065,6 +77088,9 @@ static bool nativeSelectProjectFromCommand(const std::string& commandBody)
   SelectProjectInstance_ptr(target);
   g_nativeTimecodeLanSuppressedRemoteProjectSignature =
     getCurrentProjectSignature();
+  // Limpa o projeto anterior antes de consumir o proximo comando da fila.
+  // O timer reconhece a mesma assinatura e nao apaga um novo premix_focus_song.
+  nativeObserveProjectTabChange();
   g_nativeForceStateBuild.store(true);
   return true;
 }
@@ -78359,6 +78385,7 @@ static bool nativeApplyGrandMa2MapCommand(
 static void nativeApplyHttpCommandOnMainThread(const std::string& commandBody)
 {
   if (commandBody.empty()) return;
+  nativeObserveProjectTabChange();
 
   const bool previousExternalHttpCommandState =
     g_nativeApplyingExternalHttpCommand;
@@ -79579,6 +79606,21 @@ static void nativeUiResetForProjectTabChange()
   }
 }
 
+static std::string nativeObserveProjectTabChange()
+{
+  const std::string projectSignature = getCurrentProjectSignature();
+  if (projectSignature != g_state.activeProjectSignature) {
+    const bool switchedExistingProject = !g_state.activeProjectSignature.empty();
+    g_state.activeProjectSignature = projectSignature;
+    g_state.projectStableTicks = 0;
+    if (switchedExistingProject) {
+      nativeUiResetForProjectTabChange();
+      nativeTimecodeLanPublishActiveProjectTabOnMainThread(projectSignature);
+    }
+  }
+  return projectSignature;
+}
+
 static void startupTimer()
 {
   static bool standbyDiscoveryPublished = false;
@@ -79612,19 +79654,10 @@ static void startupTimer()
   nativeTimecodeLanRefreshConfigOnMainThread();
   nativeTimecodeLanUpdateTransportOnMainThread();
 
-  const std::string projectSignature =
-    getCurrentProjectSignature();
-  if (projectSignature != g_state.activeProjectSignature) {
-    const bool switchedExistingProject =
-      !g_state.activeProjectSignature.empty();
-    g_state.activeProjectSignature = projectSignature;
-    g_state.projectStableTicks = 0;
-    if (switchedExistingProject) {
-      nativeUiResetForProjectTabChange();
-      nativeTimecodeLanPublishActiveProjectTabOnMainThread(
-        projectSignature);
-    }
-  } else {
+  const bool projectWasStable =
+    getCurrentProjectSignature() == g_state.activeProjectSignature;
+  const std::string projectSignature = nativeObserveProjectTabChange();
+  if (projectWasStable) {
     ++g_state.projectStableTicks;
   }
   // Tambem publica uma vez quando o pareamento terminou com uma aba ja

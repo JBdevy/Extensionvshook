@@ -83,11 +83,17 @@ marker correspondente, sem confundir uma região com o mesmo número. O snapshot
 confirma esse identificador em `selectedSongId` e informa o identificador nativo
 em `selectedCanonicalSongId`, mantendo compatibilidade com os apps existentes.
 
+Ao trocar de aba, o estado anterior é descartado antes de consumir o próximo
+comando do app. A seleção de Premix enviada para o projeto novo não é apagada
+no ciclo seguinte. Comandos com `premixProjectId`/`premixProjectPath` são
+validados contra a aba ativa para descartar gestos atrasados do projeto anterior.
+
 Teste de regressão:
 
 ```text
 node tests/run-premix-selection-test.js
 node tests/run-premix-item-scope-test.js
+node tests/run-project-tab-premix-test.js
 ```
 
 ## Consumo em repouso
