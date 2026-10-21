@@ -63967,7 +63967,7 @@ static void nativeTelepromptDrawPreview(
     };
     nativeTelepromptDrawPreviewLines(
       dc, titleLines, titleRect,
-      titleLineHeight, true,
+      titleLineHeight, false,
       blockColor, titleFont,
       false);
 
@@ -64043,7 +64043,7 @@ static void nativeTelepromptDrawPreview(
           songRect.top,
           songRect.right - (song.playing || song.queued ? 3 : 0),
           songRect.bottom},
-        songLineHeight, true,
+        songLineHeight, false,
         songColor, songFont,
         settings.previewUnderlineEnabled && !song.playing);
       songTop += songHeight + songGap;
