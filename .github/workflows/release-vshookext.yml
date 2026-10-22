@@ -25,6 +25,16 @@ jobs:
             exit 1
           }
 
+      - name: Cache FFmpeg source archive
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vshook-ffmpeg/ffmpeg-8.1.2.tar.xz
+          key: windows-ffmpeg-8.1.2-464beb5e7bf0c311-v1
+
+      - name: Prepare FFmpeg headers
+        shell: pwsh
+        run: ./.github/scripts/prepare-ffmpeg-headers.ps1 -Destination "$env:RUNNER_TEMP/vshook-ffmpeg"
+
       - name: Configure Windows x64
         shell: pwsh
         run: cmake -S . -B build-ci-windows -A x64
