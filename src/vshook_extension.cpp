@@ -63986,21 +63986,6 @@ static void nativeTelepromptDrawPreview(
 
     int songTop = titleSeparatorY +
       titleToSongsGap;
-    const bool hasPlayingSong = std::any_of(
-      block.songs.begin(), block.songs.end(),
-      [](const NativeTelepromptPreviewSong& song) {
-        return song.playing;
-      });
-    const bool hasQueuedSong = std::any_of(
-      block.songs.begin(), block.songs.end(),
-      [](const NativeTelepromptPreviewSong& song) {
-        return song.queued;
-      });
-    const std::string blockColorKey =
-      nativeLower(block.colorKey);
-    const bool whitenOtherSongs =
-      (blockColorKey == "green" && hasPlayingSong) ||
-      (blockColorKey == "yellow" && hasQueuedSong);
     for (size_t songIndex = 0;
          songIndex < block.songs.size(); ++songIndex) {
       const auto& song = block.songs[songIndex];
@@ -64034,9 +64019,6 @@ static void nativeTelepromptDrawPreview(
             song.playing ? playingProgress : queuedRegress);
         }
       }
-      const COLORREF songColor = song.playing || song.queued
-        ? RGB(13, 13, 13)
-        : (whitenOtherSongs ? RGB(255, 255, 255) : blockColor);
       nativeTelepromptDrawPreviewLines(
         dc, songLines,
         RECT{songRect.left + (song.playing || song.queued ? 3 : 0),
@@ -64044,7 +64026,7 @@ static void nativeTelepromptDrawPreview(
           songRect.right - (song.playing || song.queued ? 3 : 0),
           songRect.bottom},
         songLineHeight, false,
-        songColor, songFont,
+        RGB(255, 255, 255), songFont,
         settings.previewUnderlineEnabled && !song.playing);
       songTop += songHeight + songGap;
     }
