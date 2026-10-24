@@ -8963,6 +8963,7 @@ static int g_nativeAutoBlocoTargetPlaylistIndex = 0;
 static int g_nativePreviewMode = 0;
 static bool g_nativeLiveMarkEnabled = false;
 static std::map<std::string, bool> g_nativeLiveExecutedItems;
+static uint64_t g_nativeLiveMarksRevision = 0;
 static std::string g_nativeLiveMarksLoadedProjectSignature;
 static std::string g_nativeLiveTrackerId;
 static double g_nativeLiveTrackerElapsed = 0.0;
@@ -9976,6 +9977,8 @@ static std::string nativePackLiveExecutedItemsLocked()
 // por outro lado, é uma preferência global carregada pelo REAPER.
 static void nativePersistLiveMarksForCurrentProjectLocked()
 {
+  // Invalidate the teleprompter even when transport/media stay unchanged.
+  ++g_nativeLiveMarksRevision;
   if (!SetProjExtState_ptr) return;
   char pathBuf[2048] = "";
   ReaProject* project = getCurrentProject(
@@ -10018,6 +10021,7 @@ static void nativeLoadLiveMarksForCurrentProject(
   {
     std::lock_guard<std::mutex> lock(g_nativeMutex);
     g_nativeLiveExecutedItems = std::move(restored);
+    ++g_nativeLiveMarksRevision;
     g_nativeLiveMarksLoadedProjectSignature =
       projectSignature;
     nativeResetLiveTrackerLocked();
@@ -61203,6 +61207,7 @@ struct NativeTelepromptPreviewSong {
   double durationSec = 0.0;
   bool playing = false;
   bool queued = false;
+  bool liveExecuted = false;
 };
 
 struct NativeTelepromptPreviewBlock {
@@ -61351,6 +61356,7 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
     song.colorHex = current->colorHex;
     song.playing = playing;
     song.queued = queued;
+    song.liveExecuted = item.liveExecuted;
     current->songs.push_back(std::move(song));
   };
 
@@ -61464,6 +61470,7 @@ static NativeTelepromptPreviewState nativeTelepromptBuildPreviewState(
         std::llround(song.durationSec * 1000.0)));
       nativeUiHashValue(hash, song.playing);
       nativeUiHashValue(hash, song.queued);
+      nativeUiHashValue(hash, song.liveExecuted);
     }
   }
   std::ostringstream revision;
@@ -61525,6 +61532,10 @@ static std::string nativeTelepromptPreviewStateJson(
            << (song.playing ? "true" : "false") << ",";
       json << "\"queued\":"
            << (song.queued ? "true" : "false") << ",";
+      json << "\"liveExecuted\":"
+           << (song.liveExecuted ? "true" : "false") << ",";
+      json << "\"liveMarked\":"
+           << (song.liveExecuted ? "true" : "false") << ",";
       json << "\"colorHex\":"
            << nativeJsonString(song.colorHex) << ",";
       json << "\"textColorHex\":"
@@ -63285,6 +63296,12 @@ static NativeTelepromptRenderState nativeTelepromptBuildRenderState(
         0.0, 1.0)
     : state.progress;
 
+  if (previewMode > 0) {
+    // The render cache can refresh before the next bridge snapshot. Resolve
+    // marks from the current Live session rather than retaining stale copies.
+    nativeApplyLiveExecutedFlags(songs);
+    nativeApplyLiveExecutedFlags(playlistItems);
+  }
   state.preview = nativeTelepromptBuildPreviewState(
     playlistItems,
     songs,
@@ -63349,6 +63366,10 @@ static NativeTelepromptRenderState nativeTelepromptReadRenderState(
               << nativeNumber(g_nativeQueuedStart, 6) << '|'
               << nativeNumber(g_nativeQueuedEnd, 6) << '|'
               << g_nativePreviewMode;
+    if (g_nativePreviewMode > 0) {
+      signature << '|' << g_nativeLiveMarkEnabled
+                << '|' << g_nativeLiveMarksRevision;
+    }
     previewContextSignature = signature.str();
   }
 
@@ -63518,7 +63539,8 @@ static void nativeTelepromptDrawPreviewLines(
   bool centered,
   COLORREF color,
   HFONT font,
-  bool underline)
+  bool underline,
+  bool strikeThrough = false)
 {
   int top = rect.top;
   for (const auto& line : lines) {
@@ -63535,22 +63557,34 @@ static void nativeTelepromptDrawPreviewLines(
         (centered ? DT_CENTER : DT_LEFT) |
           DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         color, font);
-      if (underline) {
+      if (underline || strikeThrough) {
         const int textWidth = std::min(
           static_cast<int>(lineRect.right - lineRect.left),
           nativeUiTextWidth(dc, line, font));
         const int lineLeft = centered
           ? (lineRect.left + lineRect.right - textWidth) / 2
           : lineRect.left;
-        const int underlineY = std::min(
-          static_cast<int>(lineRect.bottom) - 1,
-          top + lineHeight - 1);
-        HPEN pen = CreatePen(PS_SOLID, 1, color);
-        HGDIOBJ previousPen = SelectObject(dc, pen);
-        MoveToEx(dc, lineLeft, underlineY, nullptr);
-        LineTo(dc, lineLeft + textWidth, underlineY);
-        SelectObject(dc, previousPen);
-        DeleteObject(pen);
+        if (underline) {
+          const int underlineY = std::min(
+            static_cast<int>(lineRect.bottom) - 1,
+            top + lineHeight - 1);
+          HPEN pen = CreatePen(PS_SOLID, 1, color);
+          HGDIOBJ previousPen = SelectObject(dc, pen);
+          MoveToEx(dc, lineLeft, underlineY, nullptr);
+          LineTo(dc, lineLeft + textWidth, underlineY);
+          SelectObject(dc, previousPen);
+          DeleteObject(pen);
+        }
+        if (strikeThrough && textWidth > 0) {
+          const int thickness = std::max(1, lineHeight / 18);
+          const int strikeY = top + (lineHeight - thickness) / 2;
+          if (strikeY < lineRect.bottom) {
+            nativeAppActiveFillRect(dc,
+              RECT{lineLeft, strikeY, lineLeft + textWidth,
+                std::min<LONG>(lineRect.bottom, strikeY + thickness)},
+              color);
+          }
+        }
       }
     }
     top += lineHeight;
@@ -64026,8 +64060,9 @@ static void nativeTelepromptDrawPreview(
           songRect.right - (song.playing || song.queued ? 3 : 0),
           songRect.bottom},
         songLineHeight, false,
-        RGB(255, 255, 255), songFont,
-        settings.previewUnderlineEnabled && !song.playing);
+        song.liveExecuted ? RGB(255, 64, 64) : RGB(255, 255, 255), songFont,
+        settings.previewUnderlineEnabled && !song.playing,
+        song.liveExecuted);
       songTop += songHeight + songGap;
     }
   }
