@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <cerrno>
+#include "../src/native_project_sync_controls.h"
 #ifdef _WIN32
 #include <winsock2.h>
 using native_socket_t = SOCKET;

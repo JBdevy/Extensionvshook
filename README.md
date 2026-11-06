@@ -188,13 +188,31 @@ cache existente sem manter um leitor ativo. Sem app, a descoberta não passa a
 reconstruir o estado completo. O teste passivo executa o guard real do timer
 e os trechos de efeitos do snapshot, incluindo desconexão e reconexão.
 
-O status do Project Sync reutiliza a serialização JSON do manifesto e do plano
-de diferenças enquanto o conteúdo permanece idêntico. O cache guarda somente
-o último valor de cada campo e usa o mesmo mutex do estado. Alterações no
-documento, inclusive sem mudança de revisão, invalidam o valor imediatamente;
-transporte e progresso continuam sendo publicados em cada consulta. O teste
-de JSON verifica equivalência byte a byte e informa um benchmark isolado, sem
-interpretá-lo como redução de CPU do processo inteiro.
+O Project Sync sincroniza somente os controles entre o PC A e o PC B. Cada
+computador usa seu projeto aberto localmente: não há exigência de pistas iguais,
+comparação de arquivos, manifestos ou hashes, nem transferência de projetos, mídias ou itens adicionados
+ao grid. O pareamento por código, os papéis Mestre/Escravo e a troca de mestre
+continuam disponíveis. Ambos os computadores precisam usar a extensão e a
+Hook Center com o protocolo 3; versões anteriores não podem enviar pacotes de
+projeto ou arquivos para essa conexão.
+
+A fila de espera e o estado do Auto são enviados como controles; cada PC
+executa suas próprias transições, sem receber outro Play ao terminar a música.
+O Project Sync não sincroniza continuamente o cursor nem o enquadramento do
+grid. Play/Stop manuais e comandos de Parts continuam sendo enviados, uma
+única vez, para os destinos já existentes no outro VS Hook. O modo Timecode
+tradicional mantém sua sincronização de transporte.
+
+Regressões do Project Sync (C++17 e Node):
+
+```text
+node tests/run-project-sync-controls-test.js
+node tests/run-project-sync-mapping-test.js
+```
+
+Os testes verificam o bloqueio dos comandos de transferência e a resolução de
+pistas, itens do Premix, músicas e marcadores já existentes em projetos com
+identificadores diferentes. Nenhuma referência recebida cria conteúdo no destino.
 
 Heartbeats repetidos do Diretor atualizam a presença sem invalidar toda a
 janela. Mudanças na permissão e fechamento dos avisos ainda repintam de

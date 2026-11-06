@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "../src/native_project_sync_controls.h"
 
 struct ReaProject {};
 static ReaProject project;

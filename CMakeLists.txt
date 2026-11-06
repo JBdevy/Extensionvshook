@@ -21,7 +21,7 @@ if(APPLE)
   endif()
 endif()
 
-project(reaper_vshook_loader VERSION 1.0.4 LANGUAGES CXX)
+project(reaper_vshook_loader VERSION 1.0.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
