@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <deque>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -26,6 +27,17 @@ struct NativeTimecodeLanTransport {
   double frameRate = 30;
   bool dropFrame = false;
 };
+struct ReaProject {};
+static ReaProject testProject;
+static ReaProject* getCurrentProject(char*, int) { return &testProject; }
+static int testPlayState = 0;
+static double testCursorPosition = 0;
+static int (*GetPlayStateEx_ptr)(ReaProject*) = [](ReaProject*) { return testPlayState; };
+static double (*GetCursorPositionEx_ptr)(ReaProject*) = [](ReaProject*) { return testCursorPosition; };
+static ReaProject* g_nativeTimecodeLanEditCursorProject = nullptr;
+static bool g_nativeTimecodeLanEditCursorBaselineValid = false;
+static double g_nativeTimecodeLanEditCursorBaseline = 0;
+static uint64_t g_nativeTimecodeLanEditCursorSequence = 0;
 static std::mutex g_nativeTimecodeLanMutex;
 static bool g_nativeApplyingTimecodeLanRemoteCommand = false;
 static std::string g_nativeTimecodeLanMode = "project_sync";
@@ -215,7 +227,7 @@ int main() {
   nativeTimecodeLanRecordCommand(R"({"type":"queue_region_song","targetId":"3","autoQueue":true})");
   nativeTimecodeLanRecordCommand(R"({"type":"queue_playlist_song","targetId":"4","manual":false})");
   assert(g_nativeTimecodeLanOutbox.size() == 2);
-  for (const auto* type : {"edit_cursor_move", "timecode_transport_sync", "project_sync_viewport_v1", "mixer_viewport_set"}) {
+  for (const auto* type : {"timecode_transport_sync", "project_sync_viewport_v1", "mixer_viewport_set"}) {
     assert(!nativeProjectSyncIsIndependentControlCommand(type));
     record(type);
   }
@@ -234,15 +246,53 @@ int main() {
   // Independent A->B does not strip position/transport from a traditional A->C link.
   g_nativeParallelTimecodeMode = "transmitter";
   record("edit_cursor_move");
-  assert(g_nativeTimecodeLanOutbox.size() == 5);
+  assert(g_nativeTimecodeLanOutbox.size() == 6);
   assert(g_nativeParallelTimecodeLanOutbox.size() == 1);
   g_nativeTimecodeLanMode = "transmitter";
   record("timecode_transport_sync");
-  assert(g_nativeTimecodeLanOutbox.size() == 6);
+  assert(g_nativeTimecodeLanOutbox.size() == 7);
   assert(nativeTimecodeLanStatusJson().find("\"transport\"") != std::string::npos);
   assert(nativeTimecodeLanOutboxJson(0).find("\"transport\"") != std::string::npos);
   g_nativeTimecodeLanMode = "receive";
   assert(nativeTimecodeLanStatusJson().find("\"projectSyncReady\":false") != std::string::npos);
+  // Manual stopped positions cross exactly once, before the next Play.
+  g_nativeTimecodeLanMode = "project_sync";
+  g_nativeTimecodeLanProjectSyncRole = "primary";
+  g_nativeParallelTimecodeMode = "off";
+  g_nativeTimecodeLanOutbox.clear();
+  testCursorPosition = 60;
+  nativeTimecodeLanPollEditCursorOnMainThread(); // initial baseline, no jump on pair
+  assert(g_nativeTimecodeLanOutbox.empty());
+  testCursorPosition = 123.456;
+  nativeTimecodeLanPollEditCursorOnMainThread();
+  nativeTimecodeLanPollEditCursorOnMainThread();
+  assert(g_nativeTimecodeLanOutbox.size() == 1);
+  const std::string cursor = g_nativeTimecodeLanOutbox.back().command;
+  assert(nativeJsonExtractString(cursor, "type") == "edit_cursor_move");
+  assert(nativeJsonExtractString(cursor, "position") == "123.456");
+  assert(nativeJsonExtractString(cursor, "noSeek") == "true");
+  record("play_start");
+  assert(g_nativeTimecodeLanOutbox.size() == 2);
+  // Neither direct UI commands nor polled cursor moves during Play travel.
+  for (int state : {1, 4, 5}) {
+    testPlayState = state;
+    testCursorPosition += 12;
+    nativeTimecodeLanPollEditCursorOnMainThread();
+    record("edit_cursor_move");
+    assert(g_nativeTimecodeLanOutbox.size() == 2);
+  }
+  testPlayState = 0;
+  nativeTimecodeLanPollEditCursorOnMainThread();
+  assert(g_nativeTimecodeLanOutbox.size() == 2); // no delayed movement after Stop
+  g_nativeTimecodeLanProjectSyncRole = "secondary";
+  testCursorPosition = 333;
+  nativeTimecodeLanPollEditCursorOnMainThread();
+  assert(g_nativeTimecodeLanOutbox.size() == 2);
+  g_nativeTimecodeLanProjectSyncRole = "primary";
+  nativeTimecodeLanPollEditCursorOnMainThread();
+  assert(g_nativeTimecodeLanOutbox.size() == 2); // role changes do not replay B's cursor
+  { NativeProjectSyncAutomaticScope automaticStop; record("edit_cursor_move"); }
+  assert(g_nativeTimecodeLanOutbox.size() == 2);
   checkAbsoluteAutoControls();
   std::cout << "PROJECT_SYNC_CONTROLS_OK: legacy file/structure commands rejected; controls survive; "
                "coalescing, role authority, no echo and pairing-only readiness preserved\n";

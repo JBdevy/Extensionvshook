@@ -214,7 +214,7 @@ inline bool nativeProjectSyncIsRemovedCommand(const std::string& type)
 inline bool nativeProjectSyncIsIndependentControlCommand(const std::string& type)
 {
   return nativeProjectSyncIsControlCommand(type) &&
-    type != "timecode_transport_sync" && type != "edit_cursor_move" &&
+    type != "timecode_transport_sync" &&
     type != "project_sync_viewport_v1" && type != "mixer_viewport_set";
 }
 

@@ -59,7 +59,24 @@ cmake --build build --config Release
 ```
 
 O workflow do macOS compila separadamente `x86_64` para macOS 10.13+ e
-`arm64` para macOS 11+, depois combina os dois binários.
+`arm64` para macOS 11+, depois combina os dois binários. Os workflows
+selecionam um SDK instalado que preserve a ligação legada de CoreMedia.
+
+Para o target Intel 10.13, use o SDK 26.5 ou anterior. O SDK 27 redireciona
+as funções C de CoreMedia para `@rpath/libswiftCoreMedia.dylib` nesse target,
+produzindo uma extensão que não carrega em instalações antigas do REAPER.
+O pós-build confere as dependências reais e rejeita esse resultado. Quando o
+Xcode padrão usa o SDK 27, selecione explicitamente um SDK compatível instalado:
+
+```bash
+cmake -S . -B build-intel -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+  -DCMAKE_OSX_SYSROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+cmake --build build-intel --config Release
+```
+
+A validação das dependências complementa o teste de carregamento no macOS
+suportado; o deployment target sozinho não comprova compatibilidade.
 
 ## Desenho das telas principais
 

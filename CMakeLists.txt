@@ -272,4 +272,13 @@ if(APPLE)
     "-undefined" "dynamic_lookup"
     "-Wl,-exported_symbol,_ReaperPluginEntry"
   )
+
+  # SDK 27 can redirect the entire CoreMedia C framework to the Swift overlay
+  # for an Intel 10.13 deployment target. A successful link then produces a
+  # plugin that older REAPER installations cannot load. Check the real binary.
+  add_custom_command(TARGET reaper_vshook POST_BUILD
+    COMMAND "${CMAKE_COMMAND}"
+      "-DVSHOOK_BINARY=$<TARGET_FILE:reaper_vshook>"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VerifyMacCompatibility.cmake"
+    VERBATIM)
 endif()

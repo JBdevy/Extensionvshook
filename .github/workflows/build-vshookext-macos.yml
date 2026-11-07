@@ -29,6 +29,9 @@ jobs:
           }
           echo "VSHookExt sources found."
 
+      - name: Select SDK compatible with older macOS
+        run: echo "VSHOOK_MACOS_SDK=$(python3 .github/scripts/select-macos-sdk.py)" >> "$GITHUB_ENV"
+
       - name: Configure x86_64 macOS 10.13+
         shell: bash
         env:
@@ -38,6 +41,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_OSX_ARCHITECTURES=x86_64
           -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+          -DCMAKE_OSX_SYSROOT="$VSHOOK_MACOS_SDK"
 
       - name: Build x86_64 macOS 10.13+
         shell: bash
@@ -54,6 +58,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_OSX_ARCHITECTURES=arm64
           -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          -DCMAKE_OSX_SYSROOT="$VSHOOK_MACOS_SDK"
 
       - name: Build arm64 macOS 11+
         shell: bash

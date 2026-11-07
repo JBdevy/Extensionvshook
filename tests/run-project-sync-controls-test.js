@@ -52,17 +52,22 @@ const transport = functionBody('nativeApplyTransportCommand');
 assert(transport.indexOf('return nativeApplyTransportCommand(blockPlayCommand)') <
   transport.indexOf('nativeTimecodeLanRecordCommand(outgoingControl)'));
 assert(transport.includes('"desiredPlaying", wantsPlay ? "true" : "false"'));
+assert(transport.indexOf('nativeTimecodeLanPollEditCursorOnMainThread();') <
+  transport.indexOf('nativeTimecodeLanRecordCommand(outgoingControl)'));
+assert(functionBody('nativeProcessPendingSelectionOnMainThread').includes('!editCursorOnlyWhilePlaying'));
 const received = functionBody('nativeApplyTimecodeLanCommand');
 assert(received.includes(': g_nativeTimecodeLanMode == "receive";'));
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'vshook-controls-test-'));
 try {
   const names = ['nativeJsonEscape', 'nativeJsonString', 'nativeTrim', 'nativeLower',
-    'nativeJsonExtractString', 'nativeBoolFromText', 'nativeProjectSyncCommandIsAutomatic', 'nativeTimecodeLanRecordCommand', 'nativeTimecodeLanStatusJson', 'nativeTimecodeLanOutboxJson', 'nativeApplyAutoCommand'];
+    'nativeJsonExtractString', 'nativeBoolFromText', 'nativeProjectSyncCommandIsAutomatic', 'nativeTimecodeLanRecordCommand', 'nativeTimecodeLanPollEditCursorOnMainThread', 'nativeTimecodeLanStatusJson', 'nativeTimecodeLanOutboxJson', 'nativeApplyAutoCommand'];
   fs.writeFileSync(path.join(temporary, 'controls-under-test.h'), names.map(functionBody).join('\n\n'));
   const windows = process.platform === 'win32';
   const executable = path.join(temporary, windows ? 'test.exe' : 'test');
-  const fixture = path.join(__dirname, 'native_project_sync_controls_test.cpp');
+  fs.writeFileSync(path.join(temporary, 'cursor-under-test.h'), functionBody('nativeProcessPendingSelectionOnMainThread'));
+  for (const fixtureName of ['native_project_sync_controls_test.cpp', 'native_project_sync_cursor_test.cpp']) {
+  const fixture = path.join(__dirname, fixtureName);
   const include = path.join(__dirname, '../src');
   const args = windows
     ? ['/nologo', '/std:c++17', '/EHsc', '/utf-8', '/I' + temporary, '/I' + include,
@@ -75,5 +80,6 @@ try {
     process.stdout.write(result.stdout || ''); process.stderr.write(result.stderr || '');
     if (result.error) throw result.error;
     if (result.status !== 0) throw new Error(command + ' failed: ' + result.status);
+  }
   }
 } finally { fs.rmSync(temporary, {recursive: true, force: true}); }

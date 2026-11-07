@@ -7057,8 +7057,12 @@ static void nativeTimecodeLanRecordCommand(
     nativeJsonExtractString(commandBody, "type")));
   if (!nativeProjectSyncIsControlCommand(type)) return;
   const bool projectSync = g_nativeTimecodeLanMode == "project_sync";
+  // Only an idle sender can share a grid position. A click during Play must
+  // not move an independently stopped backup, either.
+  const bool stoppedCursor = !projectSync || type != "edit_cursor_move" ||
+    (GetPlayStateEx_ptr && GetPlayStateEx_ptr(getCurrentProject(nullptr, 0)) == 0);
   const bool publishMain = !projectSync ||
-    (nativeProjectSyncIsIndependentControlCommand(type) &&
+    (stoppedCursor && nativeProjectSyncIsIndependentControlCommand(type) &&
      nativeProjectSyncAutomaticDepth() == 0 &&
      !nativeProjectSyncCommandIsAutomatic(commandBody));
   const bool publishParallel = g_nativeParallelTimecodeMode == "transmitter" &&
@@ -7278,6 +7282,8 @@ static void nativeTimecodeLanPollEditCursorOnMainThread()
   {
     std::lock_guard<std::mutex> lock(g_nativeTimecodeLanMutex);
     canPublish = g_nativeTimecodeLanMode == "transmitter" ||
+      (g_nativeTimecodeLanMode == "project_sync" &&
+       g_nativeTimecodeLanProjectSyncRole == "primary") ||
       g_nativeParallelTimecodeMode == "transmitter";
   }
   const double position = std::max(0.0,
@@ -7301,8 +7307,11 @@ static void nativeTimecodeLanPollEditCursorOnMainThread()
     g_nativeTimecodeLanEditCursorBaseline = position;
     return;
   }
-  if (!canPublish ||
-      std::fabs(position - g_nativeTimecodeLanEditCursorBaseline) <= 0.001) {
+  if (!canPublish) {
+    g_nativeTimecodeLanEditCursorBaseline = position;
+    return;
+  }
+  if (std::fabs(position - g_nativeTimecodeLanEditCursorBaseline) <= 0.001) {
     return;
   }
 
@@ -27116,7 +27125,7 @@ static void nativeUiCloseMainModal()
       NativeMainModalKind::PremixItemEditor) {
     nativeApplyPremixCommand("{\"type\":\"premix_close\"}");
   }
-  ;
+  g_nativeMainModalKind = NativeMainModalKind::None;
   g_nativeMainModalCancelRect = RECT{0, 0, 0, 0};
   g_nativeMainModalCloseRect = RECT{0, 0, 0, 0};
   g_nativeMainModalInputRect = RECT{0, 0, 0, 0};
@@ -68397,11 +68406,9 @@ static void nativeProcessPendingSelectionOnMainThread()
       editCursorChanged = true;
     }
   }
-  if (editCursorChanged && command.type != "edit_cursor_move") {
-    // Uma selecao semantica do VS Hook pode posicionar o cursor como efeito
-    // dela mesma. Absorve essa posicao no baseline para o poll nao publicar em
-    // seguida um edit_cursor_move redundante. Movimentos feitos diretamente
-    // no grid continuam sendo detectados e enviados normalmente.
+  if (editCursorChanged) {
+    // This command already represents the gesture. Absorb its cursor effect
+    // so polling cannot duplicate it or echo a received edit position.
     g_nativeTimecodeLanEditCursorProject = project;
     g_nativeTimecodeLanEditCursorBaseline = GetCursorPositionEx_ptr
       ? std::max(0.0, GetCursorPositionEx_ptr(project))
@@ -68789,6 +68796,14 @@ static bool nativeApplyTransportCommand(const std::string& commandBody)
         return nativeApplyTransportCommand(blockPlayCommand);
       }
     }
+  }
+
+  // A grid click followed immediately by Play may precede the next cursor
+  // poll. Publish the stopped edit position first so B consumes it before Play.
+  if (wantsPlay && !wantsStop && !isPlaying &&
+      !g_nativeApplyingTimecodeLanRemoteCommand) {
+    nativeProcessPendingSelectionOnMainThread();
+    nativeTimecodeLanPollEditCursorOnMainThread();
   }
 
   // A button's resolved intent is absolute: independently running PCs may
@@ -70295,6 +70310,8 @@ static bool nativeApplyTimecodeLanCommand(
         disconnectedPeerName = g_nativeTimecodeLanPeerName;
         if (connected != g_nativeTimecodeLanPeerConnected) {
           g_nativeTimecodeLanRemoteClock = NativeTimecodeLanRemoteClock{};
+          // A restarted sender begins cursorMoveSeq again at one.
+          g_lastCursorMoveSeq.store(0);
         }
         g_nativeTimecodeLanPeerConnected = connected;
         g_nativeTimecodeLanPeerName = connected
@@ -72143,6 +72160,17 @@ static void startupTimer()
     nativeProcessMultiLoopsOnMainThread();
     nativePrepareQueuedTunerNearRegionEndOnMainThread();
     nativeBridgeTick();
+    // Auto/queue may have moved the edit cursor while completing a local Stop.
+    // Those consequences are not a new grid gesture from A on the next tick.
+    if (g_nativeTimecodeLanMode == "project_sync" && GetCursorPositionEx_ptr) {
+      ReaProject* cursorProject = getCurrentProject(nullptr, 0);
+      if (cursorProject) {
+        g_nativeTimecodeLanEditCursorProject = cursorProject;
+        g_nativeTimecodeLanEditCursorBaseline = std::max(0.0,
+          GetCursorPositionEx_ptr(cursorProject));
+        g_nativeTimecodeLanEditCursorBaselineValid = true;
+      }
+    }
     nativeRefreshAppActivePanelModel();
 #ifdef _WIN32
     processPcResumeRequestFromAppActiveOnMainThread();
