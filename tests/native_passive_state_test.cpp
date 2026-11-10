@@ -14,6 +14,13 @@ static int getPlayState(ReaProject*) { return 0; }
 static auto GetPlayStateEx_ptr = &getPlayState;
 static bool panel = false, director = false;
 static std::string mode, projectSignature = "project-one", standbyDiscoveryProjectSignature;
+static std::string& g_nativeTimecodeLanMode = mode;
+static ReaProject* g_nativeTimecodeLanEditCursorProject = nullptr;
+static double g_nativeTimecodeLanEditCursorBaseline = 0;
+static bool g_nativeTimecodeLanEditCursorBaselineValid = false;
+static int cursorReads = 0;
+static double getCursorPosition(ReaProject*) { ++cursorReads; return 42.0; }
+static auto GetCursorPositionEx_ptr = &getCursorPosition;
 static std::string getTimecodeMode() { return mode; }
 static std::string getParallelTimecodeMode() { return {}; }
 static bool nativeAppActivePanelIsOpen() { return panel; }
@@ -164,12 +171,15 @@ int main() {
   runtimeTimerBody();
   assert(passiveBuilds == previousPassiveBuilds + 1 && !publishedEmpty);
   std::cout << "DISCOVERY_HAS_ZERO_SNAPSHOT_WORK_AND_RECONNECT_WAKES_OK\n";
+  assert(cursorReads == 0 && !g_nativeTimecodeLanEditCursorBaselineValid);
 
   // Existing local and Project Sync runtime ownership remain unchanged.
   expireReader(); mode = "project_sync"; runtimeTimerBody();
   assert(activeBuilds == 2 && g_nativeRuntimeWasActive);
+  assert(cursorReads == 1 && g_nativeTimecodeLanEditCursorBaselineValid &&
+    g_nativeTimecodeLanEditCursorProject == &project && g_nativeTimecodeLanEditCursorBaseline == 42.0);
   mode.clear(); panel = true; due(); runtimeTimerBody();
-  assert(activeBuilds == 3);
+  assert(activeBuilds == 3 && cursorReads == 1);
   std::cout << "EXISTING_PANEL_AND_PROJECT_SYNC_RUNTIME_PRESERVED_OK\n";
   testPassiveEffects();
 }

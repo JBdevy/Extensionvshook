@@ -90,7 +90,8 @@ if(VSHOOK_BUILD_TESTS)
     target_include_directories(vshook_ui_renderer_mac_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
       ${CMAKE_CURRENT_SOURCE_DIR}/WDL)
-    target_compile_definitions(vshook_ui_renderer_mac_test PRIVATE SWELL_PROVIDED_BY_APP)
+    target_compile_definitions(vshook_ui_renderer_mac_test PRIVATE
+      SWELL_PROVIDED_BY_APP NOMINMAX)
     target_compile_options(vshook_ui_renderer_mac_test PRIVATE -UNDEBUG)
     target_link_libraries(vshook_ui_renderer_mac_test PRIVATE
       "-framework AppKit" "-framework CoreGraphics" "-framework CoreText"

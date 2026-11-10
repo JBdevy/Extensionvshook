@@ -35,6 +35,18 @@ jobs:
         shell: pwsh
         run: ./.github/scripts/prepare-ffmpeg-headers.ps1 -Destination "$env:RUNNER_TEMP/vshook-ffmpeg"
 
+      - name: Validate runtime, snapshot work and modal regressions
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          where cl.exe || exit /b 1
+          node tests/run-snapshot-work-test.js || exit /b 1
+          node tests/run-passive-state-test.js || exit /b 1
+          node tests/run-idle-work-test.js || exit /b 1
+          node tests/run-project-sync-controls-test.js || exit /b 1
+          node tests/run-project-sync-mapping-test.js || exit /b 1
+          node tests/run-modal-lifecycle-test.js || exit /b 1
+
       - name: Configure Windows x64
         shell: pwsh
         run: cmake -S . -B build-ci-windows -A x64
@@ -77,8 +89,11 @@ jobs:
       - name: Select SDK compatible with older macOS
         run: echo "VSHOOK_MACOS_SDK=$(python3 .github/scripts/select-macos-sdk.py)" >> "$GITHUB_ENV"
 
-      - name: Validate Project Sync and modal regressions
+      - name: Validate runtime, snapshot work and modal regressions
         run: |
+          node tests/run-snapshot-work-test.js
+          node tests/run-passive-state-test.js
+          node tests/run-idle-work-test.js
           node tests/run-project-sync-controls-test.js
           node tests/run-project-sync-mapping-test.js
           node tests/run-modal-lifecycle-test.js

@@ -8374,34 +8374,87 @@ static std::string nativeMediaItemNotes(MediaItem* item)
   return nativeTrim(buf);
 }
 
-static std::string nativeCollectLyricsForRange(ReaProject* project, double start, double end)
-{
-  if (!project || !CountTracks_ptr || !GetTrack_ptr || !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr || !GetMediaItemInfo_Value_ptr) return std::string();
-  std::string best;
-  const int trackCount = CountTracks_ptr(project);
-  for (int ti = 0; ti < trackCount; ++ti) {
-    MediaTrack* track = GetTrack_ptr(project, ti);
-    if (!track) continue;
-    const int itemCount = GetTrackNumMediaItems_ptr(track);
-    for (int ii = 0; ii < itemCount; ++ii) {
-      MediaItem* item = GetTrackMediaItem_ptr(track, ii);
-      if (!item) continue;
-      const double pos = GetMediaItemInfo_Value_ptr(item, "D_POSITION");
-      const double len = std::max(0.0, GetMediaItemInfo_Value_ptr(item, "D_LENGTH"));
-      const double itemEnd = pos + len;
-      const bool startsInside = pos >= start - 0.0005 && pos < end - 0.0005;
-      const bool overlaps = itemEnd > start + 0.0005 && pos < end - 0.0005;
+// One reader per structural snapshot. Do not retain REAPER item pointers
+// between timer ticks: edits, undo and project switches may invalidate them.
+class NativeLyricsRangeReader {
+public:
+  explicit NativeLyricsRangeReader(ReaProject* project) : project_(project) {}
+
+  std::string forRange(double start, double end)
+  {
+    std::string fallback;
+    for (size_t i = 0; i < items_.size() || appendNextItem(); ++i) {
+      auto& entry = items_[i];
+      const bool startsInside =
+        entry.start >= start - 0.0005 && entry.start < end - 0.0005;
+      const bool overlaps =
+        entry.end > start + 0.0005 && entry.start < end - 0.0005;
       if (!startsInside && !overlaps) continue;
-      const std::string notes = nativeMediaItemNotes(item);
-      if (!notes.empty()) {
-        // Prioriza texto que começa dentro da música; se só atravessa, guarda como fallback.
-        if (startsInside) return notes;
-        if (best.empty()) best = notes;
+      if (!entry.notesRead) {
+        entry.notes = nativeMediaItemNotes(entry.item);
+        entry.notesRead = true;
       }
+      if (entry.notes.empty()) continue;
+      // Preserve track/item order and prefer text starting inside the song
+      // over an earlier item merely overlapping it, including nested songs.
+      if (startsInside) return entry.notes;
+      if (fallback.empty()) fallback = entry.notes;
     }
+    return fallback;
   }
-  return best;
-}
+
+private:
+  struct Entry {
+    MediaItem* item = nullptr;
+    double start = 0.0;
+    double end = 0.0;
+    bool notesRead = false;
+    std::string notes;
+  };
+
+  bool appendNextItem()
+  {
+    if (!initialized_) {
+      initialized_ = true;
+      if (!project_ || !CountTracks_ptr || !GetTrack_ptr ||
+          !GetTrackNumMediaItems_ptr || !GetTrackMediaItem_ptr ||
+          !GetMediaItemInfo_Value_ptr) return false;
+      trackCount_ = CountTracks_ptr(project_);
+    }
+    // Stop at the first matching lyric, just as the original lookup did.
+    // Later song queries reuse this prefix and only extend it if necessary.
+    while (trackIndex_ < trackCount_) {
+      if (!track_) {
+        track_ = GetTrack_ptr(project_, trackIndex_);
+        itemCount_ = track_ ? GetTrackNumMediaItems_ptr(track_) : 0;
+        itemIndex_ = 0;
+      }
+      while (itemIndex_ < itemCount_) {
+        MediaItem* item = GetTrackMediaItem_ptr(track_, itemIndex_++);
+        if (!item) continue;
+        Entry entry;
+        entry.item = item;
+        entry.start = GetMediaItemInfo_Value_ptr(item, "D_POSITION");
+        entry.end = entry.start + std::max(0.0,
+          GetMediaItemInfo_Value_ptr(item, "D_LENGTH"));
+        items_.push_back(std::move(entry));
+        return true;
+      }
+      track_ = nullptr;
+      ++trackIndex_;
+    }
+    return false;
+  }
+
+  ReaProject* project_ = nullptr;
+  bool initialized_ = false;
+  MediaTrack* track_ = nullptr;
+  int trackCount_ = 0;
+  int trackIndex_ = 0;
+  int itemCount_ = 0;
+  int itemIndex_ = 0;
+  std::vector<Entry> items_;
+};
 
 static bool nativeItemStartsInRange(MediaItem* item, double start, double end)
 {
@@ -10292,8 +10345,9 @@ static std::vector<NativeSongWindow> nativeCollectProjectSongs(ReaProject* proje
 
   // A extensão entrega a letra dos Empty Items direto para Diretor/Músicos.
   // O Lua não precisa mais escrever JSON pesado só para teleprompt/letras.
+  NativeLyricsRangeReader lyrics(project);
   for (auto& s : songs) {
-    if (!s.isBlock) s.lyricsText = nativeCollectLyricsForRange(project, s.start, s.end);
+    if (!s.isBlock) s.lyricsText = lyrics.forRange(s.start, s.end);
   }
   return songs;
 }
@@ -64688,6 +64742,7 @@ static void nativeRebuildState(bool forceSnapshot, bool allowRuntimeControl)
   // varrer/serializar regioes, repertorios, mixer e Premix na thread principal
   // a cada heartbeat, deixando o desenho e o zoom do Grid livres.
   static ReaProject* cachedSnapshotProject = nullptr;
+  static bool cachedSnapshotValid = false;
   static int cachedSnapshotChangeCount = -1;
   static uint64_t cachedTempoMarkerBpmSignature = 0;
   static int observedProjectChangeCount = -1;
@@ -64751,8 +64806,11 @@ static void nativeRebuildState(bool forceSnapshot, bool allowRuntimeControl)
     observedProjectChangeAt.time_since_epoch().count() != 0 &&
     std::chrono::duration_cast<std::chrono::milliseconds>(snapshotNow - observedProjectChangeAt).count() >= 300;
   const bool rebuildSnapshot = forceSnapshot || snapshotProjectChanged ||
-    tempoMarkerBpmChanged || projectRevisionSettled || cachedSongs.empty();
+    tempoMarkerBpmChanged || projectRevisionSettled || !cachedSnapshotValid;
   if (rebuildSnapshot) {
+    // An empty song list is a valid snapshot too. Rebuilding it every heartbeat
+    // also rebuilt the mixer/Premix and queried every track and its plugins.
+    cachedSnapshotValid = true;
     ++g_nativeMultiLoopPairCacheRevision;
     cachedSnapshotProject = activeProject;
     cachedSnapshotChangeCount = projectChangeCount;
