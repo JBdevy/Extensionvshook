@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const source = fs.readFileSync(path.join(__dirname, '../src/vshook_extension.cpp'),'utf8');
+const source = fs.readFileSync(path.join(__dirname, '../src/vshook_extension.cpp'),'utf8').replace(/\r\n/g, '\n');
 const extract = (from,to) => { const a=source.indexOf(from),b=source.indexOf(to,a+from.length); assert(a>=0&&b>a,from); return source.slice(a,b); };
 const temp = fs.mkdtempSync(path.join(os.tmpdir(),'vshook-control-mapping-'));
 try {

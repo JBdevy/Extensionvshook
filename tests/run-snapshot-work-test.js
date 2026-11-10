@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const source = fs.readFileSync(path.join(__dirname, '../src/vshook_extension.cpp'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '../src/vshook_extension.cpp'), 'utf8').replace(/\r\n/g, '\n');
 function extract(from, to) {
   const start = source.indexOf(from);
   const end = source.indexOf(to, start + from.length);
